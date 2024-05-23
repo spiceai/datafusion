@@ -19,8 +19,14 @@
 /// Note: this trait will eventually be replaced by the Dialect in the SQLparser package
 ///
 /// See <https://github.com/sqlparser-rs/sqlparser-rs/pull/1170>
+/// See also the discussion in <https://github.com/apache/datafusion/pull/10625>
 pub trait Dialect {
     fn identifier_quote_style(&self) -> Option<char>;
+
+    /// Does the dialect support specifying `NULLS FIRST/LAST` in `ORDER BY` clauses?
+    fn supports_nulls_first_in_sort(&self) -> bool {
+        true
+    }
 }
 pub struct DefaultDialect {}
 
@@ -43,6 +49,10 @@ pub struct MySqlDialect {}
 impl Dialect for MySqlDialect {
     fn identifier_quote_style(&self) -> Option<char> {
         Some('`')
+    }
+
+    fn supports_nulls_first_in_sort(&self) -> bool {
+        false
     }
 }
 
