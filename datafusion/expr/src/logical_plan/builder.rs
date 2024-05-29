@@ -2139,4 +2139,52 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn plan_builder_from_logical_plan() -> Result<()> {
+        let plan =
+            table_scan(Some("employee_csv"), &employee_schema(), Some(vec![3, 4]))?
+                .sort(vec![
+                    Expr::Sort(expr::Sort::new(Box::new(col("state")), true, true)),
+                    Expr::Sort(expr::Sort::new(Box::new(col("salary")), false, false)),
+                ])?
+                .build()?;
+
+        let plan_expected = format!("{plan:?}");
+        let plan_builder: LogicalPlanBuilder = Arc::new(plan).into();
+        assert_eq!(plan_expected, format!("{:?}", plan_builder.plan));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_union_strips_qualifiers() {
+        let schema = Schema::new(vec![
+            Field::new("foo", DataType::Int32, false),
+            Field::new("bar", DataType::Int32, false),
+        ]);
+        let result = table_scan(Some("t1"), &schema, None)
+            .expect("valid table scan")
+            .union(
+                table_scan(Some("t2"), &schema, None)
+                    .expect("valid table scan")
+                    .build()
+                    .expect("valid plan"),
+            )
+            .expect("valid union")
+            .build()
+            .expect("valid plan");
+
+        let LogicalPlan::Union(union) = result else {
+            panic!("expected union, got {result:?}")
+        };
+
+        assert!(
+            union
+                .schema
+                .iter()
+                .all(|(qualifier, _)| qualifier.is_none()),
+            "Expected the schema from a Union to not have any table qualifiers"
+        )
+    }
 }
