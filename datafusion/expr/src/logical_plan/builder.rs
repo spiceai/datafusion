@@ -2141,23 +2141,6 @@ mod tests {
     }
 
     #[test]
-    fn plan_builder_from_logical_plan() -> Result<()> {
-        let plan =
-            table_scan(Some("employee_csv"), &employee_schema(), Some(vec![3, 4]))?
-                .sort(vec![
-                    Expr::Sort(expr::Sort::new(Box::new(col("state")), true, true)),
-                    Expr::Sort(expr::Sort::new(Box::new(col("salary")), false, false)),
-                ])?
-                .build()?;
-
-        let plan_expected = format!("{plan:?}");
-        let plan_builder: LogicalPlanBuilder = Arc::new(plan).into();
-        assert_eq!(plan_expected, format!("{:?}", plan_builder.plan));
-
-        Ok(())
-    }
-
-    #[test]
     fn test_union_strips_qualifiers() -> Result<()> {
         let schema = Schema::new(vec![
             Field::new("foo", DataType::Int32, false),
