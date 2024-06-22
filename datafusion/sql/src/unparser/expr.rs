@@ -20,9 +20,12 @@ use arrow::datatypes::Decimal256Type;
 use arrow::datatypes::DecimalType;
 use arrow::util::display::array_value_to_string;
 use core::fmt;
+use sqlparser::ast::TimezoneInfo;
 use std::{fmt::Display, vec};
 
-use arrow_array::{Date32Array, Date64Array};
+use arrow_array::{
+    Date32Array, Date64Array, TimestampMillisecondArray, TimestampNanosecondArray,
+};
 use arrow_schema::DataType;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
@@ -649,6 +652,15 @@ impl Unparser<'_> {
         }
     }
 
+    fn timestamp_string_to_sql(&self, ts: String) -> Result<ast::Expr> {
+        Ok(ast::Expr::Cast {
+            kind: ast::CastKind::Cast,
+            expr: Box::new(ast::Expr::Value(SingleQuotedString(ts))),
+            data_type: ast::DataType::Timestamp(None, TimezoneInfo::None),
+            format: None,
+        })
+    }
+
     /// DataFusion ScalarValues sometimes require a ast::Expr to construct.
     /// For example ScalarValue::Date32(d) corresponds to the ast::Expr CAST('datestr' as DATE)
     fn scalar_to_sql(&self, v: &ScalarValue) -> Result<ast::Expr> {
@@ -808,8 +820,31 @@ impl Unparser<'_> {
             ScalarValue::TimestampSecond(None, _) => {
                 Ok(ast::Expr::Value(ast::Value::Null))
             }
-            ScalarValue::TimestampMillisecond(Some(_ts), _) => {
-                not_impl_err!("Unsupported scalar: {v:?}")
+            ScalarValue::TimestampMillisecond(Some(_ts), tz) => {
+                let result = if let Some(tz) = tz {
+                    v.to_array()?
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to downcast to TimestampMillisecond from TimestampMillisecond scalar"
+                        ))?
+                        .value_as_datetime_with_tz(0, tz.parse()?)
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to convert TimestampMillisecond to DateTime"
+                        ))?.to_string()
+                } else {
+                    v.to_array()?
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to downcast to TimestampMillisecond from TimestampMillisecond scalar"
+                        ))?
+                        .value_as_datetime(0)
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to convert TimestampMillisecond to NaiveDateTime"
+                        ))?.to_string()
+                };
+                self.timestamp_string_to_sql(result)
             }
             ScalarValue::TimestampMillisecond(None, _) => {
                 Ok(ast::Expr::Value(ast::Value::Null))
@@ -820,8 +855,31 @@ impl Unparser<'_> {
             ScalarValue::TimestampMicrosecond(None, _) => {
                 Ok(ast::Expr::Value(ast::Value::Null))
             }
-            ScalarValue::TimestampNanosecond(Some(_ts), _) => {
-                not_impl_err!("Unsupported scalar: {v:?}")
+            ScalarValue::TimestampNanosecond(Some(_ts), tz) => {
+                let result = if let Some(tz) = tz {
+                    v.to_array()?
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to downcast to TimestampNanosecond from TimestampNanosecond scalar"
+                        ))?
+                        .value_as_datetime_with_tz(0, tz.parse()?)
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to convert TimestampNanosecond to DateTime"
+                        ))?.to_string()
+                } else {
+                    v.to_array()?
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to downcast to TimestampNanosecond from TimestampNanosecond scalar"
+                        ))?
+                        .value_as_datetime(0)
+                        .ok_or(internal_datafusion_err!(
+                            "Unable to convert TimestampNanosecond to NaiveDateTime"
+                        ))?.to_string()
+                };
+                self.timestamp_string_to_sql(result)
             }
             ScalarValue::TimestampNanosecond(None, _) => {
                 Ok(ast::Expr::Value(ast::Value::Null))
@@ -993,6 +1051,7 @@ mod tests {
     use arrow::datatypes::{Field, Schema};
     use arrow_schema::DataType::Int8;
     use datafusion_common::TableReference;
+    use datafusion_expr::interval_month_day_nano_lit;
     use datafusion_expr::{
         case, col, cube, exists,
         expr::{AggregateFunction, AggregateFunctionDefinition},
@@ -1000,7 +1059,6 @@ mod tests {
         try_cast, when, wildcard, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature,
         Volatility, WindowFrame, WindowFunctionDefinition,
     };
-    use datafusion_expr::interval_month_day_nano_lit;
 
     use crate::unparser::dialect::CustomDialect;
 
@@ -1170,6 +1228,21 @@ mod tests {
                     null_treatment: None,
                 }),
                 r#"SUM(a)"#,
+            ),
+            (
+                Expr::Literal(ScalarValue::TimestampMillisecond(Some(10001), None)),
+                r#"CAST('1970-01-01 00:00:10.001' AS TIMESTAMP)"#,
+            ),
+            (
+                Expr::Literal(ScalarValue::TimestampMillisecond(
+                    Some(10001),
+                    Some("+08:00".into()),
+                )),
+                r#"CAST('1970-01-01 08:00:10.001 +08:00' AS TIMESTAMP)"#,
+            ),
+            (
+                Expr::Literal(ScalarValue::TimestampNanosecond(Some(10001), None)),
+                r#"CAST('1970-01-01 00:00:00.000010001' AS TIMESTAMP)"#,
             ),
             (
                 Expr::AggregateFunction(AggregateFunction {
@@ -1343,12 +1416,11 @@ mod tests {
                 r#"((a + b) > 100.123) IS NOT UNKNOWN"#,
             ),
             (
-                (col("a") + col("b"))
-                    .gt(Expr::Literal(ScalarValue::Decimal256(
-                        Some(100123.into()),
-                        28,
-                        3,
-                    ))),
+                (col("a") + col("b")).gt(Expr::Literal(ScalarValue::Decimal256(
+                    Some(100123.into()),
+                    28,
+                    3,
+                ))),
                 r#"((a + b) > 100.123)"#,
             ),
             (
