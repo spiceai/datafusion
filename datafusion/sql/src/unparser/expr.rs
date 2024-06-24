@@ -18,13 +18,15 @@
 use arrow::datatypes::Decimal128Type;
 use arrow::datatypes::Decimal256Type;
 use arrow::datatypes::DecimalType;
+use arrow::util::display::array_value_to_string;
 use core::fmt;
 use std::{fmt::Display, vec};
 
 use arrow_array::{Date32Array, Date64Array};
 use arrow_schema::DataType;
+use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
-    self, Expr as AstExpr, Function, FunctionArg, Ident, UnaryOperator,
+    self, Expr as AstExpr, Function, FunctionArg, Ident, Interval, UnaryOperator,
 };
 
 use datafusion_common::{
@@ -835,7 +837,22 @@ impl Unparser<'_> {
             }
             ScalarValue::IntervalDayTime(None) => Ok(ast::Expr::Value(ast::Value::Null)),
             ScalarValue::IntervalMonthDayNano(Some(_i)) => {
-                not_impl_err!("Unsupported scalar: {v:?}")
+                let wrap_array = v.to_array()?;
+                let Some(result) = array_value_to_string(&wrap_array, 0).ok() else {
+                    return internal_err!(
+                        "Unable to convert IntervalMonthDayNano to string"
+                    );
+                };
+                let interval = Interval {
+                    value: Box::new(ast::Expr::Value(SingleQuotedString(
+                        result.to_uppercase(),
+                    ))),
+                    leading_field: None,
+                    leading_precision: None,
+                    last_field: None,
+                    fractional_seconds_precision: None,
+                };
+                Ok(ast::Expr::Interval(interval))
             }
             ScalarValue::IntervalMonthDayNano(None) => {
                 Ok(ast::Expr::Value(ast::Value::Null))
@@ -970,11 +987,11 @@ impl Unparser<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::{Add, Sub};
     use std::{any::Any, sync::Arc, vec};
 
     use arrow::datatypes::{Field, Schema};
     use arrow_schema::DataType::Int8;
-
     use datafusion_common::TableReference;
     use datafusion_expr::{
         case, col, cube, exists,
@@ -983,6 +1000,7 @@ mod tests {
         try_cast, when, wildcard, ColumnarValue, ScalarUDF, ScalarUDFImpl, Signature,
         Volatility, WindowFrame, WindowFunctionDefinition,
     };
+    use datafusion_expr::interval_month_day_nano_lit;
 
     use crate::unparser::dialect::CustomDialect;
 
@@ -1294,6 +1312,30 @@ mod tests {
             ),
             (col("need-quoted").eq(lit(1)), r#"("need-quoted" = 1)"#),
             (col("need quoted").eq(lit(1)), r#"("need quoted" = 1)"#),
+            (
+                interval_month_day_nano_lit(
+                    "1 YEAR 1 MONTH 1 DAY 3 HOUR 10 MINUTE 20 SECOND",
+                ),
+                r#"INTERVAL '0 YEARS 13 MONS 1 DAYS 3 HOURS 10 MINS 20.000000000 SECS'"#,
+            ),
+            (
+                interval_month_day_nano_lit("1.5 MONTH"),
+                r#"INTERVAL '0 YEARS 1 MONS 15 DAYS 0 HOURS 0 MINS 0.000000000 SECS'"#,
+            ),
+            (
+                interval_month_day_nano_lit("-3 MONTH"),
+                r#"INTERVAL '0 YEARS -3 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS'"#,
+            ),
+            (
+                interval_month_day_nano_lit("1 MONTH")
+                    .add(interval_month_day_nano_lit("1 DAY")),
+                r#"(INTERVAL '0 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS' + INTERVAL '0 YEARS 0 MONS 1 DAYS 0 HOURS 0 MINS 0.000000000 SECS')"#,
+            ),
+            (
+                interval_month_day_nano_lit("1 MONTH")
+                    .sub(interval_month_day_nano_lit("1 DAY")),
+                r#"(INTERVAL '0 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS' - INTERVAL '0 YEARS 0 MONS 1 DAYS 0 HOURS 0 MINS 0.000000000 SECS')"#,
+            ),
             (
                 (col("a") + col("b"))
                     .gt(Expr::Literal(ScalarValue::Decimal128(Some(100123), 28, 3)))
