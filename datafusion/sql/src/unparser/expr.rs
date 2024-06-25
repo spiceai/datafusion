@@ -19,7 +19,6 @@ use arrow::datatypes::Decimal128Type;
 use arrow::datatypes::Decimal256Type;
 use arrow::datatypes::DecimalType;
 use arrow::util::display::array_value_to_string;
-use arrow_schema::TimeUnit;
 use core::fmt;
 use sqlparser::ast::TimezoneInfo;
 use std::{fmt::Display, vec};
@@ -959,16 +958,13 @@ impl Unparser<'_> {
             }
             DataType::Float32 => Ok(ast::DataType::Float(None)),
             DataType::Float64 => Ok(ast::DataType::Double),
-            DataType::Timestamp(time_unit, _) => {
-
-                let time_precision = match time_unit {
-                    TimeUnit::Second => 0,
-                    TimeUnit::Millisecond => 3,
-                    TimeUnit::Microsecond => 6,
-                    TimeUnit::Nanosecond => 9,
+            DataType::Timestamp(_, tz) => {
+                let tz_info = match tz {
+                    Some(_) => TimezoneInfo::WithTimeZone,
+                    None => TimezoneInfo::None
                 };
 
-                Ok(ast::DataType::Timestamp(Some(time_precision), TimezoneInfo::None))
+                Ok(ast::DataType::Timestamp(None, tz_info))
             }
             DataType::Date32 => Ok(ast::DataType::Date),
             DataType::Date64 => Ok(ast::DataType::Datetime(None)),
@@ -1055,6 +1051,7 @@ mod tests {
 
     use arrow::datatypes::{Field, Schema};
     use arrow_schema::DataType::Int8;
+    use arrow::datatypes::TimeUnit;
     use datafusion_common::TableReference;
     use datafusion_expr::expr::{AggregateFunction, AggregateFunctionDefinition};
     use datafusion_expr::interval_month_day_nano_lit;
@@ -1151,14 +1148,14 @@ mod tests {
                     expr: Box::new(col("a")),
                     data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("+08:00".into())),
                 }),
-                r#"CAST(a AS TIMESTAMP(9))"#,
+                r#"CAST(a AS TIMESTAMP WITH TIME ZONE)"#,
             ),
             (
                 Expr::Cast(Cast {
                     expr: Box::new(col("a")),
                     data_type: DataType::Timestamp(TimeUnit::Millisecond, None),
                 }),
-                r#"CAST(a AS TIMESTAMP(3))"#,
+                r#"CAST(a AS TIMESTAMP)"#,
             ),
             (
                 Expr::Cast(Cast {
