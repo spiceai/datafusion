@@ -958,8 +958,13 @@ impl Unparser<'_> {
             }
             DataType::Float32 => Ok(ast::DataType::Float(None)),
             DataType::Float64 => Ok(ast::DataType::Double),
-            DataType::Timestamp(_, _) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+            DataType::Timestamp(_, tz) => {
+                let tz_info = match tz {
+                    Some(_) => TimezoneInfo::WithTimeZone,
+                    None => TimezoneInfo::None
+                };
+
+                Ok(ast::DataType::Timestamp(None, tz_info))
             }
             DataType::Date32 => Ok(ast::DataType::Date),
             DataType::Date64 => Ok(ast::DataType::Datetime(None)),
@@ -1046,6 +1051,7 @@ mod tests {
 
     use arrow::datatypes::{Field, Schema};
     use arrow_schema::DataType::Int8;
+    use arrow::datatypes::TimeUnit;
     use datafusion_common::TableReference;
     use datafusion_expr::expr::{AggregateFunction, AggregateFunctionDefinition};
     use datafusion_expr::interval_month_day_nano_lit;
@@ -1136,6 +1142,20 @@ mod tests {
                     data_type: DataType::Date64,
                 }),
                 r#"CAST(a AS DATETIME)"#,
+            ),
+            (
+                Expr::Cast(Cast {
+                    expr: Box::new(col("a")),
+                    data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("+08:00".into())),
+                }),
+                r#"CAST(a AS TIMESTAMP WITH TIME ZONE)"#,
+            ),
+            (
+                Expr::Cast(Cast {
+                    expr: Box::new(col("a")),
+                    data_type: DataType::Timestamp(TimeUnit::Millisecond, None),
+                }),
+                r#"CAST(a AS TIMESTAMP)"#,
             ),
             (
                 Expr::Cast(Cast {
