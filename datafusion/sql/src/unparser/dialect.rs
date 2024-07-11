@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use datafusion_common::ScalarValue;
 use regex::Regex;
 use sqlparser::keywords::ALL_KEYWORDS;
 
@@ -41,7 +42,15 @@ pub trait Dialect {
     fn use_timestamp_for_date64(&self) -> bool {
         false
     }
+
+    fn custom_scalar_to_sql(
+        &self,
+        _: &ScalarValue,
+    ) -> Option<datafusion_common::Result<sqlparser::ast::Expr>> {
+        None
+    }
 }
+
 pub struct DefaultDialect {}
 
 impl Dialect for DefaultDialect {
