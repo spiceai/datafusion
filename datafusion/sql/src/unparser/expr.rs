@@ -513,6 +513,14 @@ impl Unparser<'_> {
         }
     }
 
+    fn ast_type_for_date64_in_cast(&self) -> ast::DataType {
+        if self.dialect.use_timestamp_for_date64() {
+            ast::DataType::Timestamp(None, ast::TimezoneInfo::None)
+        } else {
+            ast::DataType::Datetime(None)
+        }
+    }
+
     fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
         if let Some(table_ref) = &col.relation {
             let mut id = table_ref.to_vec();
@@ -789,7 +797,7 @@ impl Unparser<'_> {
                     expr: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
                         datetime.to_string(),
                     ))),
-                    data_type: ast::DataType::Datetime(None),
+                    data_type: self.ast_type_for_date64_in_cast(),
                     format: None,
                 })
             }
@@ -961,13 +969,13 @@ impl Unparser<'_> {
             DataType::Timestamp(_, tz) => {
                 let tz_info = match tz {
                     Some(_) => TimezoneInfo::WithTimeZone,
-                    None => TimezoneInfo::None
+                    None => TimezoneInfo::None,
                 };
 
                 Ok(ast::DataType::Timestamp(None, tz_info))
             }
             DataType::Date32 => Ok(ast::DataType::Date),
-            DataType::Date64 => Ok(ast::DataType::Datetime(None)),
+            DataType::Date64 => Ok(self.ast_type_for_date64_in_cast()),
             DataType::Time32(_) => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
@@ -1049,9 +1057,9 @@ mod tests {
     use std::ops::{Add, Sub};
     use std::{any::Any, sync::Arc, vec};
 
+    use arrow::datatypes::TimeUnit;
     use arrow::datatypes::{Field, Schema};
     use arrow_schema::DataType::Int8;
-    use arrow::datatypes::TimeUnit;
     use datafusion_common::TableReference;
     use datafusion_expr::expr::{AggregateFunction, AggregateFunctionDefinition};
     use datafusion_expr::interval_month_day_nano_lit;
@@ -1062,7 +1070,7 @@ mod tests {
         Signature, Volatility, WindowFrame, WindowFunctionDefinition,
     };
 
-    use crate::unparser::dialect::CustomDialect;
+    use crate::unparser::dialect::{CustomDialect, CustomDialectBuilder};
 
     use super::*;
 
@@ -1146,7 +1154,10 @@ mod tests {
             (
                 Expr::Cast(Cast {
                     expr: Box::new(col("a")),
-                    data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("+08:00".into())),
+                    data_type: DataType::Timestamp(
+                        TimeUnit::Nanosecond,
+                        Some("+08:00".into()),
+                    ),
                 }),
                 r#"CAST(a AS TIMESTAMP WITH TIME ZONE)"#,
             ),
@@ -1493,8 +1504,10 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn custom_dialect() -> Result<()> {
-        let dialect = CustomDialect::new(Some('\''));
+    fn custom_dialect_with_identifier_quote_style() -> Result<()> {
+        let dialect = CustomDialectBuilder::new()
+            .with_identifier_quote_style('\'')
+            .build();
         let unparser = Unparser::new(&dialect);
 
         let expr = col("a").gt(lit(4));
@@ -1509,8 +1522,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_dialect_none() -> Result<()> {
-        let dialect = CustomDialect::new(None);
+    fn custom_dialect_without_identifier_quote_style() -> Result<()> {
+        let dialect = CustomDialect::default();
         let unparser = Unparser::new(&dialect);
 
         let expr = col("a").gt(lit(4));
@@ -1520,6 +1533,52 @@ mod tests {
 
         let expected = r#"(a > 4)"#;
         assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn custom_dialect_use_timestamp_for_date64() -> Result<()> {
+        for (use_timestamp_for_date64, identifier) in
+            [(false, "DATETIME"), (true, "TIMESTAMP")]
+        {
+            let dialect = CustomDialectBuilder::new()
+                .with_use_timestamp_for_date64(use_timestamp_for_date64)
+                .build();
+            let unparser = Unparser::new(&dialect);
+
+            let expr = Expr::Cast(Cast {
+                expr: Box::new(col("a")),
+                data_type: DataType::Date64,
+            });
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = format!("{}", ast);
+
+            let expected = format!(r#"CAST(a AS {identifier})"#);
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn customer_dialect_support_nulls_first_in_ort() -> Result<()> {
+        let tests: Vec<(Expr, &str, bool)> = vec![
+            (col("a").sort(true, true), r#"a ASC NULLS FIRST"#, true),
+            (col("a").sort(true, true), r#"a ASC"#, false),
+        ];
+
+        for (expr, expected, supports_nulls_first_in_sort) in tests {
+            let dialect = CustomDialectBuilder::new()
+                .with_supports_nulls_first_in_sort(supports_nulls_first_in_sort)
+                .build();
+            let unparser = Unparser::new(&dialect);
+            let ast = unparser.expr_to_unparsed(&expr)?;
+
+            let actual = format!("{}", ast);
+
+            assert_eq!(actual, expected);
+        }
 
         Ok(())
     }
