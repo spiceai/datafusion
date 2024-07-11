@@ -1070,7 +1070,7 @@ mod tests {
         Signature, Volatility, WindowFrame, WindowFunctionDefinition,
     };
 
-    use crate::unparser::dialect::CustomDialect;
+    use crate::unparser::dialect::{CustomDialect, CustomDialectBuilder};
 
     use super::*;
 
@@ -1505,7 +1505,9 @@ mod tests {
     }
     #[test]
     fn custom_dialect_with_identifier_quote_style() -> Result<()> {
-        let dialect = CustomDialect::new(Some('\''), true, false);
+        let dialect = CustomDialectBuilder::new()
+            .with_identifier_quote_style('\'')
+            .build();
         let unparser = Unparser::new(&dialect);
 
         let expr = col("a").gt(lit(4));
@@ -1521,7 +1523,7 @@ mod tests {
 
     #[test]
     fn custom_dialect_without_identifier_quote_style() -> Result<()> {
-        let dialect = CustomDialect::new(None, true, false);
+        let dialect = CustomDialect::default();
         let unparser = Unparser::new(&dialect);
 
         let expr = col("a").gt(lit(4));
@@ -1540,7 +1542,9 @@ mod tests {
         for (use_timestamp_for_date64, identifier) in
             [(false, "DATETIME"), (true, "TIMESTAMP")]
         {
-            let dialect = CustomDialect::new(None, true, use_timestamp_for_date64);
+            let dialect = CustomDialectBuilder::new()
+                .with_use_timestamp_for_date64(use_timestamp_for_date64)
+                .build();
             let unparser = Unparser::new(&dialect);
 
             let expr = Expr::Cast(Cast {
@@ -1565,7 +1569,9 @@ mod tests {
         ];
 
         for (expr, expected, supports_nulls_first_in_sort) in tests {
-            let dialect = CustomDialect::new(None, supports_nulls_first_in_sort, false);
+            let dialect = CustomDialectBuilder::new()
+                .with_supports_nulls_first_in_sort(supports_nulls_first_in_sort)
+                .build();
             let unparser = Unparser::new(&dialect);
             let ast = unparser.expr_to_unparsed(&expr)?;
 
