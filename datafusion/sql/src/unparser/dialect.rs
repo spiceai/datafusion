@@ -35,6 +35,12 @@ pub trait Dialect {
     fn supports_nulls_first_in_sort(&self) -> bool {
         true
     }
+
+    // Does the dialect use TIMESTAMP to represent Date64 rather than DATETIME?
+    // E.g. Trino, Athena and Dremio does not have DATETIME data type
+    fn use_timestamp_for_date64(&self) -> bool {
+        false
+    }
 }
 pub struct DefaultDialect {}
 
@@ -81,12 +87,20 @@ impl Dialect for SqliteDialect {
 
 pub struct CustomDialect {
     identifier_quote_style: Option<char>,
+    supports_nulls_first_in_sort: bool,
+    use_timestamp_for_date64: bool,
 }
 
 impl CustomDialect {
-    pub fn new(identifier_quote_style: Option<char>) -> Self {
+    pub fn new(
+        identifier_quote_style: Option<char>,
+        supports_nulls_first_in_sort: bool,
+        use_timestamp_for_date64: bool,
+    ) -> Self {
         Self {
             identifier_quote_style,
+            supports_nulls_first_in_sort,
+            use_timestamp_for_date64,
         }
     }
 }
@@ -94,5 +108,13 @@ impl CustomDialect {
 impl Dialect for CustomDialect {
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         self.identifier_quote_style
+    }
+
+    fn supports_nulls_first_in_sort(&self) -> bool {
+        self.supports_nulls_first_in_sort
+    }
+
+    fn use_timestamp_for_date64(&self) -> bool {
+        self.use_timestamp_for_date64
     }
 }

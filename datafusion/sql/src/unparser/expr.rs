@@ -513,6 +513,14 @@ impl Unparser<'_> {
         }
     }
 
+    fn ast_type_for_datetime_in_cast(&self) -> ast::DataType {
+        if self.dialect.use_timestamp_for_date64() {
+            ast::DataType::Timestamp(None, ast::TimezoneInfo::None)
+        } else {
+            ast::DataType::Datetime(None)
+        }
+    }
+
     fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
         if let Some(table_ref) = &col.relation {
             let mut id = table_ref.to_vec();
@@ -789,7 +797,7 @@ impl Unparser<'_> {
                     expr: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
                         datetime.to_string(),
                     ))),
-                    data_type: ast::DataType::Datetime(None),
+                    data_type: self.ast_type_for_datetime_in_cast(),
                     format: None,
                 })
             }
@@ -967,7 +975,7 @@ impl Unparser<'_> {
                 Ok(ast::DataType::Timestamp(None, tz_info))
             }
             DataType::Date32 => Ok(ast::DataType::Date),
-            DataType::Date64 => Ok(ast::DataType::Datetime(None)),
+            DataType::Date64 => Ok(self.ast_type_for_datetime_in_cast()),
             DataType::Time32(_) => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
@@ -1493,8 +1501,8 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn custom_dialect() -> Result<()> {
-        let dialect = CustomDialect::new(Some('\''));
+    fn custom_dialect_with_identifier_quote_style() -> Result<()> {
+        let dialect = CustomDialect::new(Some('\''), true, false);
         let unparser = Unparser::new(&dialect);
 
         let expr = col("a").gt(lit(4));
@@ -1509,8 +1517,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_dialect_none() -> Result<()> {
-        let dialect = CustomDialect::new(None);
+    fn custom_dialect_without_identifier_quote_style() -> Result<()> {
+        let dialect = CustomDialect::new(None, true, false);
         let unparser = Unparser::new(&dialect);
 
         let expr = col("a").gt(lit(4));
@@ -1520,6 +1528,49 @@ mod tests {
 
         let expected = r#"(a > 4)"#;
         assert_eq!(actual, expected);
+
+        Ok(())
+    }
+
+    #[test]
+    fn custom_dialect_use_timestamp_for_date64() -> Result<()> {
+        for (use_timestamp_for_date64, identifier) in
+            [(false, "DATETIME"), (true, "TIMESTAMP")]
+        {
+            let dialect =
+                CustomDialect::new(None, true, use_timestamp_for_date64);
+            let unparser = Unparser::new(&dialect);
+
+            let expr = Expr::Cast(Cast {
+                expr: Box::new(col("a")),
+                data_type: DataType::Date64,
+            });
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = format!("{}", ast);
+
+            let expected = format!(r#"CAST(a AS {identifier})"#);
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn customer_dialect_support_nulls_first_in_ort() -> Result<()> {
+        let tests: Vec<(Expr, &str, bool)> = vec![
+            (col("a").sort(true, true), r#"a ASC NULLS FIRST"#, true),
+            (col("a").sort(true, true), r#"a ASC"#, false),
+        ];
+
+        for (expr, expected, supports_nulls_first_in_sort) in tests {
+            let dialect = CustomDialect::new(None, supports_nulls_first_in_sort, false);
+            let unparser = Unparser::new(&dialect);
+            let ast = unparser.expr_to_unparsed(&expr)?;
+
+            let actual = format!("{}", ast);
+
+            assert_eq!(actual, expected);
+        }
 
         Ok(())
     }

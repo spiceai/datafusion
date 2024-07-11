@@ -68,7 +68,7 @@ fn simple_expr_to_sql_demo() -> Result<()> {
 /// using a custom dialect and an explicit unparser
 fn simple_expr_to_sql_demo_escape_mysql_style() -> Result<()> {
     let expr = col("a").lt(lit(5)).or(col("a").eq(lit(8)));
-    let dialect = CustomDialect::new(Some('`'));
+    let dialect = CustomDialect::new(Some('`'), true, false);
     let unparser = Unparser::new(&dialect);
     let sql = unparser.expr_to_sql(&expr)?.to_string();
     assert_eq!(sql, r#"((`a` < 5) OR (`a` = 8))"#);
