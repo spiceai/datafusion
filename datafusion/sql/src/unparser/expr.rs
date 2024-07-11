@@ -513,7 +513,7 @@ impl Unparser<'_> {
         }
     }
 
-    fn ast_type_for_datetime_in_cast(&self) -> ast::DataType {
+    fn ast_type_for_date64_in_cast(&self) -> ast::DataType {
         if self.dialect.use_timestamp_for_date64() {
             ast::DataType::Timestamp(None, ast::TimezoneInfo::None)
         } else {
@@ -797,7 +797,7 @@ impl Unparser<'_> {
                     expr: Box::new(ast::Expr::Value(ast::Value::SingleQuotedString(
                         datetime.to_string(),
                     ))),
-                    data_type: self.ast_type_for_datetime_in_cast(),
+                    data_type: self.ast_type_for_date64_in_cast(),
                     format: None,
                 })
             }
@@ -969,13 +969,13 @@ impl Unparser<'_> {
             DataType::Timestamp(_, tz) => {
                 let tz_info = match tz {
                     Some(_) => TimezoneInfo::WithTimeZone,
-                    None => TimezoneInfo::None
+                    None => TimezoneInfo::None,
                 };
 
                 Ok(ast::DataType::Timestamp(None, tz_info))
             }
             DataType::Date32 => Ok(ast::DataType::Date),
-            DataType::Date64 => Ok(self.ast_type_for_datetime_in_cast()),
+            DataType::Date64 => Ok(self.ast_type_for_date64_in_cast()),
             DataType::Time32(_) => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
@@ -1057,9 +1057,9 @@ mod tests {
     use std::ops::{Add, Sub};
     use std::{any::Any, sync::Arc, vec};
 
+    use arrow::datatypes::TimeUnit;
     use arrow::datatypes::{Field, Schema};
     use arrow_schema::DataType::Int8;
-    use arrow::datatypes::TimeUnit;
     use datafusion_common::TableReference;
     use datafusion_expr::expr::{AggregateFunction, AggregateFunctionDefinition};
     use datafusion_expr::interval_month_day_nano_lit;
@@ -1154,7 +1154,10 @@ mod tests {
             (
                 Expr::Cast(Cast {
                     expr: Box::new(col("a")),
-                    data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("+08:00".into())),
+                    data_type: DataType::Timestamp(
+                        TimeUnit::Nanosecond,
+                        Some("+08:00".into()),
+                    ),
                 }),
                 r#"CAST(a AS TIMESTAMP WITH TIME ZONE)"#,
             ),
@@ -1537,8 +1540,7 @@ mod tests {
         for (use_timestamp_for_date64, identifier) in
             [(false, "DATETIME"), (true, "TIMESTAMP")]
         {
-            let dialect =
-                CustomDialect::new(None, true, use_timestamp_for_date64);
+            let dialect = CustomDialect::new(None, true, use_timestamp_for_date64);
             let unparser = Unparser::new(&dialect);
 
             let expr = Expr::Cast(Cast {
