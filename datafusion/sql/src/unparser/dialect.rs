@@ -43,7 +43,6 @@ pub trait Dialect {
     }
 
     fn interval_style(&self) -> IntervalStyle {
-        // keep the backward compatible
         IntervalStyle::PostgresVerbose
     }
 }
@@ -56,7 +55,7 @@ pub trait Dialect {
 /// compatible with arrow display format, as well as duckdb
 /// sql standard format is '1-2' for year-month, or '1 10:10:10.123456' for day-time
 /// https://www.contrib.andrew.cmu.edu/~shadow/sql/sql1992.txt
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub enum IntervalStyle {
     PostgresVerbose,
     SQLStandard,
@@ -156,7 +155,7 @@ impl Dialect for CustomDialect {
     }
 
     fn interval_style(&self) -> IntervalStyle {
-        self.interval_style.clone()
+        self.interval_style
     }
 }
 
