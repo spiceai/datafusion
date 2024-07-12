@@ -1710,9 +1710,7 @@ mod tests {
                 .build();
             let unparser = Unparser::new(&dialect);
 
-            let ast = unparser
-                .expr_to_sql(&value)
-                .expect("to be unparsed");
+            let ast = unparser.expr_to_sql(&value).expect("to be unparsed");
 
             let actual = format!("{ast}");
 
