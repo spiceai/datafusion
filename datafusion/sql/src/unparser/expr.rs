@@ -19,18 +19,17 @@ use arrow::datatypes::Decimal128Type;
 use arrow::datatypes::Decimal256Type;
 use arrow::datatypes::DecimalType;
 use arrow::util::display::array_value_to_string;
-use core::fmt;
-use sqlparser::ast::TimezoneInfo;
-use std::{fmt::Display, vec};
-
 use arrow_array::{
     Date32Array, Date64Array, TimestampMillisecondArray, TimestampNanosecondArray,
 };
 use arrow_schema::DataType;
+use core::fmt;
+use sqlparser::ast::TimezoneInfo;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
     self, Expr as AstExpr, Function, FunctionArg, Ident, Interval, UnaryOperator,
 };
+use std::{fmt::Display, vec};
 
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, plan_err, Column, Result,
@@ -41,6 +40,7 @@ use datafusion_expr::{
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator, TryCast,
 };
 
+use super::dialect::IntervalStyle;
 use super::Unparser;
 
 /// DataFusion's Exprs can represent either an `Expr` or an `OrderByExpr`
@@ -672,10 +672,6 @@ impl Unparser<'_> {
     /// DataFusion ScalarValues sometimes require a ast::Expr to construct.
     /// For example ScalarValue::Date32(d) corresponds to the ast::Expr CAST('datestr' as DATE)
     fn scalar_to_sql(&self, v: &ScalarValue) -> Result<ast::Expr> {
-        if let Some(value) = self.dialect.custom_scalar_to_sql(v) {
-            return value;
-        }
-
         match v {
             ScalarValue::Null => Ok(ast::Expr::Value(ast::Value::Null)),
             ScalarValue::Boolean(Some(b)) => {
@@ -899,22 +895,7 @@ impl Unparser<'_> {
             ScalarValue::IntervalYearMonth(Some(_))
             | ScalarValue::IntervalDayTime(Some(_))
             | ScalarValue::IntervalMonthDayNano(Some(_)) => {
-                let wrap_array = v.to_array()?;
-                let Some(result) = array_value_to_string(&wrap_array, 0).ok() else {
-                    return internal_err!(
-                        "Unable to convert interval scalar value to string"
-                    );
-                };
-                let interval = Interval {
-                    value: Box::new(ast::Expr::Value(SingleQuotedString(
-                        result.to_uppercase(),
-                    ))),
-                    leading_field: None,
-                    leading_precision: None,
-                    last_field: None,
-                    fractional_seconds_precision: None,
-                };
-                Ok(ast::Expr::Interval(interval))
+                self.interval_scalar_to_sql(v)
             }
             ScalarValue::IntervalYearMonth(None) => {
                 Ok(ast::Expr::Value(ast::Value::Null))
@@ -948,6 +929,123 @@ impl Unparser<'_> {
             ScalarValue::Struct(_) => not_impl_err!("Unsupported scalar: {v:?}"),
             ScalarValue::Union(..) => not_impl_err!("Unsupported scalar: {v:?}"),
             ScalarValue::Dictionary(..) => not_impl_err!("Unsupported scalar: {v:?}"),
+        }
+    }
+
+    fn interval_scalar_to_sql(&self, v: &ScalarValue) -> Result<ast::Expr> {
+        match self.dialect.interval_style() {
+            IntervalStyle::PostgresVerbose => {
+                let wrap_array = v.to_array()?;
+                let Some(result) = array_value_to_string(&wrap_array, 0).ok() else {
+                    return internal_err!(
+                        "Unable to convert interval scalar value to string"
+                    );
+                };
+                let interval = Interval {
+                    value: Box::new(ast::Expr::Value(SingleQuotedString(
+                        result.to_uppercase(),
+                    ))),
+                    leading_field: None,
+                    leading_precision: None,
+                    last_field: None,
+                    fractional_seconds_precision: None,
+                };
+                Ok(ast::Expr::Interval(interval))
+            }
+            // If the interval standard is SQLStandard, implement a simple unparse logic
+            IntervalStyle::SQLStandard => match v {
+                ScalarValue::IntervalYearMonth(v) => {
+                    let Some(v) = v else {
+                        return Ok(ast::Expr::Value(ast::Value::Null));
+                    };
+                    let interval = Interval {
+                        value: Box::new(ast::Expr::Value(
+                            ast::Value::SingleQuotedString(v.to_string()),
+                        )),
+                        leading_field: Some(ast::DateTimeField::Month),
+                        leading_precision: None,
+                        last_field: None,
+                        fractional_seconds_precision: None,
+                    };
+                    Ok(ast::Expr::Interval(interval))
+                }
+                ScalarValue::IntervalDayTime(v) => {
+                    let Some(v) = v else {
+                        return Ok(ast::Expr::Value(ast::Value::Null));
+                    };
+                    let days = v.days;
+                    let secs = v.milliseconds / 1_000;
+                    let mins = secs / 60;
+                    let hours = mins / 60;
+
+                    let secs = secs - (mins * 60);
+                    let mins = mins - (hours * 60);
+
+                    let millis = v.milliseconds % 1_000;
+                    let interval = Interval {
+                        value: Box::new(ast::Expr::Value(
+                            ast::Value::SingleQuotedString(format!(
+                                "{days} {hours}:{mins}:{secs}.{millis:3}"
+                            )),
+                        )),
+                        leading_field: Some(ast::DateTimeField::Day),
+                        leading_precision: None,
+                        last_field: Some(ast::DateTimeField::Second),
+                        fractional_seconds_precision: None,
+                    };
+                    Ok(ast::Expr::Interval(interval))
+                }
+                ScalarValue::IntervalMonthDayNano(v) => {
+                    let Some(v) = v else {
+                        return Ok(ast::Expr::Value(ast::Value::Null));
+                    };
+
+                    if v.months >= 0 && v.days == 0 && v.nanoseconds == 0 {
+                        let interval = Interval {
+                            value: Box::new(ast::Expr::Value(
+                                ast::Value::SingleQuotedString(v.months.to_string()),
+                            )),
+                            leading_field: Some(ast::DateTimeField::Month),
+                            leading_precision: None,
+                            last_field: None,
+                            fractional_seconds_precision: None,
+                        };
+                        Ok(ast::Expr::Interval(interval))
+                    } else if v.months == 0
+                        && v.days >= 0
+                        && v.nanoseconds % 1_000_000 == 0
+                    {
+                        let days = v.days;
+                        let secs = v.nanoseconds / 1_000_000_000;
+                        let mins = secs / 60;
+                        let hours = mins / 60;
+
+                        let secs = secs - (mins * 60);
+                        let mins = mins - (hours * 60);
+
+                        let millis = (v.nanoseconds % 1_000_000_000) / 1_000_000;
+
+                        let interval = Interval {
+                            value: Box::new(ast::Expr::Value(
+                                ast::Value::SingleQuotedString(format!(
+                                    "{days} {hours}:{mins}:{secs}.{millis:03}"
+                                )),
+                            )),
+                            leading_field: Some(ast::DateTimeField::Day),
+                            leading_precision: None,
+                            last_field: Some(ast::DateTimeField::Second),
+                            fractional_seconds_precision: None,
+                        };
+                        Ok(ast::Expr::Interval(interval))
+                    } else {
+                        not_impl_err!("Unsupported IntervalMonthDayNano scalar with both Month and DayTime for IntervalStyle::SQLStandard")
+                    }
+                }
+                _ => Ok(ast::Expr::Value(ast::Value::Null)),
+            },
+            IntervalStyle::MySQL => {
+                not_impl_err!("Unsupported interval scalar for IntervalStyle::MySQL")
+            }
         }
     }
 
@@ -1585,5 +1683,40 @@ mod tests {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn test_interval_scalar_to_expr() {
+        let tests = [
+            (interval_month_day_nano_lit("1 MONTH"), "INTERVAL '1' MONTH"),
+            (
+                interval_month_day_nano_lit("1.5 DAY"),
+                "INTERVAL '1 12:0:0.000' DAY TO SECOND",
+            ),
+            (
+                interval_month_day_nano_lit("1.51234 DAY"),
+                "INTERVAL '1 12:17:46.176' DAY TO SECOND",
+            ),
+            (
+                interval_datetime_lit("1.51234 DAY"),
+                "INTERVAL '1 12:17:46.176' DAY TO SECOND",
+            ),
+            (interval_year_month_lit("1 YEAR"), "INTERVAL '12' MONTH"),
+        ];
+
+        for (value, expected) in tests {
+            let dialect = CustomDialectBuilder::new()
+                .with_interval_style(IntervalStyle::SQLStandard)
+                .build();
+            let unparser = Unparser::new(&dialect);
+
+            let ast = unparser
+                .expr_to_sql(&value)
+                .expect("to be unparsed");
+
+            let actual = format!("{ast}");
+
+            assert_eq!(actual, expected);
+        }
     }
 }
