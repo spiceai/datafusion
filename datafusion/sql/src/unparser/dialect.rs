@@ -42,6 +42,12 @@ pub trait Dialect {
         false
     }
 
+    // Does the dialect use DOUBLE PRECISION to represent Float64 rather than DOUBLE?
+    // E.g. Postgres uses DOUBLE PRECISION instead of DOUBLE
+    fn use_double_precision_for_float64(&self) -> bool {
+        false
+    }
+
     // Does the dialect use CHAR to cast Utf8 rather than TEXT?
     // E.g. MySQL requires CHAR instead of TEXT and automatically produces a string with
     // the VARCHAR, TEXT or LONGTEXT data type based on the length of the string
@@ -69,6 +75,10 @@ pub struct PostgreSqlDialect {}
 impl Dialect for PostgreSqlDialect {
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('"')
+    }
+
+    fn use_double_precision_for_float64(&self) -> bool {
+        true
     }
 }
 
@@ -100,6 +110,7 @@ pub struct CustomDialect {
     identifier_quote_style: Option<char>,
     supports_nulls_first_in_sort: bool,
     use_timestamp_for_date64: bool,
+    use_double_precision_for_float64: bool,
     use_char_for_utf8_cast: bool,
 }
 
@@ -109,6 +120,7 @@ impl Default for CustomDialect {
             identifier_quote_style: None,
             supports_nulls_first_in_sort: true,
             use_timestamp_for_date64: false,
+            use_double_precision_for_float64: false,
             use_char_for_utf8_cast: false,
         }
     }
@@ -137,6 +149,10 @@ impl Dialect for CustomDialect {
         self.use_timestamp_for_date64
     }
 
+    fn use_double_precision_for_float64(&self) -> bool {
+        self.use_double_precision_for_float64
+    }
+
     fn use_char_for_utf8_cast(&self) -> bool {
         self.use_char_for_utf8_cast
     }
@@ -147,6 +163,7 @@ pub struct CustomDialectBuilder {
     identifier_quote_style: Option<char>,
     supports_nulls_first_in_sort: bool,
     use_timestamp_for_date64: bool,
+    use_double_precision_for_float64: bool,
     use_char_for_utf8_cast: bool,
 }
 
@@ -156,6 +173,7 @@ impl CustomDialectBuilder {
             identifier_quote_style: None,
             supports_nulls_first_in_sort: true,
             use_timestamp_for_date64: false,
+            use_double_precision_for_float64: false,
             use_char_for_utf8_cast: false,
         }
     }
@@ -165,6 +183,7 @@ impl CustomDialectBuilder {
             identifier_quote_style: self.identifier_quote_style,
             supports_nulls_first_in_sort: self.supports_nulls_first_in_sort,
             use_timestamp_for_date64: self.use_timestamp_for_date64,
+            use_double_precision_for_float64: self.use_double_precision_for_float64,
             use_char_for_utf8_cast: self.use_char_for_utf8_cast,
         }
     }
@@ -187,6 +206,14 @@ impl CustomDialectBuilder {
         use_timestamp_for_date64: bool,
     ) -> Self {
         self.use_timestamp_for_date64 = use_timestamp_for_date64;
+        self
+    }
+
+    pub fn with_use_double_precision_for_float64(
+        mut self,
+        use_double_precision_for_float64: bool,
+    ) -> Self {
+        self.use_double_precision_for_float64 = use_double_precision_for_float64;
         self
     }
 
