@@ -47,6 +47,13 @@ pub trait Dialect {
     fn use_double_precision_for_float64(&self) -> bool {
         false
     }
+
+    // Does the dialect use CHAR to cast Utf8 rather than TEXT?
+    // E.g. MySQL requires CHAR instead of TEXT and automatically produces a string with
+    // the VARCHAR, TEXT or LONGTEXT data type based on the length of the string
+    fn use_char_for_utf8_cast(&self) -> bool {
+        false
+    }
 }
 pub struct DefaultDialect {}
 
@@ -85,6 +92,10 @@ impl Dialect for MySqlDialect {
     fn supports_nulls_first_in_sort(&self) -> bool {
         false
     }
+
+    fn use_char_for_utf8_cast(&self) -> bool {
+        true
+    }
 }
 
 pub struct SqliteDialect {}
@@ -100,6 +111,7 @@ pub struct CustomDialect {
     supports_nulls_first_in_sort: bool,
     use_timestamp_for_date64: bool,
     use_double_precision_for_float64: bool,
+    use_char_for_utf8_cast: bool,
 }
 
 impl Default for CustomDialect {
@@ -109,6 +121,7 @@ impl Default for CustomDialect {
             supports_nulls_first_in_sort: true,
             use_timestamp_for_date64: false,
             use_double_precision_for_float64: false,
+            use_char_for_utf8_cast: false,
         }
     }
 }
@@ -139,6 +152,10 @@ impl Dialect for CustomDialect {
     fn use_double_precision_for_float64(&self) -> bool {
         self.use_double_precision_for_float64
     }
+
+    fn use_char_for_utf8_cast(&self) -> bool {
+        self.use_char_for_utf8_cast
+    }
 }
 
 // create a CustomDialectBuilder
@@ -147,6 +164,7 @@ pub struct CustomDialectBuilder {
     supports_nulls_first_in_sort: bool,
     use_timestamp_for_date64: bool,
     use_double_precision_for_float64: bool,
+    use_char_for_utf8_cast: bool,
 }
 
 impl CustomDialectBuilder {
@@ -156,6 +174,7 @@ impl CustomDialectBuilder {
             supports_nulls_first_in_sort: true,
             use_timestamp_for_date64: false,
             use_double_precision_for_float64: false,
+            use_char_for_utf8_cast: false,
         }
     }
 
@@ -165,6 +184,7 @@ impl CustomDialectBuilder {
             supports_nulls_first_in_sort: self.supports_nulls_first_in_sort,
             use_timestamp_for_date64: self.use_timestamp_for_date64,
             use_double_precision_for_float64: self.use_double_precision_for_float64,
+            use_char_for_utf8_cast: self.use_char_for_utf8_cast,
         }
     }
 
@@ -194,6 +214,11 @@ impl CustomDialectBuilder {
         use_double_precision_for_float64: bool,
     ) -> Self {
         self.use_double_precision_for_float64 = use_double_precision_for_float64;
+        self
+    }
+
+    pub fn with_use_char_for_utf8_cast(mut self, use_char_for_utf8_cast: bool) -> Self {
+        self.use_char_for_utf8_cast = use_char_for_utf8_cast;
         self
     }
 }
