@@ -1527,30 +1527,6 @@ mod tests {
             (col("need-quoted").eq(lit(1)), r#"("need-quoted" = 1)"#),
             (col("need quoted").eq(lit(1)), r#"("need quoted" = 1)"#),
             (
-                interval_month_day_nano_lit(
-                    "1 YEAR 1 MONTH 1 DAY 3 HOUR 10 MINUTE 20 SECOND",
-                ),
-                r#"INTERVAL '0 YEARS 13 MONS 1 DAYS 3 HOURS 10 MINS 20.000000000 SECS'"#,
-            ),
-            (
-                interval_month_day_nano_lit("1.5 MONTH"),
-                r#"INTERVAL '0 YEARS 1 MONS 15 DAYS 0 HOURS 0 MINS 0.000000000 SECS'"#,
-            ),
-            (
-                interval_month_day_nano_lit("-3 MONTH"),
-                r#"INTERVAL '0 YEARS -3 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS'"#,
-            ),
-            (
-                interval_month_day_nano_lit("1 MONTH")
-                    .add(interval_month_day_nano_lit("1 DAY")),
-                r#"(INTERVAL '0 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS' + INTERVAL '0 YEARS 0 MONS 1 DAYS 0 HOURS 0 MINS 0.000000000 SECS')"#,
-            ),
-            (
-                interval_month_day_nano_lit("1 MONTH")
-                    .sub(interval_month_day_nano_lit("1 DAY")),
-                r#"(INTERVAL '0 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS' - INTERVAL '0 YEARS 0 MONS 1 DAYS 0 HOURS 0 MINS 0.000000000 SECS')"#,
-            ),
-            (
                 (col("a") + col("b"))
                     .gt(Expr::Literal(ScalarValue::Decimal128(Some(100123), 28, 3)))
                     .is_not_unknown(),
@@ -1570,22 +1546,6 @@ mod tests {
                     data_type: DataType::Decimal128(10, -2),
                 }),
                 r#"CAST(a AS DECIMAL(12,0))"#,
-            ),
-            (
-                interval_datetime_lit("10 DAY 1 HOUR 10 MINUTE 20 SECOND"),
-                r#"INTERVAL '0 YEARS 0 MONS 10 DAYS 1 HOURS 10 MINS 20.000 SECS'"#,
-            ),
-            (
-                interval_datetime_lit("10 DAY 1.5 HOUR 10 MINUTE 20 SECOND"),
-                r#"INTERVAL '0 YEARS 0 MONS 10 DAYS 1 HOURS 40 MINS 20.000 SECS'"#,
-            ),
-            (
-                interval_year_month_lit("1 YEAR 1 MONTH"),
-                r#"INTERVAL '1 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.00 SECS'"#,
-            ),
-            (
-                interval_year_month_lit("1.5 YEAR 1 MONTH"),
-                r#"INTERVAL '1 YEARS 7 MONS 0 DAYS 0 HOURS 0 MINS 0.00 SECS'"#,
             ),
         ];
 
@@ -1724,25 +1684,85 @@ mod tests {
     #[test]
     fn test_interval_scalar_to_expr() {
         let tests = [
-            (interval_month_day_nano_lit("1 MONTH"), "INTERVAL '1' MONTH"),
+            (
+                interval_month_day_nano_lit("1 MONTH"),
+                IntervalStyle::SQLStandard,
+                "INTERVAL '1' MONTH",
+            ),
             (
                 interval_month_day_nano_lit("1.5 DAY"),
+                IntervalStyle::SQLStandard,
                 "INTERVAL '1 12:0:0.000' DAY TO SECOND",
             ),
             (
                 interval_month_day_nano_lit("1.51234 DAY"),
+                IntervalStyle::SQLStandard,
                 "INTERVAL '1 12:17:46.176' DAY TO SECOND",
             ),
             (
                 interval_datetime_lit("1.51234 DAY"),
+                IntervalStyle::SQLStandard,
                 "INTERVAL '1 12:17:46.176' DAY TO SECOND",
             ),
-            (interval_year_month_lit("1 YEAR"), "INTERVAL '12' MONTH"),
+            (
+                interval_year_month_lit("1 YEAR"),
+                IntervalStyle::SQLStandard,
+                "INTERVAL '12' MONTH",
+            ),
+            (
+                interval_month_day_nano_lit(
+                    "1 YEAR 1 MONTH 1 DAY 3 HOUR 10 MINUTE 20 SECOND",
+                ),
+                IntervalStyle::PostgresVerbose,
+                r#"INTERVAL '0 YEARS 13 MONS 1 DAYS 3 HOURS 10 MINS 20.000000000 SECS'"#,
+            ),
+            (
+                interval_month_day_nano_lit("1.5 MONTH"),
+                IntervalStyle::PostgresVerbose,
+                r#"INTERVAL '0 YEARS 1 MONS 15 DAYS 0 HOURS 0 MINS 0.000000000 SECS'"#,
+            ),
+            (
+                interval_month_day_nano_lit("-3 MONTH"),
+                IntervalStyle::PostgresVerbose,
+                r#"INTERVAL '0 YEARS -3 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS'"#,
+            ),
+            (
+                interval_month_day_nano_lit("1 MONTH")
+                    .add(interval_month_day_nano_lit("1 DAY")),
+                IntervalStyle::PostgresVerbose,
+                r#"(INTERVAL '0 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS' + INTERVAL '0 YEARS 0 MONS 1 DAYS 0 HOURS 0 MINS 0.000000000 SECS')"#,
+            ),
+            (
+                interval_month_day_nano_lit("1 MONTH")
+                    .sub(interval_month_day_nano_lit("1 DAY")),
+                IntervalStyle::PostgresVerbose,
+                r#"(INTERVAL '0 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.000000000 SECS' - INTERVAL '0 YEARS 0 MONS 1 DAYS 0 HOURS 0 MINS 0.000000000 SECS')"#,
+            ),
+            (
+                interval_datetime_lit("10 DAY 1 HOUR 10 MINUTE 20 SECOND"),
+                IntervalStyle::PostgresVerbose,
+                r#"INTERVAL '0 YEARS 0 MONS 10 DAYS 1 HOURS 10 MINS 20.000 SECS'"#,
+            ),
+            (
+                interval_datetime_lit("10 DAY 1.5 HOUR 10 MINUTE 20 SECOND"),
+                IntervalStyle::PostgresVerbose,
+                r#"INTERVAL '0 YEARS 0 MONS 10 DAYS 1 HOURS 40 MINS 20.000 SECS'"#,
+            ),
+            (
+                interval_year_month_lit("1 YEAR 1 MONTH"),
+                IntervalStyle::PostgresVerbose,
+                r#"INTERVAL '1 YEARS 1 MONS 0 DAYS 0 HOURS 0 MINS 0.00 SECS'"#,
+            ),
+            (
+                interval_year_month_lit("1.5 YEAR 1 MONTH"),
+                IntervalStyle::PostgresVerbose,
+                r#"INTERVAL '1 YEARS 7 MONS 0 DAYS 0 HOURS 0 MINS 0.00 SECS'"#,
+            ),
         ];
 
-        for (value, expected) in tests {
+        for (value, style, expected) in tests {
             let dialect = CustomDialectBuilder::new()
-                .with_interval_style(IntervalStyle::SQLStandard)
+                .with_interval_style(style)
                 .build();
             let unparser = Unparser::new(&dialect);
 

@@ -247,6 +247,7 @@ impl CustomDialectBuilder {
 
     pub fn with_interval_style(mut self, interval_style: IntervalStyle) -> Self {
         self.interval_style = interval_style;
+        self
     }
 
     pub fn with_use_double_precision_for_float64(
