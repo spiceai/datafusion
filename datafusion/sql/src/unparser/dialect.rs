@@ -45,6 +45,18 @@ pub trait Dialect {
     fn interval_style(&self) -> IntervalStyle {
         IntervalStyle::PostgresVerbose
     }
+    // Does the dialect use DOUBLE PRECISION to represent Float64 rather than DOUBLE?
+    // E.g. Postgres uses DOUBLE PRECISION instead of DOUBLE
+    fn use_double_precision_for_float64(&self) -> bool {
+        false
+    }
+
+    // Does the dialect use CHAR to cast Utf8 rather than TEXT?
+    // E.g. MySQL requires CHAR instead of TEXT and automatically produces a string with
+    // the VARCHAR, TEXT or LONGTEXT data type based on the length of the string
+    fn use_char_for_utf8_cast(&self) -> bool {
+        false
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -87,6 +99,10 @@ impl Dialect for PostgreSqlDialect {
     fn interval_style(&self) -> IntervalStyle {
         IntervalStyle::PostgresVerbose
     }
+
+    fn use_double_precision_for_float64(&self) -> bool {
+        true
+    }
 }
 
 pub struct MySqlDialect {}
@@ -103,6 +119,10 @@ impl Dialect for MySqlDialect {
     fn interval_style(&self) -> IntervalStyle {
         IntervalStyle::MySQL
     }
+
+    fn use_char_for_utf8_cast(&self) -> bool {
+        true
+    }
 }
 
 pub struct SqliteDialect {}
@@ -118,6 +138,8 @@ pub struct CustomDialect {
     supports_nulls_first_in_sort: bool,
     use_timestamp_for_date64: bool,
     interval_style: IntervalStyle,
+    use_double_precision_for_float64: bool,
+    use_char_for_utf8_cast: bool,
 }
 
 impl Default for CustomDialect {
@@ -127,6 +149,8 @@ impl Default for CustomDialect {
             supports_nulls_first_in_sort: true,
             use_timestamp_for_date64: false,
             interval_style: IntervalStyle::SQLStandard,
+            use_double_precision_for_float64: false,
+            use_char_for_utf8_cast: false,
         }
     }
 }
@@ -157,6 +181,14 @@ impl Dialect for CustomDialect {
     fn interval_style(&self) -> IntervalStyle {
         self.interval_style
     }
+
+    fn use_double_precision_for_float64(&self) -> bool {
+        self.use_double_precision_for_float64
+    }
+
+    fn use_char_for_utf8_cast(&self) -> bool {
+        self.use_char_for_utf8_cast
+    }
 }
 
 // create a CustomDialectBuilder
@@ -165,6 +197,8 @@ pub struct CustomDialectBuilder {
     supports_nulls_first_in_sort: bool,
     use_timestamp_for_date64: bool,
     interval_style: IntervalStyle,
+    use_double_precision_for_float64: bool,
+    use_char_for_utf8_cast: bool,
 }
 
 impl CustomDialectBuilder {
@@ -174,6 +208,8 @@ impl CustomDialectBuilder {
             supports_nulls_first_in_sort: true,
             use_timestamp_for_date64: false,
             interval_style: IntervalStyle::PostgresVerbose,
+            use_double_precision_for_float64: false,
+            use_char_for_utf8_cast: false,
         }
     }
 
@@ -183,6 +219,8 @@ impl CustomDialectBuilder {
             supports_nulls_first_in_sort: self.supports_nulls_first_in_sort,
             use_timestamp_for_date64: self.use_timestamp_for_date64,
             interval_style: self.interval_style,
+            use_double_precision_for_float64: self.use_double_precision_for_float64,
+            use_char_for_utf8_cast: self.use_char_for_utf8_cast,
         }
     }
 
@@ -209,6 +247,18 @@ impl CustomDialectBuilder {
 
     pub fn with_interval_style(mut self, interval_style: IntervalStyle) -> Self {
         self.interval_style = interval_style;
+    }
+
+    pub fn with_use_double_precision_for_float64(
+        mut self,
+        use_double_precision_for_float64: bool,
+    ) -> Self {
+        self.use_double_precision_for_float64 = use_double_precision_for_float64;
+        self
+    }
+
+    pub fn with_use_char_for_utf8_cast(mut self, use_char_for_utf8_cast: bool) -> Self {
+        self.use_char_for_utf8_cast = use_char_for_utf8_cast;
         self
     }
 }

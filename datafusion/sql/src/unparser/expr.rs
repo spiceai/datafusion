@@ -1067,7 +1067,11 @@ impl Unparser<'_> {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
             DataType::Float32 => Ok(ast::DataType::Float(None)),
-            DataType::Float64 => Ok(ast::DataType::Double),
+            DataType::Float64 => Ok(if self.dialect.use_double_precision_for_float64() {
+                ast::DataType::DoublePrecision
+            } else {
+                ast::DataType::Double
+            }),
             DataType::Timestamp(_, tz) => {
                 let tz_info = match tz {
                     Some(_) => TimezoneInfo::WithTimeZone,
@@ -1102,8 +1106,16 @@ impl Unparser<'_> {
             DataType::BinaryView => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
-            DataType::Utf8 => Ok(ast::DataType::Varchar(None)),
-            DataType::LargeUtf8 => Ok(ast::DataType::Text),
+            DataType::Utf8 => Ok(if self.dialect.use_char_for_utf8_cast() {
+                ast::DataType::Char(None)
+            } else {
+                ast::DataType::Varchar(None)
+            }),
+            DataType::LargeUtf8 => Ok(if self.dialect.use_char_for_utf8_cast() {
+                ast::DataType::Char(None)
+            } else {
+                ast::DataType::Text
+            }),
             DataType::Utf8View => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
@@ -1664,6 +1676,30 @@ mod tests {
     }
 
     #[test]
+    fn custom_dialect_use_double_precision_for_float64() -> Result<()> {
+        for (use_double_precision_for_float64, identifier) in
+            [(false, "DOUBLE"), (true, "DOUBLE PRECISION")]
+        {
+            let dialect = CustomDialectBuilder::new()
+                .with_use_double_precision_for_float64(use_double_precision_for_float64)
+                .build();
+            let unparser = Unparser::new(&dialect);
+
+            let expr = Expr::Cast(Cast {
+                expr: Box::new(col("a")),
+                data_type: DataType::Float64,
+            });
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = format!("{}", ast);
+
+            let expected = format!(r#"CAST(a AS {identifier})"#);
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn customer_dialect_support_nulls_first_in_ort() -> Result<()> {
         let tests: Vec<(Expr, &str, bool)> = vec![
             (col("a").sort(true, true), r#"a ASC NULLS FIRST"#, true),
@@ -1716,5 +1752,32 @@ mod tests {
 
             assert_eq!(actual, expected);
         }
+    }
+
+    #[test]
+    fn custom_dialect_use_char_for_utf8_cast() -> Result<()> {
+        for (use_char_for_utf8_cast, data_type, identifier) in [
+            (false, DataType::Utf8, "VARCHAR"),
+            (true, DataType::Utf8, "CHAR"),
+            (false, DataType::LargeUtf8, "TEXT"),
+            (true, DataType::LargeUtf8, "CHAR"),
+        ] {
+            let dialect = CustomDialectBuilder::new()
+                .with_use_char_for_utf8_cast(use_char_for_utf8_cast)
+                .build();
+            let unparser = Unparser::new(&dialect);
+
+            let expr = Expr::Cast(Cast {
+                expr: Box::new(col("a")),
+                data_type,
+            });
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = format!("{}", ast);
+            let expected = format!(r#"CAST(a AS {identifier})"#);
+
+            assert_eq!(actual, expected);
+        }
+        Ok(())
     }
 }
