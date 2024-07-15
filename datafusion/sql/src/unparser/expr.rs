@@ -15,22 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::datatypes::Decimal128Type;
-use arrow::datatypes::Decimal256Type;
-use arrow::datatypes::DecimalType;
+use arrow::datatypes::{
+    ArrowTemporalType, Decimal128Type, Decimal256Type, DecimalType,
+    Time32MillisecondType, Time32SecondType, Time64MicrosecondType, Time64NanosecondType,
+    TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+    TimestampSecondType,
+};
 use arrow::util::display::array_value_to_string;
 use arrow_array::{Date32Array, Date64Array, PrimitiveArray};
-use arrow_array::{
-    Date32Array, Date64Array, TimestampMillisecondArray, TimestampNanosecondArray,
-};
 use arrow_schema::DataType;
 use core::fmt;
 use sqlparser::ast::TimezoneInfo;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
-    self, Expr as AstExpr, Function, FunctionArg, Ident, Interval, TimezoneInfo,
-    UnaryOperator,
+    self, Expr as AstExpr, Function, FunctionArg, Ident, Interval, UnaryOperator,
 };
+use std::sync::Arc;
 use std::{fmt::Display, vec};
 
 use datafusion_common::{
