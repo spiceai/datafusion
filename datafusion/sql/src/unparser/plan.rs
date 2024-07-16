@@ -19,7 +19,7 @@ use datafusion_common::{internal_err, not_impl_err, plan_err, DataFusionError, R
 use datafusion_expr::{
     expr::Alias, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan, Projection,
 };
-use sqlparser::ast::{self, SetExpr};
+use sqlparser::ast::{self, Ident, SetExpr};
 
 use crate::unparser::utils::unproject_agg_exprs;
 
@@ -444,6 +444,73 @@ impl Unparser<'_> {
             }
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 // Handle bottom-up to allocate relation
+
+                // This logic is to unparse the SubqueryAlias LogicPlan correctly for derived table
+                // with column like `AS table (a, b, c...)`
+                //
+                // A roundtrip example:
+                //
+                // original query: SELECT id FROM (SELECT j1_id from j1) AS c (id)
+                // plan Projection: c.id
+                //   SubqueryAlias: c
+                //     Projection: j1.j1_id AS id
+                //       Projection: j1.j1_id
+                //         TableScan: j1
+                //
+                // Before the fix, the unparsed query was `SELECT c.id FROM (SELECT j1.j1_id AS
+                // id FROM (SELECT j1.j1_id FROM j1)) AS c`.
+                // This query is invalid as `j1.j1_id` is not a valid identifier anymore in the derived table
+                // `(SELECT j1.j1_id FROM j1)`
+                //
+                // After the fix, the unparsed query is `SELECT c.id FROM (SELECT j1.j1_id FROM j1)
+                // AS c (id)`
+                //
+                // Caveat: this won't handle the case like `select * from (select 1, 2) AS a (b, c)`
+                // as the parser gives a wrong plan which has mismatch `Int(1)` types: Literal and
+                // Column in the Projections. Once the parser side is fixed, this logic should work
+                if let LogicalPlan::Projection(project_inside_alias) =
+                    plan_alias.input.as_ref()
+                {
+                    let exprs = &project_inside_alias.expr;
+
+                    if let LogicalPlan::Projection(another_p) =
+                        project_inside_alias.input.as_ref()
+                    {
+                        let derived_with_columns =
+                            another_p.expr.iter().enumerate().all(|(i, e)| {
+                                if let Expr::Alias(ref a) = exprs[i] {
+                                    a.expr.as_ref() == e
+                                } else {
+                                    false
+                                }
+                            });
+
+                        if derived_with_columns {
+                            self.select_to_sql_recursively(
+                                project_inside_alias.input.as_ref(),
+                                query,
+                                select,
+                                relation,
+                            )?;
+
+                            let mut columns: Vec<Ident> = Vec::with_capacity(exprs.len());
+
+                            for expr in exprs {
+                                if let Expr::Alias(a) = expr {
+                                    columns.push(a.name.as_str().into());
+                                }
+                            }
+
+                            relation.alias(Some(self.new_table_alias(
+                                plan_alias.alias.table().to_string(),
+                                columns,
+                            )));
+
+                            return Ok(());
+                        }
+                    }
+                };
+
                 self.select_to_sql_recursively(
                     plan_alias.input.as_ref(),
                     query,
@@ -452,7 +519,7 @@ impl Unparser<'_> {
                 )?;
 
                 relation.alias(Some(
-                    self.new_table_alias(plan_alias.alias.table().to_string()),
+                    self.new_table_alias(plan_alias.alias.table().to_string(), vec![]),
                 ));
 
                 Ok(())
@@ -586,10 +653,10 @@ impl Unparser<'_> {
         self.binary_op_to_sql(lhs, rhs, ast::BinaryOperator::And)
     }
 
-    fn new_table_alias(&self, alias: String) -> ast::TableAlias {
+    fn new_table_alias(&self, alias: String, columns: Vec<Ident>) -> ast::TableAlias {
         ast::TableAlias {
             name: self.new_ident_quoted_if_needs(alias),
-            columns: Vec::new(),
+            columns,
         }
     }
 
