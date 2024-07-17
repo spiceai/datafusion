@@ -444,7 +444,7 @@ impl Unparser<'_> {
             }
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 // Handle bottom-up to allocate relation
-                let (plan, columns) = subquery_inner_query_and_columns(plan_alias);
+                let (plan, columns) = subquery_alias_inner_query_and_columns(plan_alias);
 
                 self.select_to_sql_recursively(plan, query, select, relation)?;
                 relation.alias(Some(
@@ -621,31 +621,35 @@ impl Unparser<'_> {
 // Caveat: this won't handle the case like `select * from (select 1, 2) AS a (b, c)`
 // as the parser gives a wrong plan which has mismatch `Int(1)` types: Literal and
 // Column in the Projections. Once the parser side is fixed, this logic should work
-fn subquery_inner_query_and_columns(
-    alias: &datafusion_expr::SubqueryAlias,
+fn subquery_alias_inner_query_and_columns(
+    subquery_alias: &datafusion_expr::SubqueryAlias,
 ) -> (&LogicalPlan, Vec<Ident>) {
-    let plan: &LogicalPlan = alias.input.as_ref();
+    let plan: &LogicalPlan = subquery_alias.input.as_ref();
 
     let LogicalPlan::Projection(outer_projections) = plan else {
         return (plan, vec![]);
     };
 
+    // check if it's projection inside projection
     let LogicalPlan::Projection(inner_projection) = outer_projections.input.as_ref()
     else {
         return (plan, vec![]);
     };
 
     let mut columns: Vec<Ident> = vec![];
-    for (i, e) in inner_projection.expr.iter().enumerate() {
-        let Expr::Alias(ref a) = &outer_projections.expr[i] else {
+    // check if the inner projection and outer projection have a matching pattern like
+    //     Projection: j1.j1_id AS id
+    //       Projection: j1.j1_id
+    for (i, inner_expr) in inner_projection.expr.iter().enumerate() {
+        let Expr::Alias(ref outer_alias) = &outer_projections.expr[i] else {
             return (plan, vec![]);
         };
 
-        if a.expr.as_ref() != e {
+        if outer_alias.expr.as_ref() != inner_expr {
             return (plan, vec![]);
         };
 
-        columns.push(a.name.as_str().into());
+        columns.push(outer_alias.name.as_str().into());
     }
 
     (outer_projections.input.as_ref(), columns)
