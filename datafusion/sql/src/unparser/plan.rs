@@ -444,82 +444,11 @@ impl Unparser<'_> {
             }
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 // Handle bottom-up to allocate relation
+                let (plan, columns) = subquery_inner_query_and_columns(plan_alias);
 
-                // This logic is to unparse the SubqueryAlias LogicPlan correctly for derived table
-                // with column like `AS table (a, b, c...)`
-                //
-                // A roundtrip example:
-                //
-                // original query: SELECT id FROM (SELECT j1_id from j1) AS c (id)
-                // plan Projection: c.id
-                //   SubqueryAlias: c
-                //     Projection: j1.j1_id AS id
-                //       Projection: j1.j1_id
-                //         TableScan: j1
-                //
-                // Before the fix, the unparsed query was `SELECT c.id FROM (SELECT j1.j1_id AS
-                // id FROM (SELECT j1.j1_id FROM j1)) AS c`.
-                // This query is invalid as `j1.j1_id` is not a valid identifier anymore in the derived table
-                // `(SELECT j1.j1_id FROM j1)`
-                //
-                // After the fix, the unparsed query is `SELECT c.id FROM (SELECT j1.j1_id FROM j1)
-                // AS c (id)`
-                //
-                // Caveat: this won't handle the case like `select * from (select 1, 2) AS a (b, c)`
-                // as the parser gives a wrong plan which has mismatch `Int(1)` types: Literal and
-                // Column in the Projections. Once the parser side is fixed, this logic should work
-                if let LogicalPlan::Projection(project_inside_alias) =
-                    plan_alias.input.as_ref()
-                {
-                    let exprs = &project_inside_alias.expr;
-
-                    if let LogicalPlan::Projection(another_p) =
-                        project_inside_alias.input.as_ref()
-                    {
-                        let derived_with_columns =
-                            another_p.expr.iter().enumerate().all(|(i, e)| {
-                                if let Expr::Alias(ref a) = exprs[i] {
-                                    a.expr.as_ref() == e
-                                } else {
-                                    false
-                                }
-                            });
-
-                        if derived_with_columns {
-                            self.select_to_sql_recursively(
-                                project_inside_alias.input.as_ref(),
-                                query,
-                                select,
-                                relation,
-                            )?;
-
-                            let mut columns: Vec<Ident> = Vec::with_capacity(exprs.len());
-
-                            for expr in exprs {
-                                if let Expr::Alias(a) = expr {
-                                    columns.push(a.name.as_str().into());
-                                }
-                            }
-
-                            relation.alias(Some(self.new_table_alias(
-                                plan_alias.alias.table().to_string(),
-                                columns,
-                            )));
-
-                            return Ok(());
-                        }
-                    }
-                };
-
-                self.select_to_sql_recursively(
-                    plan_alias.input.as_ref(),
-                    query,
-                    select,
-                    relation,
-                )?;
-
+                self.select_to_sql_recursively(plan, query, select, relation)?;
                 relation.alias(Some(
-                    self.new_table_alias(plan_alias.alias.table().to_string(), vec![]),
+                    self.new_table_alias(plan_alias.alias.table().to_string(), columns),
                 ));
 
                 Ok(())
@@ -663,6 +592,63 @@ impl Unparser<'_> {
     fn dml_to_sql(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
         not_impl_err!("Unsupported plan: {plan:?}")
     }
+}
+
+// This logic is to work out the columns and inner query for SubqueryAlias plan for both types of
+// subquery
+// - `(SELECT column_a as a from table) AS A`
+// - `(SELECT column_a from table) AS A (a)`
+//
+// A roundtrip example for table alias with columns
+//
+// query: SELECT id FROM (SELECT j1_id from j1) AS c (id)
+//
+// LogicPlan:
+// Projection: c.id
+//   SubqueryAlias: c
+//     Projection: j1.j1_id AS id
+//       Projection: j1.j1_id
+//         TableScan: j1
+//
+// Before introducing this logic, the unparsed query would be `SELECT c.id FROM (SELECT j1.j1_id AS
+// id FROM (SELECT j1.j1_id FROM j1)) AS c`.
+// The query is invalid as `j1.j1_id` is not a valid identifier in the derived table
+// `(SELECT j1.j1_id FROM j1)`
+//
+// With this logic, the unparsed query will be:
+// `SELECT c.id FROM (SELECT j1.j1_id FROM j1) AS c (id)`
+//
+// Caveat: this won't handle the case like `select * from (select 1, 2) AS a (b, c)`
+// as the parser gives a wrong plan which has mismatch `Int(1)` types: Literal and
+// Column in the Projections. Once the parser side is fixed, this logic should work
+fn subquery_inner_query_and_columns(
+    alias: &datafusion_expr::SubqueryAlias,
+) -> (&LogicalPlan, Vec<Ident>) {
+    let plan: &LogicalPlan = alias.input.as_ref();
+
+    let LogicalPlan::Projection(outer_projections) = plan else {
+        return (plan, vec![]);
+    };
+
+    let LogicalPlan::Projection(inner_projection) = outer_projections.input.as_ref()
+    else {
+        return (plan, vec![]);
+    };
+
+    let mut columns: Vec<Ident> = vec![];
+    for (i, e) in inner_projection.expr.iter().enumerate() {
+        let Expr::Alias(ref a) = &outer_projections.expr[i] else {
+            return (plan, vec![]);
+        };
+
+        if a.expr.as_ref() != e {
+            return (plan, vec![]);
+        };
+
+        columns.push(a.name.as_str().into());
+    }
+
+    (outer_projections.input.as_ref(), columns)
 }
 
 impl From<BuilderError> for DataFusionError {
