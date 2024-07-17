@@ -1087,8 +1087,10 @@ impl Unparser<'_> {
             }
             DataType::Float32 => Ok(ast::DataType::Float(None)),
             DataType::Float64 => Ok(if self.dialect.use_double_precision_for_float64() {
+                println!("TRUE");
                 ast::DataType::DoublePrecision
             } else {
+                println!("FALSE");
                 ast::DataType::Double
             }),
             DataType::Timestamp(_, tz) => {
