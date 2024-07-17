@@ -246,13 +246,12 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
                     SELECT
                         j1_id,
                         MIN(j2_string)
-                    from
-                        j1 left outer join j2 on
+                    FROM
+                        j1 LEFT OUTER JOIN j2 ON
                                     j1_id = j2_id
-                    group by
+                    GROUP BY
                         j1_id
-                ) as agg (id, string_count)
-
+                ) AS agg (id, string_count)
             ",
             expected: r#"SELECT agg.string_count FROM (SELECT j1.j1_id, MIN(j2.j2_string) FROM j1 LEFT JOIN j2 ON (j1.j1_id = j2.j2_id) GROUP BY j1.j1_id) AS agg (id, string_count)"#,
             parser_dialect: Box::new(GenericDialect {}),
