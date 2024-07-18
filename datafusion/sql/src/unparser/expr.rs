@@ -25,11 +25,11 @@ use arrow::util::display::array_value_to_string;
 use arrow_array::{Date32Array, Date64Array, PrimitiveArray};
 use arrow_schema::DataType;
 use core::fmt;
+use sqlparser::ast::TimezoneInfo;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
     self, Expr as AstExpr, Function, FunctionArg, Ident, Interval, UnaryOperator,
 };
-use sqlparser::ast::{DateTimeField, TimezoneInfo};
 use std::sync::Arc;
 use std::{fmt::Display, vec};
 
@@ -953,86 +953,126 @@ impl Unparser<'_> {
 
     /// MySQL requires INTERVAL sql to be in the format: INTERVAL 1 YEAR + INTERVAL 1 MONTH + INTERVAL 1 DAY etc
     /// https://dev.mysql.com/doc/refman/8.4/en/expressions.html#temporal-intervals
-    /// MySQL supports the DAY_MICROSECOND unit type (format is DAYS HOURS:MINUTES:SECONDS.MICROSECONDS), which can be used to optimize
-    /// the number of INTERVAL elements for complex cases. Current implementaion is made based of separate INTERVALs to generate
-    /// cleaner SQL for typical scenarios where only a few INTERVAL elements are used (day, hours, etc.).
+    /// Interval sequence can't be wrapped in (INTERVAL 1 YEAR + INTERVAL 1 MONTH ...) so we need to generate a single INTERVAL expression
+    /// MySQL supports the DAY_MICROSECOND unit type (format is DAYS HOURS:MINUTES:SECONDS.MICROSECONDS), but it is not supported by sqlparser
+    /// so we calculate the best single interval to represent the provided duration
     fn interval_to_mysql_expr(
         &self,
-        years: i32,
         months: i32,
         days: i32,
-        hours: i32,
-        minutes: i32,
-        secs: i32,
-        micros: i64,
+        microseconds: i64,
     ) -> Result<ast::Expr> {
-        let secs = secs + (micros / 1_000_000) as i32;
-        let micros = micros % 1_000_000;
-
-        let minutes = minutes + secs / 60;
-        let secs = secs % 60;
-
-        let hours = hours + minutes / 60;
-        let minutes = minutes % 60;
-
-        let days = days + hours / 24;
-        let hours = hours % 24;
-
-        let years = years + months / 12;
-        let months = months % 12;
-
-        let mut intervals = [
-            (years as i64, DateTimeField::Year),
-            (months as i64, DateTimeField::Month),
-            (days as i64, DateTimeField::Day),
-            (hours as i64, DateTimeField::Hour),
-            (minutes as i64, DateTimeField::Minute),
-            (secs as i64, DateTimeField::Second),
-            (micros, DateTimeField::Microsecond),
-        ]
-        .into_iter()
-        .filter(|(value, _)| *value != 0)
-        .map(|(value, field)| {
-            ast::Expr::Interval(Interval {
+        // MONTH only
+        if months != 0 && days == 0 && microseconds == 0 {
+            let interval = Interval {
                 value: Box::new(ast::Expr::Value(ast::Value::Number(
-                    value.to_string(),
+                    months.to_string(),
                     false,
                 ))),
-                leading_field: Some(field),
+                leading_field: Some(ast::DateTimeField::Month),
                 leading_precision: None,
                 last_field: None,
                 fractional_seconds_precision: None,
-            })
-        })
-        .collect::<Vec<_>>();
+            };
+            return Ok(ast::Expr::Interval(interval));
+        } else if months != 0 {
+            return not_impl_err!("Unsupported Interval scalar with both Month and DayTime for IntervalStyle::MySQL");
+        }
 
-        // Combine all intervals into single expression
-        let initial_interval = if !intervals.is_empty() {
-            intervals.remove(0)
-        } else {
-            // if for some reason INTERVAL value is 0, we fallback to `INTERVAL 0 DAY` as returning ast::Value::Null can break the query
-            return Ok(ast::Expr::Interval(Interval {
+        // DAY only
+        if microseconds == 0 {
+            let interval = Interval {
                 value: Box::new(ast::Expr::Value(ast::Value::Number(
-                    "0".to_string(),
+                    days.to_string(),
                     false,
                 ))),
-                leading_field: Some(DateTimeField::Day),
+                leading_field: Some(ast::DateTimeField::Day),
                 leading_precision: None,
                 last_field: None,
                 fractional_seconds_precision: None,
-            }));
+            };
+            return Ok(ast::Expr::Interval(interval));
+        }
+
+        // calculate the best single interval to represent the provided days and microseconds
+
+        let microseconds = microseconds + (days as i64 * 24 * 60 * 60 * 1_000_000);
+
+        if microseconds % 1_000_000 != 0 {
+            let interval = Interval {
+                value: Box::new(ast::Expr::Value(ast::Value::Number(
+                    microseconds.to_string(),
+                    false,
+                ))),
+                leading_field: Some(ast::DateTimeField::Microsecond),
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            };
+            return Ok(ast::Expr::Interval(interval));
+        }
+
+        let secs = microseconds / 1_000_000;
+
+        if secs % 60 != 0 {
+            let interval = Interval {
+                value: Box::new(ast::Expr::Value(ast::Value::Number(
+                    secs.to_string(),
+                    false,
+                ))),
+                leading_field: Some(ast::DateTimeField::Second),
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            };
+            return Ok(ast::Expr::Interval(interval));
+        }
+
+        let mins = secs / 60;
+
+        if mins % 60 != 0 {
+            let interval = Interval {
+                value: Box::new(ast::Expr::Value(ast::Value::Number(
+                    mins.to_string(),
+                    false,
+                ))),
+                leading_field: Some(ast::DateTimeField::Minute),
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            };
+            return Ok(ast::Expr::Interval(interval));
+        }
+
+        let hours = mins / 60;
+
+        if hours % 24 != 0 {
+            let interval = Interval {
+                value: Box::new(ast::Expr::Value(ast::Value::Number(
+                    hours.to_string(),
+                    false,
+                ))),
+                leading_field: Some(ast::DateTimeField::Hour),
+                leading_precision: None,
+                last_field: None,
+                fractional_seconds_precision: None,
+            };
+            return Ok(ast::Expr::Interval(interval));
+        }
+
+        let days = hours / 24;
+
+        let interval = Interval {
+            value: Box::new(ast::Expr::Value(ast::Value::Number(
+                days.to_string(),
+                false,
+            ))),
+            leading_field: Some(ast::DateTimeField::Day),
+            leading_precision: None,
+            last_field: None,
+            fractional_seconds_precision: None,
         };
-
-        let combined_intervals =
-            intervals
-                .into_iter()
-                .fold(initial_interval, |acc, interval| ast::Expr::BinaryOp {
-                    left: Box::new(acc),
-                    op: ast::BinaryOperator::Plus,
-                    right: Box::new(interval),
-                });
-
-        return Ok(combined_intervals);
+        return Ok(ast::Expr::Interval(interval));
     }
 
     fn interval_scalar_to_sql(&self, v: &ScalarValue) -> Result<ast::Expr> {
@@ -1104,10 +1144,7 @@ impl Unparser<'_> {
                             fractional_seconds_precision: None,
                         };
                         Ok(ast::Expr::Interval(interval))
-                    } else if v.months == 0
-                        && v.days >= 0
-                        && v.nanoseconds % 1_000_000 == 0
-                    {
+                    } else if v.months == 0 && v.nanoseconds % 1_000_000 == 0 {
                         let days = v.days;
                         let secs = v.nanoseconds / 1_000_000_000;
                         let mins = secs / 60;
@@ -1140,27 +1177,45 @@ impl Unparser<'_> {
             },
             IntervalStyle::MySQL => match v {
                 ScalarValue::IntervalYearMonth(Some(v)) => {
-                    self.interval_to_mysql_expr(0, v.clone(), 0, 0, 0, 0, 0)
+                    return self.interval_to_mysql_expr(v.clone(), 0, 0);
                 }
-                ScalarValue::IntervalDayTime(Some(v)) => self.interval_to_mysql_expr(
-                    0,
-                    0,
-                    v.days,
-                    0,
-                    0,
-                    0,
-                    v.milliseconds as i64 * 1_000,
-                ),
-                ScalarValue::IntervalMonthDayNano(Some(v)) => self
-                    .interval_to_mysql_expr(
+                ScalarValue::IntervalDayTime(Some(v)) => {
+                    return self.interval_to_mysql_expr(
                         0,
-                        v.months,
                         v.days,
-                        0,
-                        0,
-                        0,
-                        v.nanoseconds / 1_000,
-                    ),
+                        v.milliseconds as i64 * 1_000,
+                    );
+                }
+                ScalarValue::IntervalMonthDayNano(Some(v)) => {
+                    if v.nanoseconds % 1_000 > 0 {
+                        return not_impl_err!(
+                            "Unsupported IntervalMonthDayNano scalar with nanoseconds precision for IntervalStyle::MySQL"
+                        );
+                    }
+                    if v.months >= 0 && v.days == 0 && v.nanoseconds == 0 {
+                        // only Month
+                        let interval = Interval {
+                            value: Box::new(ast::Expr::Value(ast::Value::Number(
+                                v.months.to_string(),
+                                false,
+                            ))),
+                            leading_field: Some(ast::DateTimeField::Month),
+                            leading_precision: None,
+                            last_field: None,
+                            fractional_seconds_precision: None,
+                        };
+                        return Ok(ast::Expr::Interval(interval));
+                    } else if v.months == 0 {
+                        // Only Day + Nanoseconds
+                        return self.interval_to_mysql_expr(
+                            0,
+                            v.days,
+                            v.nanoseconds as i64 / 1_000,
+                        );
+                    } else {
+                        not_impl_err!("Unsupported IntervalMonthDayNano scalar with both Month and DayTime for IntervalStyle::SQLStandard")
+                    }
+                }
                 _ => not_impl_err!(
                     "Unsupported ScalarValue for Interval conversion: {v:?}"
                 ),
@@ -1836,6 +1891,11 @@ mod tests {
                 "INTERVAL '1 12:0:0.000' DAY TO SECOND",
             ),
             (
+                interval_month_day_nano_lit("-1.5 DAY"),
+                IntervalStyle::SQLStandard,
+                "INTERVAL '-1 -12:0:0.000' DAY TO SECOND",
+            ),
+            (
                 interval_month_day_nano_lit("1.51234 DAY"),
                 IntervalStyle::SQLStandard,
                 "INTERVAL '1 12:17:46.176' DAY TO SECOND",
@@ -1900,26 +1960,34 @@ mod tests {
                 r#"INTERVAL '1 YEARS 7 MONS 0 DAYS 0 HOURS 0 MINS 0.00 SECS'"#,
             ),
             (
-                interval_month_day_nano_lit(
-                    "1 YEAR 1 MONTH 1 DAY 3 HOUR 10 MINUTE 20 SECOND",
-                ),
+                interval_year_month_lit("1 YEAR 1 MONTH"),
                 IntervalStyle::MySQL,
-                r#"INTERVAL 1 YEAR + INTERVAL 1 MONTH + INTERVAL 1 DAY + INTERVAL 3 HOUR + INTERVAL 10 MINUTE + INTERVAL 20 SECOND"#,
+                r#"INTERVAL 13 MONTH"#,
             ),
             (
-                interval_month_day_nano_lit("1.5 MONTH"),
+                interval_month_day_nano_lit("1 YEAR -1 MONTH"),
                 IntervalStyle::MySQL,
-                r#"INTERVAL 1 MONTH + INTERVAL 15 DAY"#,
+                r#"INTERVAL 11 MONTH"#,
             ),
             (
-                interval_month_day_nano_lit("-3 MONTH"),
+                interval_month_day_nano_lit("15 DAY"),
                 IntervalStyle::MySQL,
-                r#"INTERVAL -3 MONTH"#,
+                r#"INTERVAL 15 DAY"#,
             ),
             (
-                interval_datetime_lit("10 DAY 1.5 HOUR 10 MINUTE 20 SECOND"),
+                interval_month_day_nano_lit("-40 HOURS"),
                 IntervalStyle::MySQL,
-                r#"INTERVAL 10 DAY + INTERVAL 1 HOUR + INTERVAL 40 MINUTE + INTERVAL 20 SECOND"#,
+                r#"INTERVAL -40 HOUR"#,
+            ),
+            (
+                interval_datetime_lit("-1.5 DAY 1 HOUR"),
+                IntervalStyle::MySQL,
+                "INTERVAL -35 HOUR",
+            ),
+            (
+                interval_datetime_lit("1000000 DAY 1.5 HOUR 10 MINUTE 20 SECOND"),
+                IntervalStyle::MySQL,
+                r#"INTERVAL 86400006020 SECOND"#,
             ),
             (
                 interval_year_month_lit("0 DAY 0 HOUR"),
@@ -1927,9 +1995,9 @@ mod tests {
                 r#"INTERVAL 0 DAY"#,
             ),
             (
-                interval_month_day_nano_lit("1296000000 SECOND"),
+                interval_month_day_nano_lit("-1296000000 SECOND"),
                 IntervalStyle::MySQL,
-                r#"INTERVAL 15000 DAY"#,
+                r#"INTERVAL -15000 DAY"#,
             ),
         ];
 
