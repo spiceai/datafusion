@@ -1926,6 +1926,11 @@ mod tests {
                 IntervalStyle::MySQL,
                 r#"INTERVAL 0 DAY"#,
             ),
+            (
+                interval_month_day_nano_lit("1296000000 SECOND"),
+                IntervalStyle::MySQL,
+                r#"INTERVAL 15000 DAY"#,
+            ),
         ];
 
         for (value, style, expected) in tests {
