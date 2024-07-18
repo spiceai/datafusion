@@ -269,6 +269,63 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
             parser_dialect: Box::new(GenericDialect {}),
             unparser_dialect: Box::new(UnparserDefaultDialect {}),
         },
+        // Test query with derived tables that put distinct,sort,limit on the wrong level
+        TestStatementWithDialect {
+            sql: "
+                SELECT
+                  j1_string,
+                  j2_string
+                FROM
+                  (
+                    SELECT
+                      distinct j1_id,
+                      j1_string,
+                      j2_string
+                    from
+                      j1
+                      INNER join j2 ON j1.j1_id = j2.j2_id
+                    order by
+                      j1.j1_id desc
+                    limit
+                      10
+                  ) abc
+                ORDER BY
+                  abc.j2_string",
+            expected: r#"SELECT abc.j1_string, abc.j2_string FROM (SELECT DISTINCT j1.j1_id, j1.j1_string, j2.j2_string FROM j1 JOIN j2 ON (j1.j1_id = j2.j2_id) ORDER BY j1.j1_id DESC NULLS FIRST LIMIT 10) AS abc ORDER BY abc.j2_string ASC NULLS LAST"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(UnparserDefaultDialect {}),
+        },
+        // Test query that order by columns are not in select columns
+        TestStatementWithDialect {
+            sql: "SELECT j1_string from j1 order by j1_id",
+            expected: r#"SELECT j1.j1_string FROM j1 ORDER BY j1.j1_id ASC NULLS LAST"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(UnparserDefaultDialect {}),
+        },
+        TestStatementWithDialect {
+            sql: "
+                SELECT
+                  j1_string
+                FROM
+                  (
+                    SELECT
+                      j1_string,
+                      j2_string
+                    from
+                      j1
+                      INNER join j2 ON j1.j1_id = j2.j2_id
+                    order by
+                      j1.j1_id desc,
+                      j2.j2_id desc
+                    limit
+                      10
+                  ) abc
+                ORDER BY
+                  j2_string",
+            expected: r#"SELECT abc.j1_string FROM (SELECT j1.j1_string, j2.j2_string FROM j1 JOIN j2 ON (j1.j1_id = j2.j2_id) ORDER BY j1.j1_id DESC NULLS FIRST, j2.j2_id DESC NULLS FIRST LIMIT 10) AS abc ORDER BY abc.j2_string ASC NULLS LAST"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(UnparserDefaultDialect {}),
+        },
     ];
 
     for query in tests {
