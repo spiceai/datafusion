@@ -953,6 +953,9 @@ impl Unparser<'_> {
 
     /// MySQL requires INTERVAL sql to be in the format: INTERVAL 1 YEAR + INTERVAL 1 MONTH + INTERVAL 1 DAY etc
     /// https://dev.mysql.com/doc/refman/8.4/en/expressions.html#temporal-intervals
+    /// MySQL supports the DAY_MICROSECOND unit type (format is DAYS HOURS:MINUTES:SECONDS.MICROSECONDS), which can be used to optimize
+    /// the number of INTERVAL elements for complex cases. Current implementaion is made based of separate INTERVALs to generate
+    /// cleaner SQL for typical scenarios where only a few INTERVAL elements are used (day, hours, etc.).
     fn interval_to_mysql_expr(
         &self,
         years: i32,
@@ -1054,10 +1057,7 @@ impl Unparser<'_> {
             }
             // If the interval standard is SQLStandard, implement a simple unparse logic
             IntervalStyle::SQLStandard => match v {
-                ScalarValue::IntervalYearMonth(v) => {
-                    let Some(v) = v else {
-                        return Ok(ast::Expr::Value(ast::Value::Null));
-                    };
+                ScalarValue::IntervalYearMonth(Some(v)) => {
                     let interval = Interval {
                         value: Box::new(ast::Expr::Value(
                             ast::Value::SingleQuotedString(v.to_string()),
@@ -1069,10 +1069,7 @@ impl Unparser<'_> {
                     };
                     Ok(ast::Expr::Interval(interval))
                 }
-                ScalarValue::IntervalDayTime(v) => {
-                    let Some(v) = v else {
-                        return Ok(ast::Expr::Value(ast::Value::Null));
-                    };
+                ScalarValue::IntervalDayTime(Some(v)) => {
                     let days = v.days;
                     let secs = v.milliseconds / 1_000;
                     let mins = secs / 60;
@@ -1095,11 +1092,7 @@ impl Unparser<'_> {
                     };
                     Ok(ast::Expr::Interval(interval))
                 }
-                ScalarValue::IntervalMonthDayNano(v) => {
-                    let Some(v) = v else {
-                        return Ok(ast::Expr::Value(ast::Value::Null));
-                    };
-
+                ScalarValue::IntervalMonthDayNano(Some(v)) => {
                     if v.months >= 0 && v.days == 0 && v.nanoseconds == 0 {
                         let interval = Interval {
                             value: Box::new(ast::Expr::Value(
@@ -1141,35 +1134,25 @@ impl Unparser<'_> {
                         not_impl_err!("Unsupported IntervalMonthDayNano scalar with both Month and DayTime for IntervalStyle::SQLStandard")
                     }
                 }
-                _ => Ok(ast::Expr::Value(ast::Value::Null)),
+                _ => not_impl_err!(
+                    "Unsupported ScalarValue for Interval conversion: {v:?}"
+                ),
             },
             IntervalStyle::MySQL => match v {
-                ScalarValue::IntervalYearMonth(v) => {
-                    let Some(v) = v else {
-                        return Ok(ast::Expr::Value(ast::Value::Null));
-                    };
-
+                ScalarValue::IntervalYearMonth(Some(v)) => {
                     self.interval_to_mysql_expr(0, v.clone(), 0, 0, 0, 0, 0)
                 }
-                ScalarValue::IntervalDayTime(v) => {
-                    let Some(v) = v else {
-                        return Ok(ast::Expr::Value(ast::Value::Null));
-                    };
-                    self.interval_to_mysql_expr(
-                        0,
-                        0,
-                        v.days,
-                        0,
-                        0,
-                        0,
-                        v.milliseconds as i64 * 1_000,
-                    )
-                }
-                ScalarValue::IntervalMonthDayNano(v) => {
-                    let Some(v) = v else {
-                        return Ok(ast::Expr::Value(ast::Value::Null));
-                    };
-                    self.interval_to_mysql_expr(
+                ScalarValue::IntervalDayTime(Some(v)) => self.interval_to_mysql_expr(
+                    0,
+                    0,
+                    v.days,
+                    0,
+                    0,
+                    0,
+                    v.milliseconds as i64 * 1_000,
+                ),
+                ScalarValue::IntervalMonthDayNano(Some(v)) => self
+                    .interval_to_mysql_expr(
                         0,
                         v.months,
                         v.days,
@@ -1177,9 +1160,10 @@ impl Unparser<'_> {
                         0,
                         0,
                         v.nanoseconds / 1_000,
-                    )
-                }
-                _ => Ok(ast::Expr::Value(ast::Value::Null)),
+                    ),
+                _ => not_impl_err!(
+                    "Unsupported ScalarValue for Interval conversion: {v:?}"
+                ),
             },
         }
     }
