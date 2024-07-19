@@ -57,6 +57,10 @@ pub trait Dialect: Send + Sync {
     fn use_char_for_utf8_cast(&self) -> bool {
         false
     }
+
+    fn date_field_extract_style(&self) -> DateFieldExtractStyle {
+        DateFieldExtractStyle::DatePart
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -72,6 +76,19 @@ pub enum IntervalStyle {
     PostgresVerbose,
     SQLStandard,
     MySQL,
+}
+
+/// Datetime subfield extraction style for unparsing
+/// 
+/// https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-EXTRACT
+/// Different DBMSs follow different standards; popular ones are:
+/// date_part('YEAR', date '2001-02-16')
+/// EXTRACT(YEAR from date '2001-02-16')
+/// Some DBMSs, like Postgres, support both, whereas others like MySQL require EXTRACT.
+#[derive(Clone, Copy, PartialEq)]
+pub enum DateFieldExtractStyle {
+    DatePart,
+    Extract
 }
 
 pub struct DefaultDialect {}
@@ -123,6 +140,10 @@ impl Dialect for MySqlDialect {
     fn use_char_for_utf8_cast(&self) -> bool {
         true
     }
+
+    fn date_field_extract_style(&self) -> DateFieldExtractStyle {
+        DateFieldExtractStyle::Extract
+    }
 }
 
 pub struct SqliteDialect {}
@@ -140,6 +161,7 @@ pub struct CustomDialect {
     interval_style: IntervalStyle,
     use_double_precision_for_float64: bool,
     use_char_for_utf8_cast: bool,
+    date_subfield_extract_style: DateFieldExtractStyle,
 }
 
 impl Default for CustomDialect {
@@ -151,6 +173,7 @@ impl Default for CustomDialect {
             interval_style: IntervalStyle::SQLStandard,
             use_double_precision_for_float64: false,
             use_char_for_utf8_cast: false,
+            date_subfield_extract_style: DateFieldExtractStyle::DatePart,
         }
     }
 }
@@ -189,6 +212,10 @@ impl Dialect for CustomDialect {
     fn use_char_for_utf8_cast(&self) -> bool {
         self.use_char_for_utf8_cast
     }
+
+    fn date_field_extract_style(&self) -> DateFieldExtractStyle {
+        self.date_subfield_extract_style
+    }
 }
 
 // create a CustomDialectBuilder
@@ -199,6 +226,7 @@ pub struct CustomDialectBuilder {
     interval_style: IntervalStyle,
     use_double_precision_for_float64: bool,
     use_char_for_utf8_cast: bool,
+    date_subfield_extract_style: DateFieldExtractStyle,
 }
 
 impl CustomDialectBuilder {
@@ -210,6 +238,7 @@ impl CustomDialectBuilder {
             interval_style: IntervalStyle::PostgresVerbose,
             use_double_precision_for_float64: false,
             use_char_for_utf8_cast: false,
+            date_subfield_extract_style: DateFieldExtractStyle::DatePart,
         }
     }
 
@@ -221,6 +250,7 @@ impl CustomDialectBuilder {
             interval_style: self.interval_style,
             use_double_precision_for_float64: self.use_double_precision_for_float64,
             use_char_for_utf8_cast: self.use_char_for_utf8_cast,
+            date_subfield_extract_style: self.date_subfield_extract_style,
         }
     }
 
@@ -260,6 +290,14 @@ impl CustomDialectBuilder {
 
     pub fn with_use_char_for_utf8_cast(mut self, use_char_for_utf8_cast: bool) -> Self {
         self.use_char_for_utf8_cast = use_char_for_utf8_cast;
+        self
+    }
+
+    pub fn with_date_field_extract_style(
+        mut self,
+        date_subfield_extract_style: DateFieldExtractStyle,
+    ) -> Self {
+        self.date_subfield_extract_style = date_subfield_extract_style;
         self
     }
 }
