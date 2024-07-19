@@ -16,7 +16,10 @@
 // under the License.
 
 use regex::Regex;
-use sqlparser::keywords::ALL_KEYWORDS;
+use sqlparser::{
+    ast::{self, Ident, ObjectName},
+    keywords::ALL_KEYWORDS,
+};
 
 /// `Dialect` to use for Unparsing
 ///
@@ -61,6 +64,12 @@ pub trait Dialect: Send + Sync {
     fn date_field_extract_style(&self) -> DateFieldExtractStyle {
         DateFieldExtractStyle::DatePart
     }
+
+    // The SQL type to use for Arrow Int64 unparsing
+    // Most dialects use BigInt, but some, like MySQL, require SIGNED
+    fn int64_cast_dtype(&self) -> ast::DataType {
+        ast::DataType::BigInt(None)
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -79,7 +88,7 @@ pub enum IntervalStyle {
 }
 
 /// Datetime subfield extraction style for unparsing
-/// 
+///
 /// https://www.postgresql.org/docs/current/functions-datetime.html#FUNCTIONS-DATETIME-EXTRACT
 /// Different DBMSs follow different standards; popular ones are:
 /// date_part('YEAR', date '2001-02-16')
@@ -88,7 +97,7 @@ pub enum IntervalStyle {
 #[derive(Clone, Copy, PartialEq)]
 pub enum DateFieldExtractStyle {
     DatePart,
-    Extract
+    Extract,
 }
 
 pub struct DefaultDialect {}
@@ -144,6 +153,10 @@ impl Dialect for MySqlDialect {
     fn date_field_extract_style(&self) -> DateFieldExtractStyle {
         DateFieldExtractStyle::Extract
     }
+
+    fn int64_cast_dtype(&self) -> ast::DataType {
+        ast::DataType::Custom(ObjectName(vec![Ident::new("SIGNED")]), vec![])
+    }
 }
 
 pub struct SqliteDialect {}
@@ -162,6 +175,7 @@ pub struct CustomDialect {
     use_double_precision_for_float64: bool,
     use_char_for_utf8_cast: bool,
     date_subfield_extract_style: DateFieldExtractStyle,
+    int64_cast_dtype: ast::DataType,
 }
 
 impl Default for CustomDialect {
@@ -174,6 +188,7 @@ impl Default for CustomDialect {
             use_double_precision_for_float64: false,
             use_char_for_utf8_cast: false,
             date_subfield_extract_style: DateFieldExtractStyle::DatePart,
+            int64_cast_dtype: ast::DataType::BigInt(None),
         }
     }
 }
@@ -216,6 +231,10 @@ impl Dialect for CustomDialect {
     fn date_field_extract_style(&self) -> DateFieldExtractStyle {
         self.date_subfield_extract_style
     }
+
+    fn int64_cast_dtype(&self) -> ast::DataType {
+        self.int64_cast_dtype.clone()
+    }
 }
 
 // create a CustomDialectBuilder
@@ -227,6 +246,7 @@ pub struct CustomDialectBuilder {
     use_double_precision_for_float64: bool,
     use_char_for_utf8_cast: bool,
     date_subfield_extract_style: DateFieldExtractStyle,
+    int64_cast_dtype: ast::DataType,
 }
 
 impl CustomDialectBuilder {
@@ -239,6 +259,7 @@ impl CustomDialectBuilder {
             use_double_precision_for_float64: false,
             use_char_for_utf8_cast: false,
             date_subfield_extract_style: DateFieldExtractStyle::DatePart,
+            int64_cast_dtype: ast::DataType::BigInt(None),
         }
     }
 
@@ -251,6 +272,7 @@ impl CustomDialectBuilder {
             use_double_precision_for_float64: self.use_double_precision_for_float64,
             use_char_for_utf8_cast: self.use_char_for_utf8_cast,
             date_subfield_extract_style: self.date_subfield_extract_style,
+            int64_cast_dtype: self.int64_cast_dtype,
         }
     }
 
@@ -298,6 +320,11 @@ impl CustomDialectBuilder {
         date_subfield_extract_style: DateFieldExtractStyle,
     ) -> Self {
         self.date_subfield_extract_style = date_subfield_extract_style;
+        self
+    }
+
+    pub fn with_int64_cast_dtype(mut self, int64_cast_dtype: ast::DataType) -> Self {
+        self.int64_cast_dtype = int64_cast_dtype;
         self
     }
 }
