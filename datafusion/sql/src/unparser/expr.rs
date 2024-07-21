@@ -2193,21 +2193,3 @@ mod tests {
         Ok(())
     }
 }
-
-// (
-//     Expr::Cast(Cast {
-//         expr: Box::new(col("a")),
-//         data_type: DataType::Timestamp(
-//             TimeUnit::Nanosecond,
-//             Some("+08:00".into()),
-//         ),
-//     }),
-//     r#"CAST(a AS TIMESTAMP WITH TIME ZONE)"#,
-// ),
-// (
-//     Expr::Cast(Cast {
-//         expr: Box::new(col("a")),
-//         data_type: DataType::Timestamp(TimeUnit::Millisecond, None),
-//     }),
-//     r#"CAST(a AS TIMESTAMP)"#,
-// ),
