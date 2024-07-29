@@ -164,6 +164,23 @@ pub trait ObjectStoreRegistry: Send + Sync + std::fmt::Debug + 'static {
     /// the `url` and [`ObjectStoreRegistry`] implementation. An [`ObjectStore`] may be lazily
     /// created and registered.
     fn get_store(&self, url: &Url) -> Result<Arc<dyn ObjectStore>>;
+
+    /// Get a suitable store for the provided URL and options.
+    ///
+    /// Allow passing through options for dynamic store creation. The options may contain
+    /// configuration like `timeout`, `authentication` etc.
+    fn get_store_with_options(
+        &self,
+        url: &Url,
+        _options: I,
+    ) -> Result<Arc<dyn ObjectStore>>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: Into<String>,
+    {
+        self.get_store(url)
+    }
 }
 
 /// The default [`ObjectStoreRegistry`]
