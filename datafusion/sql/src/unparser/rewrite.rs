@@ -144,7 +144,9 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 map.insert(a.clone(), f.clone());
                 a
             } else {
-                map.insert(Expr::Column(format!("{f}").into()), f.clone());
+                // inner expr may have different type to outer expr: e.g. a + 1 is a column of
+                // string in outer, but a expr of math in inner
+                map.insert(Expr::Column(f.to_string().into()), f.clone());
                 f.clone()
             }
         })
@@ -157,13 +159,12 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         }
     }
 
-    let outer_collects = collects
-        .iter()
-        .map(|s| format!("{s}"))
-        .collect::<HashSet<_>>();
+    // inner expr may have different type to outer expr: e.g. a + 1 is a column of
+    // string in outer, but a expr of math in inner
+    let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
     let inner_collects = inner_exprs
         .iter()
-        .map(|s| format!("{s}"))
+        .map(Expr::to_string)
         .collect::<HashSet<_>>();
 
     if outer_collects == inner_collects {
@@ -237,7 +238,9 @@ pub(super) fn subquery_alias_inner_query_and_columns(
 
         let expr = outer_alias.expr.clone();
 
-        if format!("{expr}") != format!("{inner_expr}") {
+        // inner expr may have different type to outer expr: e.g. a + 1 is a column of
+        // string in outer, but a expr of math in inner
+        if expr.to_string() != inner_expr.to_string() {
             return (plan, vec![]);
         };
 
