@@ -326,6 +326,13 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
             parser_dialect: Box::new(GenericDialect {}),
             unparser_dialect: Box::new(UnparserDefaultDialect {}),
         },
+        // Test query that has calculation in derived table with columns
+        TestStatementWithDialect {
+            sql: "SELECT id FROM (SELECT j1_id + 1 * 3 from j1) AS c (id)",
+            expected: r#"SELECT c.id FROM (SELECT (j1.j1_id + (1 * 3)) FROM j1) AS c (id)"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(UnparserDefaultDialect {}),
+        },
     ];
 
     for query in tests {

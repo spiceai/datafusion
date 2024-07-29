@@ -655,7 +655,9 @@ fn subquery_alias_inner_query_and_columns(
             return (plan, vec![]);
         };
 
-        if outer_alias.expr.as_ref() != inner_expr {
+        let expr = outer_alias.expr.clone();
+
+        if format!("{expr}") != format!("{inner_expr}") {
             return (plan, vec![]);
         };
 
