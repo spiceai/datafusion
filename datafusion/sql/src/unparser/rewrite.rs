@@ -143,6 +143,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 map.insert(a.clone(), f.clone());
                 a
             } else {
+                map.insert(Expr::Column(format!("{f}").into()), f.clone());
                 f.clone()
             }
         })
@@ -155,9 +156,16 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         }
     }
 
-    if collects.iter().collect::<HashSet<_>>()
-        == inner_exprs.iter().collect::<HashSet<_>>()
-    {
+    let outer_collects = collects
+        .iter()
+        .map(|s| format!("{s}"))
+        .collect::<HashSet<_>>();
+    let inner_collects = inner_exprs
+        .iter()
+        .map(|s| format!("{s}"))
+        .collect::<HashSet<_>>();
+
+    if outer_collects == inner_collects {
         let mut sort = sort.clone();
         let mut inner_p = inner_p.clone();
 

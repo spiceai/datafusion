@@ -341,8 +341,8 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
             unparser_dialect: Box::new(UnparserDefaultDialect {}),
         },
         TestStatementWithDialect {
-            sql: "SELECT id FROM (SELECT j1_id FROM j1 ORDER BY j1_id DESC LIMIT 1) AS c (id)",
-            expected: r#"SELECT c.id FROM (SELECT j1.j1_id FROM j1 ORDER BY j1.j1_id DESC NULLS FIRST LIMIT 1) AS c (id)"#,
+            sql: "SELECT id FROM (SELECT j1_id + 1 FROM j1 ORDER BY j1_id DESC LIMIT 1) AS c (id)",
+            expected: r#"SELECT c.id FROM (SELECT (j1.j1_id + 1) FROM j1 ORDER BY j1.j1_id DESC NULLS FIRST LIMIT 1) AS c (id)"#,
             parser_dialect: Box::new(GenericDialect {}),
             unparser_dialect: Box::new(UnparserDefaultDialect {}),
         },
