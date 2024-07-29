@@ -641,8 +641,7 @@ fn subquery_alias_inner_query_and_columns(
     };
 
     // check if it's projection inside projection
-    let LogicalPlan::Projection(inner_projection) = outer_projections.input.as_ref()
-    else {
+    let Some(inner_projection) = find_projection(outer_projections.input.as_ref()) else {
         return (plan, vec![]);
     };
 
@@ -665,6 +664,19 @@ fn subquery_alias_inner_query_and_columns(
     }
 
     (outer_projections.input.as_ref(), columns)
+}
+
+fn find_projection(logical_plan: &LogicalPlan) -> Option<&Projection> {
+    match logical_plan {
+        LogicalPlan::Projection(p) => {
+            return Some(p);
+        }
+        LogicalPlan::Limit(p) => find_projection(p.input.as_ref()),
+        LogicalPlan::Distinct(p) => find_projection(p.input().as_ref()),
+        LogicalPlan::Sort(p) => find_projection(p.input.as_ref()),
+
+        _ => None,
+    }
 }
 
 impl From<BuilderError> for DataFusionError {
