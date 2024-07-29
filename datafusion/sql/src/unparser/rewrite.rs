@@ -177,8 +177,6 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         .map(Expr::to_string)
         .collect::<HashSet<_>>();
 
-    dbg!(&outer_collects, &inner_collects);
-
     if outer_collects == inner_collects {
         let mut sort = sort.clone();
         let mut inner_p = inner_p.clone();
