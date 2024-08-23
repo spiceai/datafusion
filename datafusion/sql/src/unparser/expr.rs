@@ -582,6 +582,47 @@ impl Unparser<'_> {
                     expr: Box::new(date_expr),
                 });
             }
+        } else if func_name.to_lowercase() == "date_part"
+            && self.dialect.date_field_extract_style() == DateFieldExtractStyle::Strftime
+            && args.len() == 2
+        {
+            let column = self.expr_to_sql(&args[1]).ok()?;
+
+            if let Expr::Literal(ScalarValue::Utf8(Some(field))) = &args[0] {
+                let field = match field.to_lowercase().as_str() {
+                    "year" => "%Y",
+                    "month" => "%m",
+                    "day" => "%d",
+                    "hour" => "%H",
+                    "minute" => "%M",
+                    "second" => "%S",
+                    _ => return None,
+                };
+
+                return Some(ast::Expr::Function(ast::Function {
+                    name: ast::ObjectName(vec![ast::Ident {
+                        value: "strftime".to_string(),
+                        quote_style: None,
+                    }]),
+                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                        duplicate_treatment: None,
+                        args: vec![
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                                ast::Expr::Value(ast::Value::SingleQuotedString(
+                                    field.to_string(),
+                                )),
+                            )),
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(column)),
+                        ],
+                        clauses: vec![],
+                    }),
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                    within_group: vec![],
+                    parameters: ast::FunctionArguments::None,
+                }));
+            }
         }
         None
     }
@@ -2220,6 +2261,7 @@ mod tests {
                 "YEAR",
                 "EXTRACT(YEAR FROM x)",
             ),
+            (DateFieldExtractStyle::Strftime, "YEAR", "strftime('%Y', x)"),
             (
                 DateFieldExtractStyle::DatePart,
                 "MONTH",
@@ -2231,10 +2273,16 @@ mod tests {
                 "EXTRACT(MONTH FROM x)",
             ),
             (
+                DateFieldExtractStyle::Strftime,
+                "MONTH",
+                "strftime('%m', x)",
+            ),
+            (
                 DateFieldExtractStyle::DatePart,
                 "DAY",
                 "date_part('DAY', x)",
             ),
+            (DateFieldExtractStyle::Strftime, "DAY", "strftime('%d', x)"),
             (DateFieldExtractStyle::Extract, "DAY", "EXTRACT(DAY FROM x)"),
         ] {
             let dialect = CustomDialectBuilder::new()
