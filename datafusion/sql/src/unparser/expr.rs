@@ -560,70 +560,77 @@ impl Unparser<'_> {
         _func: &Arc<ScalarUDF>,
         args: &[Expr],
     ) -> Option<ast::Expr> {
-        if func_name.to_lowercase() == "date_part"
-            && self.dialect.date_field_extract_style() == DateFieldExtractStyle::Extract
-            && args.len() == 2
-        {
-            let date_expr = self.expr_to_sql(&args[1]).ok()?;
+        if func_name.to_lowercase() == "date_part" {
+            match (self.dialect.date_field_extract_style(), args.len()) {
+                (DateFieldExtractStyle::Extract, 2) => {
+                    let date_expr = self.expr_to_sql(&args[1]).ok()?;
 
-            if let Expr::Literal(ScalarValue::Utf8(Some(field))) = &args[0] {
-                let field = match field.to_lowercase().as_str() {
-                    "year" => ast::DateTimeField::Year,
-                    "month" => ast::DateTimeField::Month,
-                    "day" => ast::DateTimeField::Day,
-                    "hour" => ast::DateTimeField::Hour,
-                    "minute" => ast::DateTimeField::Minute,
-                    "second" => ast::DateTimeField::Second,
-                    _ => return None,
-                };
+                    if let Expr::Literal(ScalarValue::Utf8(Some(field))) = &args[0] {
+                        let field = match field.to_lowercase().as_str() {
+                            "year" => ast::DateTimeField::Year,
+                            "month" => ast::DateTimeField::Month,
+                            "day" => ast::DateTimeField::Day,
+                            "hour" => ast::DateTimeField::Hour,
+                            "minute" => ast::DateTimeField::Minute,
+                            "second" => ast::DateTimeField::Second,
+                            _ => return None,
+                        };
 
-                return Some(ast::Expr::Extract {
-                    field,
-                    expr: Box::new(date_expr),
-                });
-            }
-        } else if func_name.to_lowercase() == "date_part"
-            && self.dialect.date_field_extract_style() == DateFieldExtractStyle::Strftime
-            && args.len() == 2
-        {
-            let column = self.expr_to_sql(&args[1]).ok()?;
+                        return Some(ast::Expr::Extract {
+                            field,
+                            expr: Box::new(date_expr),
+                        });
+                    }
+                }
+                (DateFieldExtractStyle::Strftime, 2) => {
+                    let column = self.expr_to_sql(&args[1]).ok()?;
 
-            if let Expr::Literal(ScalarValue::Utf8(Some(field))) = &args[0] {
-                let field = match field.to_lowercase().as_str() {
-                    "year" => "%Y",
-                    "month" => "%m",
-                    "day" => "%d",
-                    "hour" => "%H",
-                    "minute" => "%M",
-                    "second" => "%S",
-                    _ => return None,
-                };
+                    if let Expr::Literal(ScalarValue::Utf8(Some(field))) = &args[0] {
+                        let field = match field.to_lowercase().as_str() {
+                            "year" => "%Y",
+                            "month" => "%m",
+                            "day" => "%d",
+                            "hour" => "%H",
+                            "minute" => "%M",
+                            "second" => "%S",
+                            _ => return None,
+                        };
 
-                return Some(ast::Expr::Function(ast::Function {
-                    name: ast::ObjectName(vec![ast::Ident {
-                        value: "strftime".to_string(),
-                        quote_style: None,
-                    }]),
-                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: None,
-                        args: vec![
-                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
-                                ast::Expr::Value(ast::Value::SingleQuotedString(
-                                    field.to_string(),
-                                )),
-                            )),
-                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(column)),
-                        ],
-                        clauses: vec![],
-                    }),
-                    filter: None,
-                    null_treatment: None,
-                    over: None,
-                    within_group: vec![],
-                    parameters: ast::FunctionArguments::None,
-                }));
+                        return Some(ast::Expr::Function(ast::Function {
+                            name: ast::ObjectName(vec![ast::Ident {
+                                value: "strftime".to_string(),
+                                quote_style: None,
+                            }]),
+                            args: ast::FunctionArguments::List(
+                                ast::FunctionArgumentList {
+                                    duplicate_treatment: None,
+                                    args: vec![
+                                        ast::FunctionArg::Unnamed(
+                                            ast::FunctionArgExpr::Expr(ast::Expr::Value(
+                                                ast::Value::SingleQuotedString(
+                                                    field.to_string(),
+                                                ),
+                                            )),
+                                        ),
+                                        ast::FunctionArg::Unnamed(
+                                            ast::FunctionArgExpr::Expr(column),
+                                        ),
+                                    ],
+                                    clauses: vec![],
+                                },
+                            ),
+                            filter: None,
+                            null_treatment: None,
+                            over: None,
+                            within_group: vec![],
+                            parameters: ast::FunctionArguments::None,
+                        }));
+                    }
+                }
+                _ => {} // no overrides for DateFieldExtractStyle::DatePart, because it's already a date_part
             }
         }
+
         None
     }
 
