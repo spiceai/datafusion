@@ -22,7 +22,7 @@ use std::{
 
 use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeIterator},
-    Result,
+    Result, TableReference,
 };
 use datafusion_expr::{expr::Alias, Expr, LogicalPlan, Projection, Sort};
 use sqlparser::ast::Ident;
@@ -271,34 +271,35 @@ pub(super) fn subquery_alias_inner_query_and_columns(
 /// - `SELECT col1 AS alias_1, col2 AS some_alias_2 FROM table`
 pub(super) fn inject_column_aliases(
     projection: &datafusion_expr::Projection,
-    aliases: &Vec<Ident>,
+    aliases: impl IntoIterator<Item = Ident>,
 ) -> LogicalPlan {
     let mut updated_projection = projection.clone();
 
-    let new_exprs = projection
+    let new_exprs = updated_projection
         .expr
-        .iter()
+        .into_iter()
         .zip(aliases)
-        .map(|(expr, col_alias)| match expr {
-            Expr::Column(col) => {
-                let new_expr = Expr::Alias(Alias {
-                    expr: Box::new(expr.clone()),
-                    relation: col.relation.clone(),
-                    name: col_alias.to_string(),
-                });
+        .map(|(expr, col_alias)| {
 
-                new_expr
-            }
-            _ => expr.clone(),
+            let relation = match &expr {
+                Expr::Column(col) => col.relation.clone(),
+                _ => None,
+            };
+
+            Expr::Alias(Alias {
+                expr: Box::new(expr.clone()),
+                relation,
+                name: col_alias.value,
+            })
         })
         .collect::<Vec<_>>();
 
-    updated_projection.expr.clone_from(&new_exprs);
+    updated_projection.expr = new_exprs;
 
     LogicalPlan::Projection(updated_projection)
 }
 
-fn find_projection(logical_plan: &LogicalPlan) -> Option<&Projection> {
+pub fn find_projection(logical_plan: &LogicalPlan) -> Option<&Projection> {
     match logical_plan {
         LogicalPlan::Projection(p) => Some(p),
         LogicalPlan::Limit(p) => find_projection(p.input.as_ref()),

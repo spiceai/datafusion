@@ -23,7 +23,7 @@ use datafusion_expr::{
 };
 use sqlparser::ast::{self, Ident, SetExpr};
 
-use crate::unparser::utils::unproject_agg_exprs;
+use crate::unparser::{rewrite::find_projection, utils::unproject_agg_exprs};
 
 use super::{
     ast::{
@@ -455,19 +455,21 @@ impl Unparser<'_> {
             }
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 let (plan, mut columns) =
-                    subquery_alias_inner_query_and_columns(&plan_alias);
+                    subquery_alias_inner_query_and_columns(plan_alias);
 
-                if !columns.is_empty() && !self.dialect.supports_column_alias_in_table_alias() {
-                    // if columns are returned than plan corresponds to a projection
-                    let LogicalPlan::Projection(inner_p) = plan else {
+                if !columns.is_empty()
+                    && !self.dialect.supports_column_alias_in_table_alias()
+                {
+                     // if columns are returned than plan must contain a projection
+                    let Some(inner_p) = find_projection(plan) else {
                         return plan_err!(
                             "Inner projection for subquery alias is expected"
                         );
                     };
 
-                    // Instead of specifying column aliases as part of the outer table inject them directly into the inner projection
-                    let rewritten_plan = inject_column_aliases(&inner_p, &columns);
-                    columns.clear();
+                    // Instead of specifying column aliases as part of the outer table, inject them directly into the inner projection
+                    let rewritten_plan = inject_column_aliases(inner_p, columns);
+                    columns = vec![];
 
                     self.select_to_sql_recursively(
                         &rewritten_plan,
@@ -476,7 +478,7 @@ impl Unparser<'_> {
                         relation,
                     )?;
                 } else {
-                    self.select_to_sql_recursively(&plan, query, select, relation)?;
+                    self.select_to_sql_recursively(plan, query, select, relation)?;
                 }
 
                 relation.alias(Some(
