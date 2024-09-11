@@ -22,7 +22,7 @@ use std::{
 
 use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeIterator},
-    Result, TableReference,
+    Result,
 };
 use datafusion_expr::{expr::Alias, Expr, LogicalPlan, Projection, Sort};
 use sqlparser::ast::Ident;
