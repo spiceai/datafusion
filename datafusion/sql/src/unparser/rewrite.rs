@@ -299,7 +299,7 @@ pub(super) fn inject_column_aliases(
     LogicalPlan::Projection(updated_projection)
 }
 
-pub fn find_projection(logical_plan: &LogicalPlan) -> Option<&Projection> {
+fn find_projection(logical_plan: &LogicalPlan) -> Option<&Projection> {
     match logical_plan {
         LogicalPlan::Projection(p) => Some(p),
         LogicalPlan::Limit(p) => find_projection(p.input.as_ref()),
