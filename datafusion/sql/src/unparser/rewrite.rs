@@ -280,7 +280,6 @@ pub(super) fn inject_column_aliases(
         .into_iter()
         .zip(aliases)
         .map(|(expr, col_alias)| {
-
             let relation = match &expr {
                 Expr::Column(col) => col.relation.clone(),
                 _ => None,

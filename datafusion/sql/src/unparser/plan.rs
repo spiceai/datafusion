@@ -16,7 +16,9 @@
 // under the License.
 
 use datafusion_common::{
-    internal_err, not_impl_err, plan_err, tree_node::{Transformed, TreeNode}, Column, DataFusionError, Result
+    internal_err, not_impl_err, plan_err,
+    tree_node::{Transformed, TreeNode},
+    Column, DataFusionError, Result,
 };
 use datafusion_expr::{
     expr::Alias, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan, Projection,
@@ -460,64 +462,36 @@ impl Unparser<'_> {
                 if !columns.is_empty()
                     && !self.dialect.supports_column_alias_in_table_alias()
                 {
+                    // Instead of specifying column aliases as part of the outer table, inject them directly into the inner projection
                     let plan_rewrite_result = match plan {
-                        LogicalPlan::Projection(inner_p) => Ok(inject_column_aliases(inner_p, columns)),
+                        LogicalPlan::Projection(inner_p) => {
+                            Ok(inject_column_aliases(inner_p, columns))
+                        }
                         _ => {
-                            // complex subquery where projection is wrapped by other operator: LIMIT, SORT, DISTINCT, etc
-                            match plan.clone().map_children(|child| {
-                                if let LogicalPlan::Projection(p) = &child {
-                                    // Instead of specifying column aliases as part of the outer table, inject them directly into the inner projection
-                                    Ok(Transformed::yes(inject_column_aliases(p, columns.clone())))
-                                } else {
-                                    Ok(Transformed::no(child))
-                                }
-                            }) {
-                                Ok(plan) => Ok(plan.data),
-                                Err(e) => Err(e),
-                            }
+                            // projection is wrapped by other operator (LIMIT, SORT, etc), iterate through the plan to find it
+                            plan.to_owned()
+                                .map_children(|child| {
+                                    if let LogicalPlan::Projection(p) = &child {
+                                        Ok(Transformed::yes(inject_column_aliases(
+                                            p,
+                                            columns.clone(),
+                                        )))
+                                    } else {
+                                        Ok(Transformed::no(child))
+                                    }
+                                })
+                                .map(|plan| plan.data)
                         }
                     };
 
                     let rewritten_plan = match plan_rewrite_result {
                         Ok(p) => p,
-                        Err(e) => return internal_err!("Failed to transform SubqueryAlias plan: {e}")
+                        Err(e) => {
+                            return internal_err!(
+                                "Failed to transform SubqueryAlias plan: {e}"
+                            )
+                        }
                     };
-                        // LogicalPlan::Limit(limit) => {
-                        //     let LogicalPlan::Projection(inner_p) = limit.input.as_ref() else {
-                        //         return plan_err!(
-                        //             "Inner projection for subquery alias is expected"
-                        //         );
-                        //     };
-
-                        //     let mut updated_limit  = limit.clone();
-                        //     updated_limit.input = std::sync::Arc::new(inject_column_aliases(inner_p, columns));
-                        //     LogicalPlan::Limit(updated_limit)
-                        // },
-                        // LogicalPlan::Sort(sort) => {
-                        //     let LogicalPlan::Projection(inner_p) = sort.input.as_ref() else {
-                        //         return plan_err!(
-                        //             "Inner projection for subquery alias is expected"
-                        //         );
-                        //     };
-
-                        //     let mut updated_sort  = sort.clone();
-                        //     updated_sort.input = std::sync::Arc::new(inject_column_aliases(inner_p, columns));
-                        //     LogicalPlan::Sort(updated_sort)
-                        // },
-                        // LogicalPlan::Distinct(distinct) => {
-                        //     let LogicalPlan::Projection(inner_p) = distinct.input().as_ref() else {
-                        //         return plan_err!(
-                        //             "Inner projection for subquery alias is expected"
-                        //         );
-                        //     };
-
-                        //     let mut updated_distinct  = distinct.clone();
-                        //     TODO: distinct is actuall two type as well
-                    
-                        //     updated_distinct
-
-                        // _ => unreachable!(),
-                    //};
 
                     columns = vec![];
 
