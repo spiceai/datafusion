@@ -16,9 +16,7 @@
 // under the License.
 
 use datafusion_common::{
-    internal_err, not_impl_err, plan_err,
-    tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, Result,
+    internal_err, not_impl_err, plan_err, Column, DataFusionError, Result,
 };
 use datafusion_expr::{
     expr::Alias, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan, Projection,
@@ -33,7 +31,7 @@ use super::{
         SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
     },
     rewrite::{
-        inject_column_aliases, normalize_union_schema,
+        inject_column_aliases_into_subquery, normalize_union_schema,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
@@ -463,35 +461,15 @@ impl Unparser<'_> {
                     && !self.dialect.supports_column_alias_in_table_alias()
                 {
                     // Instead of specifying column aliases as part of the outer table, inject them directly into the inner projection
-                    let plan_rewrite_result = match plan {
-                        LogicalPlan::Projection(inner_p) => {
-                            Ok(inject_column_aliases(inner_p, columns))
-                        }
-                        _ => {
-                            // projection is wrapped by other operator (LIMIT, SORT, etc), iterate through the plan to find it
-                            plan.to_owned()
-                                .map_children(|child| {
-                                    if let LogicalPlan::Projection(p) = &child {
-                                        Ok(Transformed::yes(inject_column_aliases(
-                                            p,
-                                            columns.clone(),
-                                        )))
-                                    } else {
-                                        Ok(Transformed::no(child))
-                                    }
-                                })
-                                .map(|plan| plan.data)
-                        }
-                    };
-
-                    let rewritten_plan = match plan_rewrite_result {
-                        Ok(p) => p,
-                        Err(e) => {
-                            return internal_err!(
-                                "Failed to transform SubqueryAlias plan: {e}"
-                            )
-                        }
-                    };
+                    let rewritten_plan =
+                        match inject_column_aliases_into_subquery(plan, columns) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                return internal_err!(
+                                    "Failed to transform SubqueryAlias plan: {e}"
+                                )
+                            }
+                        };
 
                     columns = vec![];
 
