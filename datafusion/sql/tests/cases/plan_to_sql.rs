@@ -413,7 +413,19 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
         },
         TestStatementWithDialect {
             sql: "SELECT temp_j.id2 FROM (SELECT j1_id, j1_string FROM j1) AS temp_j(id2, string2)",
-            expected: r#"SELECT temp_j.id2 FROM (SELECT j1.j1_id AS id2, j1.j1_string AS string2 FROM j1) AS temp_j"#,
+            expected: r#"SELECT `temp_j`.`id2` FROM (SELECT `j1`.`j1_id` AS `id2`, `j1`.`j1_string` AS `string2` FROM `j1`) AS `temp_j`"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(SqliteDialect {}),
+        },
+        TestStatementWithDialect {
+            sql: "SELECT * FROM (SELECT j1_id + 1 FROM j1) AS temp_j(id2)",
+            expected: r#"SELECT `temp_j`.`id2` FROM (SELECT (`j1`.`j1_id` + 1) AS `id2` FROM `j1`) AS `temp_j`"#,
+            parser_dialect: Box::new(GenericDialect {}),
+            unparser_dialect: Box::new(SqliteDialect {}),
+        },
+        TestStatementWithDialect {
+            sql: "SELECT * FROM (SELECT j1_id FROM j1 LIMIT 1) AS temp_j(id2)",
+            expected: r#"SELECT `temp_j`.`id2` FROM (SELECT `j1`.`j1_id` AS `id2` FROM `j1` LIMIT 1) AS `temp_j`"#,
             parser_dialect: Box::new(GenericDialect {}),
             unparser_dialect: Box::new(SqliteDialect {}),
         },

@@ -31,7 +31,7 @@ use super::{
         SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
     },
     rewrite::{
-        inject_column_aliases, normalize_union_schema,
+        inject_column_aliases_into_subquery, normalize_union_schema,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
@@ -455,19 +455,23 @@ impl Unparser<'_> {
             }
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 let (plan, mut columns) =
-                    subquery_alias_inner_query_and_columns(&plan_alias);
+                    subquery_alias_inner_query_and_columns(plan_alias);
 
-                if !columns.is_empty() && !self.dialect.supports_column_alias_in_table_alias() {
-                    // if columns are returned than plan corresponds to a projection
-                    let LogicalPlan::Projection(inner_p) = plan else {
-                        return plan_err!(
-                            "Inner projection for subquery alias is expected"
-                        );
-                    };
+                if !columns.is_empty()
+                    && !self.dialect.supports_column_alias_in_table_alias()
+                {
+                    // Instead of specifying column aliases as part of the outer table, inject them directly into the inner projection
+                    let rewritten_plan =
+                        match inject_column_aliases_into_subquery(plan, columns) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                return internal_err!(
+                                    "Failed to transform SubqueryAlias plan: {e}"
+                                )
+                            }
+                        };
 
-                    // Instead of specifying column aliases as part of the outer table inject them directly into the inner projection
-                    let rewritten_plan = inject_column_aliases(&inner_p, &columns);
-                    columns.clear();
+                    columns = vec![];
 
                     self.select_to_sql_recursively(
                         &rewritten_plan,
@@ -476,7 +480,7 @@ impl Unparser<'_> {
                         relation,
                     )?;
                 } else {
-                    self.select_to_sql_recursively(&plan, query, select, relation)?;
+                    self.select_to_sql_recursively(plan, query, select, relation)?;
                 }
 
                 relation.alias(Some(
