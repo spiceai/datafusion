@@ -247,12 +247,16 @@ impl Unparser<'_> {
             }
             Expr::Cast(Cast { expr, data_type }) => {
                 let inner_expr = self.expr_to_sql_inner(expr)?;
-                Ok(ast::Expr::Cast {
-                    kind: ast::CastKind::Cast,
-                    expr: Box::new(inner_expr),
-                    data_type: self.arrow_dtype_to_ast_dtype(data_type)?,
-                    format: None,
-                })
+                match data_type {
+                    // Dictionary value don't need to be casted to other types when rewritten back to sql
+                    DataType::Dictionary(_, _) => Ok(inner_expr),
+                    _ => Ok(ast::Expr::Cast {
+                        kind: ast::CastKind::Cast,
+                        expr: Box::new(inner_expr),
+                        data_type: self.arrow_dtype_to_ast_dtype(data_type)?,
+                        format: None,
+                    }),
+                }
             }
             Expr::Literal(value) => Ok(self.scalar_to_sql(value)?),
             Expr::Alias(Alias { expr, name: _, .. }) => self.expr_to_sql_inner(expr),
@@ -1516,7 +1520,7 @@ impl Unparser<'_> {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
             DataType::Dictionary(_, _) => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
+                unreachable!()
             }
             DataType::Decimal128(precision, scale)
             | DataType::Decimal256(precision, scale) => {
