@@ -1520,7 +1520,7 @@ impl Unparser<'_> {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
             DataType::Dictionary(_, _) => {
-                unreachable!()
+                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
             DataType::Decimal128(precision, scale)
             | DataType::Decimal256(precision, scale) => {
