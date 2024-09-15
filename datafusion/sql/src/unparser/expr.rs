@@ -248,7 +248,7 @@ impl Unparser<'_> {
             Expr::Cast(Cast { expr, data_type }) => {
                 let inner_expr = self.expr_to_sql_inner(expr)?;
                 match data_type {
-                    // Dictionary value don't need to be casted to other types when rewritten back to sql
+                    // Dictionary values don't need to be cast to other types when rewritten back to sql
                     DataType::Dictionary(_, _) => Ok(inner_expr),
                     _ => Ok(ast::Expr::Cast {
                         kind: ast::CastKind::Cast,
