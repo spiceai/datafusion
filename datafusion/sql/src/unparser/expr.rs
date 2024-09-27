@@ -600,6 +600,52 @@ impl Unparser<'_> {
             }
         }
 
+        if func_name.to_lowercase() == "round" {
+            if let Some(required_type) = self.dialect.enforce_round_fn_arg_cast_type() {
+                let args = args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, e)| {
+                        self.expr_to_sql_inner(e).map(|mut e| {
+                            // apply the new type to the first argument only.
+                            if i == 0 {
+                                // Don't create additional cast wrapper if we are able to update the existing one
+                                if let ast::Expr::Cast { data_type, .. } = &mut e {
+                                    *data_type = required_type.clone();
+                                } else {
+                                    e = ast::Expr::Cast {
+                                        kind: ast::CastKind::Cast,
+                                        expr: Box::new(e),
+                                        data_type: required_type.clone(),
+                                        format: None,
+                                    };
+                                }
+                            }
+                            FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+                    .ok()?;
+
+                return Some(ast::Expr::Function(Function {
+                    name: ast::ObjectName(vec![Ident {
+                        value: func_name.to_string(),
+                        quote_style: None,
+                    }]),
+                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                        duplicate_treatment: None,
+                        args,
+                        clauses: vec![],
+                    }),
+                    filter: None,
+                    null_treatment: None,
+                    over: None,
+                    within_group: vec![],
+                    parameters: ast::FunctionArguments::None,
+                }));
+            }
+        }
+
         None
     }
 
@@ -2417,6 +2463,41 @@ mod tests {
 
             let actual = format!("{}", ast);
             let expected = format!(r#"CAST(a AS {identifier})"#);
+
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_round_scalar_fn_to_expr() -> Result<()> {
+        let default_dialect = CustomDialectBuilder::new().build();
+        let custom_dialect = CustomDialectBuilder::new()
+            .with_enforce_round_fn_arg_cast_type(Some(ast::DataType::Numeric(
+                ast::ExactNumberInfo::None,
+            )))
+            .build();
+
+        for (dialect, identifier) in
+            [(default_dialect, "DOUBLE"), (custom_dialect, "NUMERIC")]
+        {
+            let unparser = Unparser::new(&dialect);
+            let expr = Expr::ScalarFunction(ScalarFunction {
+                func: Arc::new(ScalarUDF::from(
+                    datafusion_functions::math::round::RoundFunc::new(),
+                )),
+                args: vec![
+                    Expr::Cast(Cast {
+                        expr: Box::new(col("a")),
+                        data_type: DataType::Float64,
+                    }),
+                    Expr::Literal(ScalarValue::Int64(Some(2))),
+                ],
+            });
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = format!("{}", ast);
+            let expected = format!(r#"round(CAST(a AS {identifier}), 2)"#);
 
             assert_eq!(actual, expected);
         }

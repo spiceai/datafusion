@@ -108,6 +108,12 @@ pub trait Dialect: Send + Sync {
     fn supports_column_alias_in_table_alias(&self) -> bool {
         true
     }
+
+    /// The SQL type to use for the `ROUND` function argument casting
+    /// Some dialects, like PostgreSQL, require the argument to be a specific type (numeric).
+    fn enforce_round_fn_arg_cast_type(&self) -> Option<sqlparser::ast::DataType> {
+        None
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -170,6 +176,10 @@ impl Dialect for PostgreSqlDialect {
 
     fn float64_ast_dtype(&self) -> sqlparser::ast::DataType {
         sqlparser::ast::DataType::DoublePrecision
+    }
+
+    fn enforce_round_fn_arg_cast_type(&self) -> Option<sqlparser::ast::DataType> {
+        Some(ast::DataType::Numeric(ast::ExactNumberInfo::None))
     }
 }
 
@@ -247,6 +257,7 @@ pub struct CustomDialect {
     timestamp_tz_cast_dtype: ast::DataType,
     date32_cast_dtype: sqlparser::ast::DataType,
     supports_column_alias_in_table_alias: bool,
+    enforce_round_fn_arg_cast_type: Option<sqlparser::ast::DataType>,
 }
 
 impl Default for CustomDialect {
@@ -268,6 +279,7 @@ impl Default for CustomDialect {
             ),
             date32_cast_dtype: sqlparser::ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
+            enforce_round_fn_arg_cast_type: None,
         }
     }
 }
@@ -339,6 +351,10 @@ impl Dialect for CustomDialect {
     fn supports_column_alias_in_table_alias(&self) -> bool {
         self.supports_column_alias_in_table_alias
     }
+
+    fn enforce_round_fn_arg_cast_type(&self) -> Option<sqlparser::ast::DataType> {
+        self.enforce_round_fn_arg_cast_type.clone()
+    }
 }
 
 /// `CustomDialectBuilder` to build `CustomDialect` using builder pattern
@@ -369,6 +385,7 @@ pub struct CustomDialectBuilder {
     timestamp_tz_cast_dtype: ast::DataType,
     date32_cast_dtype: ast::DataType,
     supports_column_alias_in_table_alias: bool,
+    enforce_round_fn_arg_cast_type: Option<sqlparser::ast::DataType>,
 }
 
 impl Default for CustomDialectBuilder {
@@ -396,6 +413,7 @@ impl CustomDialectBuilder {
             ),
             date32_cast_dtype: sqlparser::ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
+            enforce_round_fn_arg_cast_type: None,
         }
     }
 
@@ -415,6 +433,7 @@ impl CustomDialectBuilder {
             date32_cast_dtype: self.date32_cast_dtype,
             supports_column_alias_in_table_alias: self
                 .supports_column_alias_in_table_alias,
+            enforce_round_fn_arg_cast_type: self.enforce_round_fn_arg_cast_type,
         }
     }
 
@@ -509,6 +528,15 @@ impl CustomDialectBuilder {
         supports_column_alias_in_table_alias: bool,
     ) -> Self {
         self.supports_column_alias_in_table_alias = supports_column_alias_in_table_alias;
+        self
+    }
+
+    /// Customize the dialect with a specific SQL type for the `ROUND` function argument casting
+    pub fn with_enforce_round_fn_arg_cast_type(
+        mut self,
+        enforce_round_fn_arg_cast_type: Option<sqlparser::ast::DataType>,
+    ) -> Self {
+        self.enforce_round_fn_arg_cast_type = enforce_round_fn_arg_cast_type;
         self
     }
 }
