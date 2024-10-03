@@ -95,7 +95,7 @@ impl Unparser<'_> {
         Ok(root_expr)
     }
 
-    pub(crate) fn expr_to_sql_inner(&self, expr: &Expr) -> Result<ast::Expr> {
+    fn expr_to_sql_inner(&self, expr: &Expr) -> Result<ast::Expr> {
         match expr {
             Expr::InList(InList {
                 expr,
