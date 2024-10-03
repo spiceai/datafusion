@@ -18,11 +18,16 @@
 use std::sync::Arc;
 
 use arrow_schema::TimeUnit;
+use datafusion_expr::Expr;
 use regex::Regex;
 use sqlparser::{
-    ast::{self, Ident, ObjectName, TimezoneInfo},
+    ast::{self, Function, Ident, ObjectName, TimezoneInfo},
     keywords::ALL_KEYWORDS,
 };
+
+use datafusion_common::Result;
+
+use super::{utils::date_part_to_sql, Unparser};
 
 /// `Dialect` to use for Unparsing
 ///
@@ -109,10 +114,13 @@ pub trait Dialect: Send + Sync {
         true
     }
 
-    /// The SQL type to use for the `ROUND` function argument casting
-    /// Some dialects, like PostgreSQL, require the argument to be a specific type (numeric).
-    fn enforce_round_fn_arg_cast_type(&self) -> Option<sqlparser::ast::DataType> {
-        None
+    fn scalar_function_to_sql_overrides(
+        &self,
+        _unparser: &Unparser,
+        _func_name: &str,
+        _args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        Ok(None)
     }
 }
 
@@ -178,8 +186,65 @@ impl Dialect for PostgreSqlDialect {
         sqlparser::ast::DataType::DoublePrecision
     }
 
-    fn enforce_round_fn_arg_cast_type(&self) -> Option<sqlparser::ast::DataType> {
-        Some(ast::DataType::Numeric(ast::ExactNumberInfo::None))
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        if func_name == "round" {
+            return Ok(Some(
+                self.round_to_sql_enforce_numeric(unparser, func_name, args)?,
+            ));
+        }
+
+        Ok(None)
+    }
+}
+
+impl PostgreSqlDialect {
+    fn round_to_sql_enforce_numeric(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<ast::Expr> {
+        let mut args = unparser.function_args_to_sql(args)?;
+
+        // Enforce the first argument to be Numeric
+        if let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(expr))) =
+            args.first_mut()
+        {
+            if let ast::Expr::Cast { data_type, .. } = expr {
+                // Don't create an additional cast wrapper if we can update the existing one
+                *data_type = ast::DataType::Numeric(ast::ExactNumberInfo::None);
+            } else {
+                // Wrap the expression in a new cast
+                *expr = ast::Expr::Cast {
+                    kind: ast::CastKind::Cast,
+                    expr: Box::new(expr.clone()),
+                    data_type: ast::DataType::Numeric(ast::ExactNumberInfo::None),
+                    format: None,
+                };
+            }
+        }
+
+        Ok(ast::Expr::Function(Function {
+            name: ast::ObjectName(vec![Ident {
+                value: func_name.to_string(),
+                quote_style: None,
+            }]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args,
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+        }))
     }
 }
 
@@ -221,6 +286,19 @@ impl Dialect for MySqlDialect {
     ) -> ast::DataType {
         ast::DataType::Datetime(None)
     }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        if func_name == "date_part" {
+            return date_part_to_sql(unparser, self.date_field_extract_style(), args);
+        }
+
+        Ok(None)
+    }
 }
 
 pub struct SqliteDialect {}
@@ -241,6 +319,19 @@ impl Dialect for SqliteDialect {
     fn supports_column_alias_in_table_alias(&self) -> bool {
         false
     }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        if func_name == "date_part" {
+            return date_part_to_sql(unparser, self.date_field_extract_style(), args);
+        }
+
+        Ok(None)
+    }
 }
 
 pub struct CustomDialect {
@@ -257,7 +348,6 @@ pub struct CustomDialect {
     timestamp_tz_cast_dtype: ast::DataType,
     date32_cast_dtype: sqlparser::ast::DataType,
     supports_column_alias_in_table_alias: bool,
-    enforce_round_fn_arg_cast_type: Option<sqlparser::ast::DataType>,
 }
 
 impl Default for CustomDialect {
@@ -279,7 +369,6 @@ impl Default for CustomDialect {
             ),
             date32_cast_dtype: sqlparser::ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
-            enforce_round_fn_arg_cast_type: None,
         }
     }
 }
@@ -352,8 +441,17 @@ impl Dialect for CustomDialect {
         self.supports_column_alias_in_table_alias
     }
 
-    fn enforce_round_fn_arg_cast_type(&self) -> Option<sqlparser::ast::DataType> {
-        self.enforce_round_fn_arg_cast_type.clone()
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        if func_name == "date_part" {
+            return date_part_to_sql(unparser, self.date_field_extract_style(), args);
+        }
+
+        Ok(None)
     }
 }
 
@@ -385,7 +483,6 @@ pub struct CustomDialectBuilder {
     timestamp_tz_cast_dtype: ast::DataType,
     date32_cast_dtype: ast::DataType,
     supports_column_alias_in_table_alias: bool,
-    enforce_round_fn_arg_cast_type: Option<sqlparser::ast::DataType>,
 }
 
 impl Default for CustomDialectBuilder {
@@ -413,7 +510,6 @@ impl CustomDialectBuilder {
             ),
             date32_cast_dtype: sqlparser::ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
-            enforce_round_fn_arg_cast_type: None,
         }
     }
 
@@ -433,7 +529,6 @@ impl CustomDialectBuilder {
             date32_cast_dtype: self.date32_cast_dtype,
             supports_column_alias_in_table_alias: self
                 .supports_column_alias_in_table_alias,
-            enforce_round_fn_arg_cast_type: self.enforce_round_fn_arg_cast_type,
         }
     }
 
@@ -528,15 +623,6 @@ impl CustomDialectBuilder {
         supports_column_alias_in_table_alias: bool,
     ) -> Self {
         self.supports_column_alias_in_table_alias = supports_column_alias_in_table_alias;
-        self
-    }
-
-    /// Customize the dialect with a specific SQL type for the `ROUND` function argument casting
-    pub fn with_enforce_round_fn_arg_cast_type(
-        mut self,
-        enforce_round_fn_arg_cast_type: Option<sqlparser::ast::DataType>,
-    ) -> Self {
-        self.enforce_round_fn_arg_cast_type = enforce_round_fn_arg_cast_type;
         self
     }
 }

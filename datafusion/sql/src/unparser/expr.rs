@@ -15,16 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use datafusion_expr::ScalarUDF;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
-    self, BinaryOperator, Expr as AstExpr, Function, FunctionArg, Ident, Interval,
-    ObjectName, TimezoneInfo, UnaryOperator,
+    self, BinaryOperator, Expr as AstExpr, Function, Ident, Interval, ObjectName,
+    TimezoneInfo, UnaryOperator,
 };
 use std::sync::Arc;
 use std::vec;
 
-use super::dialect::{DateFieldExtractStyle, IntervalStyle};
+use super::dialect::IntervalStyle;
 use super::Unparser;
 use arrow::datatypes::{Decimal128Type, Decimal256Type, DecimalType};
 use arrow::util::display::array_value_to_string;
@@ -96,7 +95,7 @@ impl Unparser<'_> {
         Ok(root_expr)
     }
 
-    fn expr_to_sql_inner(&self, expr: &Expr) -> Result<ast::Expr> {
+    pub(crate) fn expr_to_sql_inner(&self, expr: &Expr) -> Result<ast::Expr> {
         match expr {
             Expr::InList(InList {
                 expr,
@@ -116,47 +115,14 @@ impl Unparser<'_> {
             Expr::ScalarFunction(ScalarFunction { func, args }) => {
                 let func_name = func.name();
 
-                if let Some(expr) =
-                    self.scalar_function_to_sql_overrides(func_name, func, args)
+                if let Some(expr) = self
+                    .dialect
+                    .scalar_function_to_sql_overrides(self, func_name, args)?
                 {
                     return Ok(expr);
                 }
 
-                let args = args
-                    .iter()
-                    .map(|e| {
-                        if matches!(
-                            e,
-                            Expr::Wildcard {
-                                qualifier: None,
-                                ..
-                            }
-                        ) {
-                            Ok(FunctionArg::Unnamed(ast::FunctionArgExpr::Wildcard))
-                        } else {
-                            self.expr_to_sql_inner(e).map(|e| {
-                                FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
-                            })
-                        }
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-
-                Ok(ast::Expr::Function(Function {
-                    name: ast::ObjectName(vec![Ident {
-                        value: func_name.to_string(),
-                        quote_style: None,
-                    }]),
-                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: None,
-                        args,
-                        clauses: vec![],
-                    }),
-                    filter: None,
-                    null_treatment: None,
-                    over: None,
-                    within_group: vec![],
-                    parameters: ast::FunctionArguments::None,
-                }))
+                self.scalar_function_to_sql(func_name, args)
             }
             Expr::Between(Between {
                 expr,
@@ -500,6 +466,30 @@ impl Unparser<'_> {
         }
     }
 
+    pub fn scalar_function_to_sql(
+        &self,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<ast::Expr> {
+        let args = self.function_args_to_sql(args)?;
+        Ok(ast::Expr::Function(Function {
+            name: ast::ObjectName(vec![Ident {
+                value: func_name.to_string(),
+                quote_style: None,
+            }]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args,
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+        }))
+    }
+
     pub fn sort_to_sql(&self, sort: &Sort) -> Result<ast::OrderByExpr> {
         let Sort {
             expr,
@@ -520,133 +510,6 @@ impl Unparser<'_> {
             nulls_first,
             with_fill: None,
         })
-    }
-
-    fn scalar_function_to_sql_overrides(
-        &self,
-        func_name: &str,
-        _func: &Arc<ScalarUDF>,
-        args: &[Expr],
-    ) -> Option<ast::Expr> {
-        if func_name.to_lowercase() == "date_part" {
-            match (self.dialect.date_field_extract_style(), args.len()) {
-                (DateFieldExtractStyle::Extract, 2) => {
-                    let date_expr = self.expr_to_sql(&args[1]).ok()?;
-
-                    if let Expr::Literal(ScalarValue::Utf8(Some(field))) = &args[0] {
-                        let field = match field.to_lowercase().as_str() {
-                            "year" => ast::DateTimeField::Year,
-                            "month" => ast::DateTimeField::Month,
-                            "day" => ast::DateTimeField::Day,
-                            "hour" => ast::DateTimeField::Hour,
-                            "minute" => ast::DateTimeField::Minute,
-                            "second" => ast::DateTimeField::Second,
-                            _ => return None,
-                        };
-
-                        return Some(ast::Expr::Extract {
-                            field,
-                            expr: Box::new(date_expr),
-                            syntax: ast::ExtractSyntax::From,
-                        });
-                    }
-                }
-                (DateFieldExtractStyle::Strftime, 2) => {
-                    let column = self.expr_to_sql(&args[1]).ok()?;
-
-                    if let Expr::Literal(ScalarValue::Utf8(Some(field))) = &args[0] {
-                        let field = match field.to_lowercase().as_str() {
-                            "year" => "%Y",
-                            "month" => "%m",
-                            "day" => "%d",
-                            "hour" => "%H",
-                            "minute" => "%M",
-                            "second" => "%S",
-                            _ => return None,
-                        };
-
-                        return Some(ast::Expr::Function(ast::Function {
-                            name: ast::ObjectName(vec![ast::Ident {
-                                value: "strftime".to_string(),
-                                quote_style: None,
-                            }]),
-                            args: ast::FunctionArguments::List(
-                                ast::FunctionArgumentList {
-                                    duplicate_treatment: None,
-                                    args: vec![
-                                        ast::FunctionArg::Unnamed(
-                                            ast::FunctionArgExpr::Expr(ast::Expr::Value(
-                                                ast::Value::SingleQuotedString(
-                                                    field.to_string(),
-                                                ),
-                                            )),
-                                        ),
-                                        ast::FunctionArg::Unnamed(
-                                            ast::FunctionArgExpr::Expr(column),
-                                        ),
-                                    ],
-                                    clauses: vec![],
-                                },
-                            ),
-                            filter: None,
-                            null_treatment: None,
-                            over: None,
-                            within_group: vec![],
-                            parameters: ast::FunctionArguments::None,
-                        }));
-                    }
-                }
-                _ => {} // no overrides for DateFieldExtractStyle::DatePart, because it's already a date_part
-            }
-        }
-
-        if func_name.to_lowercase() == "round" {
-            if let Some(required_type) = self.dialect.enforce_round_fn_arg_cast_type() {
-                let args = args
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| {
-                        self.expr_to_sql_inner(e).map(|mut e| {
-                            // apply the new type to the first argument only.
-                            if i == 0 {
-                                // Don't create additional cast wrapper if we are able to update the existing one
-                                if let ast::Expr::Cast { data_type, .. } = &mut e {
-                                    *data_type = required_type.clone();
-                                } else {
-                                    e = ast::Expr::Cast {
-                                        kind: ast::CastKind::Cast,
-                                        expr: Box::new(e),
-                                        data_type: required_type.clone(),
-                                        format: None,
-                                    };
-                                }
-                            }
-                            FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))
-                        })
-                    })
-                    .collect::<Result<Vec<_>>>()
-                    .ok()?;
-
-                return Some(ast::Expr::Function(Function {
-                    name: ast::ObjectName(vec![Ident {
-                        value: func_name.to_string(),
-                        quote_style: None,
-                    }]),
-                    args: ast::FunctionArguments::List(ast::FunctionArgumentList {
-                        duplicate_treatment: None,
-                        args,
-                        clauses: vec![],
-                    }),
-                    filter: None,
-                    null_treatment: None,
-                    over: None,
-                    within_group: vec![],
-                    parameters: ast::FunctionArguments::None,
-                }));
-            }
-        }
-
-        None
     }
 
     fn ast_type_for_date64_in_cast(&self) -> ast::DataType {
@@ -703,7 +566,7 @@ impl Unparser<'_> {
         }
     }
 
-    fn function_args_to_sql(&self, args: &[Expr]) -> Result<Vec<ast::FunctionArg>> {
+    pub(crate) fn function_args_to_sql(&self, args: &[Expr]) -> Result<Vec<ast::FunctionArg>> {
         args.iter()
             .map(|e| {
                 if matches!(
@@ -1596,7 +1459,10 @@ mod tests {
     use datafusion_functions_aggregate::expr_fn::sum;
     use datafusion_functions_window::row_number::row_number_udwf;
 
-    use crate::unparser::dialect::{CustomDialect, CustomDialectBuilder};
+    use crate::unparser::dialect::{
+        CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, Dialect,
+        PostgreSqlDialect,
+    };
 
     use super::*;
 
@@ -2471,17 +2337,17 @@ mod tests {
 
     #[test]
     fn test_round_scalar_fn_to_expr() -> Result<()> {
-        let default_dialect = CustomDialectBuilder::new().build();
-        let custom_dialect = CustomDialectBuilder::new()
-            .with_enforce_round_fn_arg_cast_type(Some(ast::DataType::Numeric(
-                ast::ExactNumberInfo::None,
-            )))
-            .build();
+        let default_dialect: Arc<dyn Dialect> = Arc::new(
+            CustomDialectBuilder::new()
+                .with_identifier_quote_style('"')
+                .build(),
+        );
+        let postgres_dialect: Arc<dyn Dialect> = Arc::new(PostgreSqlDialect {});
 
         for (dialect, identifier) in
-            [(default_dialect, "DOUBLE"), (custom_dialect, "NUMERIC")]
+            [(default_dialect, "DOUBLE"), (postgres_dialect, "NUMERIC")]
         {
-            let unparser = Unparser::new(&dialect);
+            let unparser = Unparser::new(dialect.as_ref());
             let expr = Expr::ScalarFunction(ScalarFunction {
                 func: Arc::new(ScalarUDF::from(
                     datafusion_functions::math::round::RoundFunc::new(),
@@ -2497,7 +2363,7 @@ mod tests {
             let ast = unparser.expr_to_sql(&expr)?;
 
             let actual = format!("{}", ast);
-            let expected = format!(r#"round(CAST(a AS {identifier}), 2)"#);
+            let expected = format!(r#"round(CAST("a" AS {identifier}), 2)"#);
 
             assert_eq!(actual, expected);
         }
