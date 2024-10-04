@@ -1,0 +1,27 @@
+version: v1beta1
+kind: Spicepod
+name: datafusion
+
+datasets:
+  - from: github:github.com/apache/datafusion/files/main
+    name: datafusion.docs
+    description: Datafusion docs at https://datafusion.apache.org
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+      include: "docs/source/**/*.md"
+    acceleration:
+      enabled: true
+      refresh_check_interval: 12h
+      refresh_jitter_enabled: true
+      refresh_jitter_max: 5m
+
+  - from: github:github.com/apache/datafusion/issues
+    name: datafusion.issues
+    description: Datafusion issues from github.com/apache/datafusion
+    params:
+      github_token: ${secrets:GITHUB_TOKEN}
+    acceleration:
+      enabled: true
+      refresh_check_interval: 12h
+      refresh_jitter_enabled: true
+      refresh_jitter_max: 5m
