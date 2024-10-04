@@ -354,7 +354,7 @@ impl Unparser<'_> {
                             .map(|sort_expr| {
                                 let mut sort_expr = sort_expr.clone();
 
-                                // ORDER BY can't have aliases, this indicates that the column was not properly unaprsed, update it
+                                // ORDER BY can't have aliases, this indicates that the column was not properly unparsed, update it
                                 if let Expr::Alias(alias) = &sort_expr.expr {
                                     sort_expr.expr = *alias.expr.clone();
                                 }
