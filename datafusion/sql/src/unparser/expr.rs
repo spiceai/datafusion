@@ -2273,6 +2273,34 @@ mod tests {
     }
 
     #[test]
+    fn custom_dialect_with_int32_cast_dtype() -> Result<()> {
+        let default_dialect = CustomDialectBuilder::new().build();
+        let mysql_dialect = CustomDialectBuilder::new()
+            .with_int32_cast_dtype(ast::DataType::Custom(
+                ObjectName(vec![Ident::new("SIGNED")]),
+                vec![],
+            ))
+            .build();
+
+        for (dialect, identifier) in
+            [(default_dialect, "INTEGER"), (mysql_dialect, "SIGNED")]
+        {
+            let unparser = Unparser::new(&dialect);
+            let expr = Expr::Cast(Cast {
+                expr: Box::new(col("a")),
+                data_type: DataType::Int64,
+            });
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = format!("{}", ast);
+            let expected = format!(r#"CAST(a AS {identifier})"#);
+
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn custom_dialect_with_timestamp_cast_dtype() -> Result<()> {
         let default_dialect = CustomDialectBuilder::new().build();
         let mysql_dialect = CustomDialectBuilder::new()

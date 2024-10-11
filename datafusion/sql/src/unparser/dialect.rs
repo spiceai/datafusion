@@ -354,6 +354,7 @@ pub struct CustomDialect {
     large_utf8_cast_dtype: ast::DataType,
     date_field_extract_style: DateFieldExtractStyle,
     int64_cast_dtype: ast::DataType,
+    int32_cast_dtype: ast::DataType,
     timestamp_cast_dtype: ast::DataType,
     timestamp_tz_cast_dtype: ast::DataType,
     date32_cast_dtype: sqlparser::ast::DataType,
@@ -372,6 +373,7 @@ impl Default for CustomDialect {
             large_utf8_cast_dtype: ast::DataType::Text,
             date_field_extract_style: DateFieldExtractStyle::DatePart,
             int64_cast_dtype: ast::DataType::BigInt(None),
+            int32_cast_dtype: ast::DataType::Integer(None),
             timestamp_cast_dtype: ast::DataType::Timestamp(None, TimezoneInfo::None),
             timestamp_tz_cast_dtype: ast::DataType::Timestamp(
                 None,
@@ -429,6 +431,10 @@ impl Dialect for CustomDialect {
 
     fn int64_cast_dtype(&self) -> ast::DataType {
         self.int64_cast_dtype.clone()
+    }
+
+    fn int32_cast_dtype(&self) -> ast::DataType {
+        self.int32_cast_dtype.clone()
     }
 
     fn timestamp_cast_dtype(
@@ -489,6 +495,7 @@ pub struct CustomDialectBuilder {
     large_utf8_cast_dtype: ast::DataType,
     date_field_extract_style: DateFieldExtractStyle,
     int64_cast_dtype: ast::DataType,
+    int32_cast_dtype: ast::DataType,
     timestamp_cast_dtype: ast::DataType,
     timestamp_tz_cast_dtype: ast::DataType,
     date32_cast_dtype: ast::DataType,
@@ -513,6 +520,7 @@ impl CustomDialectBuilder {
             large_utf8_cast_dtype: ast::DataType::Text,
             date_field_extract_style: DateFieldExtractStyle::DatePart,
             int64_cast_dtype: ast::DataType::BigInt(None),
+            int32_cast_dtype: ast::DataType::Integer(None),
             timestamp_cast_dtype: ast::DataType::Timestamp(None, TimezoneInfo::None),
             timestamp_tz_cast_dtype: ast::DataType::Timestamp(
                 None,
@@ -534,6 +542,7 @@ impl CustomDialectBuilder {
             large_utf8_cast_dtype: self.large_utf8_cast_dtype,
             date_field_extract_style: self.date_field_extract_style,
             int64_cast_dtype: self.int64_cast_dtype,
+            int32_cast_dtype: self.int32_cast_dtype,
             timestamp_cast_dtype: self.timestamp_cast_dtype,
             timestamp_tz_cast_dtype: self.timestamp_tz_cast_dtype,
             date32_cast_dtype: self.date32_cast_dtype,
@@ -608,6 +617,12 @@ impl CustomDialectBuilder {
     /// Customize the dialect with a specific SQL type for Int64 casting: BigInt, SIGNED, etc.
     pub fn with_int64_cast_dtype(mut self, int64_cast_dtype: ast::DataType) -> Self {
         self.int64_cast_dtype = int64_cast_dtype;
+        self
+    }
+
+    /// Customize the dialect with a specific SQL type for Int64 casting: BigInt, SIGNED, etc.
+    pub fn with_int32_cast_dtype(mut self, int32_cast_dtype: ast::DataType) -> Self {
+        self.int32_cast_dtype = int32_cast_dtype;
         self
     }
 
