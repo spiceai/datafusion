@@ -86,6 +86,12 @@ pub trait Dialect: Send + Sync {
         ast::DataType::BigInt(None)
     }
 
+    /// The SQL type to use for Arrow Int32 unparsing
+    /// Most dialects use Integer, but some, like MySQL, require SIGNED
+    fn int32_cast_dtype(&self) -> ast::DataType {
+        ast::DataType::Integer(None)
+    }
+
     /// The SQL type to use for Timestamp unparsing
     /// Most dialects use Timestamp, but some, like MySQL, require Datetime
     /// Some dialects like Dremio does not support WithTimeZone and requires always Timestamp
@@ -276,6 +282,10 @@ impl Dialect for MySqlDialect {
     }
 
     fn int64_cast_dtype(&self) -> ast::DataType {
+        ast::DataType::Custom(ObjectName(vec![Ident::new("SIGNED")]), vec![])
+    }
+
+    fn int32_cast_dtype(&self) -> ast::DataType {
         ast::DataType::Custom(ObjectName(vec![Ident::new("SIGNED")]), vec![])
     }
 
