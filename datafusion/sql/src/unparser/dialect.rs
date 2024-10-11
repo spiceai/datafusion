@@ -620,7 +620,7 @@ impl CustomDialectBuilder {
         self
     }
 
-    /// Customize the dialect with a specific SQL type for Int64 casting: BigInt, SIGNED, etc.
+    /// Customize the dialect with a specific SQL type for Int32 casting: BigInt, SIGNED, etc.
     pub fn with_int32_cast_dtype(mut self, int32_cast_dtype: ast::DataType) -> Self {
         self.int32_cast_dtype = int32_cast_dtype;
         self
