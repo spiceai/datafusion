@@ -405,6 +405,13 @@ impl Unparser<'_> {
                     );
                 };
 
+                if let Some(fetch) = sort.fetch {
+	                query_ref.limit(Some(ast::Expr::Value(ast::Value::Number(
+	                    fetch.to_string(),
+	                    false,
+	                ))));
+                }
+
                 let agg = find_agg_node_within_select(plan, select.already_projected());
                 // unproject sort expressions
                 let sort_exprs: Vec<SortExpr> = sort
