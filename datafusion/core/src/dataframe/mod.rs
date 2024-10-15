@@ -2334,7 +2334,7 @@ mod tests {
             // SELECT `c1` , max(c3) as `result`
             .select(vec![col("c1"), max(col("c3")).alias("result")])?;
 
-        let df_union = df1.clone().union(df2.clone())?;
+        let df_union = df1.union(df2)?;
         let df = df_union
             // GROUP BY `c1`
             .aggregate(
@@ -2343,10 +2343,6 @@ mod tests {
             )?
             // SELECT `c1`, sum(result) as `sum_result`
             .select(vec![(col("c1")), col("sum_result")])?;
-
-        df1.show().await?;
-        df2.show().await?;
-        df.clone().show().await?;
 
         let df_results = df.collect().await?;
 
