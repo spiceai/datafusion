@@ -249,7 +249,7 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         relation: &mut RelationBuilder,
     ) -> Result<()> {
-        match self.dialect.requires_table_alias() {
+        match self.dialect.requires_derived_table_alias() {
             false => self.derive(plan, relation, None),
             true => self.derive(
                 plan,
