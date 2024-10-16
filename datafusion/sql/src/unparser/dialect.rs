@@ -120,6 +120,12 @@ pub trait Dialect: Send + Sync {
         true
     }
 
+    /// Whether the dialect requires a table alias for any subquery in the FROM clause
+    /// This affects behavior when deriving logical plans for Sort, Limit, etc.
+    fn requires_table_alias(&self) -> bool {
+        false
+    }
+
     fn scalar_function_to_sql_overrides(
         &self,
         _unparser: &Unparser,
@@ -295,6 +301,10 @@ impl Dialect for MySqlDialect {
         _tz: &Option<Arc<str>>,
     ) -> ast::DataType {
         ast::DataType::Datetime(None)
+    }
+
+    fn requires_table_alias(&self) -> bool {
+        true
     }
 
     fn scalar_function_to_sql_overrides(
