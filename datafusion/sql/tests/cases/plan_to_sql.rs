@@ -258,7 +258,7 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
         TestStatementWithDialect {
             sql: "select min(ta.j1_id) as j1_min from j1 ta order by min(ta.j1_id) limit 10;",
             expected:
-                // top projection sort still gets derived into a in default dialect subquery
+                // top projection sort still gets derived into a subquery in default dialect
                 // except for the default dialect, the subquery is left non-aliased
                 "SELECT j1_min FROM (SELECT min(ta.j1_id) AS j1_min, min(ta.j1_id) FROM j1 AS ta ORDER BY min(ta.j1_id) ASC NULLS LAST) LIMIT 10",
             parser_dialect: Box::new(GenericDialect {}),
