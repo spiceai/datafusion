@@ -73,7 +73,7 @@ fn roundtrip_expr() {
 
         let ast = expr_to_sql(&expr)?;
 
-        Ok(format!("{}", ast))
+        Ok(ast.to_string())
     };
 
     for (table, query, expected) in tests {
@@ -187,7 +187,7 @@ fn roundtrip_statement() -> Result<()> {
 
         let roundtrip_statement = plan_to_sql(&plan)?;
 
-        let actual = format!("{}", &roundtrip_statement);
+        let actual = &roundtrip_statement.to_string();
         println!("roundtrip sql: {actual}");
         println!("plan {}", plan.display_indent());
 
@@ -219,7 +219,7 @@ fn roundtrip_crossjoin() -> Result<()> {
 
     let roundtrip_statement = plan_to_sql(&plan)?;
 
-    let actual = format!("{}", &roundtrip_statement);
+    let actual = &roundtrip_statement.to_string();
     println!("roundtrip sql: {actual}");
     println!("plan {}", plan.display_indent());
 
@@ -232,7 +232,7 @@ fn roundtrip_crossjoin() -> Result<()> {
         \n    TableScan: j1\
         \n    TableScan: j2";
 
-    assert_eq!(format!("{plan_roundtrip}"), expected);
+    assert_eq!(plan_roundtrip.to_string(), expected);
 
     Ok(())
 }
@@ -491,7 +491,7 @@ fn roundtrip_statement_with_dialect() -> Result<()> {
         let unparser = Unparser::new(&*query.unparser_dialect);
         let roundtrip_statement = unparser.plan_to_sql(&plan)?;
 
-        let actual = format!("{}", &roundtrip_statement);
+        let actual = &roundtrip_statement.to_string();
         println!("roundtrip sql: {actual}");
         println!("plan {}", plan.display_indent());
 
@@ -521,7 +521,7 @@ fn test_unnest_logical_plan() -> Result<()> {
     \n    Projection: unnest_table.struct_col AS UNNEST(unnest_table.struct_col), unnest_table.array_col AS UNNEST(unnest_table.array_col), unnest_table.struct_col, unnest_table.array_col\
     \n      TableScan: unnest_table";
 
-    assert_eq!(format!("{plan}"), expected);
+    assert_eq!(plan.to_string(), expected);
 
     Ok(())
 }
@@ -541,7 +541,7 @@ fn test_table_references_in_plan_to_sql() {
             .unwrap();
         let sql = plan_to_sql(&plan).unwrap();
 
-        assert_eq!(format!("{}", sql), expected_sql)
+        assert_eq!(sql.to_string(), expected_sql)
     }
 
     test("catalog.schema.table", "SELECT catalog.\"schema\".\"table\".id, catalog.\"schema\".\"table\".\"value\" FROM catalog.\"schema\".\"table\"");
@@ -565,7 +565,7 @@ fn test_table_scan_with_no_projection_in_plan_to_sql() {
             .build()
             .unwrap();
         let sql = plan_to_sql(&plan).unwrap();
-        assert_eq!(format!("{}", sql), expected_sql)
+        assert_eq!(sql.to_string(), expected_sql)
     }
 
     test(
@@ -678,27 +678,103 @@ where
 }
 
 #[test]
-fn test_table_scan_pushdown() -> Result<()> {
+fn test_table_scan_alias() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("age", DataType::Utf8, false),
     ]);
 
+    let plan = table_scan(Some("t1"), &schema, None)?
+        .project(vec![col("id")])?
+        .alias("a")?
+        .build()?;
+    let sql = plan_to_sql(&plan)?;
+    assert_eq!(sql.to_string(), "SELECT * FROM (SELECT t1.id FROM t1) AS a");
+
+    let plan = table_scan(Some("t1"), &schema, None)?
+        .project(vec![col("id")])?
+        .alias("a")?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    assert_eq!(sql.to_string(), "SELECT * FROM (SELECT t1.id FROM t1) AS a");
+
+    let plan = table_scan(Some("t1"), &schema, None)?
+        .filter(col("id").gt(lit(5)))?
+        .project(vec![col("id")])?
+        .alias("a")?
+        .build()?;
+    let sql = plan_to_sql(&plan)?;
+    assert_eq!(
+        sql.to_string(),
+        "SELECT * FROM (SELECT t1.id FROM t1 WHERE (t1.id > 5)) AS a"
+    );
+
+    let table_scan_with_two_filter = table_scan_with_filters(
+        Some("t1"),
+        &schema,
+        None,
+        vec![col("id").gt(lit(1)), col("age").lt(lit(2))],
+    )?
+    .project(vec![col("id")])?
+    .alias("a")?
+    .build()?;
+    let table_scan_with_two_filter = plan_to_sql(&table_scan_with_two_filter)?;
+    assert_eq!(
+        table_scan_with_two_filter.to_string(),
+        "SELECT * FROM (SELECT t1.id FROM t1 WHERE ((t1.id > 1) AND (t1.age < 2))) AS a"
+    );
+
+    let table_scan_with_fetch =
+        table_scan_with_filter_and_fetch(Some("t1"), &schema, None, vec![], Some(10))?
+            .project(vec![col("id")])?
+            .alias("a")?
+            .build()?;
+    let table_scan_with_fetch = plan_to_sql(&table_scan_with_fetch)?;
+    assert_eq!(
+        table_scan_with_fetch.to_string(),
+        "SELECT * FROM (SELECT t1.id FROM (SELECT * FROM t1 LIMIT 10)) AS a"
+    );
+
+    let table_scan_with_pushdown_all = table_scan_with_filter_and_fetch(
+        Some("t1"),
+        &schema,
+        Some(vec![0, 1]),
+        vec![col("id").gt(lit(1))],
+        Some(10),
+    )?
+    .project(vec![col("id")])?
+    .alias("a")?
+    .build()?;
+    let table_scan_with_pushdown_all = plan_to_sql(&table_scan_with_pushdown_all)?;
+    assert_eq!(
+        table_scan_with_pushdown_all.to_string(),
+        "SELECT * FROM (SELECT t1.id FROM (SELECT t1.id, t1.age FROM t1 WHERE (t1.id > 1) LIMIT 10)) AS a"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_table_scan_pushdown() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Utf8, false),
+    ]);
     let scan_with_projection =
         table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
     let scan_with_projection = plan_to_sql(&scan_with_projection)?;
     assert_eq!(
-        format!("{}", scan_with_projection),
+        scan_with_projection.to_string(),
         "SELECT t1.id, t1.age FROM t1"
     );
 
     let scan_with_projection = table_scan(Some("t1"), &schema, Some(vec![1]))?.build()?;
     let scan_with_projection = plan_to_sql(&scan_with_projection)?;
-    assert_eq!(format!("{}", scan_with_projection), "SELECT t1.age FROM t1");
+    assert_eq!(scan_with_projection.to_string(), "SELECT t1.age FROM t1");
 
     let scan_with_no_projection = table_scan(Some("t1"), &schema, None)?.build()?;
     let scan_with_no_projection = plan_to_sql(&scan_with_no_projection)?;
-    assert_eq!(format!("{}", scan_with_no_projection), "SELECT * FROM t1");
+    assert_eq!(scan_with_no_projection.to_string(), "SELECT * FROM t1");
 
     let table_scan_with_projection_alias =
         table_scan(Some("t1"), &schema, Some(vec![0, 1]))?
@@ -707,7 +783,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     let table_scan_with_projection_alias =
         plan_to_sql(&table_scan_with_projection_alias)?;
     assert_eq!(
-        format!("{}", table_scan_with_projection_alias),
+        table_scan_with_projection_alias.to_string(),
         "SELECT ta.id, ta.age FROM t1 AS ta"
     );
 
@@ -718,7 +794,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     let table_scan_with_projection_alias =
         plan_to_sql(&table_scan_with_projection_alias)?;
     assert_eq!(
-        format!("{}", table_scan_with_projection_alias),
+        table_scan_with_projection_alias.to_string(),
         "SELECT ta.age FROM t1 AS ta"
     );
 
@@ -728,7 +804,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     let table_scan_with_no_projection_alias =
         plan_to_sql(&table_scan_with_no_projection_alias)?;
     assert_eq!(
-        format!("{}", table_scan_with_no_projection_alias),
+        table_scan_with_no_projection_alias.to_string(),
         "SELECT * FROM t1 AS ta"
     );
 
@@ -740,7 +816,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     let query_from_table_scan_with_projection =
         plan_to_sql(&query_from_table_scan_with_projection)?;
     assert_eq!(
-        format!("{}", query_from_table_scan_with_projection),
+        query_from_table_scan_with_projection.to_string(),
         "SELECT * FROM (SELECT t1.id, t1.age FROM t1)"
     );
 
@@ -753,7 +829,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     .build()?;
     let table_scan_with_filter = plan_to_sql(&table_scan_with_filter)?;
     assert_eq!(
-        format!("{}", table_scan_with_filter),
+        table_scan_with_filter.to_string(),
         "SELECT * FROM t1 WHERE (t1.id > t1.age)"
     );
 
@@ -766,7 +842,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     .build()?;
     let table_scan_with_two_filter = plan_to_sql(&table_scan_with_two_filter)?;
     assert_eq!(
-        format!("{}", table_scan_with_two_filter),
+        table_scan_with_two_filter.to_string(),
         "SELECT * FROM t1 WHERE ((t1.id > 1) AND (t1.age < 2))"
     );
 
@@ -780,7 +856,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     .build()?;
     let table_scan_with_filter_alias = plan_to_sql(&table_scan_with_filter_alias)?;
     assert_eq!(
-        format!("{}", table_scan_with_filter_alias),
+        table_scan_with_filter_alias.to_string(),
         "SELECT * FROM t1 AS ta WHERE (ta.id > ta.age)"
     );
 
@@ -794,7 +870,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     let table_scan_with_projection_and_filter =
         plan_to_sql(&table_scan_with_projection_and_filter)?;
     assert_eq!(
-        format!("{}", table_scan_with_projection_and_filter),
+        table_scan_with_projection_and_filter.to_string(),
         "SELECT t1.id, t1.age FROM t1 WHERE (t1.id > t1.age)"
     );
 
@@ -808,7 +884,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     let table_scan_with_projection_and_filter =
         plan_to_sql(&table_scan_with_projection_and_filter)?;
     assert_eq!(
-        format!("{}", table_scan_with_projection_and_filter),
+        table_scan_with_projection_and_filter.to_string(),
         "SELECT t1.age FROM t1 WHERE (t1.id > t1.age)"
     );
 
@@ -817,7 +893,7 @@ fn test_table_scan_pushdown() -> Result<()> {
             .build()?;
     let table_scan_with_inline_fetch = plan_to_sql(&table_scan_with_inline_fetch)?;
     assert_eq!(
-        format!("{}", table_scan_with_inline_fetch),
+        table_scan_with_inline_fetch.to_string(),
         "SELECT * FROM t1 LIMIT 10"
     );
 
@@ -832,7 +908,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     let table_scan_with_projection_and_inline_fetch =
         plan_to_sql(&table_scan_with_projection_and_inline_fetch)?;
     assert_eq!(
-        format!("{}", table_scan_with_projection_and_inline_fetch),
+        table_scan_with_projection_and_inline_fetch.to_string(),
         "SELECT t1.id, t1.age FROM t1 LIMIT 10"
     );
 
@@ -846,7 +922,7 @@ fn test_table_scan_pushdown() -> Result<()> {
     .build()?;
     let table_scan_with_all = plan_to_sql(&table_scan_with_all)?;
     assert_eq!(
-        format!("{}", table_scan_with_all),
+        table_scan_with_all.to_string(),
         "SELECT t1.id, t1.age FROM t1 WHERE (t1.id > t1.age) LIMIT 10"
     );
     Ok(())
