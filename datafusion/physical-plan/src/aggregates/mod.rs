@@ -26,6 +26,7 @@ use crate::aggregates::{
     topk_stream::GroupedTopKAggregateStream,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
+use crate::projection::get_field_metadata;
 use crate::windows::get_ordered_partition_by_indices;
 use crate::{
     DisplayFormatType, Distribution, ExecutionPlan, InputOrderMode,
