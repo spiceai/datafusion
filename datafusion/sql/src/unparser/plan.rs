@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::unparser::utils::{
-    find_unnest_node_within_select, unproject_agg_exprs, unproject_unnest_expr,
+    find_unnest_node_within_select, unproject_agg_exprs, unproject_unnest_expr
 };
 use datafusion_common::{
     internal_err, not_impl_err,
@@ -24,11 +24,10 @@ use datafusion_common::{
     Column, DataFusionError, Result, TableReference,
 };
 use datafusion_expr::{
-    expr::Alias, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan,
-    LogicalPlanBuilder, Projection, SortExpr, TableScan,
+    expr::Alias, BinaryExpr, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan, LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan
 };
 use sqlparser::ast::{self, Ident, SetExpr};
-use std::sync::Arc;
+use std::{sync::Arc, vec};
 
 use super::{
     ast::{
@@ -41,8 +40,7 @@ use super::{
         subquery_alias_inner_query_and_columns, TableAliasRewriter,
     },
     utils::{
-        find_agg_node_within_select, find_window_nodes_within_select,
-        unproject_sort_expr, unproject_window_exprs,
+        find_agg_node_within_select, find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters, unproject_sort_expr, unproject_window_exprs
     },
     Unparser,
 };
@@ -476,22 +474,72 @@ impl Unparser<'_> {
                 self.select_to_sql_recursively(input, query, select, relation)
             }
             LogicalPlan::Join(join) => {
-                let join_constraint = self.join_constraint_to_sql(
-                    join.join_constraint,
-                    &join.on,
-                    join.filter.as_ref(),
-                )?;
 
-                let mut right_relation = RelationBuilder::default();
+                let mut table_scan_filters = vec![];
+
+                let left_plan = match try_transform_to_simple_table_scan_with_filters(&join.left) {
+                    Some((plan, filters)) => {
+                        table_scan_filters.extend(filters);
+                        Arc::new(plan)
+                    }
+                    None => Arc::clone(&join.left)
+                };
 
                 self.select_to_sql_recursively(
-                    join.left.as_ref(),
+                    left_plan.as_ref(),
                     query,
                     select,
                     relation,
                 )?;
+
+                let right_plan = match try_transform_to_simple_table_scan_with_filters(&join.right) {
+                    Some((plan, filters)) => {
+                        table_scan_filters.extend(filters);
+                        Arc::new(plan)
+                    }
+                    None => Arc::clone(&join.right)
+                };
+
+                let mut right_relation = RelationBuilder::default();
+
                 self.select_to_sql_recursively(
-                    join.right.as_ref(),
+                    right_plan.as_ref(),
+                    query,
+                    select,
+                    &mut right_relation,
+                )?;
+
+                let join_filters = if table_scan_filters.is_empty() {
+                    join.filter.clone() // Return a clone of `join.filter` (Option<Expr>) if there are no table scan filters
+                } else {
+                    // Combine `table_scan_filters` into a single filter using `AND`
+                    let combined_filters = table_scan_filters
+                        .into_iter()
+                        .reduce(|acc, filter| Expr::BinaryExpr(BinaryExpr {
+                            left: Box::new(acc),
+                            op: Operator::And,
+                            right: Box::new(filter),
+                        }))
+                        .unwrap();
+                
+                    // Combine `join.filter` with `combined_filters` using `AND`
+                    join.filter.clone().map_or(Some(combined_filters.clone()), |filter| {
+                        Some(Expr::BinaryExpr(BinaryExpr {
+                            left: Box::new(filter),
+                            op: Operator::And,
+                            right: Box::new(combined_filters),
+                        }))
+                    })
+                };
+
+                let join_constraint = self.join_constraint_to_sql(
+                    join.join_constraint,
+                    &join.on,
+                    join_filters.as_ref(),
+                )?;
+
+                self.select_to_sql_recursively(
+                    right_plan.as_ref(),
                     query,
                     select,
                     &mut right_relation,

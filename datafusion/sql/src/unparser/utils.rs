@@ -15,15 +15,15 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc, vec};
 
 use datafusion_common::{
     internal_err,
     tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, Result, ScalarValue,
+    Column, DataFusionError, Result, ScalarValue
 };
 use datafusion_expr::{
-    expr, utils::grouping_set_to_exprlist, Aggregate, Expr, LogicalPlan, Projection, SortExpr, Unnest, Window
+    expr, utils::grouping_set_to_exprlist, Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr, Unnest, Window
 };
 use sqlparser::ast;
 
@@ -83,6 +83,48 @@ pub(crate) fn find_unnest_node_within_select(
     } else {
         find_unnest_node_within_select(input)
     }
+}
+
+pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> { 
+    let mut filters: Vec<&Expr> = vec![];
+    let mut plan_stack = vec![plan];
+    let mut table_alias = None;
+
+    while let Some(current_plan) = plan_stack.pop() {
+        match current_plan {
+            LogicalPlan::SubqueryAlias(alias) => {
+                table_alias = Some(alias.alias.clone());
+                plan_stack.push(alias.input.as_ref());
+            }
+            LogicalPlan::Filter(filter) => {
+                filters.push(&filter.predicate);
+                plan_stack.push(filter.input.as_ref());
+            }
+            LogicalPlan::TableScan(table_scan) => {
+                filters.extend(table_scan.filters.as_slice());
+
+                let mut builder = LogicalPlanBuilder::scan(
+                    table_scan.table_name.clone(),
+                    Arc::clone(&table_scan.source),
+                    None,
+                ).ok()?;
+
+                if let Some(alias) = table_alias.take() {
+                    builder = builder.alias(alias).ok()?;
+                }
+
+                let plan = builder.build().ok()?;
+
+                return Some((plan, filters.into_iter().cloned().collect()));
+                
+            }
+            _ => {
+                return None;
+            }
+        }
+    }
+
+    None
 }
 
 /// Recursively searches children of [LogicalPlan] to find Window nodes if exist
