@@ -182,7 +182,20 @@ impl SelectBuilder {
         self
     }
     pub fn selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
-        self.selection = value;
+        match (&self.selection, value) {
+            (Some(existing_selection), Some(new_selection)) => {
+                self.selection = Some(ast::Expr::BinaryOp {
+                    left: Box::new(existing_selection.clone()),
+                    op: ast::BinaryOperator::And,
+                    right: Box::new(new_selection),
+                });
+            }
+            (None, Some(new_selection)) => {
+                self.selection = Some(new_selection);
+            }
+            (_, None) => ()
+        }
+    
         self
     }
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {
@@ -218,7 +231,7 @@ impl SelectBuilder {
         self
     }
     pub fn build(&self) -> Result<ast::Select, BuilderError> {
-        Ok(ast::Select {
+        let res = Ok(ast::Select {
             distinct: self.distinct.clone(),
             top: self.top.clone(),
             projection: self.projection.clone(),
@@ -246,7 +259,11 @@ impl SelectBuilder {
             connect_by: None,
             window_before_qualify: false,
             prewhere: None,
-        })
+        });
+
+        println!("\n\nSelect build done: {:?}\n\n", res);
+
+        res
     }
     fn create_empty() -> Self {
         Self {
