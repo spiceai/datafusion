@@ -19,7 +19,7 @@ use std::{cmp::Ordering, sync::Arc, vec};
 
 use datafusion_common::{
     internal_err,
-    tree_node::{Transformed, TreeNode},
+    tree_node::{Transformed, TransformedResult, TreeNode},
     Column, DataFusionError, Result, ScalarValue
 };
 use datafusion_expr::{
@@ -85,6 +85,22 @@ pub(crate) fn find_unnest_node_within_select(
     }
 }
 
+/// Iterates through the children of a [LogicalPlan] to find a TableScan node before encountering
+/// a Projection or any unexpected node that indicates the presence of a Projection (SELECT) in the plan.
+/// If a TableScan node is found, returns the TableScan node without filters, along with the collected filters separately.
+/// If the plan contains a Projection, returns None.
+/// 
+/// Note: If a table alias is present, TableScan filters are rewritten to reference the alias.
+///
+/// LogicalPlan example:
+///   Filter: ta.j1_id < 5 
+///     Alias:  ta
+///       TableScan: j1, j1_id > 10 
+///
+/// Will return LogicalPlan below:
+///     Alias:  ta
+///       TableScan: j1
+/// And filters: [ta.j1_id < 5, ta.j1_id > 10]
 pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> { 
     let mut filters: Vec<Expr> = vec![];
     let mut plan_stack = vec![plan];
@@ -110,17 +126,17 @@ pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPla
                     });
 
                 // rewrite filters to use table alias if present
-                let table_scan_filters: Vec<_> = table_scan
+                let table_scan_filters = table_scan
                     .filters
                     .iter()
                     .cloned()
                     .map(|expr| {
                         if let Some(ref mut rewriter) = filter_alias_rewriter {
-                            expr.rewrite(rewriter).unwrap().data
+                            expr.rewrite(rewriter).data()
                         } else {
-                            expr
+                            Ok(expr)
                         }
-                    }).collect();
+                    }).collect::<Result<Vec<_>, DataFusionError>>().ok()?;
 
                 filters.extend(table_scan_filters);
 

@@ -513,23 +513,26 @@ impl Unparser<'_> {
                     join.filter.clone()
                 } else {
                     // Combine `table_scan_filters` into a single filter using `AND`
-                    let combined_filters = table_scan_filters
+                    let Some(combined_filters) = table_scan_filters
                         .into_iter()
                         .reduce(|acc, filter| Expr::BinaryExpr(BinaryExpr {
                             left: Box::new(acc),
                             op: Operator::And,
                             right: Box::new(filter),
                         }))
-                        .unwrap();
-                
-                    // Combine `join.filter` with `combined_filters` using `AND`
-                    join.filter.clone().map_or(Some(combined_filters.clone()), |filter| {
-                        Some(Expr::BinaryExpr(BinaryExpr {
-                            left: Box::new(filter),
-                            op: Operator::And,
-                            right: Box::new(combined_filters),
-                        }))
-                    })
+                        else {
+                            return internal_err!("Failed to combine TableScan filters");
+                        };
+
+                        // Combine `join.filter` with `combined_filters` using `AND`
+                        match &join.filter {
+                            Some(filter) => Some(Expr::BinaryExpr(BinaryExpr {
+                                left: Box::new(filter.clone()),
+                                op: Operator::And,
+                                right: Box::new(combined_filters),
+                            })),
+                            None => Some(combined_filters),
+                        }
                 };
 
                 let join_constraint = self.join_constraint_to_sql(

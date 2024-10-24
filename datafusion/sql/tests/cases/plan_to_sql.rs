@@ -968,44 +968,39 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let right_plan = table_scan_with_filters(Some("right_table"), &schema_right, None, vec![col("age").gt(lit(10))])?
         .build()?;
 
-    let join_plan = LogicalPlanBuilder::from(left_plan)
+    let join_plan_with_filter = LogicalPlanBuilder::from(left_plan.clone())
         .join(
-            right_plan, 
+            right_plan.clone(), 
             datafusion_expr::JoinType::Inner, 
             (vec!["left.id"], vec!["right_table.id"]), 
             Some(col("left.id").gt(lit(5))),
         )?
         .build()?;
 
-    let sql = plan_to_sql(&join_plan)?;
+    let sql = plan_to_sql(&join_plan_with_filter)?;
 
     let expected_sql = r#"SELECT * FROM left_table AS "left" JOIN right_table ON "left".id = right_table.id AND (("left".id > 5) AND ("left"."name" LIKE 'some_name' AND (age > 10)))"#;
     
     assert_eq!(sql.to_string(), expected_sql);
 
+
+    let join_plan_no_filter = LogicalPlanBuilder::from(left_plan)
+        .join(
+            right_plan, 
+            datafusion_expr::JoinType::Inner, 
+            (vec!["left.id"], vec!["right_table.id"]), 
+            None
+        )?
+        .build()?;
+
+    let sql = plan_to_sql(&join_plan_no_filter)?;
+
+    let expected_sql = r#"SELECT * FROM left_table AS "left" JOIN right_table ON "left".id = right_table.id AND ("left"."name" LIKE 'some_name' AND (age > 10))"#;
+    
+    assert_eq!(sql.to_string(), expected_sql);
+
     Ok(())
 }
-
-// temporary disabled as need to include PR that adds `sort_with_limit` method
-// #[test]
-// fn test_sort_with_push_down_fetch() -> Result<()> {
-//     let schema = Schema::new(vec![
-//         Field::new("id", DataType::Utf8, false),
-//         Field::new("age", DataType::Utf8, false),
-//     ]);
-
-//     let plan = table_scan(Some("t1"), &schema, None)?
-//         .project(vec![col("id"), col("age")])?
-//         .sort_with_limit(vec![col("age").sort(true, true)], Some(10))?
-//         .build()?;
-
-//     let sql = plan_to_sql(&plan)?;
-//     assert_eq!(
-//         format!("{}", sql),
-//         "SELECT t1.id, t1.age FROM t1 ORDER BY t1.age ASC NULLS FIRST LIMIT 10"
-//     );
-//     Ok(())
-// }
 
 #[test]
 fn test_interval_lhs_eq() {
