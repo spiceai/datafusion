@@ -126,10 +126,10 @@ impl FileOpener for ParquetOpener {
                 adapted_projections.iter().cloned(),
             );
 
-            let original_predicates = predicate.clone();
-
             // Filter pushdown: evaluate predicates during scan
-            if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
+            if let Some(predicate) =
+                pushdown_filters.then_some(predicate.clone()).flatten()
+            {
                 let row_filter = row_filter::build_row_filter(
                     &predicate,
                     &file_schema,
@@ -157,7 +157,7 @@ impl FileOpener for ParquetOpener {
             // Determine which row groups to actually read. The idea is to skip
             // as many row groups as possible based on the metadata and query
             let file_metadata = builder.metadata().clone();
-            let predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
+            let pruning_predicate = pruning_predicate.as_ref().map(|p| p.as_ref());
             let rg_metadata = file_metadata.row_groups();
             // track which row groups to actually read
             let access_plan =
@@ -168,12 +168,12 @@ impl FileOpener for ParquetOpener {
                 row_groups.prune_by_range(rg_metadata, range);
             }
             // If there is a predicate that can be evaluated against the metadata
-            if let Some(predicate) = predicate.as_ref() {
+            if let Some(pruning_predicate) = pruning_predicate.as_ref() {
                 row_groups.prune_by_statistics(
                     &file_schema,
                     builder.parquet_schema(),
                     rg_metadata,
-                    predicate,
+                    pruning_predicate,
                     &file_metrics,
                 );
 
@@ -182,7 +182,7 @@ impl FileOpener for ParquetOpener {
                         .prune_by_bloom_filters(
                             &file_schema,
                             &mut builder,
-                            predicate,
+                            pruning_predicate,
                             &file_metrics,
                         )
                         .await;
@@ -228,13 +228,11 @@ impl FileOpener for ParquetOpener {
                 .map(move |maybe_batch| {
                     maybe_batch.and_then(|b| {
                         if !pushdown_filters {
-                            if let Some(original_predicates) = original_predicates.clone()
-                            {
+                            if let Some(predicate) = predicate.clone() {
                                 let updated_predicate = update_predicate_index(
-                                    Arc::clone(&original_predicates),
+                                    Arc::clone(&predicate),
                                     b.schema_ref(),
-                                )
-                                .map_err(Into::<ArrowError>::into)?;
+                                )?;
 
                                 let b = batch_filter(&b, &updated_predicate)?;
 
@@ -283,16 +281,26 @@ fn create_initial_plan(
     Ok(ParquetAccessPlan::new_all(row_group_count))
 }
 
+/// Return the predicate with updated column indexes
+///
+/// The indexes of Column PhysicalExpr in predicate are based on
+/// file_schema / table_schema, which might be different from the
+/// RecordBatch schema returned by Parquet Reader
+///
+/// Recursively find all Column PhysicalExpr
+/// and update with indexes of RecordBatch Schema
+///
+/// Returns an error if failed to update Column index
 fn update_predicate_index(
     predicate: Arc<dyn PhysicalExpr>,
     schema: &Arc<Schema>,
-) -> Result<Arc<dyn PhysicalExpr>> {
+) -> std::result::Result<Arc<dyn PhysicalExpr>, ArrowError> {
     let children = predicate.children();
 
     if children.len() == 0 {
         if let Some(column) = predicate.as_any().downcast_ref::<Column>() {
             let name = column.name();
-            let new_index = schema.index_of(name).unwrap();
+            let new_index = schema.index_of(name)?;
             let new_column = Column::new(name, new_index);
             return Ok(Arc::new(new_column));
         }
@@ -305,5 +313,7 @@ fn update_predicate_index(
         new_children.push(updated_child);
     }
 
-    predicate.with_new_children(new_children)
+    predicate
+        .with_new_children(new_children)
+        .map_err(Into::into)
 }
