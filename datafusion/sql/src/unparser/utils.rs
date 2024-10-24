@@ -27,7 +27,7 @@ use datafusion_expr::{
 };
 use sqlparser::ast;
 
-use super::{dialect::DateFieldExtractStyle, Unparser};
+use super::{dialect::DateFieldExtractStyle, rewrite::TableAliasRewriter, Unparser};
 
 /// Recursively searches children of [LogicalPlan] to find an Aggregate node if exists
 /// prior to encountering a Join, TableScan, or a nested subquery (derived table factor).
@@ -86,7 +86,7 @@ pub(crate) fn find_unnest_node_within_select(
 }
 
 pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> { 
-    let mut filters: Vec<&Expr> = vec![];
+    let mut filters: Vec<Expr> = vec![];
     let mut plan_stack = vec![plan];
     let mut table_alias = None;
 
@@ -97,11 +97,32 @@ pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPla
                 plan_stack.push(alias.input.as_ref());
             }
             LogicalPlan::Filter(filter) => {
-                filters.push(&filter.predicate);
+                filters.push(filter.predicate.clone());
                 plan_stack.push(filter.input.as_ref());
             }
             LogicalPlan::TableScan(table_scan) => {
-                filters.extend(table_scan.filters.as_slice());
+                let table_schema = table_scan.source.schema();
+                // optional rewriter if table has an alias
+                let mut filter_alias_rewriter =
+                    table_alias.as_ref().map(|alias_name| TableAliasRewriter {
+                        table_schema: &table_schema,
+                        alias_name: alias_name.clone(),
+                    });
+
+                // rewrite filters to use table alias if present
+                let table_scan_filters: Vec<_> = table_scan
+                    .filters
+                    .iter()
+                    .cloned()
+                    .map(|expr| {
+                        if let Some(ref mut rewriter) = filter_alias_rewriter {
+                            expr.rewrite(rewriter).unwrap().data
+                        } else {
+                            expr
+                        }
+                    }).collect();
+
+                filters.extend(table_scan_filters);
 
                 let mut builder = LogicalPlanBuilder::scan(
                     table_scan.table_name.clone(),
@@ -111,11 +132,11 @@ pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPla
 
                 if let Some(alias) = table_alias.take() {
                     builder = builder.alias(alias).ok()?;
-                }
+                } 
 
                 let plan = builder.build().ok()?;
 
-                return Some((plan, filters.into_iter().cloned().collect()));
+                return Some((plan, filters));
                 
             }
             _ => {
