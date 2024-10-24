@@ -182,7 +182,20 @@ impl SelectBuilder {
         self
     }
     pub fn selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
-        self.selection = value;
+        match (&self.selection, value) {
+            (Some(existing_selection), Some(new_selection)) => {
+                self.selection = Some(ast::Expr::BinaryOp {
+                    left: Box::new(existing_selection.clone()),
+                    op: ast::BinaryOperator::And,
+                    right: Box::new(new_selection),
+                });
+            }
+            (None, Some(new_selection)) => {
+                self.selection = Some(new_selection);
+            }
+            (_, None) => ()
+        }
+    
         self
     }
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {
