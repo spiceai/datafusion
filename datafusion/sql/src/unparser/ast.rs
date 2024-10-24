@@ -231,7 +231,7 @@ impl SelectBuilder {
         self
     }
     pub fn build(&self) -> Result<ast::Select, BuilderError> {
-        let res = Ok(ast::Select {
+        Ok(ast::Select {
             distinct: self.distinct.clone(),
             top: self.top.clone(),
             projection: self.projection.clone(),
@@ -259,11 +259,7 @@ impl SelectBuilder {
             connect_by: None,
             window_before_qualify: false,
             prewhere: None,
-        });
-
-        println!("\n\nSelect build done: {:?}\n\n", res);
-
-        res
+        })
     }
     fn create_empty() -> Self {
         Self {
