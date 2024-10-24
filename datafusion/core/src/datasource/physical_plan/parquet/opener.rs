@@ -28,9 +28,12 @@ use crate::datasource::physical_plan::{
 };
 use crate::datasource::schema_adapter::SchemaAdapterFactory;
 use crate::physical_optimizer::pruning::PruningPredicate;
-use arrow_schema::{ArrowError, SchemaRef};
+use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion_common::{exec_err, Result};
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::split_conjunction;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_plan::filter::batch_filter;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::{StreamExt, TryStreamExt};
 use log::debug;
@@ -124,8 +127,14 @@ impl FileOpener for ParquetOpener {
                 adapted_projections.iter().cloned(),
             );
 
+            println!("{:?}", pushdown_filters);
+            println!("{:?}", predicate);
+
+            let original_predicates = predicate.clone();
+
             // Filter pushdown: evaluate predicates during scan
             if let Some(predicate) = pushdown_filters.then_some(predicate).flatten() {
+                println!("{}", predicate);
                 let row_filter = row_filter::build_row_filter(
                     &predicate,
                     &file_schema,
@@ -222,8 +231,26 @@ impl FileOpener for ParquetOpener {
             let adapted = stream
                 .map_err(|e| ArrowError::ExternalError(Box::new(e)))
                 .map(move |maybe_batch| {
-                    maybe_batch
-                        .and_then(|b| schema_mapping.map_batch(b).map_err(Into::into))
+                    maybe_batch.and_then(|b| {
+                        if !pushdown_filters {
+                            if let Some(original_predicates) = original_predicates.clone()
+                            {
+                                let tmp = split_conjunction(&original_predicates);
+                                let result_schema = b.schema_ref();
+
+                                println!("Original Predicate {:?}", original_predicates);
+
+                                let updated_predicate = update_predicate_index(
+                                    Arc::clone(&original_predicates),
+                                    result_schema,
+                                );
+                                println!("{:?}", updated_predicate);
+                                let b = batch_filter(&b, &original_predicates)?;
+                                return schema_mapping.map_batch(b).map_err(Into::into);
+                            }
+                        }
+                        schema_mapping.map_batch(b).map_err(Into::into)
+                    })
                 });
 
             Ok(adapted.boxed())
@@ -262,4 +289,32 @@ fn create_initial_plan(
 
     // default to scanning all row groups
     Ok(ParquetAccessPlan::new_all(row_group_count))
+}
+
+fn update_predicate_index(
+    predicate: Arc<dyn PhysicalExpr>,
+    schema: &Arc<Schema>,
+) -> Arc<dyn PhysicalExpr> {
+    let children = predicate.children();
+    if children.len() == 0 {
+        return Arc::clone(&predicate);
+    }
+
+    let mut new_children: Vec<Arc<dyn PhysicalExpr>> = Vec::new();
+    for child in children {
+        let updated_child = update_predicate_index(Arc::clone(child), schema);
+
+        if let Some(column) = updated_child.as_any().downcast_ref::<Column>() {
+            let name = column.name();
+            let new_index = schema.index_of(name).unwrap();
+            let new_column = Column::new(name, new_index);
+            new_children.push(Arc::new(new_column));
+        } else {
+            new_children.push(Arc::clone(child))
+        }
+    }
+
+    let new_predicate = predicate.with_new_children(new_children).unwrap();
+
+    return new_predicate;
 }
