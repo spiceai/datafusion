@@ -31,7 +31,6 @@ use crate::physical_optimizer::pruning::PruningPredicate;
 use arrow_schema::{ArrowError, Schema, SchemaRef};
 use datafusion_common::{exec_err, Result};
 use datafusion_physical_expr::expressions::Column;
-use datafusion_physical_expr::split_conjunction;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_plan::filter::batch_filter;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
