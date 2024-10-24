@@ -510,7 +510,7 @@ impl Unparser<'_> {
                 )?;
 
                 let join_filters = if table_scan_filters.is_empty() {
-                    join.filter.clone() // Return a clone of `join.filter` (Option<Expr>) if there are no table scan filters
+                    join.filter.clone()
                 } else {
                     // Combine `table_scan_filters` into a single filter using `AND`
                     let combined_filters = table_scan_filters
