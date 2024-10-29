@@ -15,19 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::Arc, vec};
 
 use datafusion_common::{
     internal_err,
-    tree_node::{Transformed, TreeNode},
-    Column, DataFusionError, Result, ScalarValue,
+    tree_node::{Transformed, TransformedResult, TreeNode},
+    Column, DataFusionError, Result, ScalarValue
 };
 use datafusion_expr::{
-    expr, utils::grouping_set_to_exprlist, Aggregate, Expr, LogicalPlan, Projection, SortExpr, Unnest, Window
+    expr, utils::grouping_set_to_exprlist, Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr, Unnest, Window
 };
 use sqlparser::ast;
 
-use super::{dialect::DateFieldExtractStyle, Unparser};
+use super::{dialect::DateFieldExtractStyle, rewrite::TableAliasRewriter, Unparser};
 
 /// Recursively searches children of [LogicalPlan] to find an Aggregate node if exists
 /// prior to encountering a Join, TableScan, or a nested subquery (derived table factor).
@@ -83,6 +83,85 @@ pub(crate) fn find_unnest_node_within_select(
     } else {
         find_unnest_node_within_select(input)
     }
+}
+
+/// Iterates through the children of a [LogicalPlan] to find a TableScan node before encountering
+/// a Projection or any unexpected node that indicates the presence of a Projection (SELECT) in the plan.
+/// If a TableScan node is found, returns the TableScan node without filters, along with the collected filters separately.
+/// If the plan contains a Projection, returns None.
+/// 
+/// Note: If a table alias is present, TableScan filters are rewritten to reference the alias.
+///
+/// LogicalPlan example:
+///   Filter: ta.j1_id < 5 
+///     Alias:  ta
+///       TableScan: j1, j1_id > 10 
+///
+/// Will return LogicalPlan below:
+///     Alias:  ta
+///       TableScan: j1
+/// And filters: [ta.j1_id < 5, ta.j1_id > 10]
+pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> { 
+    let mut filters: Vec<Expr> = vec![];
+    let mut plan_stack = vec![plan];
+    let mut table_alias = None;
+
+    while let Some(current_plan) = plan_stack.pop() {
+        match current_plan {
+            LogicalPlan::SubqueryAlias(alias) => {
+                table_alias = Some(alias.alias.clone());
+                plan_stack.push(alias.input.as_ref());
+            }
+            LogicalPlan::Filter(filter) => {
+                filters.push(filter.predicate.clone());
+                plan_stack.push(filter.input.as_ref());
+            }
+            LogicalPlan::TableScan(table_scan) => {
+                let table_schema = table_scan.source.schema();
+                // optional rewriter if table has an alias
+                let mut filter_alias_rewriter =
+                    table_alias.as_ref().map(|alias_name| TableAliasRewriter {
+                        table_schema: &table_schema,
+                        alias_name: alias_name.clone(),
+                    });
+
+                // rewrite filters to use table alias if present
+                let table_scan_filters = table_scan
+                    .filters
+                    .iter()
+                    .cloned()
+                    .map(|expr| {
+                        if let Some(ref mut rewriter) = filter_alias_rewriter {
+                            expr.rewrite(rewriter).data()
+                        } else {
+                            Ok(expr)
+                        }
+                    }).collect::<Result<Vec<_>, DataFusionError>>().ok()?;
+
+                filters.extend(table_scan_filters);
+
+                let mut builder = LogicalPlanBuilder::scan(
+                    table_scan.table_name.clone(),
+                    Arc::clone(&table_scan.source),
+                    None,
+                ).ok()?;
+
+                if let Some(alias) = table_alias.take() {
+                    builder = builder.alias(alias).ok()?;
+                } 
+
+                let plan = builder.build().ok()?;
+
+                return Some((plan, filters));
+                
+            }
+            _ => {
+                return None;
+            }
+        }
+    }
+
+    None
 }
 
 /// Recursively searches children of [LogicalPlan] to find Window nodes if exist
