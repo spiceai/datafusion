@@ -20,10 +20,9 @@ use std::{
     sync::Arc,
 };
 
-use arrow_schema::Schema;
 use datafusion_common::{
-    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
-    Column, Result, TableReference,
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
+    Result,
 };
 use datafusion_expr::{expr::Alias, tree_node::transform_sort_vec};
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
@@ -286,27 +285,6 @@ pub(super) fn inject_column_aliases_into_subquery(
     }
 }
 
-pub(super) fn eliminate_duplicate_filter_in_tablescan(
-    filter: datafusion_expr::Filter,
-) -> Result<datafusion_expr::Filter> {
-    match filter.input.as_ref() {
-        LogicalPlan::TableScan(table_scan) => {
-            let mut updated_filter = filter.clone();
-            let expr = updated_filter.predicate.clone();
-            let mut inner_filters = table_scan.filters.clone();
-            expr.apply(|e| {
-                inner_filters.retain(|inner_filter| inner_filter != e);
-                Ok(TreeNodeRecursion::Continue)
-            })?;
-            let mut updated_table_scan = table_scan.clone();
-            updated_table_scan.filters = inner_filters;
-            updated_filter.input = Arc::new(LogicalPlan::TableScan(updated_table_scan));
-            Ok(updated_filter)
-        }
-        _ => Ok(filter),
-    }
-}
-
 /// Injects column aliases into the projection of a logical plan by wrapping expressions
 /// with `Expr::Alias` using the provided list of aliases.
 ///
@@ -349,41 +327,5 @@ fn find_projection(logical_plan: &LogicalPlan) -> Option<&Projection> {
         LogicalPlan::Distinct(p) => find_projection(p.input().as_ref()),
         LogicalPlan::Sort(p) => find_projection(p.input.as_ref()),
         _ => None,
-    }
-}
-
-/// A `TreeNodeRewriter` implementation that rewrites `Expr::Column` expressions by
-/// replacing the column's name with an alias if the column exists in the provided schema.
-///
-/// This is typically used to apply table aliases in query plans, ensuring that
-/// the column references in the expressions use the correct table alias.
-///
-/// # Fields
-///
-/// * `table_schema`: The schema (`SchemaRef`) representing the table structure
-///   from which the columns are referenced. This is used to look up columns by their names.
-/// * `alias_name`: The alias (`TableReference`) that will replace the table name
-///   in the column references when applicable.
-pub struct TableAliasRewriter<'a> {
-    pub table_schema: &'a Schema,
-    pub alias_name: TableReference,
-}
-
-impl TreeNodeRewriter for TableAliasRewriter<'_> {
-    type Node = Expr;
-
-    fn f_down(&mut self, expr: Expr) -> Result<Transformed<Expr>> {
-        match expr {
-            Expr::Column(column) => {
-                if let Ok(field) = self.table_schema.field_with_name(&column.name) {
-                    let new_column =
-                        Column::new(Some(self.alias_name.clone()), field.name().clone());
-                    Ok(Transformed::yes(Expr::Column(new_column)))
-                } else {
-                    Ok(Transformed::no(Expr::Column(column)))
-                }
-            }
-            _ => Ok(Transformed::no(expr)),
-        }
     }
 }

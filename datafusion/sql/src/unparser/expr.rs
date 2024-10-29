@@ -18,7 +18,8 @@
 use datafusion_expr::expr::Unnest;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
-    self, BinaryOperator, Expr as AstExpr, Function, Ident, Interval, ObjectName, TimezoneInfo, UnaryOperator
+    self, BinaryOperator, Expr as AstExpr, Function, Ident, Interval, ObjectName,
+    TimezoneInfo, UnaryOperator,
 };
 use std::sync::Arc;
 use std::vec;
@@ -217,7 +218,7 @@ impl Unparser<'_> {
                     }
                 };
 
-                let order_by =order_by
+                let order_by = order_by
                     .iter()
                     .map(|sort_expr| self.sort_to_sql(sort_expr))
                     .collect::<Result<Vec<_>>>()?;
@@ -1881,7 +1882,7 @@ mod tests {
                         name: "array_col".to_string(),
                     })),
                 }),
-                r#"UNNEST("schema"."table".array_col)"#
+                r#"UNNEST("schema"."table".array_col)"#,
             ),
         ];
 

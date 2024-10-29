@@ -36,7 +36,7 @@ use super::{
         SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
     },
     rewrite::{
-        eliminate_duplicate_filter_in_tablescan, inject_column_aliases_into_subquery, normalize_union_schema,
+        inject_column_aliases_into_subquery, normalize_union_schema,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns, TableAliasRewriter,
     },
@@ -385,7 +385,6 @@ impl Unparser<'_> {
                 self.select_to_sql_recursively(p.input.as_ref(), query, select, relation)
             }
             LogicalPlan::Filter(filter) => {
-                let filter = eliminate_duplicate_filter_in_tablescan(filter.clone())?;
                 // Instead of specifying column aliases as part of the outer table, inject them directly into the inner projection
                 if let Some(agg) =
                     find_agg_node_within_select(plan, select.already_projected())
