@@ -27,7 +27,7 @@ use datafusion_expr::{
     expr::Alias, BinaryExpr, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan,
 };
-use sqlparser::ast::{self, Ident, SetExpr};
+use sqlparser::ast::{self, display_separated, Ident, SetExpr};
 use std::{sync::Arc, vec};
 
 use super::{
@@ -162,9 +162,68 @@ impl Unparser<'_> {
             )]);
         }
 
+        // Construct a list of all the identifiers present in query sources
+        let mut all_idents = Vec::new();
+        if let Some(source_alias) = relation_builder.get_alias() {
+            all_idents.push(source_alias);
+        } else if let Some(source_name) = relation_builder.get_name() {
+            all_idents.push(source_name);
+        }
+
         let mut twj = select_builder.pop_from().unwrap();
+        twj.get_joins()
+            .iter()
+            .for_each(|join| match &join.relation {
+                ast::TableFactor::Table { alias, name, .. } => {
+                    if let Some(alias) = alias {
+                        all_idents.push(alias.name.to_string());
+                    } else {
+                        all_idents.push(name.to_string());
+                    }
+                }
+                ast::TableFactor::Derived { alias, .. } => {
+                    if let Some(alias) = alias {
+                        all_idents.push(alias.name.to_string());
+                    }
+                }
+                _ => {}
+            });
+
         twj.relation(relation_builder);
         select_builder.push_from(twj);
+
+        // Ensure that the projection contains references to sources that actually exist
+        let mut projection = select_builder.get_projection();
+        projection
+            .iter_mut()
+            .for_each(|select_item| match select_item {
+                ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) => {
+                    if idents.len() > 1 {
+                        let ident_source = display_separated(
+                            &idents
+                                .clone()
+                                .into_iter()
+                                .take(idents.len() - 1)
+                                .collect::<Vec<Ident>>(),
+                            ".",
+                        )
+                        .to_string();
+                        // If the identifier is not present in the list of all identifiers, it refers to a table that does not exist
+                        if !all_idents.contains(&ident_source) {
+                            let Some(last) = idents.last() else {
+                                unreachable!(
+                                    "CompoundIdentifier must have a last element"
+                                );
+                            };
+                            // Reset the identifiers to only the last element, which is the column name
+                            *idents = vec![last.clone()];
+                        }
+                    }
+                }
+                _ => {}
+            });
+
+        select_builder.projection(projection);
 
         Ok(SetExpr::Select(Box::new(select_builder.build()?)))
     }
