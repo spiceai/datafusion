@@ -27,7 +27,7 @@ use datafusion_common::{
 };
 use datafusion_expr::{expr::Alias, tree_node::transform_sort_vec};
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
-use sqlparser::ast::Ident;
+use sqlparser::ast::{display_separated, Ident};
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -363,6 +363,31 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
                 }
             }
             _ => Ok(Transformed::no(expr)),
+        }
+    }
+}
+
+pub fn remove_dangling_identifiers(
+    idents: &mut Vec<Ident>,
+    available_idents: &Vec<String>,
+) -> () {
+    if idents.len() > 1 {
+        let ident_source = display_separated(
+            &idents
+                .clone()
+                .into_iter()
+                .take(idents.len() - 1)
+                .collect::<Vec<Ident>>(),
+            ".",
+        )
+        .to_string();
+        // If the identifier is not present in the list of all identifiers, it refers to a table that does not exist
+        if !available_idents.contains(&ident_source) {
+            let Some(last) = idents.last() else {
+                unreachable!("CompoundIdentifier must have a last element");
+            };
+            // Reset the identifiers to only the last element, which is the column name
+            *idents = vec![last.clone()];
         }
     }
 }
