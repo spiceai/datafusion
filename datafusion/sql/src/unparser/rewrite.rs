@@ -367,6 +367,8 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
     }
 }
 
+/// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
+/// Removes any table identifiers that are not present in the list of available identifiers, retains original column names.
 pub fn remove_dangling_identifiers(
     idents: &mut Vec<Ident>,
     available_idents: &Vec<String>,
@@ -388,6 +390,44 @@ pub fn remove_dangling_identifiers(
             };
             // Reset the identifiers to only the last element, which is the column name
             *idents = vec![last.clone()];
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_remove_dangling_identifiers() {
+        let tests = vec![
+            (vec![], vec![Ident::new("column1".to_string())]),
+            (
+                vec!["table1.table2".to_string()],
+                vec![
+                    Ident::new("table1".to_string()),
+                    Ident::new("table2".to_string()),
+                    Ident::new("column1".to_string()),
+                ],
+            ),
+            (
+                vec!["table1".to_string()],
+                vec![Ident::new("column1".to_string())],
+            ),
+        ];
+
+        for test in tests {
+            let test_in = test.0;
+            let test_out = test.1;
+
+            let mut idents = vec![
+                Ident::new("table1".to_string()),
+                Ident::new("table2".to_string()),
+                Ident::new("column1".to_string()),
+            ];
+
+            remove_dangling_identifiers(&mut idents, &test_in);
+            assert_eq!(idents, test_out);
         }
     }
 }
