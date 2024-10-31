@@ -22,7 +22,7 @@ use super::{
     },
     rewrite::{
         inject_column_aliases_into_subquery, normalize_union_schema,
-        rewrite_plan_for_sort_on_non_projected_fields,
+        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns, TableAliasRewriter,
     },
     utils::{
@@ -42,7 +42,7 @@ use datafusion_expr::{
     expr::Alias, BinaryExpr, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan,
 };
-use sqlparser::ast::{self, display_separated, Ident, SetExpr};
+use sqlparser::ast::{self, Ident, SetExpr};
 use std::sync::Arc;
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
@@ -195,30 +195,30 @@ impl Unparser<'_> {
             .iter_mut()
             .for_each(|select_item| match select_item {
                 ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) => {
-                    if idents.len() > 1 {
-                        let ident_source = display_separated(
-                            &idents
-                                .clone()
-                                .into_iter()
-                                .take(idents.len() - 1)
-                                .collect::<Vec<Ident>>(),
-                            ".",
-                        )
-                        .to_string();
-                        // If the identifier is not present in the list of all identifiers, it refers to a table that does not exist
-                        if !all_idents.contains(&ident_source) {
-                            let Some(last) = idents.last() else {
-                                unreachable!(
-                                    "CompoundIdentifier must have a last element"
-                                );
-                            };
-                            // Reset the identifiers to only the last element, which is the column name
-                            *idents = vec![last.clone()];
-                        }
-                    }
+                    remove_dangling_identifiers(idents, &all_idents);
                 }
                 _ => {}
             });
+
+        // Check the order by as well
+        if let Some(query) = query.as_mut() {
+            let mut order_by = query.get_order_by();
+            order_by.iter_mut().for_each(|sort_item| {
+                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
+                    remove_dangling_identifiers(idents, &all_idents);
+                }
+            });
+
+            query.order_by(order_by);
+        }
+
+        // Order by could be a sort in the select builder
+        let mut sort = select_builder.get_sort_by();
+        sort.iter_mut().for_each(|sort_item| {
+            if let ast::Expr::CompoundIdentifier(idents) = sort_item {
+                remove_dangling_identifiers(idents, &all_idents);
+            }
+        });
 
         select_builder.projection(projection);
 
@@ -297,7 +297,7 @@ impl Unparser<'_> {
     ) -> Result<()> {
         let mut derived_builder = DerivedRelationBuilder::default();
         derived_builder.lateral(false).alias(alias).subquery({
-            let inner_statement = self.plan_to_sql(plan)?;
+            let inner_statement = self.plan_to_sql(&plan)?;
             if let ast::Statement::Query(inner_query) = inner_statement {
                 inner_query
             } else {

@@ -51,6 +51,9 @@ impl QueryBuilder {
     pub fn take_body(&mut self) -> Option<Box<ast::SetExpr>> {
         self.body.take()
     }
+    pub fn get_order_by(&self) -> Vec<ast::OrderByExpr> {
+        self.order_by.clone()
+    }
     pub fn order_by(&mut self, value: Vec<ast::OrderByExpr>) -> &mut Self {
         self.order_by = value;
         self
@@ -224,6 +227,9 @@ impl SelectBuilder {
     pub fn sort_by(&mut self, value: Vec<ast::Expr>) -> &mut Self {
         self.sort_by = value;
         self
+    }
+    pub fn get_sort_by(&self) -> Vec<ast::Expr> {
+        self.sort_by.clone()
     }
     pub fn having(&mut self, value: Option<ast::Expr>) -> &mut Self {
         self.having = value;
