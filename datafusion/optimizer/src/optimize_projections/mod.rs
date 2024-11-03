@@ -185,6 +185,13 @@ fn optimize_projections(
                 necessary_indices,
             )?
             .transform_data(|aggregate_input| {
+                if config
+                    .options()
+                    .optimizer
+                    .optimize_projections_preserve_existing_projections
+                {
+                    return Ok(Transformed::no(aggregate_input));
+                }
                 // Simplify the input of the aggregation by adding a projection so
                 // that its input only contains absolutely necessary columns for
                 // the aggregate expressions. Note that necessary_indices refer to
@@ -224,7 +231,7 @@ fn optimize_projections(
                 config,
                 required_indices.clone(),
             )?
-            .transform_data(|window_child| {
+            .transform_data(|mut window_child| {
                 if new_window_expr.is_empty() {
                     // When no window expression is necessary, use the input directly:
                     Ok(Transformed::no(window_child))
@@ -234,9 +241,18 @@ fn optimize_projections(
                     // refers to that schema
                     let required_exprs =
                         required_indices.get_required_exprs(&input_schema);
-                    let window_child =
-                        add_projection_on_top_if_helpful(window_child, required_exprs)?
-                            .data;
+
+                    if !config
+                        .options()
+                        .optimizer
+                        .optimize_projections_preserve_existing_projections
+                    {
+                        window_child = add_projection_on_top_if_helpful(
+                            window_child,
+                            required_exprs,
+                        )?
+                        .data;
+                    }
                     Window::try_new(new_window_expr, Arc::new(window_child))
                         .map(LogicalPlan::Window)
                         .map(Transformed::yes)
@@ -420,7 +436,12 @@ fn optimize_projections(
 
         optimize_projections(child, config, required_indices)?.transform_data(
             |new_input| {
-                if projection_beneficial {
+                if !config
+                    .options()
+                    .optimizer
+                    .optimize_projections_preserve_existing_projections
+                    && projection_beneficial
+                {
                     add_projection_on_top_if_helpful(new_input, project_exprs)
                 } else {
                     Ok(Transformed::no(new_input))
@@ -767,7 +788,12 @@ fn rewrite_projection_given_requirements(
     // projection down
     optimize_projections(Arc::unwrap_or_clone(input), config, required_indices)?
         .transform_data(|input| {
-            if is_projection_unnecessary(&input, &exprs_used)? {
+            if !config
+                .options()
+                .optimizer
+                .optimize_projections_preserve_existing_projections
+                && is_projection_unnecessary(&input, &exprs_used)?
+            {
                 Ok(Transformed::yes(input))
             } else {
                 Projection::try_new(exprs_used, Arc::new(input))

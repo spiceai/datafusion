@@ -338,6 +338,14 @@ impl SessionConfig {
         self
     }
 
+    /// When set to true, the `optimize_projections` rule will not attempt to move, add or remove existing projections
+    ///
+    /// [optimize_projections_preserve_existing_projections]: datafusion_common::config::OptimizerOptions::optimize_projections_preserve_existing_projections
+    pub fn with_optimize_projections_preserve_existing_projections(mut self, enabled: bool) -> Self {
+        self.options.optimizer.optimize_projections_preserve_existing_projections = enabled;
+        self
+    }
+
     /// Enables or disables the use of pruning predicate for parquet readers to skip row groups
     pub fn with_parquet_pruning(mut self, enabled: bool) -> Self {
         self.options.execution.parquet.pruning = enabled;

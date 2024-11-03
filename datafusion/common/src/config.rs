@@ -611,6 +611,9 @@ config_namespace! {
         /// then the output will be coerced to a non-view.
         /// Coerces `Utf8View` to `LargeUtf8`, and `BinaryView` to `LargeBinary`.
         pub expand_views_at_output: bool, default = false
+
+        /// When set to true, the `optimize_projections` rule will not attempt to move, add or remove existing projections
+        pub optimize_projections_preserve_existing_projections: bool, default = false
     }
 }
 
