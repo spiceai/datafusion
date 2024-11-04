@@ -612,7 +612,8 @@ config_namespace! {
         /// Coerces `Utf8View` to `LargeUtf8`, and `BinaryView` to `LargeBinary`.
         pub expand_views_at_output: bool, default = false
 
-        /// When set to true, the `optimize_projections` rule will not attempt to move, add or remove existing projections
+        /// When set to true, the `optimize_projections` rule will not attempt to move, add, or remove existing projections.
+        /// This is useful when optimization is used alongside unparsing logic to preserve the original layout and simplify the overall query structure.
         pub optimize_projections_preserve_existing_projections: bool, default = false
     }
 }

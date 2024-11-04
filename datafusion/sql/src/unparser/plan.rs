@@ -338,7 +338,7 @@ impl Unparser<'_> {
         match plan {
             LogicalPlan::TableScan(scan) => {
                 if let Some(unparsed_table_scan) =
-                    Self::unparse_table_scan_pushdown(plan, None, select)?
+                    Self::unparse_table_scan_pushdown(plan, None, select.already_projected())?
                 {
                     return self.select_to_sql_recursively(
                         &unparsed_table_scan,
@@ -670,7 +670,7 @@ impl Unparser<'_> {
                 let unparsed_table_scan = Self::unparse_table_scan_pushdown(
                     plan,
                     Some(plan_alias.alias.clone()),
-                    select,
+                    select.already_projected(),
             )?;
                 // if the child plan is a TableScan with pushdown operations, we don't need to
                 // create an additional subquery for it
@@ -799,7 +799,7 @@ impl Unparser<'_> {
     fn unparse_table_scan_pushdown(
         plan: &LogicalPlan,
         alias: Option<TableReference>,
-        select: &mut SelectBuilder,
+        already_projected: bool,
     ) -> Result<Option<LogicalPlan>> {
         match plan {
             LogicalPlan::TableScan(table_scan) => {
@@ -832,7 +832,7 @@ impl Unparser<'_> {
                 // Avoid creating a duplicate Projection node, which would result in an additional subquery if a projection already exists.
                 // For example, if the `optimize_projection` rule is applied, there will be a Projection node, and duplicate projection 
                 // information included in the TableScan node.
-                if !select.already_projected() {
+                if !already_projected {
                     if let Some(project_vec) = &table_scan.projection {
                         let project_columns = project_vec
                             .iter()
@@ -896,7 +896,7 @@ impl Unparser<'_> {
                 Self::unparse_table_scan_pushdown(
                     &subquery_alias.input,
                     Some(subquery_alias.alias.clone()),
-                    select,
+                    already_projected,
                 )
             }
             // SubqueryAlias could be rewritten to a plan with a projection as the top node by [rewrite::subquery_alias_inner_query_and_columns].
@@ -905,7 +905,7 @@ impl Unparser<'_> {
                 if let Some(plan) = Self::unparse_table_scan_pushdown(
                     &projection.input,
                     alias.clone(),
-                    select,
+                    already_projected,
                 )? {
                     let exprs = if alias.is_some() {
                         let mut alias_rewriter =

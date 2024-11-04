@@ -338,7 +338,8 @@ impl SessionConfig {
         self
     }
 
-    /// When set to true, the `optimize_projections` rule will not attempt to move, add or remove existing projections
+    /// When set to true, the `optimize_projections` rule will not attempt to move, add, or remove existing projections.
+    /// This is useful when optimization is used alongside unparsing logic to preserve the original layout and simplify the overall query structure.
     ///
     /// [optimize_projections_preserve_existing_projections]: datafusion_common::config::OptimizerOptions::optimize_projections_preserve_existing_projections
     pub fn with_optimize_projections_preserve_existing_projections(mut self, enabled: bool) -> Self {
