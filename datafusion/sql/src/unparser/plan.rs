@@ -41,9 +41,7 @@ use super::{
         subquery_alias_inner_query_and_columns, TableAliasRewriter,
     },
     utils::{
-        find_agg_node_within_select, find_window_nodes_within_select,
-        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
-        unproject_window_exprs,
+        find_agg_node_within_select, find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters, unproject_sort_expr, unproject_window_exprs
     },
     Unparser,
 };
@@ -340,7 +338,7 @@ impl Unparser<'_> {
         match plan {
             LogicalPlan::TableScan(scan) => {
                 if let Some(unparsed_table_scan) =
-                    Self::unparse_table_scan_pushdown(plan, None)?
+                    Self::unparse_table_scan_pushdown(plan, None, select.already_projected())?
                 {
                     return self.select_to_sql_recursively(
                         &unparsed_table_scan,
@@ -672,7 +670,8 @@ impl Unparser<'_> {
                 let unparsed_table_scan = Self::unparse_table_scan_pushdown(
                     plan,
                     Some(plan_alias.alias.clone()),
-                )?;
+                    select.already_projected(),
+            )?;
                 // if the child plan is a TableScan with pushdown operations, we don't need to
                 // create an additional subquery for it
                 if !select.already_projected() && unparsed_table_scan.is_none() {
@@ -800,6 +799,7 @@ impl Unparser<'_> {
     fn unparse_table_scan_pushdown(
         plan: &LogicalPlan,
         alias: Option<TableReference>,
+        already_projected: bool,
     ) -> Result<Option<LogicalPlan>> {
         match plan {
             LogicalPlan::TableScan(table_scan) => {
@@ -829,24 +829,29 @@ impl Unparser<'_> {
                     builder = builder.alias(alias.clone().unwrap())?;
                 }
 
-                if let Some(project_vec) = &table_scan.projection {
-                    let project_columns = project_vec
-                        .iter()
-                        .cloned()
-                        .map(|i| {
-                            let schema = table_scan.source.schema();
-                            let field = schema.field(i);
-                            if alias.is_some() {
-                                Column::new(alias.clone(), field.name().clone())
-                            } else {
-                                Column::new(
-                                    Some(table_scan.table_name.clone()),
-                                    field.name().clone(),
-                                )
-                            }
-                        })
-                        .collect::<Vec<_>>();
-                    builder = builder.project(project_columns)?;
+                // Avoid creating a duplicate Projection node, which would result in an additional subquery if a projection already exists.
+                // For example, if the `optimize_projection` rule is applied, there will be a Projection node, and duplicate projection 
+                // information included in the TableScan node.
+                if !already_projected {
+                    if let Some(project_vec) = &table_scan.projection {
+                        let project_columns = project_vec
+                            .iter()
+                            .cloned()
+                            .map(|i| {
+                                let schema = table_scan.source.schema();
+                                let field = schema.field(i);
+                                if alias.is_some() {
+                                    Column::new(alias.clone(), field.name().clone())
+                                } else {
+                                    Column::new(
+                                        Some(table_scan.table_name.clone()),
+                                        field.name().clone(),
+                                    )
+                                }
+                            })
+                            .collect::<Vec<_>>();
+                        builder = builder.project(project_columns)?;
+                    }
                 }
 
                 let filter_expr: Result<Option<Expr>> = table_scan
@@ -891,14 +896,17 @@ impl Unparser<'_> {
                 Self::unparse_table_scan_pushdown(
                     &subquery_alias.input,
                     Some(subquery_alias.alias.clone()),
+                    already_projected,
                 )
             }
             // SubqueryAlias could be rewritten to a plan with a projection as the top node by [rewrite::subquery_alias_inner_query_and_columns].
             // The inner table scan could be a scan with pushdown operations.
             LogicalPlan::Projection(projection) => {
-                if let Some(plan) =
-                    Self::unparse_table_scan_pushdown(&projection.input, alias.clone())?
-                {
+                if let Some(plan) = Self::unparse_table_scan_pushdown(
+                    &projection.input,
+                    alias.clone(),
+                    already_projected,
+                )? {
                     let exprs = if alias.is_some() {
                         let mut alias_rewriter =
                             alias.as_ref().map(|alias_name| TableAliasRewriter {

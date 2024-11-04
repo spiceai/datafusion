@@ -189,7 +189,7 @@ fn optimize_projections(
                 // that its input only contains absolutely necessary columns for
                 // the aggregate expressions. Note that necessary_indices refer to
                 // fields in `aggregate.input.schema()`.
-                add_projection_on_top_if_helpful(aggregate_input, necessary_exprs)
+                add_projection_on_top_if_helpful(aggregate_input, necessary_exprs, config)
             })?
             .map_data(|aggregate_input| {
                 // Create a new aggregate plan with the updated input and only the
@@ -234,9 +234,14 @@ fn optimize_projections(
                     // refers to that schema
                     let required_exprs =
                         required_indices.get_required_exprs(&input_schema);
-                    let window_child =
-                        add_projection_on_top_if_helpful(window_child, required_exprs)?
-                            .data;
+
+                    let window_child = add_projection_on_top_if_helpful(
+                        window_child,
+                        required_exprs,
+                        config,
+                    )?
+                    .data;
+
                     Window::try_new(new_window_expr, Arc::new(window_child))
                         .map(LogicalPlan::Window)
                         .map(Transformed::yes)
@@ -421,7 +426,7 @@ fn optimize_projections(
         optimize_projections(child, config, required_indices)?.transform_data(
             |new_input| {
                 if projection_beneficial {
-                    add_projection_on_top_if_helpful(new_input, project_exprs)
+                    add_projection_on_top_if_helpful(new_input, project_exprs, config)
                 } else {
                     Ok(Transformed::no(new_input))
                 }
@@ -716,6 +721,7 @@ fn split_join_requirements(
 ///
 /// * `plan` - The input `LogicalPlan` to potentially add a projection to.
 /// * `project_exprs` - A list of expressions for the projection.
+/// * `config` - A reference to the optimizer configuration.
 ///
 /// # Returns
 ///
@@ -723,9 +729,15 @@ fn split_join_requirements(
 fn add_projection_on_top_if_helpful(
     plan: LogicalPlan,
     project_exprs: Vec<Expr>,
+    config: &dyn OptimizerConfig,
 ) -> Result<Transformed<LogicalPlan>> {
     // Make sure projection decreases the number of columns, otherwise it is unnecessary.
-    if project_exprs.len() >= plan.schema().fields().len() {
+    if config
+        .options()
+        .optimizer
+        .optimize_projections_preserve_existing_projections
+        || project_exprs.len() >= plan.schema().fields().len()
+    {
         Ok(Transformed::no(plan))
     } else {
         Projection::try_new(project_exprs, Arc::new(plan))
@@ -767,7 +779,7 @@ fn rewrite_projection_given_requirements(
     // projection down
     optimize_projections(Arc::unwrap_or_clone(input), config, required_indices)?
         .transform_data(|input| {
-            if is_projection_unnecessary(&input, &exprs_used)? {
+            if is_projection_unnecessary(&input, &exprs_used, config)? {
                 Ok(Transformed::yes(input))
             } else {
                 Projection::try_new(exprs_used, Arc::new(input))
@@ -778,10 +790,19 @@ fn rewrite_projection_given_requirements(
 }
 
 /// Projection is unnecessary, when
+/// - `optimize_projections_preserve_existing_projections` optimizer config is false, and
 /// - input schema of the projection, output schema of the projection are same, and
 /// - all projection expressions are either Column or Literal
-fn is_projection_unnecessary(input: &LogicalPlan, proj_exprs: &[Expr]) -> Result<bool> {
-    Ok(&projection_schema(input, proj_exprs)? == input.schema()
+fn is_projection_unnecessary(
+    input: &LogicalPlan,
+    proj_exprs: &[Expr],
+    config: &dyn OptimizerConfig,
+) -> Result<bool> {
+    Ok(!config
+        .options()
+        .optimizer
+        .optimize_projections_preserve_existing_projections
+        && &projection_schema(input, proj_exprs)? == input.schema()
         && proj_exprs.iter().all(is_expr_trivial))
 }
 
