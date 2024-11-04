@@ -613,7 +613,7 @@ config_namespace! {
         pub expand_views_at_output: bool, default = false
 
         /// When set to true, the `optimize_projections` rule will not attempt to move, add, or remove existing projections.
-        /// This is useful when optimization is used alongside unparsing logic to preserve the original layout and simplify the overall query structure.
+        /// This flag helps maintain the original structure of the `LogicalPlan` when converting it back into SQL via the `unparser` module. It ensures the query layout remains simple and readable, relying on the underlying SQL engine to apply its own optimizations during execution.
         pub optimize_projections_preserve_existing_projections: bool, default = false
     }
 }
