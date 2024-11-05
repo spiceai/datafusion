@@ -362,7 +362,6 @@ impl<F: FileOpener> FileStream<F> {
                         }
                     }
                     Err(e) => {
-                        // println!("{:?}", e);
                         self.file_stream_metrics.file_open_errors.add(1);
                         match self.on_error {
                             OnError::Skip => {
