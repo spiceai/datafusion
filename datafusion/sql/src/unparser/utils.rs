@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{cmp::Ordering, collections::HashSet, sync::Arc, vec};
+use std::{cmp::Ordering, sync::Arc, vec};
 
 use datafusion_common::{
     internal_err,
@@ -102,7 +102,7 @@ pub(crate) fn find_unnest_node_within_select(
 ///       TableScan: j1
 /// And filters: [ta.j1_id < 5, ta.j1_id > 10]
 pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPlan) -> Option<(LogicalPlan, Vec<Expr>)> { 
-    let mut filters: HashSet<Expr> = HashSet::new();
+    let mut filters: Vec<Expr> = Vec::new();
     let mut plan_stack = vec![plan];
     let mut table_alias = None;
 
@@ -113,7 +113,9 @@ pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPla
                 plan_stack.push(alias.input.as_ref());
             }
             LogicalPlan::Filter(filter) => {
-                filters.insert(filter.predicate.clone());
+                if !filters.contains(&filter.predicate) {
+                    filters.push(filter.predicate.clone());
+                }
                 plan_stack.push(filter.input.as_ref());
             }
             LogicalPlan::TableScan(table_scan) => {
@@ -139,7 +141,9 @@ pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPla
                     }).collect::<Result<Vec<_>, DataFusionError>>().ok()?;
 
                 for table_scan_filter in table_scan_filters {
-                    filters.insert(table_scan_filter);
+                    if !filters.contains(&table_scan_filter) {
+                        filters.push(table_scan_filter);
+                    }
                 }
 
                 let mut builder = LogicalPlanBuilder::scan(
@@ -153,7 +157,6 @@ pub (crate) fn try_transform_to_simple_table_scan_with_filters(plan: &LogicalPla
                 } 
 
                 let plan = builder.build().ok()?;
-                let filters: Vec<Expr> = filters.into_iter().collect();
 
                 return Some((plan, filters));
                 
