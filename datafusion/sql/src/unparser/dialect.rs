@@ -175,6 +175,9 @@ pub enum DateFieldExtractStyle {
 
 /// `CharacterLengthStyle` to use for unparsing
 ///
+/// Different DBMSs uses different names for function calculating the number of characters in the string
+/// `Length` style uses length(x)
+/// `SQLStandard` style uses character_length(x)
 #[derive(Clone, Copy, PartialEq)]
 pub enum CharacterLengthStyle {
     Length,
