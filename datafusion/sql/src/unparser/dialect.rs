@@ -21,7 +21,7 @@ use arrow_schema::TimeUnit;
 use datafusion_expr::Expr;
 use regex::Regex;
 use sqlparser::{
-    ast::{self, Function, Ident, ObjectName, TimezoneInfo},
+    ast::{self, BinaryOperator, Function, Ident, ObjectName, TimezoneInfo},
     keywords::ALL_KEYWORDS,
 };
 
@@ -129,6 +129,13 @@ pub trait Dialect: Send + Sync {
     /// This affects behavior when deriving logical plans for Sort, Limit, etc.
     fn requires_derived_table_alias(&self) -> bool {
         false
+    }
+
+    /// The division operator for the dialect
+    /// Most dialect uses ` BinaryOperator::Divide` (/)
+    /// But DuckDB dialect uses `BinaryOperator::DuckIntegerDivide` (//)
+    fn division_operator(&self) -> BinaryOperator {
+        BinaryOperator::Divide
     }
 
     /// Allows the dialect to override scalar function unparsing if the dialect has specific rules.
@@ -290,6 +297,10 @@ impl Dialect for DuckDBDialect {
         CharacterLengthStyle::Length
     }
 
+    fn division_operator(&self) -> BinaryOperator {
+        BinaryOperator::DuckIntegerDivide
+    }
+
     fn scalar_function_to_sql_overrides(
         &self,
         unparser: &Unparser,
@@ -431,6 +442,7 @@ pub struct CustomDialect {
     date32_cast_dtype: ast::DataType,
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
+    division_operator: BinaryOperator,
 }
 
 impl Default for CustomDialect {
@@ -455,6 +467,7 @@ impl Default for CustomDialect {
             date32_cast_dtype: ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
+            division_operator: BinaryOperator::Divide,
         }
     }
 }
@@ -559,6 +572,10 @@ impl Dialect for CustomDialect {
     fn requires_derived_table_alias(&self) -> bool {
         self.requires_derived_table_alias
     }
+
+    fn division_operator(&self) -> BinaryOperator {
+        self.division_operator.clone()
+    }
 }
 
 /// `CustomDialectBuilder` to build `CustomDialect` using builder pattern
@@ -592,6 +609,7 @@ pub struct CustomDialectBuilder {
     date32_cast_dtype: ast::DataType,
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
+    division_operator: BinaryOperator,
 }
 
 impl Default for CustomDialectBuilder {
@@ -622,6 +640,7 @@ impl CustomDialectBuilder {
             date32_cast_dtype: ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
+            division_operator: BinaryOperator::Divide,
         }
     }
 
@@ -644,6 +663,7 @@ impl CustomDialectBuilder {
             supports_column_alias_in_table_alias: self
                 .supports_column_alias_in_table_alias,
             requires_derived_table_alias: self.requires_derived_table_alias,
+            division_operator: self.division_operator,
         }
     }
 
@@ -758,6 +778,11 @@ impl CustomDialectBuilder {
         requires_derived_table_alias: bool,
     ) -> Self {
         self.requires_derived_table_alias = requires_derived_table_alias;
+        self
+    }
+
+    pub fn with_division_operator(mut self, division_operator: BinaryOperator) -> Self {
+        self.division_operator = division_operator;
         self
     }
 }
