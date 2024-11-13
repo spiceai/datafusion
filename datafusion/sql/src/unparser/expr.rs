@@ -2006,7 +2006,7 @@ mod tests {
     fn test_character_length_scalar_to_expr() {
         let tests = [
             (CharacterLengthStyle::Length, "length(x)"),
-            (CharacterLengthStyle::SQLStandard, "character_length(x)"),
+            (CharacterLengthStyle::CharacterLength, "character_length(x)"),
         ];
 
         for (style, expected) in tests {

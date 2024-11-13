@@ -28,7 +28,10 @@ use datafusion_expr::{
 };
 use sqlparser::ast;
 
-use super::{dialect::DateFieldExtractStyle, dialect::CharacterLengthStyle, rewrite::TableAliasRewriter, Unparser};
+use super::{
+    dialect::CharacterLengthStyle, dialect::DateFieldExtractStyle,
+    rewrite::TableAliasRewriter, Unparser,
+};
 
 /// Recursively searches children of [LogicalPlan] to find an Aggregate node if exists
 /// prior to encountering a Join, TableScan, or a nested subquery (derived table factor).
@@ -458,10 +461,11 @@ pub(crate) fn character_length_to_sql(
     character_length_args: &[Expr],
 ) -> Result<Option<ast::Expr>> {
     let func_name = match style {
-        CharacterLengthStyle::SQLStandard => "character_length",
-        CharacterLengthStyle::Length => "length"
+        CharacterLengthStyle::CharacterLength => "character_length",
+        CharacterLengthStyle::Length => "length",
     };
 
-    return Ok(Some(unparser.scalar_function_to_sql(func_name, character_length_args)?))
-
+    return Ok(Some(
+        unparser.scalar_function_to_sql(func_name, character_length_args)?,
+    ));
 }

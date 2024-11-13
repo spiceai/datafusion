@@ -80,9 +80,9 @@ pub trait Dialect: Send + Sync {
         DateFieldExtractStyle::DatePart
     }
 
-    /// The date field extract style to use: `DateFieldExtractStyle`
+    /// The character length extraction style to use: `CharacterLengthStyle`
     fn character_length_style(&self) -> CharacterLengthStyle {
-        CharacterLengthStyle::SQLStandard
+        CharacterLengthStyle::CharacterLength
     }
 
     /// The SQL type to use for Arrow Int64 unparsing
@@ -181,7 +181,7 @@ pub enum DateFieldExtractStyle {
 #[derive(Clone, Copy, PartialEq)]
 pub enum CharacterLengthStyle {
     Length,
-    SQLStandard,
+    CharacterLength,
 }
 
 pub struct DefaultDialect {}
@@ -444,7 +444,7 @@ impl Default for CustomDialect {
             utf8_cast_dtype: ast::DataType::Varchar(None),
             large_utf8_cast_dtype: ast::DataType::Text,
             date_field_extract_style: DateFieldExtractStyle::DatePart,
-            character_length_style: CharacterLengthStyle::SQLStandard,
+            character_length_style: CharacterLengthStyle::CharacterLength,
             int64_cast_dtype: ast::DataType::BigInt(None),
             int32_cast_dtype: ast::DataType::Integer(None),
             timestamp_cast_dtype: ast::DataType::Timestamp(None, TimezoneInfo::None),
@@ -611,7 +611,7 @@ impl CustomDialectBuilder {
             utf8_cast_dtype: ast::DataType::Varchar(None),
             large_utf8_cast_dtype: ast::DataType::Text,
             date_field_extract_style: DateFieldExtractStyle::DatePart,
-            character_length_style: CharacterLengthStyle::SQLStandard,
+            character_length_style: CharacterLengthStyle::CharacterLength,
             int64_cast_dtype: ast::DataType::BigInt(None),
             int32_cast_dtype: ast::DataType::Integer(None),
             timestamp_cast_dtype: ast::DataType::Timestamp(None, TimezoneInfo::None),
