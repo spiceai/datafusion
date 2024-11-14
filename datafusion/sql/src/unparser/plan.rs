@@ -929,7 +929,16 @@ impl Unparser<'_> {
         constraint: ast::JoinConstraint,
     ) -> Result<ast::JoinOperator> {
         Ok(match join_type {
-            JoinType::Inner => ast::JoinOperator::Inner(constraint),
+            JoinType::Inner => ast::JoinOperator::Inner(match &constraint {
+                ast::JoinConstraint::On(_)
+                | ast::JoinConstraint::Using(_)
+                | ast::JoinConstraint::Natural => constraint,
+                ast::JoinConstraint::None => {
+                    // Inner joins with no conditions or filters are not valid SQL,
+                    // add a join constraint that is always true to simulate a cross join
+                    ast::JoinConstraint::On(ast::Expr::Value(ast::Value::Boolean(true)))
+                }
+            }),
             JoinType::Left => ast::JoinOperator::LeftOuter(constraint),
             JoinType::Right => ast::JoinOperator::RightOuter(constraint),
             JoinType::Full => ast::JoinOperator::FullOuter(constraint),
