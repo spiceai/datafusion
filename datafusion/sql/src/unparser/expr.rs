@@ -1417,9 +1417,7 @@ impl Unparser<'_> {
             }
             DataType::Utf8 => Ok(self.dialect.utf8_cast_dtype()),
             DataType::LargeUtf8 => Ok(self.dialect.large_utf8_cast_dtype()),
-            DataType::Utf8View => {
-                not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
-            }
+            DataType::Utf8View => Ok(self.dialect.utf8_cast_dtype()),
             DataType::List(_) => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type:?}")
             }
