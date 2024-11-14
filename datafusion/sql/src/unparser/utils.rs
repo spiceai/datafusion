@@ -19,12 +19,14 @@ use std::{cmp::Ordering, sync::Arc, vec};
 
 use datafusion_common::{
     internal_err,
-    tree_node::{Transformed, TransformedResult, TreeNode},
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
     Column, DataFusionError, Result, ScalarValue,
 };
 use datafusion_expr::{
-    expr, utils::grouping_set_to_exprlist, Aggregate, Expr, LogicalPlan,
-    LogicalPlanBuilder, Projection, SortExpr, Unnest, Window,
+    expr::{self, Placeholder},
+    utils::grouping_set_to_exprlist,
+    Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr, Unnest,
+    Window,
 };
 use sqlparser::ast;
 
@@ -168,6 +170,20 @@ pub(crate) fn unproject_agg_exprs(
     agg: &Aggregate,
     windows: Option<&[&Window]>,
 ) -> Result<Expr> {
+    // If the current expression is an Alias over the internal grouping id column,
+    // we need to return a placeholder expression that represents the inverse
+    // of the replacement done in the [ResolveGroupingFunction] analyzer rule.
+    //
+    // [ResolveGroupingFunction]: datafusion_optimizer::resolve_grouping_function::ResolveGroupingFunction
+    if let Expr::Alias(alias) = &expr {
+        if find_grouping_id_col(&expr).is_some() {
+            return Ok(Expr::Placeholder(Placeholder::new(
+                alias.name.clone(),
+                None,
+            )));
+        }
+    }
+
     expr.transform(|sub_expr| {
             if let Expr::Column(c) = sub_expr {
                 if let Some(unprojected_expr) = find_agg_expr(agg, &c)? {
@@ -241,6 +257,21 @@ fn find_window_expr<'a>(
         .iter()
         .flat_map(|w| w.window_expr.iter())
         .find(|expr| expr.schema_name().to_string() == column_name)
+}
+
+/// Recursively searches for a Column expression with the name of the internal grouping id column: `__grouping_id`.
+fn find_grouping_id_col(expr: &Expr) -> Option<&Expr> {
+    let mut grouping_id_col: Option<&Expr> = None;
+    expr.apply(|sub_expr| {
+        if let Expr::Column(c) = sub_expr {
+            if c.name == Aggregate::INTERNAL_GROUPING_ID {
+                grouping_id_col = Some(sub_expr);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .ok()?;
+    grouping_id_col
 }
 
 /// Transforms a Column expression into the actual expression from aggregation or projection if found.

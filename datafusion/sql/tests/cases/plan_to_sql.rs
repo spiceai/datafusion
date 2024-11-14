@@ -19,6 +19,7 @@ use std::sync::Arc;
 use std::vec;
 
 use arrow_schema::*;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::{DFSchema, Result, TableReference};
 use datafusion_expr::test::function_stub::{count_udaf, max_udaf, min_udaf, sum_udaf};
 use datafusion_expr::{col, lit, table_scan, wildcard, LogicalPlanBuilder};
@@ -26,6 +27,8 @@ use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
 use datafusion_functions_nested::make_array::make_array_udf;
 use datafusion_functions_window::rank::rank_udwf;
+use datafusion_optimizer::analyzer::resolve_grouping_function::ResolveGroupingFunction;
+use datafusion_optimizer::AnalyzerRule;
 use datafusion_sql::planner::{ContextProvider, PlannerContext, SqlToRel};
 use datafusion_sql::unparser::dialect::{
     DefaultDialect as UnparserDefaultDialect, Dialect as UnparserDialect,
@@ -796,6 +799,38 @@ where
     assert_eq!(roundtrip_statement.to_string(), expect);
 }
 
+fn sql_round_trip_with_analyzer<D>(
+    dialect: D,
+    query: &str,
+    expect: &str,
+    analyzer: &dyn AnalyzerRule,
+) where
+    D: Dialect,
+{
+    let statement = Parser::new(&dialect)
+        .try_with_sql(query)
+        .unwrap()
+        .parse_statement()
+        .unwrap();
+
+    let context = MockContextProvider {
+        state: MockSessionState::default()
+            .with_aggregate_function(sum_udaf())
+            .with_aggregate_function(max_udaf())
+            .with_aggregate_function(grouping_udaf())
+            .with_window_function(rank_udwf())
+            .with_scalar_function(Arc::new(unicode::substr().as_ref().clone()))
+            .with_scalar_function(make_array_udf()),
+    };
+    let sql_to_rel = SqlToRel::new(&context);
+    let plan = sql_to_rel.sql_statement_to_plan(statement).unwrap();
+
+    let plan = analyzer.analyze(plan, &ConfigOptions::default()).unwrap();
+
+    let roundtrip_statement = plan_to_sql(&plan).unwrap();
+    assert_eq!(roundtrip_statement.to_string(), expect);
+}
+
 #[test]
 fn test_table_scan_alias() -> Result<()> {
     let schema = Schema::new(vec![
@@ -1273,6 +1308,16 @@ rank() OVER (PARTITION BY (grouping(person.id) + grouping(person.age)), CASE WHE
 rank() OVER (PARTITION BY (grouping(person.age) + grouping(person.id)), CASE WHEN (CAST(grouping(person.age) AS BIGINT) = 0) THEN person.id END ORDER BY sum(person.id) DESC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rank_within_parent_2
 FROM person
 GROUP BY person.id, person.first_name"#.replace("\n", " ").as_str(),
+    );
+}
+
+#[test]
+fn test_grouping_aggregate_function_to_sql() {
+    sql_round_trip_with_analyzer(
+        GenericDialect {},
+        r#"SELECT id, first_name, grouping(id) FROM person GROUP BY ROLLUP(id, first_name)"#,
+        r#"SELECT id, first_name, "grouping(person.id)" FROM (SELECT person.id, person.first_name, grouping(person.id) FROM person GROUP BY ROLLUP (person.id, person.first_name))"#,
+        &ResolveGroupingFunction,
     );
 }
 
