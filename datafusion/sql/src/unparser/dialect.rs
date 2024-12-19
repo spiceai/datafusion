@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
+use std::{any::Any, sync::Arc};
 
 use arrow_schema::TimeUnit;
 use datafusion_expr::Expr;
@@ -39,6 +39,10 @@ use super::{utils::character_length_to_sql, utils::date_part_to_sql, Unparser};
 /// See <https://github.com/sqlparser-rs/sqlparser-rs/pull/1170>
 /// See also the discussion in <https://github.com/apache/datafusion/pull/10625>
 pub trait Dialect: Send + Sync {
+    
+    /// Provides a way to downcast the dialect to the specific type implementing the `Dialect` trait
+    fn as_any(&self) -> &dyn Any;
+
     /// Return the character used to quote identifiers.
     fn identifier_quote_style(&self, _identifier: &str) -> Option<char>;
 
@@ -194,6 +198,10 @@ pub enum CharacterLengthStyle {
 pub struct DefaultDialect {}
 
 impl Dialect for DefaultDialect {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
         let identifier_regex = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").unwrap();
         let id_upper = identifier.to_uppercase();
@@ -212,6 +220,10 @@ impl Dialect for DefaultDialect {
 pub struct PostgreSqlDialect {}
 
 impl Dialect for PostgreSqlDialect {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('"')
     }
@@ -289,6 +301,10 @@ impl PostgreSqlDialect {
 pub struct DuckDBDialect {}
 
 impl Dialect for DuckDBDialect {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('"')
     }
@@ -322,6 +338,10 @@ impl Dialect for DuckDBDialect {
 pub struct MySqlDialect {}
 
 impl Dialect for MySqlDialect {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
     }
@@ -383,6 +403,10 @@ impl Dialect for MySqlDialect {
 pub struct SqliteDialect {}
 
 impl Dialect for SqliteDialect {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
     }
@@ -484,6 +508,10 @@ impl CustomDialect {
 }
 
 impl Dialect for CustomDialect {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         self.identifier_quote_style
     }
