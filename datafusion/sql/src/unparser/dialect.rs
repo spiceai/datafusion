@@ -27,7 +27,10 @@ use sqlparser::{
 
 use datafusion_common::Result;
 
-use super::{utils::character_length_to_sql, utils::date_part_to_sql, Unparser};
+use super::{
+    utils::{array_element_to_sql_subscript, character_length_to_sql, date_part_to_sql},
+    Unparser,
+};
 
 pub type ScalarFnToSqlHandler =
     Box<dyn Fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>> + Send + Sync>;
@@ -337,15 +340,13 @@ impl Dialect for DuckDBDialect {
             return handler(unparser, args);
         }
 
-        if func_name == "character_length" {
-            return character_length_to_sql(
-                unparser,
-                self.character_length_style(),
-                args,
-            );
+        match func_name {
+            "character_length" => {
+                character_length_to_sql(unparser, self.character_length_style(), args)
+            }
+            "array_element" => array_element_to_sql_subscript(unparser, args),
+            _ => Ok(None),
         }
-
-        Ok(None)
     }
 }
 
