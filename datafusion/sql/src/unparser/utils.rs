@@ -469,3 +469,21 @@ pub(crate) fn character_length_to_sql(
         unparser.scalar_function_to_sql(func_name, character_length_args)?,
     ));
 }
+
+/// Converts the `array_element` function call into a SQL subscript expression: `array_expr[index_expr]`.
+pub(crate) fn array_element_to_sql_subscript(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    if args.len() != 2 {
+        return internal_err!("array_element expects 2 arguments, found {}", args.len());
+    }
+
+    let array_expr = unparser.expr_to_sql(&args[0])?;
+    let index_expr = unparser.expr_to_sql(&args[1])?;
+
+    Ok(Some(ast::Expr::Subscript {
+        expr: Box::new(array_expr),
+        subscript: Box::new(ast::Subscript::Index { index: index_expr }),
+    }))
+}
