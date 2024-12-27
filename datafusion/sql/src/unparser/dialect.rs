@@ -152,6 +152,10 @@ pub trait Dialect: Send + Sync {
     ) -> Result<Option<ast::Expr>> {
         Ok(None)
     }
+
+    fn window_func_support_window_frame(&self, _func_name: &str) -> bool {
+        true
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -473,6 +477,7 @@ pub struct CustomDialect {
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
     division_operator: BinaryOperator,
+    window_func_support_window_frame: bool,
 }
 
 impl Default for CustomDialect {
@@ -498,6 +503,7 @@ impl Default for CustomDialect {
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
             division_operator: BinaryOperator::Divide,
+            window_func_support_window_frame: true,
         }
     }
 }
@@ -606,6 +612,10 @@ impl Dialect for CustomDialect {
     fn division_operator(&self) -> BinaryOperator {
         self.division_operator.clone()
     }
+
+    fn window_func_support_window_frame(&self, _func_name: &str) -> bool {
+        self.window_func_support_window_frame
+    }
 }
 
 /// `CustomDialectBuilder` to build `CustomDialect` using builder pattern
@@ -640,6 +650,7 @@ pub struct CustomDialectBuilder {
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
     division_operator: BinaryOperator,
+    window_func_support_window_frame: bool,
 }
 
 impl Default for CustomDialectBuilder {
@@ -671,6 +682,7 @@ impl CustomDialectBuilder {
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
             division_operator: BinaryOperator::Divide,
+            window_func_support_window_frame: true,
         }
     }
 
@@ -694,6 +706,7 @@ impl CustomDialectBuilder {
                 .supports_column_alias_in_table_alias,
             requires_derived_table_alias: self.requires_derived_table_alias,
             division_operator: self.division_operator,
+            window_func_support_window_frame: self.window_func_support_window_frame,
         }
     }
 
@@ -813,6 +826,14 @@ impl CustomDialectBuilder {
 
     pub fn with_division_operator(mut self, division_operator: BinaryOperator) -> Self {
         self.division_operator = division_operator;
+        self
+    }
+
+    pub fn with_window_func_support_window_frame(
+        mut self,
+        window_func_support_window_frame: bool,
+    ) -> Self {
+        self.window_func_support_window_frame = window_func_support_window_frame;
         self
     }
 }

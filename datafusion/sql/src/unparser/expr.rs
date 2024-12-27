@@ -213,8 +213,20 @@ impl Unparser<'_> {
                     .map(|sort_expr| self.sort_to_sql(sort_expr))
                     .collect::<Result<Vec<_>>>()?;
 
-                let start_bound = self.convert_bound(&window_frame.start_bound)?;
-                let end_bound = self.convert_bound(&window_frame.end_bound)?;
+                let window_frame =
+                    if self.dialect.window_func_support_window_frame(func_name) {
+                        let start_bound =
+                            self.convert_bound(&window_frame.start_bound)?;
+                        let end_bound = self.convert_bound(&window_frame.end_bound)?;
+                        Some(ast::WindowFrame {
+                            units,
+                            start_bound,
+                            end_bound: Some(end_bound),
+                        })
+                    } else {
+                        None
+                    };
+
                 let over = Some(ast::WindowType::WindowSpec(ast::WindowSpec {
                     window_name: None,
                     partition_by: partition_by
@@ -222,11 +234,7 @@ impl Unparser<'_> {
                         .map(|e| self.expr_to_sql_inner(e))
                         .collect::<Result<Vec<_>>>()?,
                     order_by,
-                    window_frame: Some(ast::WindowFrame {
-                        units,
-                        start_bound,
-                        end_bound: Option::from(end_bound),
-                    }),
+                    window_frame,
                 }));
 
                 Ok(ast::Expr::Function(Function {
@@ -1479,12 +1487,13 @@ mod tests {
     use datafusion_expr::{
         case, col, cube, exists, grouping_set, interval_datetime_lit,
         interval_year_month_lit, lit, not, not_exists, out_ref_col, placeholder, rollup,
-        table_scan, try_cast, when, wildcard, ColumnarValue, ScalarUDF, ScalarUDFImpl,
-        Signature, Volatility, WindowFrame, WindowFunctionDefinition,
+        table_scan, try_cast, when, wildcard, window_function, ColumnarValue, ScalarUDF,
+        ScalarUDFImpl, Signature, Volatility, WindowFrame, WindowFunctionDefinition,
     };
     use datafusion_expr::{interval_month_day_nano_lit, ExprFunctionExt};
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::expr_fn::sum;
+    use datafusion_functions_window::rank::rank_udwf;
     use datafusion_functions_window::row_number::row_number_udwf;
 
     use crate::unparser::dialect::{
@@ -2196,22 +2205,26 @@ mod tests {
 
     #[test]
     fn test_cast_value_to_binary_expr() {
-        let tests = [(
-            Expr::Cast(Cast {
-                expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(
-                    "blah".to_string(),
-                )))),
-                data_type: DataType::Binary,
-            }),
-            "'blah'",
-            Expr::Cast(Cast {
-                expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(
-                    "blah".to_string(),
-                )))),
-                data_type: DataType::BinaryView,
-            }),
-            "'blah'",
-        )];
+        let tests = [
+            (
+                Expr::Cast(Cast {
+                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(
+                        "blah".to_string(),
+                    )))),
+                    data_type: DataType::Binary,
+                }),
+                "'blah'",
+            ),
+            (
+                Expr::Cast(Cast {
+                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(
+                        "blah".to_string(),
+                    )))),
+                    data_type: DataType::BinaryView,
+                }),
+                "'blah'",
+            ),
+        ];
         for (value, expected) in tests {
             let dialect = CustomDialectBuilder::new().build();
             let unparser = Unparser::new(&dialect);
@@ -2507,6 +2520,38 @@ mod tests {
 
             let actual = format!("{}", ast);
             let expected = format!(r#"round(CAST("a" AS {identifier}), 2)"#);
+
+            assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_window_func_support_window_frame() -> Result<()> {
+        let default_dialect: Arc<dyn Dialect> =
+            Arc::new(CustomDialectBuilder::new().build());
+
+        let test_dialect: Arc<dyn Dialect> = Arc::new(
+            CustomDialectBuilder::new()
+                .with_window_func_support_window_frame(false)
+                .build(),
+        );
+
+        for (dialect, expected) in [
+            (
+                default_dialect,
+                "rank(a) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+            ),
+            (test_dialect, "rank(a) OVER ()"),
+        ] {
+            let unparser = Unparser::new(dialect.as_ref());
+            let func = WindowFunctionDefinition::WindowUDF(rank_udwf());
+            let window_func = WindowFunction::new(func, vec![col("a")]);
+            let expr = Expr::WindowFunction(window_func);
+            let ast = unparser.expr_to_sql(&expr)?;
+
+            let actual = format!("{ast}");
+            let expected = format!("{expected}");
 
             assert_eq!(actual, expected);
         }
