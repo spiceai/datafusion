@@ -19,7 +19,7 @@ use datafusion_expr::expr::Unnest;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
     self, BinaryOperator, Expr as AstExpr, Function, Ident, Interval, ObjectName,
-    TimezoneInfo, UnaryOperator,
+    TimezoneInfo, UnaryOperator, WindowFrameBound,
 };
 use std::sync::Arc;
 use std::vec;
@@ -213,18 +213,32 @@ impl Unparser<'_> {
                     .map(|sort_expr| self.sort_to_sql(sort_expr))
                     .collect::<Result<Vec<_>>>()?;
 
+                let start_bound = self.convert_bound(&window_frame.start_bound)?;
+                let end_bound = self.convert_bound(&window_frame.end_bound)?;
+
                 let window_frame =
-                    if self.dialect.window_func_support_window_frame(func_name) {
-                        let start_bound =
-                            self.convert_bound(&window_frame.start_bound)?;
-                        let end_bound = self.convert_bound(&window_frame.end_bound)?;
+                    if !self.dialect.window_func_support_window_frame(func_name) {
+                        if matches!(start_bound, WindowFrameBound::Preceding(None))
+                            && matches!(
+                                end_bound,
+                                WindowFrameBound::CurrentRow
+                                    | WindowFrameBound::Following(None)
+                            )
+                        {
+                            None
+                        } else {
+                            Some(ast::WindowFrame {
+                                units,
+                                start_bound,
+                                end_bound: Some(end_bound),
+                            })
+                        }
+                    } else {
                         Some(ast::WindowFrame {
                             units,
                             start_bound,
                             end_bound: Some(end_bound),
                         })
-                    } else {
-                        None
                     };
 
                 let over = Some(ast::WindowType::WindowSpec(ast::WindowSpec {
@@ -533,10 +547,10 @@ impl Unparser<'_> {
     fn convert_bound(
         &self,
         bound: &datafusion_expr::window_frame::WindowFrameBound,
-    ) -> Result<ast::WindowFrameBound> {
+    ) -> Result<WindowFrameBound> {
         match bound {
             datafusion_expr::window_frame::WindowFrameBound::Preceding(val) => {
-                Ok(ast::WindowFrameBound::Preceding({
+                Ok(WindowFrameBound::Preceding({
                     let val = self.scalar_to_sql(val)?;
                     if let ast::Expr::Value(ast::Value::Null) = &val {
                         None
@@ -546,7 +560,7 @@ impl Unparser<'_> {
                 }))
             }
             datafusion_expr::window_frame::WindowFrameBound::Following(val) => {
-                Ok(ast::WindowFrameBound::Following({
+                Ok(WindowFrameBound::Following({
                     let val = self.scalar_to_sql(val)?;
                     if let ast::Expr::Value(ast::Value::Null) = &val {
                         None
@@ -556,7 +570,7 @@ impl Unparser<'_> {
                 }))
             }
             datafusion_expr::window_frame::WindowFrameBound::CurrentRow => {
-                Ok(ast::WindowFrameBound::CurrentRow)
+                Ok(WindowFrameBound::CurrentRow)
             }
         }
     }
@@ -1487,8 +1501,8 @@ mod tests {
     use datafusion_expr::{
         case, col, cube, exists, grouping_set, interval_datetime_lit,
         interval_year_month_lit, lit, not, not_exists, out_ref_col, placeholder, rollup,
-        table_scan, try_cast, when, wildcard, window_function, ColumnarValue, ScalarUDF,
-        ScalarUDFImpl, Signature, Volatility, WindowFrame, WindowFunctionDefinition,
+        table_scan, try_cast, when, wildcard, ColumnarValue, ScalarUDF, ScalarUDFImpl,
+        Signature, Volatility, WindowFrame, WindowFunctionDefinition,
     };
     use datafusion_expr::{interval_month_day_nano_lit, ExprFunctionExt};
     use datafusion_functions_aggregate::count::count_udaf;
