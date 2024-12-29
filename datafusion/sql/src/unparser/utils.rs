@@ -476,7 +476,8 @@ pub(crate) fn character_length_to_sql(
 ///
 /// # Errors
 ///
-/// Returns an error if the number of arguments is not 1 - the column or expression to convert.
+/// - If the number of arguments is not 1 - the column or expression to convert.
+/// - If the scalar function cannot be converted to SQL.
 pub(crate) fn sqlite_from_unixtime_to_sql(
     unparser: &Unparser,
     from_unixtime_args: &[Expr],
@@ -502,7 +503,8 @@ pub(crate) fn sqlite_from_unixtime_to_sql(
 ///
 /// # Errors
 ///
-/// Returns an error if the number of arguments is not 2 - truncation unit and the column or expression to convert.
+/// - If the number of arguments is not 2 - truncation unit and the column or expression to convert.
+/// - If the scalar function cannot be converted to SQL.
 pub(crate) fn sqlite_date_trunc_to_sql(
     unparser: &Unparser,
     date_trunc_args: &[Expr],
