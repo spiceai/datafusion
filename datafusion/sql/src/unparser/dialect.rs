@@ -21,7 +21,9 @@ use arrow_schema::TimeUnit;
 use datafusion_expr::Expr;
 use regex::Regex;
 use sqlparser::{
-    ast::{self, BinaryOperator, Function, Ident, ObjectName, TimezoneInfo},
+    ast::{
+        self, BinaryOperator, Function, Ident, ObjectName, TimezoneInfo, WindowFrameBound,
+    },
     keywords::ALL_KEYWORDS,
 };
 
@@ -153,7 +155,15 @@ pub trait Dialect: Send + Sync {
         Ok(None)
     }
 
-    fn window_func_support_window_frame(&self, _func_name: &str) -> bool {
+    /// Allows the dialect to choose to omit window frame in unparsing
+    /// based on function name and window frame bound
+    /// Returns false if specific function name / window frame bound inidcates no window frame is needed in unparsing
+    fn window_func_support_window_frame(
+        &self,
+        _func_name: &str,
+        _start_bound: &WindowFrameBound,
+        _end_bound: &WindowFrameBound,
+    ) -> bool {
         true
     }
 }
@@ -613,7 +623,12 @@ impl Dialect for CustomDialect {
         self.division_operator.clone()
     }
 
-    fn window_func_support_window_frame(&self, _func_name: &str) -> bool {
+    fn window_func_support_window_frame(
+        &self,
+        _func_name: &str,
+        _start_bound: &WindowFrameBound,
+        _end_bound: &WindowFrameBound,
+    ) -> bool {
         self.window_func_support_window_frame
     }
 }

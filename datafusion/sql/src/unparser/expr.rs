@@ -216,30 +216,19 @@ impl Unparser<'_> {
                 let start_bound = self.convert_bound(&window_frame.start_bound)?;
                 let end_bound = self.convert_bound(&window_frame.end_bound)?;
 
-                let window_frame =
-                    if !self.dialect.window_func_support_window_frame(func_name) {
-                        if matches!(start_bound, WindowFrameBound::Preceding(None))
-                            && matches!(
-                                end_bound,
-                                WindowFrameBound::CurrentRow
-                                    | WindowFrameBound::Following(None)
-                            )
-                        {
-                            None
-                        } else {
-                            Some(ast::WindowFrame {
-                                units,
-                                start_bound,
-                                end_bound: Some(end_bound),
-                            })
-                        }
-                    } else {
-                        Some(ast::WindowFrame {
-                            units,
-                            start_bound,
-                            end_bound: Some(end_bound),
-                        })
-                    };
+                let window_frame = if self.dialect.window_func_support_window_frame(
+                    func_name,
+                    &start_bound,
+                    &end_bound,
+                ) {
+                    Some(ast::WindowFrame {
+                        units,
+                        start_bound,
+                        end_bound: Some(end_bound),
+                    })
+                } else {
+                    None
+                };
 
                 let over = Some(ast::WindowType::WindowSpec(ast::WindowSpec {
                     window_name: None,
@@ -547,10 +536,10 @@ impl Unparser<'_> {
     fn convert_bound(
         &self,
         bound: &datafusion_expr::window_frame::WindowFrameBound,
-    ) -> Result<WindowFrameBound> {
+    ) -> Result<ast::WindowFrameBound> {
         match bound {
             datafusion_expr::window_frame::WindowFrameBound::Preceding(val) => {
-                Ok(WindowFrameBound::Preceding({
+                Ok(ast::WindowFrameBound::Preceding({
                     let val = self.scalar_to_sql(val)?;
                     if let ast::Expr::Value(ast::Value::Null) = &val {
                         None
@@ -560,7 +549,7 @@ impl Unparser<'_> {
                 }))
             }
             datafusion_expr::window_frame::WindowFrameBound::Following(val) => {
-                Ok(WindowFrameBound::Following({
+                Ok(ast::WindowFrameBound::Following({
                     let val = self.scalar_to_sql(val)?;
                     if let ast::Expr::Value(ast::Value::Null) = &val {
                         None
@@ -570,7 +559,7 @@ impl Unparser<'_> {
                 }))
             }
             datafusion_expr::window_frame::WindowFrameBound::CurrentRow => {
-                Ok(WindowFrameBound::CurrentRow)
+                Ok(ast::WindowFrameBound::CurrentRow)
             }
         }
     }
