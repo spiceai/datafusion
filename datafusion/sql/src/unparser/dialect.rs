@@ -28,7 +28,10 @@ use sqlparser::{
 use datafusion_common::Result;
 
 use super::{
-    utils::{array_element_to_sql_subscript, character_length_to_sql, date_part_to_sql},
+    utils::{
+        array_element_to_sql_subscript, character_length_to_sql, date_part_to_sql,
+        sqlite_date_trunc_to_sql, sqlite_from_unixtime_to_sql,
+    },
     Unparser,
 };
 
@@ -450,6 +453,12 @@ impl Dialect for SqliteDialect {
                     self.character_length_style(),
                     args,
                 );
+            }
+            "from_unixtime" => {
+                return sqlite_from_unixtime_to_sql(unparser, args);
+            }
+            "date_trunc" => {
+                return sqlite_date_trunc_to_sql(unparser, args);
             }
             _ => return Ok(None),
         }
