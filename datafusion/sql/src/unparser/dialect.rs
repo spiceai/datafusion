@@ -29,7 +29,13 @@ use sqlparser::{
     keywords::ALL_KEYWORDS,
 };
 
-use super::{utils::character_length_to_sql, utils::date_part_to_sql, Unparser};
+use super::{
+    utils::{
+        character_length_to_sql, date_part_to_sql, sqlite_date_trunc_to_sql,
+        sqlite_from_unixtime_to_sql,
+    },
+    Unparser,
+};
 
 pub type ScalarFnToSqlHandler =
     Box<dyn Fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>> + Send + Sync>;
@@ -491,7 +497,13 @@ impl Dialect for SqliteDialect {
             "character_length" => {
                 character_length_to_sql(unparser, self.character_length_style(), args)
             }
-            _ => Ok(None),
+            "from_unixtime" => {
+                return sqlite_from_unixtime_to_sql(unparser, args);
+            }
+            "date_trunc" => {
+                return sqlite_date_trunc_to_sql(unparser, args);
+            }
+            _ => return Ok(None),
         }
     }
 }
