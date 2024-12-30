@@ -157,7 +157,7 @@ pub trait Dialect: Send + Sync {
 
     /// Allows the dialect to choose to omit window frame in unparsing
     /// based on function name and window frame bound
-    /// Returns false if specific function name / window frame bound inidcates no window frame is needed in unparsing
+    /// Returns false if specific function name / window frame bound indicates no window frame is needed in unparsing
     fn window_func_support_window_frame(
         &self,
         _func_name: &str,
