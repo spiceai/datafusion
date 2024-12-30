@@ -2543,13 +2543,13 @@ mod tests {
         for (dialect, expected) in [
             (
                 default_dialect,
-                "rank(a) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+                "rank() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
             ),
-            (test_dialect, "rank(a) OVER ()"),
+            (test_dialect, "rank() OVER ()"),
         ] {
             let unparser = Unparser::new(dialect.as_ref());
             let func = WindowFunctionDefinition::WindowUDF(rank_udwf());
-            let window_func = WindowFunction::new(func, vec![col("a")]);
+            let window_func = WindowFunction::new(func, vec![]);
             let expr = Expr::WindowFunction(window_func);
             let ast = unparser.expr_to_sql(&expr)?;
 
