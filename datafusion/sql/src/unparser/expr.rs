@@ -19,7 +19,7 @@ use datafusion_expr::expr::Unnest;
 use sqlparser::ast::Value::SingleQuotedString;
 use sqlparser::ast::{
     self, BinaryOperator, Expr as AstExpr, Function, Ident, Interval, ObjectName,
-    TimezoneInfo, UnaryOperator, WindowFrameBound,
+    TimezoneInfo, UnaryOperator,
 };
 use std::sync::Arc;
 use std::vec;
@@ -2543,13 +2543,14 @@ mod tests {
         for (dialect, expected) in [
             (
                 default_dialect,
-                "rank() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
+                "rank() OVER (ORDER BY a ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING)",
             ),
-            (test_dialect, "rank() OVER ()"),
+            (test_dialect, "rank() OVER (ORDER BY a ASC NULLS FIRST)"),
         ] {
             let unparser = Unparser::new(dialect.as_ref());
             let func = WindowFunctionDefinition::WindowUDF(rank_udwf());
-            let window_func = WindowFunction::new(func, vec![]);
+            let mut window_func = WindowFunction::new(func, vec![]);
+            window_func.order_by = vec![Sort::new(col("a"), true, true)];
             let expr = Expr::WindowFunction(window_func);
             let ast = unparser.expr_to_sql(&expr)?;
 
