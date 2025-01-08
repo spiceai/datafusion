@@ -20,8 +20,11 @@ use std::vec;
 
 use arrow_schema::*;
 use datafusion_common::{DFSchema, Result, TableReference};
+use datafusion_expr::expr::Exists;
 use datafusion_expr::test::function_stub::{count_udaf, max_udaf, min_udaf, sum_udaf};
-use datafusion_expr::{col, lit, table_scan, wildcard, LogicalPlanBuilder};
+use datafusion_expr::{
+    col, lit, table_scan, wildcard, Expr, LogicalPlanBuilder, Subquery,
+};
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
 use datafusion_functions_nested::make_array::make_array_udf;
@@ -1191,6 +1194,66 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_duplicated_filter)?;
 
     let expected_sql = r#"SELECT * FROM left_table AS "left" JOIN right_table ON "left".id = right_table.id AND (("left".id > 5) AND ("left"."name" LIKE 'some_name' AND (right_table.age > 10)))"#;
+
+    assert_eq!(sql.to_string(), expected_sql);
+
+    Ok(())
+}
+
+#[test]
+fn test_correlated_subquery_with_aliases() -> Result<()> {
+    let schema_supplier = Schema::new(vec![
+        Field::new("s_suppkey", DataType::Utf8, false),
+        Field::new("s_name", DataType::Utf8, false),
+    ]);
+
+    let schema_lineitem = Schema::new(vec![
+        Field::new("l_orderkey", DataType::Utf8, false),
+        Field::new("l_suppkey", DataType::Utf8, false),
+    ]);
+
+    let supplier_plan =
+        table_scan_with_filters(Some("supplier"), &schema_supplier, None, vec![])?
+            .build()?;
+
+    let lineitem_plan_l1 =
+        table_scan_with_filters(Some("lineitem"), &schema_lineitem, None, vec![])?
+            .alias("l1")?
+            .build()?;
+
+    let lineitem_plan_l2 =
+        table_scan_with_filters(Some("lineitem"), &schema_lineitem, None, vec![])?
+            .alias("l2")?
+            .build()?;
+
+    let subquery_plan = LogicalPlanBuilder::from(lineitem_plan_l2)
+        .filter(col("l2.l_orderkey").eq(col("l1.l_orderkey")))?
+        .project(vec![lit(1)])?
+        .build()?;
+
+    let subquery = Subquery {
+        subquery: Arc::new(subquery_plan),
+        outer_ref_columns: vec![col("l1.l_orderkey")],
+    };
+
+    let exists_expr = Exists {
+        subquery,
+        negated: false,
+    };
+
+    let join_plan = LogicalPlanBuilder::from(supplier_plan)
+        .join(
+            lineitem_plan_l1,
+            datafusion_expr::JoinType::Inner,
+            (vec!["s_suppkey"], vec!["l1.l_suppkey"]),
+            Some(Expr::Exists(exists_expr)),
+        )?
+        .project(vec![col("supplier.s_name")])?
+        .build()?;
+
+    let sql = plan_to_sql(&join_plan)?;
+
+    let expected_sql = r#"SELECT supplier.s_name FROM supplier JOIN lineitem AS l1 ON supplier.s_suppkey = l1.l_suppkey AND EXISTS (SELECT 1 FROM lineitem AS l2 WHERE (l2.l_orderkey = l1.l_orderkey))"#;
 
     assert_eq!(sql.to_string(), expected_sql);
 

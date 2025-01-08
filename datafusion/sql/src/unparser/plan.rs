@@ -42,6 +42,7 @@ use datafusion_expr::{
     expr::Alias, BinaryExpr, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan,
 };
+use log::info;
 use sqlparser::ast::{self, Ident, SetExpr};
 use std::sync::Arc;
 
@@ -532,6 +533,8 @@ impl Unparser<'_> {
             LogicalPlan::Join(join) => {
                 let mut table_scan_filters = vec![];
 
+                println!("\n!DF Join: {:?}\n", join);
+
                 let left_plan =
                     match try_transform_to_simple_table_scan_with_filters(&join.left)? {
                         Some((plan, filters)) => {
@@ -605,6 +608,19 @@ impl Unparser<'_> {
                     select,
                     &mut right_relation,
                 )?;
+
+                info!("Join: {:?}", join);
+
+                // Ensure that the right_relation preserves any subquery aliases
+                if let LogicalPlan::SubqueryAlias(subquery_alias) = right_plan.as_ref() {
+                    let alias = subquery_alias.alias.clone();
+
+                    info!("Joining right relation with alias: {:?}", alias);
+
+                    right_relation.alias(Some(
+                        self.new_table_alias(alias.table().to_string(), vec![]),
+                    ));
+                }
 
                 let Ok(Some(relation)) = right_relation.build() else {
                     return internal_err!("Failed to build right relation");
