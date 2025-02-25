@@ -40,7 +40,7 @@ use datafusion_expr::{SortExpr, TableType};
 use datafusion_physical_plan::{empty::EmptyExec, ExecutionPlan, Statistics};
 
 use arrow::datatypes::{DataType, Field, SchemaBuilder, SchemaRef};
-use arrow_schema::Schema;
+use arrow_schema::{Schema, TimeUnit};
 use datafusion_common::{
     config_datafusion_err, internal_err, plan_err, project_schema, Constraints,
     SchemaExt, ToDFSchema,
@@ -58,6 +58,8 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::{future, stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ObjectStore;
+
+const METADATA_COLUMNS: [&str; 3] = ["location", "last_modified", "size"];
 
 /// Configuration for creating a [`ListingTable`]
 #[derive(Debug, Clone)]
@@ -259,6 +261,9 @@ pub struct ListingOptions {
     ///       multiple equivalent orderings, the outer `Vec` will have a
     ///       single element.
     pub file_sort_order: Vec<Vec<SortExpr>>,
+    /// Additional columns to include in the table schema, based on the metadata of the files.
+    /// See [Self::with_metadata_cols] for details.
+    pub metadata_cols: Vec<String>,
 }
 
 impl ListingOptions {
@@ -276,6 +281,7 @@ impl ListingOptions {
             collect_stat: true,
             target_partitions: 1,
             file_sort_order: vec![],
+            metadata_cols: vec![],
         }
     }
 
@@ -394,6 +400,50 @@ impl ListingOptions {
         self
     }
 
+    /// Set metadata columns on [`ListingOptions`] and returns self.
+    ///
+    /// "metadata columns" are columns that are computed from the `ObjectMeta` of the files from object store.
+    ///
+    /// Available metadata columns:
+    /// - `location`: The full path to the object
+    /// - `last_modified`: The last modified time
+    /// - `size`: The size in bytes of the object
+    ///
+    /// For example, given the following files in object store:
+    ///
+    /// ```text
+    /// /mnt/nyctaxi/tripdata01.parquet
+    /// /mnt/nyctaxi/tripdata02.parquet
+    /// /mnt/nyctaxi/tripdata03.parquet
+    /// ```
+    ///
+    /// If the `last_modified` field in the `ObjectMeta` for `tripdata01.parquet` is `2024-01-01 12:00:00`,
+    /// then the table schema will include a column named `last_modified` with the value `2024-01-01 12:00:00`
+    /// for all rows read from `tripdata01.parquet`.
+    ///
+    /// | <other columns> | last_modified         |
+    /// |-----------------|-----------------------|
+    /// | ...             | 2024-01-01 12:00:00   |
+    /// | ...             | 2024-01-02 15:30:00   |
+    /// | ...             | 2024-01-03 09:15:00   |
+    ///
+    /// # Example
+    /// ```
+    /// # use std::sync::Arc;
+    /// # use datafusion::datasource::{listing::ListingOptions, file_format::parquet::ParquetFormat};
+    ///
+    /// let listing_options = ListingOptions::new(Arc::new(
+    ///     ParquetFormat::default()
+    ///   ))
+    ///   .with_metadata_cols(vec!["last_modified".to_string()]);
+    ///
+    /// assert_eq!(listing_options.metadata_cols, vec!["last_modified".to_string()]);
+    /// ```
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<String>) -> Self {
+        self.metadata_cols = metadata_cols;
+        self
+    }
+
     /// Set stat collection on [`ListingOptions`] and returns self.
     ///
     /// ```
@@ -476,6 +526,25 @@ impl ListingOptions {
         let schema = self.format.infer_schema(state, &store, &files).await?;
 
         Ok(schema)
+    }
+
+    /// Validates that the metadata columns do not already exist in the schema, and are one of the allowed metadata columns.
+    pub fn validate_metadata_cols(&self, schema: &SchemaRef) -> Result<()> {
+        for col in self.metadata_cols.iter() {
+            if schema.column_with_name(col).is_some() {
+                return plan_err!("Column {} already exists in schema", col);
+            }
+
+            if !METADATA_COLUMNS.contains(&col.as_str()) {
+                return plan_err!(
+                    "Metadata column {} invalid; must be one of {:?}",
+                    col,
+                    METADATA_COLUMNS
+                );
+            }
+        }
+
+        Ok(())
     }
 
     /// Infers the partition columns stored in `LOCATION` and compares
@@ -583,6 +652,15 @@ impl ListingOptions {
             }
         }
     }
+
+    pub(crate) fn metadata_column_type(col: &str) -> Result<DataType> {
+        match col {
+            "location" => Ok(DataType::Utf8),
+            "last_modified" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+            "size" => Ok(DataType::UInt64),
+            _ => plan_err!("Invalid metadata column: {}", col),
+        }
+    }
 }
 
 /// Reads data from one or more files as a single table.
@@ -684,7 +762,7 @@ pub struct ListingTable {
     table_paths: Vec<ListingTableUrl>,
     /// File fields only
     file_schema: SchemaRef,
-    /// File fields + partition columns
+    /// File fields + partition columns + metadata columns
     table_schema: SchemaRef,
     options: ListingOptions,
     definition: Option<String>,
@@ -701,9 +779,8 @@ impl ListingTable {
     /// `ListingOptions` and `SchemaRef` are optional.  If they are not
     /// provided the file type is inferred based on the file suffix.
     /// If the schema is provided then it must be resolved before creating the table
-    /// and should contain the fields of the file without the table
-    /// partitioning columns.
-    ///
+    /// and should contain the fields of the file without the extended table columns,
+    /// i.e. the partitioning and metadata columns.
     pub fn try_new(config: ListingTableConfig) -> Result<Self> {
         let file_schema = config
             .file_schema
@@ -717,6 +794,16 @@ impl ListingTable {
         let mut builder = SchemaBuilder::from(file_schema.as_ref().to_owned());
         for (part_col_name, part_col_type) in &options.table_partition_cols {
             builder.push(Field::new(part_col_name, part_col_type.clone(), false));
+        }
+
+        // Validate and add metadata columns to the schema
+        options.validate_metadata_cols(&file_schema)?;
+        for col in &options.metadata_cols {
+            builder.push(Field::new(
+                col,
+                ListingOptions::metadata_column_type(col)?,
+                false,
+            ));
         }
 
         let table_schema = Arc::new(
@@ -786,16 +873,38 @@ impl ListingTable {
     fn try_create_output_ordering(&self) -> Result<Vec<LexOrdering>> {
         create_ordering(&self.table_schema, &self.options.file_sort_order)
     }
+
+    fn partition_column_fields(&self) -> Result<Vec<&Field>> {
+        self.options
+            .table_partition_cols
+            .iter()
+            .map(|col| &col.0)
+            .chain(self.options.metadata_cols.iter())
+            .map(|col| Ok(self.table_schema.field_with_name(col)?))
+            .collect::<Result<Vec<_>>>()
+    }
+
+    fn partition_column_names(&self) -> Result<impl Iterator<Item = &str>> {
+        Ok(self
+            .options
+            .table_partition_cols
+            .iter()
+            .map(|col| col.0.as_str()))
+    }
+
+    fn metadata_column_names(&self) -> impl Iterator<Item = &str> {
+        self.options.metadata_cols.iter().map(|col| col.as_str())
+    }
 }
 
-// Expressions can be used for parttion pruning if they can be evaluated using
-// only the partiton columns and there are partition columns.
-fn can_be_evaluted_for_partition_pruning(
-    partition_column_names: &[&str],
+// Expressions can be used for extended columns (partition/metadata) pruning if they can be evaluated using
+// only the extended columns and there are extended columns.
+fn can_be_evaluated_for_extended_col_pruning(
+    extended_column_names: &[&str],
     expr: &Expr,
 ) -> bool {
-    !partition_column_names.is_empty()
-        && expr_applicable_for_cols(partition_column_names, expr)
+    !extended_column_names.is_empty()
+        && expr_applicable_for_cols(extended_column_names, expr)
 }
 
 #[async_trait]
@@ -823,23 +932,20 @@ impl TableProvider for ListingTable {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // extract types of partition columns
-        let table_partition_cols = self
-            .options
-            .table_partition_cols
-            .iter()
-            .map(|col| Ok(self.table_schema.field_with_name(&col.0)?.clone()))
-            .collect::<Result<Vec<_>>>()?;
-
-        let table_partition_col_names = table_partition_cols
-            .iter()
-            .map(|field| field.name().as_str())
+        // extract types of extended columns (partition + metadata columns)
+        let extended_table_col_names = self
+            .partition_column_names()?
+            .chain(self.metadata_column_names())
             .collect::<Vec<_>>();
-        // If the filters can be resolved using only partition cols, there is no need to
-        // pushdown it to TableScan, otherwise, `unhandled` pruning predicates will be generated
+
+        // If the filters can be resolved using only partition/metadata cols, there is no need to
+        // push it down to the TableScan, otherwise, `unhandled` pruning predicates will be generated
         let (partition_filters, filters): (Vec<_>, Vec<_>) =
             filters.iter().cloned().partition(|filter| {
-                can_be_evaluted_for_partition_pruning(&table_partition_col_names, filter)
+                can_be_evaluated_for_extended_col_pruning(
+                    &extended_table_col_names,
+                    filter,
+                )
             });
         // TODO (https://github.com/apache/datafusion/issues/11600) remove downcast_ref from here?
         let session_state = state.as_any().downcast_ref::<SessionState>().unwrap();
@@ -899,6 +1005,12 @@ impl TableProvider for ListingTable {
             return Ok(Arc::new(EmptyExec::new(Arc::new(Schema::empty()))));
         };
 
+        let table_partition_cols = self
+            .partition_column_fields()?
+            .into_iter()
+            .cloned()
+            .collect();
+
         // create the execution plan
         self.options
             .format
@@ -920,18 +1032,19 @@ impl TableProvider for ListingTable {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        let partition_column_names = self
-            .options
-            .table_partition_cols
-            .iter()
-            .map(|col| col.0.as_str())
+        let extended_column_names = self
+            .partition_column_names()?
+            .chain(self.metadata_column_names())
             .collect::<Vec<_>>();
+
         filters
             .iter()
             .map(|filter| {
-                if can_be_evaluted_for_partition_pruning(&partition_column_names, filter)
-                {
-                    // if filter can be handled by partition pruning, it is exact
+                if can_be_evaluated_for_extended_col_pruning(
+                    &extended_column_names,
+                    filter,
+                ) {
+                    // if filter can be handled by pruning from the extended columns, it is exact
                     return Ok(TableProviderFilterPushDown::Exact);
                 }
 
