@@ -39,9 +39,14 @@ use datafusion_common::DataFusionError;
 use datafusion_expr::Expr;
 use object_store::ObjectMeta;
 
-pub(crate) enum MetadataColumn {
+/// A metadata column that can be used to filter files
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MetadataColumn {
+    /// The location of the file in object store
     Location,
+    /// The last modified timestamp of the file
     LastModified,
+    /// The size of the file in bytes
     Size,
 }
 
@@ -51,6 +56,70 @@ impl fmt::Display for MetadataColumn {
             MetadataColumn::Location => write!(f, "location"),
             MetadataColumn::LastModified => write!(f, "last_modified"),
             MetadataColumn::Size => write!(f, "size"),
+        }
+    }
+}
+
+impl MetadataColumn {
+    /// Returns the arrow type of this metadata column
+    pub fn arrow_type(&self) -> DataType {
+        match self {
+            MetadataColumn::Location => DataType::Utf8,
+            MetadataColumn::LastModified => {
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+            }
+            MetadataColumn::Size => DataType::UInt64,
+        }
+    }
+
+    /// Returns the arrow field for this metadata column
+    pub fn field(&self) -> Field {
+        Field::new(self.to_string(), self.arrow_type(), true)
+    }
+
+    /// Returns the scalar value for this metadata column given an object meta
+    pub fn to_scalar_value(&self, meta: &ObjectMeta) -> ScalarValue {
+        match self {
+            MetadataColumn::Location => {
+                ScalarValue::Utf8(Some(meta.location.to_string()))
+            }
+            MetadataColumn::LastModified => ScalarValue::TimestampMicrosecond(
+                Some(meta.last_modified.timestamp_micros()),
+                Some("UTC".into()),
+            ),
+            MetadataColumn::Size => ScalarValue::UInt64(Some(meta.size as u64)),
+        }
+    }
+
+    pub(crate) fn builder(&self, capacity: usize) -> MetadataBuilder {
+        match self {
+            MetadataColumn::Location => MetadataBuilder::Location(
+                StringBuilder::with_capacity(capacity, capacity * 10),
+            ),
+            MetadataColumn::LastModified => MetadataBuilder::LastModified(
+                TimestampMicrosecondBuilder::with_capacity(capacity).with_data_type(
+                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                ),
+            ),
+            MetadataColumn::Size => {
+                MetadataBuilder::Size(UInt64Builder::with_capacity(capacity))
+            }
+        }
+    }
+}
+
+impl FromStr for MetadataColumn {
+    type Err = DataFusionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "location" => Ok(MetadataColumn::Location),
+            "last_modified" => Ok(MetadataColumn::LastModified),
+            "size" => Ok(MetadataColumn::Size),
+            _ => plan_err!(
+                "Invalid metadata column: {}, expected: location, last_modified, or size",
+                s
+            ),
         }
     }
 }
@@ -77,63 +146,6 @@ impl MetadataBuilder {
             MetadataBuilder::Location(mut builder) => Arc::new(builder.finish()),
             MetadataBuilder::LastModified(mut builder) => Arc::new(builder.finish()),
             MetadataBuilder::Size(mut builder) => Arc::new(builder.finish()),
-        }
-    }
-}
-
-impl MetadataColumn {
-    pub fn arrow_type(&self) -> DataType {
-        match self {
-            MetadataColumn::Location => DataType::Utf8,
-            MetadataColumn::LastModified => {
-                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
-            }
-            MetadataColumn::Size => DataType::UInt64,
-        }
-    }
-
-    pub fn builder(&self, capacity: usize) -> MetadataBuilder {
-        match self {
-            MetadataColumn::Location => MetadataBuilder::Location(
-                StringBuilder::with_capacity(capacity, capacity * 10),
-            ),
-            MetadataColumn::LastModified => MetadataBuilder::LastModified(
-                TimestampMicrosecondBuilder::with_capacity(capacity).with_data_type(
-                    DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-                ),
-            ),
-            MetadataColumn::Size => {
-                MetadataBuilder::Size(UInt64Builder::with_capacity(capacity))
-            }
-        }
-    }
-
-    pub fn to_scalar_value(&self, meta: &ObjectMeta) -> ScalarValue {
-        match self {
-            MetadataColumn::Location => {
-                ScalarValue::Utf8(Some(meta.location.to_string()))
-            }
-            MetadataColumn::LastModified => ScalarValue::TimestampMicrosecond(
-                Some(meta.last_modified.timestamp_micros()),
-                Some("UTC".into()),
-            ),
-            MetadataColumn::Size => ScalarValue::UInt64(Some(meta.size as u64)),
-        }
-    }
-}
-
-impl FromStr for MetadataColumn {
-    type Err = DataFusionError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "location" => Ok(MetadataColumn::Location),
-            "last_modified" => Ok(MetadataColumn::LastModified),
-            "size" => Ok(MetadataColumn::Size),
-            _ => plan_err!(
-                "Invalid metadata column: {}, expected: location, last_modified, or size",
-                s
-            ),
         }
     }
 }

@@ -24,7 +24,10 @@ use std::{
 };
 
 use super::{get_projected_output_ordering, statistics::MinMaxStatistics};
-use crate::datasource::{listing::PartitionedFile, object_store::ObjectStoreUrl};
+use crate::datasource::{
+    listing::{MetadataColumn, PartitionedFile},
+    object_store::ObjectStoreUrl,
+};
 use crate::{error::Result, scalar::ScalarValue};
 
 use arrow::array::{ArrayData, BufferBuilder};
@@ -126,6 +129,8 @@ pub struct FileScanConfig {
     pub limit: Option<usize>,
     /// The partitioning columns
     pub table_partition_cols: Vec<Field>,
+    /// The metadata columns
+    pub metadata_cols: Vec<MetadataColumn>,
     /// All equivalent lexicographical orderings that describe the schema.
     pub output_ordering: Vec<LexOrdering>,
 }
@@ -151,6 +156,7 @@ impl FileScanConfig {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
+            metadata_cols: vec![],
             output_ordering: vec![],
         }
     }
@@ -205,6 +211,12 @@ impl FileScanConfig {
         self
     }
 
+    /// Set the metadata columns of the files
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
+        self.metadata_cols = metadata_cols;
+        self
+    }
+
     /// Set the output ordering of the files
     pub fn with_output_ordering(mut self, output_ordering: Vec<LexOrdering>) -> Self {
         self.output_ordering = output_ordering;
@@ -224,23 +236,19 @@ impl FileScanConfig {
         let proj_iter: Box<dyn Iterator<Item = usize>> = match &self.projection {
             Some(proj) => Box::new(proj.iter().copied()),
             None => Box::new(
-                0..(self.file_schema.fields().len() + self.table_partition_cols.len()),
+                0..(self.file_schema.fields().len()
+                    + self.table_partition_cols.len()
+                    + self.metadata_cols.len()),
             ),
         };
 
         let mut table_fields = vec![];
         let mut table_cols_stats = vec![];
+
         for idx in proj_iter {
-            if idx < self.file_schema.fields().len() {
-                let field = self.file_schema.field(idx);
-                table_fields.push(field.clone());
-                table_cols_stats.push(self.statistics.column_statistics[idx].clone())
-            } else {
-                let partition_idx = idx - self.file_schema.fields().len();
-                table_fields.push(self.table_partition_cols[partition_idx].to_owned());
-                // TODO provide accurate stat for partition column (#1186)
-                table_cols_stats.push(ColumnStatistics::new_unknown())
-            }
+            let (field, stats) = self.get_field_and_stats(idx);
+            table_fields.push(field);
+            table_cols_stats.push(stats);
         }
 
         let table_stats = Statistics {
@@ -259,6 +267,38 @@ impl FileScanConfig {
             get_projected_output_ordering(self, &projected_schema);
 
         (projected_schema, table_stats, projected_output_ordering)
+    }
+
+    /// Helper function to get field and statistics for a given index
+    fn get_field_and_stats(&self, idx: usize) -> (Field, ColumnStatistics) {
+        let file_schema_len = self.file_schema.fields().len();
+        let partition_cols_len = self.table_partition_cols.len();
+
+        match idx {
+            // File schema columns
+            i if i < file_schema_len => (
+                self.file_schema.field(i).clone(),
+                self.statistics.column_statistics[i].clone(),
+            ),
+
+            // Partition columns
+            i if i < file_schema_len + partition_cols_len => {
+                let partition_idx = i - file_schema_len;
+                (
+                    self.table_partition_cols[partition_idx].to_owned(),
+                    ColumnStatistics::new_unknown(),
+                )
+            }
+
+            // Metadata columns
+            i => {
+                let metadata_idx = i - file_schema_len - partition_cols_len;
+                (
+                    self.metadata_cols[metadata_idx].field(),
+                    ColumnStatistics::new_unknown(),
+                )
+            }
+        }
     }
 
     #[cfg_attr(not(feature = "avro"), allow(unused))] // Only used by avro
