@@ -19,6 +19,7 @@
 //! to get the list of files to process.
 
 mod helpers;
+mod metadata;
 mod table;
 mod url;
 

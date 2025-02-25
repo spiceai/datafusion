@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::{any::Any, str::FromStr, sync::Arc};
 
 use super::helpers::{expr_applicable_for_cols, pruned_partition_list, split_files};
+use super::metadata::{apply_metadata_filters, MetadataColumn};
 use super::{ListingTableUrl, PartitionedFile};
 
 use crate::datasource::{
@@ -40,7 +41,7 @@ use datafusion_expr::{SortExpr, TableType};
 use datafusion_physical_plan::{empty::EmptyExec, ExecutionPlan, Statistics};
 
 use arrow::datatypes::{DataType, Field, SchemaBuilder, SchemaRef};
-use arrow_schema::{Schema, TimeUnit};
+use arrow_schema::Schema;
 use datafusion_common::{
     config_datafusion_err, internal_err, plan_err, project_schema, Constraints,
     SchemaExt, ToDFSchema,
@@ -58,8 +59,6 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::{future, stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ObjectStore;
-
-const METADATA_COLUMNS: [&str; 3] = ["location", "last_modified", "size"];
 
 /// Configuration for creating a [`ListingTable`]
 #[derive(Debug, Clone)]
@@ -535,13 +534,7 @@ impl ListingOptions {
                 return plan_err!("Column {} already exists in schema", col);
             }
 
-            if !METADATA_COLUMNS.contains(&col.as_str()) {
-                return plan_err!(
-                    "Metadata column {} invalid; must be one of {:?}",
-                    col,
-                    METADATA_COLUMNS
-                );
-            }
+            let _ = MetadataColumn::from_str(col)?;
         }
 
         Ok(())
@@ -650,15 +643,6 @@ impl ListingOptions {
                 sorted_diff.sort();
                 plan_err!("Found mixed partition values on disk {:?}", sorted_diff)
             }
-        }
-    }
-
-    pub(crate) fn metadata_column_type(col: &str) -> Result<DataType> {
-        match col {
-            "location" => Ok(DataType::Utf8),
-            "last_modified" => Ok(DataType::Timestamp(TimeUnit::Nanosecond, None)),
-            "size" => Ok(DataType::UInt64),
-            _ => plan_err!("Invalid metadata column: {}", col),
         }
     }
 }
@@ -801,7 +785,7 @@ impl ListingTable {
         for col in &options.metadata_cols {
             builder.push(Field::new(
                 col,
-                ListingOptions::metadata_column_type(col)?,
+                MetadataColumn::from_str(col)?.arrow_type(),
                 false,
             ));
         }
@@ -933,24 +917,28 @@ impl TableProvider for ListingTable {
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // extract types of extended columns (partition + metadata columns)
-        let extended_table_col_names = self
-            .partition_column_names()?
-            .chain(self.metadata_column_names())
-            .collect::<Vec<_>>();
+        let partition_col_names = self.partition_column_names()?.collect::<Vec<_>>();
+        let metadata_col_names = self.metadata_column_names().collect::<Vec<_>>();
 
         // If the filters can be resolved using only partition/metadata cols, there is no need to
         // push it down to the TableScan, otherwise, `unhandled` pruning predicates will be generated
         let (partition_filters, filters): (Vec<_>, Vec<_>) =
             filters.iter().cloned().partition(|filter| {
-                can_be_evaluated_for_extended_col_pruning(
-                    &extended_table_col_names,
-                    filter,
-                )
+                can_be_evaluated_for_extended_col_pruning(&partition_col_names, filter)
+            });
+        let (metadata_filters, filters): (Vec<_>, Vec<_>) =
+            filters.iter().cloned().partition(|filter| {
+                can_be_evaluated_for_extended_col_pruning(&metadata_col_names, filter)
             });
         // TODO (https://github.com/apache/datafusion/issues/11600) remove downcast_ref from here?
         let session_state = state.as_any().downcast_ref::<SessionState>().unwrap();
         let (mut partitioned_file_lists, statistics) = self
-            .list_files_for_scan(session_state, &partition_filters, limit)
+            .list_files_for_scan(
+                session_state,
+                &partition_filters,
+                &metadata_filters,
+                limit,
+            )
             .await?;
 
         // if no files need to be read, return an `EmptyExec`
@@ -988,7 +976,7 @@ impl TableProvider for ListingTable {
 
         let filters = conjunction(filters.to_vec())
             .map(|expr| -> Result<_> {
-                // NOTE: Use the table schema (NOT file schema) here because `expr` may contain references to partition columns.
+                // NOTE: Use the table schema (NOT file schema) here because `expr` may contain references to partition/metadata columns.
                 let table_df_schema = self.table_schema.as_ref().clone().to_dfschema()?;
                 let filters = create_physical_expr(
                     &expr,
@@ -1174,7 +1162,8 @@ impl ListingTable {
     async fn list_files_for_scan<'a>(
         &'a self,
         ctx: &'a SessionState,
-        filters: &'a [Expr],
+        partition_filters: &'a [Expr],
+        metadata_filters: &'a [Expr],
         limit: Option<usize>,
     ) -> Result<(Vec<Vec<PartitionedFile>>, Statistics)> {
         let store = if let Some(url) = self.table_paths.first() {
@@ -1188,17 +1177,36 @@ impl ListingTable {
                 ctx,
                 store.as_ref(),
                 table_path,
-                filters,
+                partition_filters,
                 &self.options.file_extension,
                 &self.options.table_partition_cols,
             )
         }))
         .await?;
         let file_list = stream::iter(file_list).flatten();
-        // collect the statistics if required by the config
+
+        let metadata_cols = self
+            .metadata_column_names()
+            .map(MetadataColumn::from_str)
+            .collect::<Result<Vec<_>>>()?;
+
+        // collect the statistics if required by the config + filter out files that don't match the metadata filters
         let files = file_list
+            .filter_map(|par_file| async {
+                if metadata_cols.is_empty() {
+                    return Some(par_file);
+                }
+
+                let Ok(par_file) = par_file else {
+                    return Some(par_file);
+                };
+
+                apply_metadata_filters(par_file, metadata_filters, &metadata_cols)
+                    .transpose()
+            })
             .map(|part_file| async {
                 let part_file = part_file?;
+
                 if self.options.collect_stat {
                     let statistics =
                         self.do_collect_statistics(ctx, &store, &part_file).await?;
@@ -1722,7 +1730,9 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let (file_list, _) = table
+            .list_files_for_scan(&ctx.state(), &[], &[], None)
+            .await?;
 
         assert_eq!(file_list.len(), output_partitioning);
 
@@ -1759,7 +1769,9 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let (file_list, _) = table
+            .list_files_for_scan(&ctx.state(), &[], &[], None)
+            .await?;
 
         assert_eq!(file_list.len(), output_partitioning);
 
