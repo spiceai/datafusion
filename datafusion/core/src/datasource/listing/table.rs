@@ -999,6 +999,11 @@ impl TableProvider for ListingTable {
             .cloned()
             .collect();
 
+        let metadata_cols = self
+            .metadata_column_names()
+            .filter_map(|c| MetadataColumn::from_str(c).ok())
+            .collect::<Vec<_>>();
+
         // create the execution plan
         self.options
             .format
@@ -1010,7 +1015,8 @@ impl TableProvider for ListingTable {
                     .with_projection(projection.cloned())
                     .with_limit(limit)
                     .with_output_ordering(output_ordering)
-                    .with_table_partition_cols(table_partition_cols),
+                    .with_table_partition_cols(table_partition_cols)
+                    .with_metadata_cols(metadata_cols),
                 filters.as_ref(),
             )
             .await

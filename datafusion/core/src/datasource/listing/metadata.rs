@@ -52,15 +52,19 @@ pub enum MetadataColumn {
 
 impl fmt::Display for MetadataColumn {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            MetadataColumn::Location => write!(f, "location"),
-            MetadataColumn::LastModified => write!(f, "last_modified"),
-            MetadataColumn::Size => write!(f, "size"),
-        }
+        write!(f, "{}", self.name())
     }
 }
 
 impl MetadataColumn {
+    pub fn name(&self) -> &str {
+        match self {
+            MetadataColumn::Location => "location",
+            MetadataColumn::LastModified => "last_modified",
+            MetadataColumn::Size => "size",
+        }
+    }
+
     /// Returns the arrow type of this metadata column
     pub fn arrow_type(&self) -> DataType {
         match self {

@@ -20,7 +20,7 @@
 
 use std::{
     borrow::Cow, collections::HashMap, fmt::Debug, marker::PhantomData, mem::size_of,
-    sync::Arc, vec,
+    str::FromStr, sync::Arc, vec,
 };
 
 use super::{get_projected_output_ordering, statistics::MinMaxStatistics};
@@ -41,6 +41,7 @@ use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr_common::sort_expr::LexOrderingRef;
 
 use log::warn;
+use object_store::ObjectMeta;
 
 /// Convert type to a type suitable for use as a [`ListingTable`]
 /// partition column. Returns `Dictionary(UInt16, val_type)`, which is
@@ -122,7 +123,7 @@ pub struct FileScanConfig {
     /// Defaults to [`Statistics::new_unknown`].
     pub statistics: Statistics,
     /// Columns on which to project the data. Indexes that are higher than the
-    /// number of columns of `file_schema` refer to `table_partition_cols`.
+    /// number of columns of `file_schema` refer to `table_partition_cols` and then `metadata_cols`.
     pub projection: Option<Vec<usize>>,
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
@@ -312,7 +313,7 @@ impl FileScanConfig {
         })
     }
 
-    /// Projects only file schema, ignoring partition columns
+    /// Projects only file schema, ignoring partition/metadata columns
     pub(crate) fn projected_file_schema(&self) -> SchemaRef {
         let fields = self.file_column_projection_indices().map(|indices| {
             indices
@@ -408,13 +409,13 @@ impl FileScanConfig {
     }
 }
 
-/// A helper that projects partition columns into the file record batches.
+/// A helper that projects extended (i.e. partition/metadata) columns into the file record batches.
 ///
 /// One interesting trick is the usage of a cache for the key buffers of the partition column
 /// dictionaries. Indeed, the partition columns are constant, so the dictionaries that represent them
 /// have all their keys equal to 0. This enables us to re-use the same "all-zero" buffer across batches,
 /// which makes the space consumption of the partition columns O(batch_size) instead of O(record_count).
-pub struct PartitionColumnProjector {
+pub struct ExtendedColumnProjector {
     /// An Arrow buffer initialized to zeros that represents the key array of all partition
     /// columns (partition columns are materialized by dictionary arrays with only one
     /// value in the dictionary, thus all the keys are equal to zero).
@@ -423,15 +424,21 @@ pub struct PartitionColumnProjector {
     /// schema. Sorted by index in the target schema so that we can iterate on it to
     /// insert the partition columns in the target record batch.
     projected_partition_indexes: Vec<(usize, usize)>,
+    /// Similar to `projected_partition_indexes` but only stores the indexes in the target schema
+    projected_metadata_indexes: Vec<usize>,
     /// The schema of the table once the projection was applied.
     projected_schema: SchemaRef,
 }
 
-impl PartitionColumnProjector {
-    // Create a projector to insert the partitioning columns into batches read from files
-    // - `projected_schema`: the target schema with both file and partitioning columns
+impl ExtendedColumnProjector {
+    // Create a projector to insert the partitioning/metadata columns into batches read from files
+    // - `projected_schema`: the target schema with file, partitioning and metadata columns
     // - `table_partition_cols`: all the partitioning column names
-    pub fn new(projected_schema: SchemaRef, table_partition_cols: &[String]) -> Self {
+    pub fn new(
+        projected_schema: SchemaRef,
+        table_partition_cols: &[String],
+        metadata_cols: &[MetadataColumn],
+    ) -> Self {
         let mut idx_map = HashMap::new();
         for (partition_idx, partition_name) in table_partition_cols.iter().enumerate() {
             if let Ok(schema_idx) = projected_schema.index_of(partition_name) {
@@ -442,25 +449,40 @@ impl PartitionColumnProjector {
         let mut projected_partition_indexes: Vec<_> = idx_map.into_iter().collect();
         projected_partition_indexes.sort_by(|(_, a), (_, b)| a.cmp(b));
 
+        let mut projected_metadata_indexes = vec![];
+        for metadata_name in metadata_cols.iter() {
+            if let Ok(schema_idx) = projected_schema.index_of(metadata_name.name()) {
+                projected_metadata_indexes.push(schema_idx);
+            }
+        }
+
+        projected_metadata_indexes.sort_by(|a, b| a.cmp(b));
+
         Self {
-            projected_partition_indexes,
             key_buffer_cache: Default::default(),
+            projected_partition_indexes,
+            projected_metadata_indexes,
             projected_schema,
         }
     }
 
-    // Transform the batch read from the file by inserting the partitioning columns
+    // Transform the batch read from the file by inserting both partitioning and metadata columns
     // to the right positions as deduced from `projected_schema`
     // - `file_batch`: batch read from the file, with internal projection applied
     // - `partition_values`: the list of partition values, one for each partition column
+    // - `metadata`: the metadata of the file containing information like location, size, etc.
     pub fn project(
         &mut self,
         file_batch: RecordBatch,
         partition_values: &[ScalarValue],
+        metadata: &ObjectMeta,
     ) -> Result<RecordBatch> {
-        let expected_cols =
-            self.projected_schema.fields().len() - self.projected_partition_indexes.len();
+        // Calculate expected number of columns from the file (excluding partition and metadata columns)
+        let expected_cols = self.projected_schema.fields().len()
+            - self.projected_partition_indexes.len()
+            - self.projected_metadata_indexes.len();
 
+        // Verify the file batch has the expected number of columns
         if file_batch.columns().len() != expected_cols {
             return exec_err!(
                 "Unexpected batch schema from file, expected {} cols but got {}",
@@ -469,18 +491,21 @@ impl PartitionColumnProjector {
             );
         }
 
+        // Start with the columns from the file batch
         let mut cols = file_batch.columns().to_vec();
+
+        // Insert partition columns
         for &(pidx, sidx) in &self.projected_partition_indexes {
-            let p_value =
-                partition_values
-                    .get(pidx)
-                    .ok_or(DataFusionError::Execution(
-                        "Invalid partitioning found on disk".to_string(),
-                    ))?;
+            // Get the partition value from the provided values
+            let p_value = partition_values.get(pidx).ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Invalid partitioning found on disk".to_string(),
+                )
+            })?;
 
             let mut partition_value = Cow::Borrowed(p_value);
 
-            // check if user forgot to dict-encode the partition value
+            // Check if user forgot to dict-encode the partition value and apply auto-fix if needed
             let field = self.projected_schema.field(sidx);
             let expected_data_type = field.data_type();
             let actual_data_type = partition_value.data_type();
@@ -494,6 +519,7 @@ impl PartitionColumnProjector {
                 }
             }
 
+            // Create array and insert at the correct schema position
             cols.insert(
                 sidx,
                 create_output_array(
@@ -501,9 +527,25 @@ impl PartitionColumnProjector {
                     partition_value.as_ref(),
                     file_batch.num_rows(),
                 )?,
-            )
+            );
         }
 
+        // Insert metadata columns
+        for &sidx in &self.projected_metadata_indexes {
+            // Get the metadata column type from the field name
+            let field_name = self.projected_schema.field(sidx).name();
+            let metadata_col = MetadataColumn::from_str(field_name).map_err(|e| {
+                DataFusionError::Execution(format!("Invalid metadata column: {}", e))
+            })?;
+
+            // Convert metadata to scalar value based on the column type
+            let scalar_value = metadata_col.to_scalar_value(metadata);
+
+            // Create array and insert at the correct schema position
+            cols.insert(sidx, scalar_value.to_array_of_size(file_batch.num_rows())?);
+        }
+
+        // Create a new record batch with all columns in the correct order
         RecordBatch::try_new_with_options(
             Arc::clone(&self.projected_schema),
             cols,
@@ -659,9 +701,20 @@ fn create_output_array(
 #[cfg(test)]
 mod tests {
     use arrow_array::Int32Array;
+    use object_store::path::Path;
 
     use super::*;
     use crate::{test::columns, test_util::aggr_test_schema};
+
+    fn test_object_meta() -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from("test"),
+            size: 100,
+            last_modified: chrono::Utc::now(),
+            e_tag: None,
+            version: None,
+        }
+    }
 
     #[test]
     fn physical_plan_config_no_projection() {
@@ -804,12 +857,13 @@ mod tests {
         );
         let (proj_schema, ..) = conf.project();
         // created a projector for that projected schema
-        let mut proj = PartitionColumnProjector::new(
+        let mut proj = ExtendedColumnProjector::new(
             proj_schema,
             &partition_cols
                 .iter()
                 .map(|x| x.0.clone())
                 .collect::<Vec<_>>(),
+            &[],
         );
 
         // project first batch
@@ -822,6 +876,7 @@ mod tests {
                     wrap_partition_value_in_dict(ScalarValue::from("10")),
                     wrap_partition_value_in_dict(ScalarValue::from("26")),
                 ],
+                &ObjectMeta::default(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [
@@ -850,6 +905,7 @@ mod tests {
                     wrap_partition_value_in_dict(ScalarValue::from("10")),
                     wrap_partition_value_in_dict(ScalarValue::from("27")),
                 ],
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [
@@ -880,6 +936,7 @@ mod tests {
                     wrap_partition_value_in_dict(ScalarValue::from("10")),
                     wrap_partition_value_in_dict(ScalarValue::from("28")),
                 ],
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [
@@ -908,6 +965,7 @@ mod tests {
                     ScalarValue::from("10"),
                     ScalarValue::from("26"),
                 ],
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [

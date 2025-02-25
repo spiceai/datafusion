@@ -45,6 +45,8 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use futures::{ready, FutureExt, Stream, StreamExt};
 
+use super::file_scan_config::ExtendedColumnProjector;
+
 /// A fallible future that resolves to a stream of [`RecordBatch`]
 pub type FileOpenFuture =
     BoxFuture<'static, Result<BoxStream<'static, Result<RecordBatch, ArrowError>>>>;
@@ -251,7 +253,7 @@ impl<F: FileOpener> FileStream<F> {
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
         let (projected_schema, ..) = config.project();
-        let pc_projector = PartitionColumnProjector::new(
+        let pc_projector = ExtendedColumnProjector::new(
             projected_schema.clone(),
             &config
                 .table_partition_cols
