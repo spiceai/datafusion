@@ -262,7 +262,7 @@ pub struct ListingOptions {
     pub file_sort_order: Vec<Vec<SortExpr>>,
     /// Additional columns to include in the table schema, based on the metadata of the files.
     /// See [Self::with_metadata_cols] for details.
-    pub metadata_cols: Vec<String>,
+    pub metadata_cols: Vec<MetadataColumn>,
 }
 
 impl ListingOptions {
@@ -434,11 +434,11 @@ impl ListingOptions {
     /// let listing_options = ListingOptions::new(Arc::new(
     ///     ParquetFormat::default()
     ///   ))
-    ///   .with_metadata_cols(vec!["last_modified".to_string()]);
+    ///   .with_metadata_cols(vec![MetadataColumn::LastModified]);
     ///
-    /// assert_eq!(listing_options.metadata_cols, vec!["last_modified".to_string()]);
+    /// assert_eq!(listing_options.metadata_cols, vec![MetadataColumn::LastModified]);
     /// ```
-    pub fn with_metadata_cols(mut self, metadata_cols: Vec<String>) -> Self {
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
         self.metadata_cols = metadata_cols;
         self
     }
@@ -530,11 +530,9 @@ impl ListingOptions {
     /// Validates that the metadata columns do not already exist in the schema, and are one of the allowed metadata columns.
     pub fn validate_metadata_cols(&self, schema: &SchemaRef) -> Result<()> {
         for col in self.metadata_cols.iter() {
-            if schema.column_with_name(col).is_some() {
+            if schema.column_with_name(col.name()).is_some() {
                 return plan_err!("Column {} already exists in schema", col);
             }
-
-            let _ = MetadataColumn::from_str(col)?;
         }
 
         Ok(())
@@ -783,11 +781,7 @@ impl ListingTable {
         // Validate and add metadata columns to the schema
         options.validate_metadata_cols(&file_schema)?;
         for col in &options.metadata_cols {
-            builder.push(Field::new(
-                col,
-                MetadataColumn::from_str(col)?.arrow_type(),
-                false,
-            ));
+            builder.push(col.field());
         }
 
         let table_schema = Arc::new(
@@ -875,7 +869,7 @@ impl ListingTable {
     }
 
     fn metadata_column_names(&self) -> impl Iterator<Item = &str> {
-        self.options.metadata_cols.iter().map(|col| col.as_str())
+        self.options.metadata_cols.iter().map(|col| col.name())
     }
 }
 
