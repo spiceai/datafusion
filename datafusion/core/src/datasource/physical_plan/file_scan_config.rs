@@ -434,6 +434,7 @@ impl ExtendedColumnProjector {
     // Create a projector to insert the partitioning/metadata columns into batches read from files
     // - `projected_schema`: the target schema with file, partitioning and metadata columns
     // - `table_partition_cols`: all the partitioning column names
+    // - `metadata_cols`: all the metadata column names
     pub fn new(
         projected_schema: SchemaRef,
         table_partition_cols: &[String],
@@ -455,8 +456,6 @@ impl ExtendedColumnProjector {
                 projected_metadata_indexes.push(schema_idx);
             }
         }
-
-        projected_metadata_indexes.sort_by(|a, b| a.cmp(b));
 
         Self {
             key_buffer_cache: Default::default(),
@@ -876,7 +875,7 @@ mod tests {
                     wrap_partition_value_in_dict(ScalarValue::from("10")),
                     wrap_partition_value_in_dict(ScalarValue::from("26")),
                 ],
-                &ObjectMeta::default(),
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [

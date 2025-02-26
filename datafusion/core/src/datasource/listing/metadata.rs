@@ -57,6 +57,7 @@ impl fmt::Display for MetadataColumn {
 }
 
 impl MetadataColumn {
+    /// The name of the metadata column (one of `location`, `last_modified`, or `size`)
     pub fn name(&self) -> &str {
         match self {
             MetadataColumn::Location => "location",
