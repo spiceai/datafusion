@@ -862,9 +862,7 @@ impl ListingTable {
         self.options
             .table_partition_cols
             .iter()
-            .map(|col| &col.0)
-            .chain(self.options.metadata_cols.iter())
-            .map(|col| Ok(self.table_schema.field_with_name(col)?))
+            .map(|col| Ok(self.table_schema.field_with_name(&col.0)?))
             .collect::<Result<Vec<_>>>()
     }
 
