@@ -31,7 +31,7 @@ use crate::file_sink_config::FileSinkConfig;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::file_options::file_type::FileType;
 use datafusion_common::{internal_err, not_impl_err, GetExt, Result, Statistics};
-use datafusion_physical_expr::LexRequirement;
+use datafusion_physical_expr::{LexRequirement, PhysicalExpr};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
 
@@ -93,6 +93,7 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
         &self,
         state: &dyn Session,
         conf: FileScanConfig,
+        filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Take a list of files and the configuration to convert it to the

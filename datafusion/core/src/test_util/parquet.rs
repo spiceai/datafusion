@@ -182,10 +182,10 @@ impl TestParquetFile {
             let physical_filter_expr =
                 create_physical_expr(&filter, &df_schema, &ExecutionProps::default())?;
 
-            let source = Arc::new(
-                ParquetSource::new(parquet_options)
-                    .with_predicate(Arc::clone(&physical_filter_expr)),
-            )
+            let source = Arc::new(ParquetSource::new(parquet_options).with_predicate(
+                Arc::clone(&self.schema),
+                Arc::clone(&physical_filter_expr),
+            ))
             .with_schema(Arc::clone(&self.schema));
             let config = scan_config_builder.with_source(source).build();
             let parquet_exec = DataSourceExec::from_data_source(config);

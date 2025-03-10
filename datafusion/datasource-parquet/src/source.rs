@@ -21,11 +21,15 @@ use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use crate::opener::build_page_pruning_predicate;
+use crate::opener::build_pruning_predicate;
 use crate::opener::build_pruning_predicates;
 use crate::opener::ParquetOpener;
 use crate::row_filter::can_expr_be_pushed_down_with_schemas;
 use crate::DefaultParquetFileReaderFactory;
+use crate::PagePruningAccessPlanFilter;
 use crate::ParquetFileReaderFactory;
+use arrow::datatypes::Schema;
 use datafusion_common::config::ConfigOptions;
 use datafusion_datasource::as_file_source;
 use datafusion_datasource::file_stream::FileOpener;
@@ -41,11 +45,13 @@ use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_physical_expr::conjunction;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_optimizer::pruning::PruningPredicate;
 use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion_physical_plan::filter_pushdown::PredicateSupport;
 use datafusion_physical_plan::filter_pushdown::PredicateSupports;
 use datafusion_physical_plan::metrics::Count;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
+use datafusion_physical_plan::metrics::MetricBuilder;
 use datafusion_physical_plan::DisplayFormatType;
 
 use itertools::Itertools;
@@ -269,6 +275,10 @@ pub struct ParquetSource {
     pub(crate) file_schema: Option<SchemaRef>,
     /// Optional predicate for row filtering during parquet scan
     pub(crate) predicate: Option<Arc<dyn PhysicalExpr>>,
+    /// Optional predicate for pruning row groups (derived from `predicate`)
+    pub(crate) pruning_predicate: Option<Arc<PruningPredicate>>,
+    /// Optional predicate for pruning pages (derived from `predicate`)
+    pub(crate) page_pruning_predicate: Option<Arc<PagePruningAccessPlanFilter>>,
     /// Optional user defined parquet file reader factory
     pub(crate) parquet_file_reader_factory: Option<Arc<dyn ParquetFileReaderFactory>>,
     /// Optional user defined schema adapter
@@ -307,12 +317,26 @@ impl ParquetSource {
         self
     }
 
-    /// Set predicate information
-    pub fn with_predicate(&self, predicate: Arc<dyn PhysicalExpr>) -> Self {
+    /// Set predicate information, also sets pruning_predicate and page_pruning_predicate attributes
+    pub fn with_predicate(
+        &self,
+        file_schema: Arc<Schema>,
+        predicate: Arc<dyn PhysicalExpr>,
+    ) -> Self {
         let mut conf = self.clone();
+
         let metrics = ExecutionPlanMetricsSet::new();
+        let predicate_creation_errors =
+            MetricBuilder::new(&metrics).global_counter("num_predicate_creation_errors");
+
         conf = conf.with_metrics(metrics);
         conf.predicate = Some(Arc::clone(&predicate));
+
+        conf.page_pruning_predicate =
+            Some(build_page_pruning_predicate(&predicate, &file_schema));
+        conf.pruning_predicate =
+            build_pruning_predicate(predicate, &file_schema, &predicate_creation_errors);
+
         conf
     }
 

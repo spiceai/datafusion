@@ -1930,6 +1930,7 @@ version = "48.0.1"
 dependencies = [
  "arrow",
  "async-trait",
+ "chrono",
  "datafusion-catalog",
  "datafusion-common",
  "datafusion-datasource",
@@ -1942,6 +1943,7 @@ dependencies = [
  "futures",
  "log",
  "object_store",
+ "tempfile",
  "tokio",
 ]
 

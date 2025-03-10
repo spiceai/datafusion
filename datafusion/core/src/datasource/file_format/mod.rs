@@ -93,6 +93,7 @@ pub(crate) mod test_util {
                 .with_projection(projection)
                 .with_limit(limit)
                 .build(),
+                None,
             )
             .await?;
         Ok(exec)
