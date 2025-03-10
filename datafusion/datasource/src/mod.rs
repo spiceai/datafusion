@@ -40,6 +40,7 @@ pub mod file_stream;
 pub mod memory;
 pub mod schema_adapter;
 pub mod sink;
+pub mod metadata;
 pub mod source;
 mod statistics;
 
