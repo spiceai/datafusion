@@ -266,7 +266,7 @@ impl Unparser<'_> {
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
         sort.iter_mut().for_each(|sort_item| {
-            if let ast::Expr::CompoundIdentifier(idents) = sort_item {
+            if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
                 remove_dangling_identifiers(idents, &all_idents);
             }
         });

@@ -48,6 +48,8 @@ object_store = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

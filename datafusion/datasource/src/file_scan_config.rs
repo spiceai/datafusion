@@ -20,18 +20,9 @@
 
 use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
-    fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
+    fmt::Result as FmtResult, marker::PhantomData, str::FromStr, sync::Arc,
 };
 
-use crate::file_groups::FileGroup;
-#[allow(unused_imports)]
-use crate::schema_adapter::SchemaAdapterFactory;
-use crate::{
-    display::FileGroupsDisplay, file::FileSource,
-    file_compression_type::FileCompressionType, file_stream::FileStream,
-    source::DataSource, statistics::MinMaxStatistics, PartitionedFile,
-};
-use arrow::datatypes::FieldRef;
 use arrow::{
     array::{
         ArrayData, ArrayRef, BufferBuilder, DictionaryArray, RecordBatch,
@@ -40,33 +31,46 @@ use arrow::{
     buffer::Buffer,
     datatypes::{ArrowNativeType, DataType, Field, Schema, SchemaRef, UInt16Type},
 };
-use datafusion_common::config::ConfigOptions;
-use datafusion_common::{
-    exec_err, ColumnStatistics, Constraints, DataFusionError, Result, ScalarValue,
-    Statistics,
-};
+use datafusion_common::{exec_err, ColumnStatistics, Constraints, Result, Statistics};
+use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{
     object_store::ObjectStoreUrl, SendableRecordBatchStream, TaskContext,
 };
-use datafusion_physical_expr::{expressions::Column, utils::reassign_predicate_columns};
-use datafusion_physical_expr::{EquivalenceProperties, Partitioning};
-use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
-use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
-use datafusion_physical_plan::projection::ProjectionExpr;
+use datafusion_physical_expr::{
+    expressions::Column, EquivalenceProperties, LexOrdering, Partitioning,
+    PhysicalSortExpr,
+};
 use datafusion_physical_plan::{
     display::{display_orderings, ProjectSchemaDisplay},
     metrics::ExecutionPlanMetricsSet,
     projection::{all_alias_free_columns, new_projections_for_columns},
     DisplayAs, DisplayFormatType,
 };
+use log::{debug, warn};
+use object_store::ObjectMeta;
+
+use crate::file_groups::FileGroup;
+#[allow(unused_imports)]
+use crate::schema_adapter::SchemaAdapterFactory;
+use crate::{
+    display::FileGroupsDisplay, file::FileSource,
+    file_compression_type::FileCompressionType, file_stream::FileStream,
+    metadata::MetadataColumn, source::DataSource, statistics::MinMaxStatistics,
+    PartitionedFile,
+};
+use arrow::datatypes::FieldRef;
+
+use datafusion_common::config::ConfigOptions;
+use datafusion_physical_expr::utils::reassign_predicate_columns;
+use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_plan::projection::ProjectionExpr;
 use datafusion_physical_plan::{
     filter::collect_columns_from_predicate, filter_pushdown::FilterPushdownPropagation,
 };
 
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
-use log::{debug, warn};
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -175,13 +179,15 @@ pub struct FileScanConfig {
     /// Table constraints
     pub constraints: Constraints,
     /// Columns on which to project the data. Indexes that are higher than the
-    /// number of columns of `file_schema` refer to `table_partition_cols`.
+    /// number of columns of `file_schema` refer to `table_partition_cols` and then `metadata_cols`.
     pub projection: Option<Vec<usize>>,
     /// The maximum number of records to read from this plan. If `None`,
     /// all records after filtering are returned.
     pub limit: Option<usize>,
     /// The partitioning columns
     pub table_partition_cols: Vec<FieldRef>,
+    /// The metadata columns
+    pub metadata_cols: Vec<MetadataColumn>,
     /// All equivalent lexicographical orderings that describe the schema.
     pub output_ordering: Vec<LexOrdering>,
     /// File compression type
@@ -267,6 +273,7 @@ pub struct FileScanConfigBuilder {
     limit: Option<usize>,
     projection: Option<Vec<usize>>,
     table_partition_cols: Vec<FieldRef>,
+    metadata_cols: Vec<MetadataColumn>,
     constraints: Option<Constraints>,
     file_groups: Vec<FileGroup>,
     statistics: Option<Statistics>,
@@ -301,6 +308,7 @@ impl FileScanConfigBuilder {
             limit: None,
             projection: None,
             table_partition_cols: vec![],
+            metadata_cols: vec![],
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
@@ -336,6 +344,12 @@ impl FileScanConfigBuilder {
             .into_iter()
             .map(|f| Arc::new(f) as FieldRef)
             .collect();
+        self
+    }
+
+    /// Set the metadata columns
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
+        self.metadata_cols = metadata_cols;
         self
     }
 
@@ -438,6 +452,7 @@ impl FileScanConfigBuilder {
             limit,
             projection,
             table_partition_cols,
+            metadata_cols,
             constraints,
             file_groups,
             statistics,
@@ -466,6 +481,7 @@ impl FileScanConfigBuilder {
             limit,
             projection,
             table_partition_cols,
+            metadata_cols,
             constraints,
             file_groups,
             output_ordering,
@@ -491,6 +507,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             limit: config.limit,
             projection: config.projection,
             table_partition_cols: config.table_partition_cols,
+            metadata_cols: config.metadata_cols,
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
@@ -704,11 +721,72 @@ impl DataSource for FileScanConfig {
 }
 
 impl FileScanConfig {
+    /// Create a new [`FileScanConfig`] with default settings for scanning files.
+    ///
+    /// See example on [`FileScanConfig`]
+    ///
+    /// No file groups are added by default. See [`Self::with_file`], [`Self::with_file_group`] and
+    /// [`Self::with_file_groups`].
+    ///
+    /// # Parameters:
+    /// * `object_store_url`: See [`Self::object_store_url`]
+    /// * `file_schema`: See [`Self::file_schema`]
+    #[allow(deprecated)] // `new` will be removed same time as `with_source`
+    pub fn new(
+        object_store_url: ObjectStoreUrl,
+        file_schema: SchemaRef,
+        file_source: Arc<dyn FileSource>,
+    ) -> Self {
+        let statistics = Statistics::new_unknown(&file_schema);
+        let file_source = file_source
+            .with_statistics(statistics.clone())
+            .with_schema(Arc::clone(&file_schema));
+        Self {
+            object_store_url,
+            file_schema,
+            file_groups: vec![],
+            constraints: Constraints::default(),
+            projection: None,
+            limit: None,
+            table_partition_cols: vec![],
+            metadata_cols: vec![],
+            output_ordering: vec![],
+            file_compression_type: FileCompressionType::UNCOMPRESSED,
+            new_lines_in_values: false,
+            file_source: Arc::clone(&file_source),
+            batch_size: None,
+            expr_adapter_factory: None,
+        }
+    }
+
+    /// Set the file source
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_source(mut self, file_source: Arc<dyn FileSource>) -> Self {
+        self.file_source =
+            file_source.with_statistics(Statistics::new_unknown(&self.file_schema));
+        self
+    }
+
+    /// Set the table constraints of the files
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_constraints(mut self, constraints: Constraints) -> Self {
+        self.constraints = constraints;
+        self
+    }
+
+    /// Set the statistics of the files
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_statistics(mut self, statistics: Statistics) -> Self {
+        self.file_source = self.file_source.with_statistics(statistics);
+        self
+    }
+
     fn projection_indices(&self) -> Vec<usize> {
         match &self.projection {
             Some(proj) => proj.clone(),
             None => (0..self.file_schema.fields().len()
-                + self.table_partition_cols.len())
+                + self.table_partition_cols.len()
+                + self.metadata_cols.len())
                 .collect(),
         }
     }
@@ -742,13 +820,26 @@ impl FileScanConfig {
             .projection_indices()
             .into_iter()
             .map(|idx| {
-                if idx < self.file_schema.fields().len() {
-                    self.file_schema.field(idx).clone()
-                } else {
-                    let partition_idx = idx - self.file_schema.fields().len();
-                    Arc::unwrap_or_clone(Arc::clone(
-                        &self.table_partition_cols[partition_idx],
-                    ))
+                let file_schema_len = self.file_schema.fields().len();
+                let partition_cols_len = self.table_partition_cols.len();
+
+                match idx {
+                    // File schema columns
+                    i if i < file_schema_len => self.file_schema.field(i).clone(),
+
+                    // Partition columns
+                    i if i < file_schema_len + partition_cols_len => {
+                        let partition_idx = i - file_schema_len;
+                        Arc::unwrap_or_clone(Arc::clone(
+                            &self.table_partition_cols[partition_idx],
+                        ))
+                    }
+
+                    // Metadata columns
+                    i => {
+                        let metadata_idx = i - file_schema_len - partition_cols_len;
+                        self.metadata_cols[metadata_idx].field()
+                    }
                 }
             })
             .collect();
@@ -788,6 +879,94 @@ impl FileScanConfig {
     pub fn projected_constraints(&self) -> Constraints {
         let indexes = self.projection_indices();
         self.constraints.project(&indexes).unwrap_or_default()
+    }
+
+    /// Set the projection of the files
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    /// Set the limit of the files
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
+    }
+
+    /// Add a file as a single group
+    ///
+    /// See [Self::file_groups] for more information.
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    #[allow(deprecated)]
+    pub fn with_file(self, file: PartitionedFile) -> Self {
+        self.with_file_group(FileGroup::new(vec![file]))
+    }
+
+    /// Add the file groups
+    ///
+    /// See [Self::file_groups] for more information.
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_file_groups(mut self, mut file_groups: Vec<FileGroup>) -> Self {
+        self.file_groups.append(&mut file_groups);
+        self
+    }
+
+    /// Add a new file group
+    ///
+    /// See [Self::file_groups] for more information
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_file_group(mut self, file_group: FileGroup) -> Self {
+        self.file_groups.push(file_group);
+        self
+    }
+
+    /// Set the partitioning columns of the files
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_table_partition_cols(mut self, table_partition_cols: Vec<Field>) -> Self {
+        self.table_partition_cols = table_partition_cols
+            .into_iter()
+            .map(|f| Arc::new(f) as FieldRef)
+            .collect();
+        self
+    }
+
+    /// Set the metadata columns of the files
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
+        self.metadata_cols = metadata_cols;
+        self
+    }
+
+    /// Set the output ordering of the files
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_output_ordering(mut self, output_ordering: Vec<LexOrdering>) -> Self {
+        self.output_ordering = output_ordering;
+        self
+    }
+
+    /// Set the file compression type
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_file_compression_type(
+        mut self,
+        file_compression_type: FileCompressionType,
+    ) -> Self {
+        self.file_compression_type = file_compression_type;
+        self
+    }
+
+    /// Set the new_lines_in_values property
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_newlines_in_values(mut self, new_lines_in_values: bool) -> Self {
+        self.new_lines_in_values = new_lines_in_values;
+        self
+    }
+
+    /// Set the batch_size property
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
+    pub fn with_batch_size(mut self, batch_size: Option<usize>) -> Self {
+        self.batch_size = batch_size;
+        self
     }
 
     /// Specifies whether newlines in (quoted) values are supported.
@@ -831,7 +1010,7 @@ impl FileScanConfig {
         })
     }
 
-    /// Projects only file schema, ignoring partition columns
+    /// Projects only file schema, ignoring partition/metadata columns
     pub fn projected_file_schema(&self) -> SchemaRef {
         let fields = self.file_column_projection_indices().map(|indices| {
             indices
@@ -1073,13 +1252,13 @@ impl DisplayAs for FileScanConfig {
     }
 }
 
-/// A helper that projects partition columns into the file record batches.
+/// A helper that projects extended (i.e. partition/metadata) columns into the file record batches.
 ///
 /// One interesting trick is the usage of a cache for the key buffers of the partition column
 /// dictionaries. Indeed, the partition columns are constant, so the dictionaries that represent them
 /// have all their keys equal to 0. This enables us to re-use the same "all-zero" buffer across batches,
 /// which makes the space consumption of the partition columns O(batch_size) instead of O(record_count).
-pub struct PartitionColumnProjector {
+pub struct ExtendedColumnProjector {
     /// An Arrow buffer initialized to zeros that represents the key array of all partition
     /// columns (partition columns are materialized by dictionary arrays with only one
     /// value in the dictionary, thus all the keys are equal to zero).
@@ -1088,15 +1267,22 @@ pub struct PartitionColumnProjector {
     /// schema. Sorted by index in the target schema so that we can iterate on it to
     /// insert the partition columns in the target record batch.
     projected_partition_indexes: Vec<(usize, usize)>,
+    /// Similar to `projected_partition_indexes` but only stores the indexes in the target schema
+    projected_metadata_indexes: Vec<usize>,
     /// The schema of the table once the projection was applied.
     projected_schema: SchemaRef,
 }
 
-impl PartitionColumnProjector {
-    // Create a projector to insert the partitioning columns into batches read from files
-    // - `projected_schema`: the target schema with both file and partitioning columns
+impl ExtendedColumnProjector {
+    // Create a projector to insert the partitioning/metadata columns into batches read from files
+    // - `projected_schema`: the target schema with file, partitioning and metadata columns
     // - `table_partition_cols`: all the partitioning column names
-    pub fn new(projected_schema: SchemaRef, table_partition_cols: &[String]) -> Self {
+    // - `metadata_cols`: all the metadata column names
+    pub fn new(
+        projected_schema: SchemaRef,
+        table_partition_cols: &[String],
+        metadata_cols: &[MetadataColumn],
+    ) -> Self {
         let mut idx_map = HashMap::new();
         for (partition_idx, partition_name) in table_partition_cols.iter().enumerate() {
             if let Ok(schema_idx) = projected_schema.index_of(partition_name) {
@@ -1107,25 +1293,42 @@ impl PartitionColumnProjector {
         let mut projected_partition_indexes: Vec<_> = idx_map.into_iter().collect();
         projected_partition_indexes.sort_by(|(_, a), (_, b)| a.cmp(b));
 
+        let mut projected_metadata_indexes = vec![];
+        for metadata_name in metadata_cols.iter() {
+            if let Ok(schema_idx) = projected_schema.index_of(metadata_name.name()) {
+                projected_metadata_indexes.push(schema_idx);
+            }
+        }
+        // Sort to ensure that the final metadata column vector is expanded properly
+        if !projected_metadata_indexes.is_empty() {
+            projected_metadata_indexes.sort();
+        }
+
         Self {
-            projected_partition_indexes,
             key_buffer_cache: Default::default(),
+            projected_partition_indexes,
+            projected_metadata_indexes,
             projected_schema,
         }
     }
 
-    // Transform the batch read from the file by inserting the partitioning columns
+    // Transform the batch read from the file by inserting both partitioning and metadata columns
     // to the right positions as deduced from `projected_schema`
     // - `file_batch`: batch read from the file, with internal projection applied
     // - `partition_values`: the list of partition values, one for each partition column
+    // - `metadata`: the metadata of the file containing information like location, size, etc.
     pub fn project(
         &mut self,
         file_batch: RecordBatch,
         partition_values: &[ScalarValue],
+        metadata: &ObjectMeta,
     ) -> Result<RecordBatch> {
-        let expected_cols =
-            self.projected_schema.fields().len() - self.projected_partition_indexes.len();
+        // Calculate expected number of columns from the file (excluding partition and metadata columns)
+        let expected_cols = self.projected_schema.fields().len()
+            - self.projected_partition_indexes.len()
+            - self.projected_metadata_indexes.len();
 
+        // Verify the file batch has the expected number of columns
         if file_batch.columns().len() != expected_cols {
             return exec_err!(
                 "Unexpected batch schema from file, expected {} cols but got {}",
@@ -1134,18 +1337,21 @@ impl PartitionColumnProjector {
             );
         }
 
+        // Start with the columns from the file batch
         let mut cols = file_batch.columns().to_vec();
+
+        // Insert partition columns
         for &(pidx, sidx) in &self.projected_partition_indexes {
-            let p_value =
-                partition_values
-                    .get(pidx)
-                    .ok_or(DataFusionError::Execution(
-                        "Invalid partitioning found on disk".to_string(),
-                    ))?;
+            // Get the partition value from the provided values
+            let p_value = partition_values.get(pidx).ok_or_else(|| {
+                DataFusionError::Execution(
+                    "Invalid partitioning found on disk".to_string(),
+                )
+            })?;
 
             let mut partition_value = Cow::Borrowed(p_value);
 
-            // check if user forgot to dict-encode the partition value
+            // Check if user forgot to dict-encode the partition value and apply auto-fix if needed
             let field = self.projected_schema.field(sidx);
             let expected_data_type = field.data_type();
             let actual_data_type = partition_value.data_type();
@@ -1159,6 +1365,7 @@ impl PartitionColumnProjector {
                 }
             }
 
+            // Create array and insert at the correct schema position
             cols.insert(
                 sidx,
                 create_output_array(
@@ -1166,9 +1373,25 @@ impl PartitionColumnProjector {
                     partition_value.as_ref(),
                     file_batch.num_rows(),
                 )?,
-            )
+            );
         }
 
+        // Insert metadata columns
+        for &sidx in &self.projected_metadata_indexes {
+            // Get the metadata column type from the field name
+            let field_name = self.projected_schema.field(sidx).name();
+            let metadata_col = MetadataColumn::from_str(field_name).map_err(|e| {
+                DataFusionError::Execution(format!("Invalid metadata column: {}", e))
+            })?;
+
+            // Convert metadata to scalar value based on the column type
+            let scalar_value = metadata_col.to_scalar_value(metadata);
+
+            // Create array and insert at the correct schema position
+            cols.insert(sidx, scalar_value.to_array_of_size(file_batch.num_rows())?);
+        }
+
+        // Create a new record batch with all columns in the correct order
         RecordBatch::try_new_with_options(
             Arc::clone(&self.projected_schema),
             cols,
@@ -1473,8 +1696,15 @@ mod tests {
         generate_test_files, test_util::MockSource, tests::aggr_test_schema,
         verify_sort_integrity,
     };
+    use object_store::{path::Path, ObjectMeta};
 
-    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::{
+        array::{
+            Int32Array, RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
+        },
+        datatypes::TimeUnit,
+    };
+
     use datafusion_common::stats::Precision;
     use datafusion_common::{assert_batches_eq, internal_err};
     use datafusion_expr::{Operator, SortExpr};
@@ -1484,6 +1714,16 @@ mod tests {
     /// Returns the column names on the schema
     pub fn columns(schema: &Schema) -> Vec<String> {
         schema.fields().iter().map(|f| f.name().clone()).collect()
+    }
+
+    fn test_object_meta() -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from("test"),
+            size: 100,
+            last_modified: chrono::Utc::now(),
+            e_tag: None,
+            version: None,
+        }
     }
 
     #[test]
@@ -1647,12 +1887,13 @@ mod tests {
 
         let proj_schema = conf.projected_schema();
         // created a projector for that projected schema
-        let mut proj = PartitionColumnProjector::new(
+        let mut proj = ExtendedColumnProjector::new(
             proj_schema,
             &partition_cols
                 .iter()
                 .map(|x| x.0.clone())
                 .collect::<Vec<_>>(),
+            &[],
         );
 
         // project first batch
@@ -1665,6 +1906,7 @@ mod tests {
                     wrap_partition_value_in_dict(ScalarValue::from("10")),
                     wrap_partition_value_in_dict(ScalarValue::from("26")),
                 ],
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [
@@ -1693,6 +1935,7 @@ mod tests {
                     wrap_partition_value_in_dict(ScalarValue::from("10")),
                     wrap_partition_value_in_dict(ScalarValue::from("27")),
                 ],
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [
@@ -1723,6 +1966,7 @@ mod tests {
                     wrap_partition_value_in_dict(ScalarValue::from("10")),
                     wrap_partition_value_in_dict(ScalarValue::from("28")),
                 ],
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [
@@ -1751,6 +1995,7 @@ mod tests {
                     ScalarValue::from("10"),
                     ScalarValue::from("26"),
                 ],
+                &test_object_meta(),
             )
             .expect("Projection of partition columns into record batch failed");
         let expected = [
@@ -2179,6 +2424,37 @@ mod tests {
         .unwrap()
     }
 
+    /// Create a test ObjectMeta with given path, size and a fixed timestamp
+    fn create_test_object_meta(path: &str, size: usize) -> ObjectMeta {
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2023-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+
+        ObjectMeta {
+            location: Path::from(path),
+            size: size.try_into().unwrap(),
+            last_modified: timestamp,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    /// Create a configuration with metadata columns
+    fn config_with_metadata(
+        file_schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        metadata_cols: Vec<MetadataColumn>,
+    ) -> FileScanConfig {
+        FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            file_schema.clone(),
+            Arc::new(MockSource::default()),
+        )
+        .with_projection(projection)
+        .with_metadata_cols(metadata_cols)
+        .build()
+    }
+
     #[test]
     fn test_file_scan_config_builder() {
         let file_schema = aggr_test_schema();
@@ -2336,6 +2612,289 @@ mod tests {
             assert_eq!(stat.max_value, Precision::Absent);
             assert_eq!(stat.null_count, Precision::Absent);
         }
+    }
+
+    #[test]
+    fn test_projected_schema_with_metadata_col() {
+        let file_schema = aggr_test_schema();
+        let metadata_cols = vec![
+            MetadataColumn::Location,
+            MetadataColumn::Size,
+            MetadataColumn::LastModified,
+        ];
+
+        let conf = config_with_metadata(Arc::clone(&file_schema), None, metadata_cols);
+
+        // Get projected schema
+        let schema = conf.projected_schema();
+
+        // Verify schema has all file schema fields plus metadata columns
+        assert_eq!(schema.fields().len(), file_schema.fields().len() + 3);
+
+        // Check that metadata fields are added at the end
+        let file_schema_len = file_schema.fields().len();
+        assert_eq!(schema.field(file_schema_len).name(), "location");
+        assert_eq!(schema.field(file_schema_len + 1).name(), "size");
+        assert_eq!(schema.field(file_schema_len + 2).name(), "last_modified");
+
+        // Check data types
+        assert_eq!(schema.field(file_schema_len).data_type(), &DataType::Utf8);
+        assert_eq!(
+            schema.field(file_schema_len + 1).data_type(),
+            &DataType::UInt64
+        );
+        assert_eq!(
+            schema.field(file_schema_len + 2).data_type(),
+            &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
+        );
+    }
+
+    #[test]
+    fn test_projected_schema_with_projection_and_metadata_cols() {
+        let file_schema = aggr_test_schema();
+        let metadata_cols = vec![MetadataColumn::Location, MetadataColumn::Size];
+
+        // Create projection that includes only the first two columns from file schema plus metadata
+        let file_schema_len = file_schema.fields().len();
+        let projection = Some(vec![
+            0,
+            1,                   // First two columns from file schema
+            file_schema_len,     // Location metadata column
+            file_schema_len + 1, // Size metadata column
+        ]);
+
+        let conf =
+            config_with_metadata(Arc::clone(&file_schema), projection, metadata_cols);
+
+        // Get projected schema
+        let schema = conf.projected_schema();
+
+        // Verify schema has only the projected columns
+        assert_eq!(schema.fields().len(), 4);
+
+        // Check that the first two columns are from the file schema
+        assert_eq!(schema.field(0).name(), file_schema.field(0).name());
+        assert_eq!(schema.field(1).name(), file_schema.field(1).name());
+
+        // Check that metadata fields are correctly projected
+        assert_eq!(schema.field(2).name(), "location");
+        assert_eq!(schema.field(3).name(), "size");
+    }
+
+    #[test]
+    fn test_projected_schema_with_partition_and_metadata_cols() {
+        let file_schema = aggr_test_schema();
+        let partition_cols = to_partition_cols(vec![
+            (
+                "year".to_owned(),
+                wrap_partition_type_in_dict(DataType::Int32),
+            ),
+            (
+                "month".to_owned(),
+                wrap_partition_type_in_dict(DataType::Int32),
+            ),
+        ]);
+        let metadata_cols = vec![MetadataColumn::Location, MetadataColumn::Size];
+
+        // Create config with partition and metadata columns
+        let conf = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            file_schema.clone(),
+            Arc::new(MockSource::default()),
+        )
+        .with_table_partition_cols(partition_cols)
+        .with_metadata_cols(metadata_cols)
+        .build();
+
+        // Get projected schema
+        let schema = conf.projected_schema();
+
+        // Verify schema has all file schema fields plus partition and metadata columns
+        let expected_len = file_schema.fields().len() + 2 + 2; // file + partition + metadata
+        assert_eq!(schema.fields().len(), expected_len);
+
+        // Check order of columns: file, partition, metadata
+        let file_len = file_schema.fields().len();
+        assert_eq!(schema.field(file_len).name(), "year");
+        assert_eq!(schema.field(file_len + 1).name(), "month");
+        assert_eq!(schema.field(file_len + 2).name(), "location");
+        assert_eq!(schema.field(file_len + 3).name(), "size");
+    }
+
+    #[test]
+    fn test_metadata_column_projector() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+
+        // Create metadata columns
+        let metadata_cols = vec![
+            MetadataColumn::Location,
+            MetadataColumn::Size,
+            MetadataColumn::LastModified,
+        ];
+
+        // Create test object metadata
+        let object_meta = create_test_object_meta("bucket/file.parquet", 1024);
+
+        // Create projected schema with metadata columns
+        let projected_fields = vec![
+            file_schema.field(0).clone(),
+            file_schema.field(1).clone(),
+            metadata_cols[0].field(),
+            metadata_cols[1].field(),
+            metadata_cols[2].field(),
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        // Create projector
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &[], // No partition columns
+            &metadata_cols,
+        );
+
+        // Create a test record batch
+        let a_values = Int32Array::from(vec![1, 2, 3]);
+        let b_values = Int32Array::from(vec![4, 5, 6]);
+        let file_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("a", DataType::Int32, false),
+                Field::new("b", DataType::Int32, false),
+            ])),
+            vec![Arc::new(a_values), Arc::new(b_values)],
+        )
+        .unwrap();
+
+        // Apply projection
+        let result = projector.project(file_batch, &[], &object_meta).unwrap();
+
+        // Verify result
+        assert_eq!(result.num_columns(), 5);
+        assert_eq!(result.num_rows(), 3);
+
+        // Check metadata column values
+        let location_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(location_col.value(0), "bucket/file.parquet");
+
+        let size_col = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(size_col.value(0), 1024);
+
+        let timestamp_col = result
+            .column(4)
+            .as_any()
+            .downcast_ref::<TimestampMicrosecondArray>()
+            .unwrap();
+        // The timestamp should match what we set in create_test_object_meta
+        let expected_ts = chrono::DateTime::parse_from_rfc3339("2023-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            .timestamp_micros();
+        assert_eq!(timestamp_col.value(0), expected_ts);
+    }
+
+    #[test]
+    fn test_extended_column_projector_partition_and_metadata() {
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+
+        // Create partition values
+        let partition_cols = vec!["year".to_string(), "month".to_string()];
+        let partition_values = vec![
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::Int32(Some(2023))),
+            ),
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::Int32(Some(1))),
+            ),
+        ];
+
+        // Create metadata columns
+        let metadata_cols = vec![MetadataColumn::Location, MetadataColumn::Size];
+
+        // Create test object metadata
+        let object_meta = create_test_object_meta("bucket/file.parquet", 1024);
+
+        // Create projected schema with file, partition and metadata columns
+        let projected_fields = vec![
+            file_schema.field(0).clone(),
+            Field::new(
+                "year",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Int32),
+                ),
+                true,
+            ),
+            Field::new(
+                "month",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Int32),
+                ),
+                true,
+            ),
+            metadata_cols[0].field(),
+            metadata_cols[1].field(),
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        // Create projector
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &partition_cols,
+            &metadata_cols,
+        );
+
+        // Create a test record batch with just the file columns
+        let a_values = Int32Array::from(vec![1, 2, 3]);
+        let file_batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
+            vec![Arc::new(a_values)],
+        )
+        .unwrap();
+
+        // Apply projection
+        let result = projector
+            .project(file_batch, &partition_values, &object_meta)
+            .unwrap();
+
+        // Verify result
+        assert_eq!(result.num_columns(), 5);
+        assert_eq!(result.num_rows(), 3);
+
+        // Columns should be in order: file column, partition columns, metadata columns
+        assert_eq!(result.schema().field(0).name(), "a");
+        assert_eq!(result.schema().field(1).name(), "year");
+        assert_eq!(result.schema().field(2).name(), "month");
+        assert_eq!(result.schema().field(3).name(), "location");
+        assert_eq!(result.schema().field(4).name(), "size");
+
+        // Check metadata column values
+        let location_col = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(location_col.value(0), "bucket/file.parquet");
+
+        let size_col = result
+            .column(4)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(size_col.value(0), 1024);
     }
 
     #[test]
