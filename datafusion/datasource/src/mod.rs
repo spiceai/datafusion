@@ -34,6 +34,7 @@ pub mod file_scan_config;
 pub mod file_sink_config;
 pub mod file_stream;
 pub mod memory;
+pub mod metadata;
 pub mod source;
 mod statistics;
 #[cfg(test)]
