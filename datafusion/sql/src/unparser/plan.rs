@@ -336,6 +336,7 @@ impl Unparser<'_> {
                     None,
                     select.already_projected(),
                 )? {
+                    println!("unparsed_table_scan: {:?}", unparsed_table_scan);
                     return self.select_to_sql_recursively(
                         &unparsed_table_scan,
                         query,
