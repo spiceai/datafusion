@@ -31,6 +31,8 @@ pub struct QueryBuilder {
     fetch: Option<ast::Fetch>,
     locks: Vec<ast::LockClause>,
     for_clause: Option<ast::ForClause>,
+    // If true, we need to unparse LogicalPlan::Union as a SQL `UNION` rather than a `UNION ALL`.
+    distinct_union: bool,
 }
 
 #[allow(dead_code)]
@@ -77,6 +79,13 @@ impl QueryBuilder {
         self.for_clause = value;
         self
     }
+    pub fn distinct_union(&mut self) -> &mut Self {
+        self.distinct_union = true;
+        self
+    }
+    pub fn is_distinct_union(&self) -> bool {
+        self.distinct_union
+    }
     pub fn build(&self) -> Result<ast::Query, BuilderError> {
         let order_by = if self.order_by.is_empty() {
             None
@@ -115,6 +124,7 @@ impl QueryBuilder {
             fetch: Default::default(),
             locks: Default::default(),
             for_clause: Default::default(),
+            distinct_union: false,
         }
     }
 }
