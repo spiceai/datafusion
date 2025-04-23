@@ -1534,6 +1534,51 @@ fn test_unnest_to_sql() {
 }
 
 #[test]
+fn test_like_filters() {
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name LIKE '%John%'"#,
+        r#"SELECT * FROM person WHERE person.first_name LIKE '%John%'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name ILIKE '%john%'"#,
+        r#"SELECT * FROM person WHERE person.first_name ILIKE '%john%'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name NOT LIKE 'A%'"#,
+        r#"SELECT * FROM person WHERE person.first_name NOT LIKE 'A%'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name NOT ILIKE 'a%'"#,
+        r#"SELECT * FROM person WHERE person.first_name NOT ILIKE 'a%'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name LIKE 'A!_%' ESCAPE '!'"#,
+        r#"SELECT * FROM person WHERE person.first_name LIKE 'A!_%' ESCAPE '!'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name NOT LIKE 'A!_%' ESCAPE '!'"#,
+        r#"SELECT * FROM person WHERE person.first_name NOT LIKE 'A!_%' ESCAPE '!'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name NOT ILIKE 'A!_%' ESCAPE '!'"#,
+        r#"SELECT * FROM person WHERE person.first_name NOT ILIKE 'A!_%' ESCAPE '!'"#,
+    );
+}
+
+#[test]
 fn test_join_with_no_conditions() {
     sql_round_trip(
         GenericDialect {},
