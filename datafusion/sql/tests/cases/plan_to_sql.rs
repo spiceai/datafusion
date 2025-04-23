@@ -1558,6 +1558,24 @@ fn test_like_filters() {
         r#"SELECT * FROM person WHERE first_name NOT ILIKE 'a%'"#,
         r#"SELECT * FROM person WHERE person.first_name NOT ILIKE 'a%'"#,
     );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name LIKE 'A!_%' ESCAPE '!'"#,
+        r#"SELECT * FROM person WHERE person.first_name LIKE 'A!_%' ESCAPE '!'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name NOT LIKE 'A!_%' ESCAPE '!'"#,
+        r#"SELECT * FROM person WHERE person.first_name NOT LIKE 'A!_%' ESCAPE '!'"#,
+    );
+
+    sql_round_trip(
+        GenericDialect {},
+        r#"SELECT * FROM person WHERE first_name NOT ILIKE 'A!_%' ESCAPE '!'"#,
+        r#"SELECT * FROM person WHERE person.first_name NOT ILIKE 'A!_%' ESCAPE '!'"#,
+    );
 }
 
 #[test]
