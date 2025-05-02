@@ -1629,8 +1629,10 @@ impl Expr {
                     negated: _,
                 }) => {
                     let subquery_schema = subquery.subquery.schema();
-                    // Using the datatype of the first field in the subquery
-                    if let Some(first_field) = subquery_schema.fields().first() {
+                    let fields = subquery_schema.fields();
+
+                    // only supports subquery with exactly 1 field
+                    if let [first_field] = &fields[..] {
                         rewrite_placeholder(
                             expr.as_mut(),
                             &Expr::Column(Column {
@@ -2914,13 +2916,17 @@ mod test {
             fetch: None,
         });
 
+        let projected_fields = vec![Field::new("A", DataType::Int32, true)];
+        let projected_schema = Arc::new(DFSchema::from_unqualified_fields(
+            projected_fields.into(),
+            Default::default(),
+        )?);
+
         let subquery = Subquery {
             subquery: Arc::new(LogicalPlan::Projection(Projection {
                 expr: vec![col("A")],
                 input: Arc::new(subquery_scan),
-                schema: Arc::new(DFSchema::try_from_qualified_schema(
-                    "my_table", &schema,
-                )?),
+                schema: projected_schema,
             })),
             outer_ref_columns: vec![],
         };
