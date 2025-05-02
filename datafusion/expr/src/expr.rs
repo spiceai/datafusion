@@ -1629,8 +1629,7 @@ impl Expr {
                     negated: _,
                 }) => {
                     let subquery_schema = subquery.subquery.schema();
-                    // using first field of subquery schema since `IN`
-                    // subqueries typically return a single column
+                    // Using the datatype of the first field in the subquery
                     if let Some(first_field) = subquery_schema.fields().first() {
                         rewrite_placeholder(
                             expr.as_mut(),
