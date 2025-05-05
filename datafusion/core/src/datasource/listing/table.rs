@@ -35,7 +35,6 @@ use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuil
 use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_expr::dml::InsertOp;
 use datafusion_expr::{Expr, SortExpr, TableProviderFilterPushDown, TableType};
-use datafusion_physical_expr::create_physical_expr;
 use datafusion_physical_plan::empty::EmptyExec;
 use datafusion_physical_plan::{ExecutionPlan, Statistics};
 

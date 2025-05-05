@@ -40,16 +40,15 @@ use datafusion_catalog::memory::DataSourceExec;
 use datafusion_catalog::TableProvider;
 use datafusion_common::stats::Precision;
 use datafusion_common::test_util::batches_to_sort_string;
-use datafusion_common::{Column, ScalarValue};
+use datafusion_common::ScalarValue;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::metadata::MetadataColumn;
-use datafusion_datasource_parquet::source::ParquetSource;
 use datafusion_execution::config::SessionConfig;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{TimeZone, Utc};
-use datafusion_expr::{col, lit, BinaryExpr, Expr, Operator};
+use datafusion_expr::{col, lit, Expr};
 use futures::stream::{self, BoxStream};
 use insta::assert_snapshot;
 use object_store::{

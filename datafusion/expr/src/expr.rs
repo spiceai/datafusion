@@ -1985,7 +1985,7 @@ impl Expr {
                             &Expr::Column(Column {
                                 relation: None,
                                 name: first_field.name().clone(),
-                                spans: Spans::new(),
+                                spans: Spans::default(),
                             }),
                             schema,
                         )?;
@@ -3525,7 +3525,7 @@ mod test {
         let subquery_filter = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(col("B")),
             op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(3)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(3)), None)),
         });
 
         let subquery_scan = LogicalPlan::TableScan(TableScan {
