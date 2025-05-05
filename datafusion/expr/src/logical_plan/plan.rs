@@ -1484,12 +1484,7 @@ impl LogicalPlan {
         self.apply_with_subqueries(|plan| {
             if let LogicalPlan::Limit(Limit { fetch: Some(e), .. }) = plan {
                 if let Expr::Placeholder(Placeholder { id, data_type }) = &**e {
-                    if data_type.is_none() {
-                        // Hardcode to Int64 for LIMIT placeholders
-                        param_types.insert(id.clone(), Some(DataType::Int64));
-                    } else {
-                        param_types.insert(id.clone(), data_type.clone());
-                    }
+                    Some(data_type.unwrap_or(DataType::Int64))
                 }
             }
             plan.apply_expressions(|expr| {
@@ -4507,10 +4502,14 @@ digraph {
             })),
         });
 
-        let params = plan.get_parameter_types().unwrap();
+        let params = plan.get_parameter_types().expect("to infer type");
         assert_eq!(params.len(), 1);
 
-        let parameter_type = params.clone().get(placeholder_value).unwrap().clone();
+        let parameter_type = params
+            .clone()
+            .get(placeholder_value)
+            .expect("to get type")
+            .clone();
         assert_eq!(parameter_type, Some(DataType::Int64));
 
         Ok(())
