@@ -1790,7 +1790,7 @@ impl Expr {
                             &Expr::Column(Column {
                                 relation: None,
                                 name: first_field.name().clone(),
-                                spans: Spans::new(),
+                                spans: Spans::default(),
                             }),
                             schema,
                         )?;
