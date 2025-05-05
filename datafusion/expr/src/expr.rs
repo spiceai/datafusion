@@ -1815,6 +1815,27 @@ impl Expr {
                 | Expr::SimilarTo(Like { expr, pattern, .. }) => {
                     rewrite_placeholder(pattern.as_mut(), expr.as_ref(), schema)?;
                 }
+                Expr::InSubquery(InSubquery {
+                    expr,
+                    subquery,
+                    negated: _,
+                }) => {
+                    let subquery_schema = subquery.subquery.schema();
+                    let fields = subquery_schema.fields();
+
+                    // only supports subquery with exactly 1 field
+                    if let [first_field] = &fields[..] {
+                        rewrite_placeholder(
+                            expr.as_mut(),
+                            &Expr::Column(Column {
+                                relation: None,
+                                name: first_field.name().clone(),
+                                spans: Spans::default(),
+                            }),
+                            schema,
+                        )?;
+                    }
+                }
                 Expr::Placeholder(_) => {
                     has_placeholder = true;
                 }
