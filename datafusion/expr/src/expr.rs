@@ -412,6 +412,19 @@ impl Alias {
             name: name.into(),
         }
     }
+
+    /// Return true if this alias represents the unaliased `name`
+    pub fn eq_name(&self, name: &str) -> bool {
+        self.eq_qualified_name(None, name)
+    }
+
+    pub fn eq_qualified_name(
+        &self,
+        relation: Option<&TableReference>,
+        name: &str,
+    ) -> bool {
+        self.relation.as_ref() == relation && self.name == name
+    }
 }
 
 /// Binary expression
@@ -1290,7 +1303,14 @@ impl Expr {
         relation: Option<impl Into<TableReference>>,
         name: impl Into<String>,
     ) -> Expr {
-        Expr::Alias(Alias::new(self, relation, name.into()))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(Alias::new(self, relation, name));
+        };
+
+        alias.relation = relation.map(|r| r.into());
+        alias.name = name.into();
+        Expr::Alias(alias)
     }
 
     /// Remove an alias from an expression if one exists.
