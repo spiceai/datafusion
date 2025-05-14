@@ -20,7 +20,7 @@
 
 use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
-    fmt::Result as FmtResult, marker::PhantomData, str::FromStr, sync::Arc,
+    fmt::Result as FmtResult, marker::PhantomData, mem::size_of, sync::Arc, vec,
 };
 
 use arrow::{
@@ -1271,6 +1271,8 @@ pub struct ExtendedColumnProjector {
     projected_metadata_indexes: Vec<usize>,
     /// The schema of the table once the projection was applied.
     projected_schema: SchemaRef,
+    /// Mapping between the column name and the metadata column.
+    metadata_map: HashMap<String, MetadataColumn>,
 }
 
 impl ExtendedColumnProjector {
@@ -1304,11 +1306,17 @@ impl ExtendedColumnProjector {
             projected_metadata_indexes.sort();
         }
 
+        let mut metadata_map = HashMap::new();
+        for metadata_col in metadata_cols.iter() {
+            metadata_map.insert(metadata_col.name().to_string(), metadata_col.clone());
+        }
+
         Self {
             key_buffer_cache: Default::default(),
             projected_partition_indexes,
             projected_metadata_indexes,
             projected_schema,
+            metadata_map,
         }
     }
 
@@ -1380,8 +1388,11 @@ impl ExtendedColumnProjector {
         for &sidx in &self.projected_metadata_indexes {
             // Get the metadata column type from the field name
             let field_name = self.projected_schema.field(sidx).name();
-            let metadata_col = MetadataColumn::from_str(field_name).map_err(|e| {
-                DataFusionError::Execution(format!("Invalid metadata column: {}", e))
+            let metadata_col = self.metadata_map.get(field_name).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Invalid metadata column: {}",
+                    field_name
+                ))
             })?;
 
             // Convert metadata to scalar value based on the column type
@@ -2618,7 +2629,7 @@ mod tests {
     fn test_projected_schema_with_metadata_col() {
         let file_schema = aggr_test_schema();
         let metadata_cols = vec![
-            MetadataColumn::Location,
+            MetadataColumn::Location(None),
             MetadataColumn::Size,
             MetadataColumn::LastModified,
         ];
@@ -2652,7 +2663,7 @@ mod tests {
     #[test]
     fn test_projected_schema_with_projection_and_metadata_cols() {
         let file_schema = aggr_test_schema();
-        let metadata_cols = vec![MetadataColumn::Location, MetadataColumn::Size];
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
 
         // Create projection that includes only the first two columns from file schema plus metadata
         let file_schema_len = file_schema.fields().len();
@@ -2694,7 +2705,7 @@ mod tests {
                 wrap_partition_type_in_dict(DataType::Int32),
             ),
         ]);
-        let metadata_cols = vec![MetadataColumn::Location, MetadataColumn::Size];
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
 
         // Create config with partition and metadata columns
         let conf = FileScanConfigBuilder::new(
@@ -2730,7 +2741,7 @@ mod tests {
 
         // Create metadata columns
         let metadata_cols = vec![
-            MetadataColumn::Location,
+            MetadataColumn::Location(None),
             MetadataColumn::Size,
             MetadataColumn::LastModified,
         ];
@@ -2821,7 +2832,7 @@ mod tests {
         ];
 
         // Create metadata columns
-        let metadata_cols = vec![MetadataColumn::Location, MetadataColumn::Size];
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
 
         // Create test object metadata
         let object_meta = create_test_object_meta("bucket/file.parquet", 1024);

@@ -781,7 +781,7 @@ impl ListingOptions {
             }
 
             // Check for duplicate metadata columns
-            if !seen.insert(*col) {
+            if !seen.insert(col.clone()) {
                 return plan_err!("Duplicate metadata column: {}", col);
             }
         }
@@ -1240,6 +1240,10 @@ impl ListingTable {
     fn metadata_column_names(&self) -> impl Iterator<Item = &str> {
         self.options.metadata_cols.iter().map(|col| col.name())
     }
+
+    fn metadata_columns(&self) -> &Vec<MetadataColumn> {
+        &self.options.metadata_cols
+    }
 }
 
 // Expressions can be used for extended columns (partition/metadata) pruning if they can be evaluated using
@@ -1357,10 +1361,7 @@ impl TableProvider for ListingTable {
             .cloned()
             .collect();
 
-        let metadata_cols = self
-            .metadata_column_names()
-            .filter_map(|c| MetadataColumn::from_str(c).ok())
-            .collect::<Vec<_>>();
+        let metadata_cols = self.metadata_columns().clone();
 
         // create the execution plan
         self.options
@@ -1510,10 +1511,7 @@ impl ListingTable {
             ctx.config_options().execution.meta_fetch_concurrency;
         let file_list = stream::iter(file_list).flatten_unordered(meta_fetch_concurrency);
 
-        let metadata_cols = self
-            .metadata_column_names()
-            .map(MetadataColumn::from_str)
-            .collect::<Result<Vec<_>>>()?;
+        let metadata_cols = self.metadata_columns().clone();
 
         // collect the statistics if required by the config + filter out files that don't match the metadata filters
         let files = file_list
@@ -3232,7 +3230,7 @@ mod tests {
         // Test valid case - all different metadata columns
         let options = ListingOptions::new(Arc::new(CsvFormat::default()))
             .with_metadata_cols(vec![
-                MetadataColumn::Location,
+                MetadataColumn::Location(None),
                 MetadataColumn::Size,
                 MetadataColumn::LastModified,
             ]);
@@ -3241,7 +3239,7 @@ mod tests {
         // Test invalid case - duplicate metadata column
         let options = ListingOptions::new(Arc::new(CsvFormat::default()))
             .with_metadata_cols(vec![
-                MetadataColumn::Location,
+                MetadataColumn::Location(None),
                 MetadataColumn::Size,
                 MetadataColumn::Size, // Duplicate
             ]);
@@ -3259,7 +3257,7 @@ mod tests {
         ]));
 
         let options = ListingOptions::new(Arc::new(CsvFormat::default()))
-            .with_metadata_cols(vec![MetadataColumn::Location]);
+            .with_metadata_cols(vec![MetadataColumn::Location(None)]);
 
         let result = options.validate_metadata_cols(&schema_with_location);
         assert!(result.is_err());

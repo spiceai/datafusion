@@ -534,7 +534,7 @@ async fn test_metadata_columns() -> Result<()> {
             ("day", DataType::Int32),
         ],
         &[
-            MetadataColumn::Location,
+            MetadataColumn::Location(None),
             MetadataColumn::Size,
             MetadataColumn::LastModified,
         ],
@@ -592,7 +592,7 @@ async fn test_metadata_columns_pushdown() -> Result<()> {
             ("day", DataType::Int32),
         ],
         &[
-            MetadataColumn::Location,
+            MetadataColumn::Location(None),
             MetadataColumn::Size,
             MetadataColumn::LastModified,
         ],

@@ -1098,7 +1098,7 @@ mod tests {
         let mut projector = ExtendedColumnProjector::new(
             schema_with_metadata.clone(),
             &[],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         );
 
         // Project the batch
@@ -1136,7 +1136,7 @@ mod tests {
         let mut projector = ExtendedColumnProjector::new(
             schema_combined.clone(),
             &["year".to_string()],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         );
 
         // Project the batch
@@ -1176,7 +1176,7 @@ mod tests {
         let mut projector = ExtendedColumnProjector::new(
             schema_mixed.clone(),
             &["year".to_string()],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         );
 
         // We need to reorder the file batch to match the expected file columns in the mixed schema
