@@ -118,7 +118,7 @@ mod tests {
             file.clone(),
             &[],
             &[
-                MetadataColumn::Location,
+                MetadataColumn::Location(None),
                 MetadataColumn::Size,
                 MetadataColumn::LastModified,
             ],
@@ -165,9 +165,12 @@ mod tests {
 
         // Test with location filter - matching
         let filter = col("location").eq(lit("test/file.parquet"));
-        let result =
-            apply_metadata_filters(file.clone(), &[filter], &[MetadataColumn::Location])
-                .unwrap();
+        let result = apply_metadata_filters(
+            file.clone(),
+            &[filter],
+            &[MetadataColumn::Location(None)],
+        )
+        .unwrap();
 
         // The file should match
         assert!(result.is_some());
@@ -178,18 +181,24 @@ mod tests {
 
         // Test with location filter - not matching
         let filter = col("location").eq(lit("test/different.parquet"));
-        let result =
-            apply_metadata_filters(file.clone(), &[filter], &[MetadataColumn::Location])
-                .unwrap();
+        let result = apply_metadata_filters(
+            file.clone(),
+            &[filter],
+            &[MetadataColumn::Location(None)],
+        )
+        .unwrap();
 
         // The file should not match
         assert!(result.is_none());
 
         // Test with location filter - partial match (contains)
         let filter = col("location").like(lit("%file.parquet"));
-        let result =
-            apply_metadata_filters(file.clone(), &[filter], &[MetadataColumn::Location])
-                .unwrap();
+        let result = apply_metadata_filters(
+            file.clone(),
+            &[filter],
+            &[MetadataColumn::Location(None)],
+        )
+        .unwrap();
 
         // The file should match
         assert!(result.is_some());
@@ -329,7 +338,7 @@ mod tests {
         let result = apply_metadata_filters(
             file.clone(),
             &[filter],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         )
         .unwrap();
 
@@ -344,7 +353,7 @@ mod tests {
         let result = apply_metadata_filters(
             file.clone(),
             &[filter],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         )
         .unwrap();
 
@@ -366,7 +375,7 @@ mod tests {
             file.clone(),
             &[filter],
             &[
-                MetadataColumn::Location,
+                MetadataColumn::Location(None),
                 MetadataColumn::Size,
                 MetadataColumn::LastModified,
             ],
@@ -397,7 +406,7 @@ mod tests {
         let result = apply_metadata_filters(
             file.clone(),
             &[filter],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         )
         .unwrap();
 
@@ -418,7 +427,7 @@ mod tests {
             file.clone(),
             &[filter],
             &[
-                MetadataColumn::Location,
+                MetadataColumn::Location(None),
                 MetadataColumn::Size,
                 MetadataColumn::LastModified,
             ],
@@ -447,7 +456,7 @@ mod tests {
         let result = apply_metadata_filters(
             file.clone(),
             &[filter1, filter2],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         )
         .unwrap();
 
@@ -461,7 +470,7 @@ mod tests {
         let result = apply_metadata_filters(
             file.clone(),
             &[filter1, filter2],
-            &[MetadataColumn::Location, MetadataColumn::Size],
+            &[MetadataColumn::Location(None), MetadataColumn::Size],
         )
         .unwrap();
 

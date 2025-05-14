@@ -33,10 +33,10 @@ use datafusion_common::DataFusionError;
 use object_store::ObjectMeta;
 
 /// A metadata column that can be used to filter files
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetadataColumn {
-    /// The location of the file in object store
-    Location,
+    /// The location of the file in object store, with an optional prefix.
+    Location(Option<Arc<str>>),
     /// The last modified timestamp of the file
     LastModified,
     /// The size of the file in bytes
@@ -53,7 +53,7 @@ impl MetadataColumn {
     /// The name of the metadata column (one of `location`, `last_modified`, or `size`)
     pub fn name(&self) -> &str {
         match self {
-            MetadataColumn::Location => "location",
+            MetadataColumn::Location(_) => "location",
             MetadataColumn::LastModified => "last_modified",
             MetadataColumn::Size => "size",
         }
@@ -62,7 +62,7 @@ impl MetadataColumn {
     /// Returns the arrow type of this metadata column
     pub fn arrow_type(&self) -> DataType {
         match self {
-            MetadataColumn::Location => DataType::Utf8,
+            MetadataColumn::Location(_) => DataType::Utf8,
             MetadataColumn::LastModified => {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
             }
@@ -78,8 +78,10 @@ impl MetadataColumn {
     /// Returns the scalar value for this metadata column given an object meta
     pub fn to_scalar_value(&self, meta: &ObjectMeta) -> ScalarValue {
         match self {
-            MetadataColumn::Location => {
-                ScalarValue::Utf8(Some(meta.location.to_string()))
+            MetadataColumn::Location(prefix) => {
+                let location = meta.location.to_string();
+                let prefix = prefix.as_ref().map(|p| p.as_ref()).unwrap_or("");
+                ScalarValue::Utf8(Some(format!("{}{}", prefix, location)))
             }
             MetadataColumn::LastModified => ScalarValue::TimestampMicrosecond(
                 Some(meta.last_modified.timestamp_micros()),
@@ -91,7 +93,8 @@ impl MetadataColumn {
 
     pub fn builder(&self, capacity: usize) -> MetadataBuilder {
         match self {
-            MetadataColumn::Location => MetadataBuilder::Location(
+            MetadataColumn::Location(prefix) => MetadataBuilder::Location(
+                prefix.clone(),
                 StringBuilder::with_capacity(capacity, capacity * 10),
             ),
             MetadataColumn::LastModified => MetadataBuilder::LastModified(
@@ -111,7 +114,7 @@ impl FromStr for MetadataColumn {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "location" => Ok(MetadataColumn::Location),
+            "location" => Ok(MetadataColumn::Location(None)),
             "last_modified" => Ok(MetadataColumn::LastModified),
             "size" => Ok(MetadataColumn::Size),
             _ => plan_err!(
@@ -123,7 +126,7 @@ impl FromStr for MetadataColumn {
 }
 
 pub enum MetadataBuilder {
-    Location(StringBuilder),
+    Location(Option<Arc<str>>, StringBuilder),
     LastModified(TimestampMicrosecondBuilder),
     Size(UInt64Builder),
 }
@@ -131,7 +134,11 @@ pub enum MetadataBuilder {
 impl MetadataBuilder {
     pub fn append(&mut self, meta: &ObjectMeta) {
         match self {
-            Self::Location(builder) => builder.append_value(&meta.location),
+            Self::Location(prefix, builder) => {
+                let location = meta.location.to_string();
+                let prefix = prefix.as_ref().map(|p| p.as_ref()).unwrap_or("");
+                builder.append_value(format!("{}{}", prefix, location))
+            }
             Self::LastModified(builder) => {
                 builder.append_value(meta.last_modified.timestamp_micros())
             }
@@ -141,7 +148,7 @@ impl MetadataBuilder {
 
     pub fn finish(self) -> Arc<dyn Array> {
         match self {
-            MetadataBuilder::Location(mut builder) => Arc::new(builder.finish()),
+            MetadataBuilder::Location(_, mut builder) => Arc::new(builder.finish()),
             MetadataBuilder::LastModified(mut builder) => Arc::new(builder.finish()),
             MetadataBuilder::Size(mut builder) => Arc::new(builder.finish()),
         }
@@ -173,14 +180,14 @@ mod tests {
 
     #[test]
     fn test_metadata_column_name() {
-        assert_eq!(MetadataColumn::Location.name(), "location");
+        assert_eq!(MetadataColumn::Location(None).name(), "location");
         assert_eq!(MetadataColumn::LastModified.name(), "last_modified");
         assert_eq!(MetadataColumn::Size.name(), "size");
     }
 
     #[test]
     fn test_metadata_column_arrow_type() {
-        assert_eq!(MetadataColumn::Location.arrow_type(), DataType::Utf8);
+        assert_eq!(MetadataColumn::Location(None).arrow_type(), DataType::Utf8);
         assert_eq!(
             MetadataColumn::LastModified.arrow_type(),
             DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
@@ -190,7 +197,7 @@ mod tests {
 
     #[test]
     fn test_metadata_column_field() {
-        let field = MetadataColumn::Location.field();
+        let field = MetadataColumn::Location(None).field();
         assert_eq!(field.name(), "location");
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert!(field.is_nullable());
@@ -215,7 +222,7 @@ mod tests {
         let meta = create_test_object_meta("test/file.parquet", 1024, timestamp);
 
         // Test Location scalar value
-        let scalar = MetadataColumn::Location.to_scalar_value(&meta);
+        let scalar = MetadataColumn::Location(None).to_scalar_value(&meta);
         assert_eq!(
             scalar,
             ScalarValue::Utf8(Some("test/file.parquet".to_string()))
@@ -241,7 +248,7 @@ mod tests {
         // Test valid values
         assert_eq!(
             MetadataColumn::from_str("location").unwrap(),
-            MetadataColumn::Location
+            MetadataColumn::Location(None)
         );
         assert_eq!(
             MetadataColumn::from_str("last_modified").unwrap(),
@@ -259,7 +266,7 @@ mod tests {
 
     #[test]
     fn test_metadata_column_display() {
-        assert_eq!(format!("{}", MetadataColumn::Location), "location");
+        assert_eq!(format!("{}", MetadataColumn::Location(None)), "location");
         assert_eq!(format!("{}", MetadataColumn::LastModified), "last_modified");
         assert_eq!(format!("{}", MetadataColumn::Size), "size");
     }
@@ -271,7 +278,7 @@ mod tests {
         let meta2 = create_test_object_meta("file2.parquet", 2048, timestamp);
 
         // Create a location builder and append values
-        let mut builder = MetadataColumn::Location.builder(2);
+        let mut builder = MetadataColumn::Location(None).builder(2);
         builder.append(&meta1);
         builder.append(&meta2);
 
@@ -332,7 +339,7 @@ mod tests {
     #[test]
     fn test_metadata_builder_empty() {
         // Test with empty builders
-        let location_builder = MetadataColumn::Location.builder(0);
+        let location_builder = MetadataColumn::Location(None).builder(0);
         let location_array = location_builder.finish();
         assert_eq!(location_array.len(), 0);
 
