@@ -40,10 +40,10 @@ use datafusion_expr::Expr;
 use object_store::ObjectMeta;
 
 /// A metadata column that can be used to filter files
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetadataColumn {
-    /// The location of the file in object store
-    Location,
+    /// The location of the file in object store, with an optional prefix.
+    Location(Option<Arc<str>>),
     /// The last modified timestamp of the file
     LastModified,
     /// The size of the file in bytes
@@ -60,7 +60,7 @@ impl MetadataColumn {
     /// The name of the metadata column (one of `location`, `last_modified`, or `size`)
     pub fn name(&self) -> &str {
         match self {
-            MetadataColumn::Location => "location",
+            MetadataColumn::Location(_) => "location",
             MetadataColumn::LastModified => "last_modified",
             MetadataColumn::Size => "size",
         }
@@ -69,7 +69,7 @@ impl MetadataColumn {
     /// Returns the arrow type of this metadata column
     pub fn arrow_type(&self) -> DataType {
         match self {
-            MetadataColumn::Location => DataType::Utf8,
+            MetadataColumn::Location(_) => DataType::Utf8,
             MetadataColumn::LastModified => {
                 DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
             }
@@ -85,8 +85,10 @@ impl MetadataColumn {
     /// Returns the scalar value for this metadata column given an object meta
     pub fn to_scalar_value(&self, meta: &ObjectMeta) -> ScalarValue {
         match self {
-            MetadataColumn::Location => {
-                ScalarValue::Utf8(Some(meta.location.to_string()))
+            MetadataColumn::Location(prefix) => {
+                let location = meta.location.to_string();
+                let prefix = prefix.as_ref().map(|p| p.as_ref()).unwrap_or("");
+                ScalarValue::Utf8(Some(format!("{}{}", prefix, location)))
             }
             MetadataColumn::LastModified => ScalarValue::TimestampMicrosecond(
                 Some(meta.last_modified.timestamp_micros()),
@@ -98,7 +100,8 @@ impl MetadataColumn {
 
     pub(crate) fn builder(&self, capacity: usize) -> MetadataBuilder {
         match self {
-            MetadataColumn::Location => MetadataBuilder::Location(
+            MetadataColumn::Location(prefix) => MetadataBuilder::Location(
+                prefix.clone(),
                 StringBuilder::with_capacity(capacity, capacity * 10),
             ),
             MetadataColumn::LastModified => MetadataBuilder::LastModified(
@@ -118,7 +121,7 @@ impl FromStr for MetadataColumn {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "location" => Ok(MetadataColumn::Location),
+            "location" => Ok(MetadataColumn::Location(None)),
             "last_modified" => Ok(MetadataColumn::LastModified),
             "size" => Ok(MetadataColumn::Size),
             _ => plan_err!(
@@ -130,7 +133,7 @@ impl FromStr for MetadataColumn {
 }
 
 pub(crate) enum MetadataBuilder {
-    Location(StringBuilder),
+    Location(Option<Arc<str>>, StringBuilder),
     LastModified(TimestampMicrosecondBuilder),
     Size(UInt64Builder),
 }
@@ -138,7 +141,11 @@ pub(crate) enum MetadataBuilder {
 impl MetadataBuilder {
     pub fn append(&mut self, meta: &ObjectMeta) {
         match self {
-            Self::Location(builder) => builder.append_value(&meta.location),
+            Self::Location(prefix, builder) => {
+                let location = meta.location.to_string();
+                let prefix = prefix.as_ref().map(|p| p.as_ref()).unwrap_or("");
+                builder.append_value(format!("{}{}", prefix, location))
+            }
             Self::LastModified(builder) => {
                 builder.append_value(meta.last_modified.timestamp_micros())
             }
@@ -148,7 +155,7 @@ impl MetadataBuilder {
 
     pub fn finish(self) -> Arc<dyn Array> {
         match self {
-            MetadataBuilder::Location(mut builder) => Arc::new(builder.finish()),
+            MetadataBuilder::Location(_, mut builder) => Arc::new(builder.finish()),
             MetadataBuilder::LastModified(mut builder) => Arc::new(builder.finish()),
             MetadataBuilder::Size(mut builder) => Arc::new(builder.finish()),
         }
