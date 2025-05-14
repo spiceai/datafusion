@@ -20,7 +20,7 @@
 
 use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
-    fmt::Result as FmtResult, marker::PhantomData, str::FromStr, sync::Arc,
+    fmt::Result as FmtResult, marker::PhantomData, mem::size_of, sync::Arc, vec,
 };
 
 use arrow::{
@@ -717,6 +717,8 @@ pub struct ExtendedColumnProjector {
     projected_metadata_indexes: Vec<usize>,
     /// The schema of the table once the projection was applied.
     projected_schema: SchemaRef,
+    /// Mapping between the column name and the metadata column.
+    metadata_map: HashMap<String, MetadataColumn>,
 }
 
 impl ExtendedColumnProjector {
@@ -746,11 +748,17 @@ impl ExtendedColumnProjector {
             }
         }
 
+        let mut metadata_map = HashMap::new();
+        for metadata_col in metadata_cols.iter() {
+            metadata_map.insert(metadata_col.name().to_string(), metadata_col.clone());
+        }
+
         Self {
             key_buffer_cache: Default::default(),
             projected_partition_indexes,
             projected_metadata_indexes,
             projected_schema,
+            metadata_map,
         }
     }
 
@@ -822,8 +830,11 @@ impl ExtendedColumnProjector {
         for &sidx in &self.projected_metadata_indexes {
             // Get the metadata column type from the field name
             let field_name = self.projected_schema.field(sidx).name();
-            let metadata_col = MetadataColumn::from_str(field_name).map_err(|e| {
-                DataFusionError::Execution(format!("Invalid metadata column: {}", e))
+            let metadata_col = self.metadata_map.get(field_name).ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "Invalid metadata column: {}",
+                    field_name
+                ))
             })?;
 
             // Convert metadata to scalar value based on the column type

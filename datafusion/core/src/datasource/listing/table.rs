@@ -903,6 +903,10 @@ impl ListingTable {
     fn metadata_column_names(&self) -> impl Iterator<Item = &str> {
         self.options.metadata_cols.iter().map(|col| col.name())
     }
+
+    fn metadata_columns(&self) -> &Vec<MetadataColumn> {
+        &self.options.metadata_cols
+    }
 }
 
 // Expressions can be used for extended columns (partition/metadata) pruning if they can be evaluated using
@@ -1029,10 +1033,7 @@ impl TableProvider for ListingTable {
             .cloned()
             .collect();
 
-        let metadata_cols = self
-            .metadata_column_names()
-            .filter_map(|c| MetadataColumn::from_str(c).ok())
-            .collect::<Vec<_>>();
+        let metadata_cols = self.metadata_columns().clone();
 
         // create the execution plan
         self.options
@@ -1208,10 +1209,7 @@ impl ListingTable {
         .await?;
         let file_list = stream::iter(file_list).flatten();
 
-        let metadata_cols = self
-            .metadata_column_names()
-            .map(MetadataColumn::from_str)
-            .collect::<Result<Vec<_>>>()?;
+        let metadata_cols = self.metadata_columns().clone();
 
         // collect the statistics if required by the config + filter out files that don't match the metadata filters
         let files = file_list
