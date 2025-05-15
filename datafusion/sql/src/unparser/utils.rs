@@ -163,8 +163,8 @@ pub(crate) fn find_window_nodes_within_select<'a>(
 pub(crate) fn unproject_unnest_expr(expr: Expr, unnest: &Unnest) -> Result<Expr> {
     expr.transform(|sub_expr| {
             if let Expr::Column(col_ref) = &sub_expr {
-                // Check if the column is among the columns to run unnest on. 
-                // Currently, only List/Array columns (defined in `list_type_columns`) are supported for unnesting. 
+                // Check if the column is among the columns to run unnest on.
+                // Currently, only List/Array columns (defined in `list_type_columns`) are supported for unnesting.
                 if unnest.list_type_columns.iter().any(|e| e.1.output_column.name == col_ref.name) {
                     if let Ok(idx) = unnest.schema.index_of_column(col_ref) {
                         if let LogicalPlan::Projection(Projection { expr, .. }) = unnest.input.as_ref() {
@@ -314,6 +314,7 @@ pub(crate) fn unproject_sort_expr(
                                 )));
                             }
                         }
+                        return Ok(Transformed::no(Expr::Column(col)));
                     }
 
                     Ok(Transformed::no(Expr::Column(col)))
