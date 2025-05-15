@@ -314,6 +314,7 @@ pub(crate) fn unproject_sort_expr(
                                 )));
                             }
                         }
+                        return Ok(Transformed::no(Expr::Column(col)));
                     }
 
                     Ok(Transformed::no(Expr::Column(col)))
