@@ -185,6 +185,12 @@ mod tests {
                 source = source.with_bloom_filter_on_read(false);
             }
 
+            if self.bloom_filters {
+                source = source.with_bloom_filter_on_read(true);
+            } else {
+                source = source.with_bloom_filter_on_read(false);
+            }
+
             source.with_schema(Arc::clone(&table_schema))
         }
 
@@ -883,7 +889,6 @@ mod tests {
             Arc::new(StringViewArray::from(vec![Some("foo"), Some("bar")]));
         let batch = create_batch(vec![("c1", c1.clone())]);
 
-        // Table schema is Utf8 but file schema is StringView
         let table_schema =
             Arc::new(Schema::new(vec![Field::new("c1", DataType::Utf8, false)]));
 
