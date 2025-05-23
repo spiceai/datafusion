@@ -740,7 +740,13 @@ impl Unparser<'_> {
                         }
                         for (left, right) in &join.on {
                             exists_select.selection(Some(
-                                self.expr_to_sql(&left.clone().eq(right.clone()))?,
+                                self.expr_to_sql(
+                                    &left
+                                        .clone()
+                                        .eq(right.clone())
+                                        .or(Expr::IsNull(Box::new(left.clone()))
+                                            .and(Expr::IsNull(Box::new(right.clone())))),
+                                )?,
                             ));
                         }
                         exists_select.projection(vec![ast::SelectItem::UnnamedExpr(
