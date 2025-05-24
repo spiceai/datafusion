@@ -1276,7 +1276,6 @@ impl LogicalPlan {
     ) -> Result<LogicalPlan> {
         let param_values = param_values.into();
         let plan_with_values = self.replace_params_with_values(&param_values)?;
-
         // unwrap Prepare
         Ok(
             if let LogicalPlan::Statement(Statement::Prepare(prepare_lp)) =
