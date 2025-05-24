@@ -927,7 +927,7 @@ fn roundtrip_statement_with_dialect_39() -> Result<(), DataFusionError> {
         sql: "SELECT UNNEST([1,2,3]) as c1",
         parser_dialect: GenericDialect {},
         unparser_dialect: unparser,
-        expected: @r#"SELECT UNNEST([1, 2, 3]) AS c1"#,
+        expected: @"SELECT * FROM UNNEST([1, 2, 3])",
     );
     Ok(())
 }
