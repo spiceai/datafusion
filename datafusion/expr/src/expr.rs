@@ -498,7 +498,7 @@ impl Alias {
         self
     }
 
-        /// Return true if this alias represents the unaliased `name`
+    /// Return true if this alias represents the unaliased `name`
     pub fn eq_name(&self, name: &str) -> bool {
         self.eq_qualified_name(None, name)
     }
@@ -1399,7 +1399,14 @@ impl Expr {
 
     /// Return `self AS name` alias expression
     pub fn alias(self, name: impl Into<String>) -> Expr {
-        Expr::Alias(Alias::new(self, None::<&str>, name.into()))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(Alias::new(self, None::<&str>, name.into()));
+        };
+
+        alias.relation = None;
+        alias.name = name.into();
+        Expr::Alias(alias)
     }
 
     /// Return `self AS name` alias expression with metadata
@@ -1420,7 +1427,16 @@ impl Expr {
         name: impl Into<String>,
         metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Expr {
-        Expr::Alias(Alias::new(self, None::<&str>, name.into()).with_metadata(metadata))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(
+                Alias::new(self, None::<&str>, name.into()).with_metadata(metadata),
+            );
+        };
+
+        alias.relation = None;
+        alias.name = name.into();
+        Expr::Alias(alias.with_metadata(metadata))
     }
 
     /// Return `self AS name` alias expression with a specific qualifier
@@ -1458,7 +1474,14 @@ impl Expr {
         name: impl Into<String>,
         metadata: Option<std::collections::HashMap<String, String>>,
     ) -> Expr {
-        Expr::Alias(Alias::new(self, relation, name.into()).with_metadata(metadata))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(Alias::new(self, relation, name).with_metadata(metadata));
+        };
+
+        alias.relation = relation.map(|r| r.into());
+        alias.name = name.into();
+        Expr::Alias(alias.with_metadata(metadata))
     }
 
     /// Remove an alias from an expression if one exists.
