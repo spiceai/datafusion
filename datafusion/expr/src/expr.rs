@@ -1858,6 +1858,62 @@ impl Expr {
                 | Expr::SimilarTo(Like { expr, pattern, .. }) => {
                     rewrite_placeholder(pattern.as_mut(), expr.as_ref(), schema)?;
                 }
+                Expr::InSubquery(InSubquery {
+                    expr,
+                    subquery,
+                    negated: _,
+                }) => {
+                    let subquery_schema = subquery.subquery.schema();
+                    let fields = subquery_schema.fields();
+
+                    // only supports subquery with exactly 1 field
+                    if let [first_field] = &fields[..] {
+                        rewrite_placeholder(
+                            expr.as_mut(),
+                            &Expr::Column(Column {
+                                relation: None,
+                                name: first_field.name().clone(),
+                                spans: Spans::default(),
+                            }),
+                            schema,
+                        )?;
+                    }
+                }
+                Expr::Case(Case {
+                    expr,
+                    when_then_expr,
+                    else_expr,
+                }) => {
+                    // If `expr` is present, then it must match the types of each WHEN expression.
+                    // If `expr` is not present, then the type of each WHEN expression must evaluate to a boolean.
+                    // The types of the THEN and ELSE expressions must match `expr_type` (which is the final type of the CASE expression).
+                    let when_type = match expr {
+                        Some(expr) => {
+                            let mut when_type = expr.get_type(schema)?;
+                            if when_type == DataType::Null {
+                                for (when_expr, _) in when_then_expr.iter() {
+                                    let when_expr_type = when_expr.get_type(schema)?;
+                                    if when_expr_type != DataType::Null {
+                                        when_type = when_expr_type;
+                                        break;
+                                    }
+                                }
+                            }
+                            when_type
+                        }
+                        None => DataType::Boolean,
+                    };
+                    if let Some(expr) = expr {
+                        rewrite_placeholder_type(expr.as_mut(), &when_type)?;
+                    }
+                    for (when_expr, then_expr) in when_then_expr.iter_mut() {
+                        rewrite_placeholder_type(when_expr.as_mut(), &when_type)?;
+                        rewrite_placeholder_type(then_expr.as_mut(), &when_type)?;
+                    }
+                    if let Some(else_expr) = else_expr {
+                        rewrite_placeholder_type(else_expr.as_mut(), &when_type)?;
+                    }
+                }
                 Expr::Placeholder(_) => {
                     has_placeholder = true;
                 }
@@ -2511,18 +2567,13 @@ fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Resu
     Ok(())
 }
 
-fn find_first_non_null_data_type_expr_placeholder<'a>(
-    exprs: impl Iterator<Item = &'a Expr>,
-    schema: &DFSchema,
-) -> Option<DataType> {
-    for expr in exprs {
-        match expr.get_type(schema) {
-            Ok(dt) if dt != DataType::Null => return Some(dt),
-            _ => {}
+fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
+    if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
+        if data_type.is_none() {
+            *data_type = Some(dt.clone());
         };
     }
-
-    None
+    Ok(())
 }
 
 #[macro_export]
