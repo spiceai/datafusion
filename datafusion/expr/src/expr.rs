@@ -669,6 +669,19 @@ impl Alias {
         self.metadata = metadata;
         self
     }
+
+    /// Return true if this alias represents the unaliased `name`
+    pub fn eq_name(&self, name: &str) -> bool {
+        self.eq_qualified_name(None, name)
+    }
+
+    pub fn eq_qualified_name(
+        &self,
+        relation: Option<&TableReference>,
+        name: &str,
+    ) -> bool {
+        self.relation.as_ref() == relation && self.name == name
+    }
 }
 
 /// Binary expression
@@ -1569,7 +1582,14 @@ impl Expr {
 
     /// Return `self AS name` alias expression
     pub fn alias(self, name: impl Into<String>) -> Expr {
-        Expr::Alias(Alias::new(self, None::<&str>, name.into()))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(Alias::new(self, None::<&str>, name.into()));
+        };
+
+        alias.relation = None;
+        alias.name = name.into();
+        Expr::Alias(alias)
     }
 
     /// Return `self AS name` alias expression with metadata
@@ -1592,7 +1612,16 @@ impl Expr {
         name: impl Into<String>,
         metadata: Option<FieldMetadata>,
     ) -> Expr {
-        Expr::Alias(Alias::new(self, None::<&str>, name.into()).with_metadata(metadata))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(
+                Alias::new(self, None::<&str>, name.into()).with_metadata(metadata),
+            );
+        };
+
+        alias.relation = None;
+        alias.name = name.into();
+        Expr::Alias(alias.with_metadata(metadata))
     }
 
     /// Return `self AS name` alias expression with a specific qualifier
@@ -1601,7 +1630,14 @@ impl Expr {
         relation: Option<impl Into<TableReference>>,
         name: impl Into<String>,
     ) -> Expr {
-        Expr::Alias(Alias::new(self, relation, name.into()))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(Alias::new(self, relation, name));
+        };
+
+        alias.relation = relation.map(|r| r.into());
+        alias.name = name.into();
+        Expr::Alias(alias)
     }
 
     /// Return `self AS name` alias expression with a specific qualifier and metadata
@@ -1625,7 +1661,14 @@ impl Expr {
         name: impl Into<String>,
         metadata: Option<FieldMetadata>,
     ) -> Expr {
-        Expr::Alias(Alias::new(self, relation, name.into()).with_metadata(metadata))
+        // Don't nest aliases
+        let Expr::Alias(mut alias) = self else {
+            return Expr::Alias(Alias::new(self, relation, name).with_metadata(metadata));
+        };
+
+        alias.relation = relation.map(|r| r.into());
+        alias.name = name.into();
+        Expr::Alias(alias.with_metadata(metadata))
     }
 
     /// Remove an alias from an expression if one exists.
