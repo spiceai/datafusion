@@ -24,6 +24,7 @@ use datafusion_expr::ScalarUDF;
 pub mod common;
 pub mod current_date;
 pub mod current_time;
+pub mod date_add;
 pub mod date_bin;
 pub mod date_part;
 pub mod date_trunc;
@@ -39,6 +40,7 @@ pub mod to_unixtime;
 // create UDFs
 make_udf_function!(current_date::CurrentDateFunc, current_date);
 make_udf_function!(current_time::CurrentTimeFunc, current_time);
+make_udf_function!(date_add::DateAddFunc, date_add);
 make_udf_function!(date_bin::DateBinFunc, date_bin);
 make_udf_function!(date_part::DatePartFunc, date_part);
 make_udf_function!(date_trunc::DateTruncFunc, date_trunc);
@@ -71,6 +73,9 @@ pub mod expr_fn {
         from_unixtime,
         "converts an integer to RFC3339 timestamp format string",
         unixtime
+    ),(
+        date_add,
+        "adds a specified interval to a date, timestamp, or time value",
     ),(
         date_bin,
         "coerces an arbitrary timestamp to the start of the nearest specified interval",
@@ -257,6 +262,7 @@ pub fn functions() -> Vec<Arc<ScalarUDF>> {
     vec![
         current_date(),
         current_time(),
+        date_add(),
         date_bin(),
         date_part(),
         date_trunc(),
