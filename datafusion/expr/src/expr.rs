@@ -1641,13 +1641,14 @@ impl Expr {
             #[expect(deprecated)]
             match &mut expr {
                 Expr::BinaryExpr(BinaryExpr { left, op: _, right }) => {
-                    let binary_expr_type =
-                        find_first_non_null_data_type_expr_placeholder(
-                            [left.as_ref(), right.as_ref()].into_iter(),
-                            schema,
-                        )?;
-                    rewrite_placeholder_type(left.as_mut(), &binary_expr_type)?;
-                    rewrite_placeholder_type(right.as_mut(), &binary_expr_type)?;
+                    let binary_expr_type = find_first_non_null_data_type_expr_placeholder(
+                        [left.as_ref(), right.as_ref()].into_iter(),
+                        schema,
+                    );
+                    if let Some(binary_expr_type) = binary_expr_type {
+                        rewrite_placeholder_type(left.as_mut(), &binary_expr_type)?;
+                        rewrite_placeholder_type(right.as_mut(), &binary_expr_type)?;
+                    }
                 }
                 Expr::Between(Between {
                     expr,
@@ -1658,10 +1659,12 @@ impl Expr {
                     let between_type = find_first_non_null_data_type_expr_placeholder(
                         [low.as_ref(), high.as_ref(), expr.as_ref()].into_iter(),
                         schema,
-                    )?;
-                    rewrite_placeholder_type(expr.as_mut(), &between_type)?;
-                    rewrite_placeholder_type(low.as_mut(), &between_type)?;
-                    rewrite_placeholder_type(high.as_mut(), &between_type)?;
+                    );
+                    if let Some(between_type) = between_type {
+                        rewrite_placeholder_type(expr.as_mut(), &between_type)?;
+                        rewrite_placeholder_type(low.as_mut(), &between_type)?;
+                        rewrite_placeholder_type(high.as_mut(), &between_type)?;
+                    }
                 }
                 Expr::InList(InList {
                     expr,
@@ -1671,10 +1674,12 @@ impl Expr {
                     let in_list_type = find_first_non_null_data_type_expr_placeholder(
                         [expr.as_ref()].into_iter().chain(list.iter()),
                         schema,
-                    )?;
-                    rewrite_placeholder_type(expr.as_mut(), &in_list_type)?;
-                    for item in list.iter_mut() {
-                        rewrite_placeholder_type(item, &in_list_type)?;
+                    );
+                    if let Some(in_list_type) = in_list_type {
+                        rewrite_placeholder_type(expr.as_mut(), &in_list_type)?;
+                        for item in list.iter_mut() {
+                            rewrite_placeholder_type(item, &in_list_type)?;
+                        }
                     }
                 }
                 Expr::Like(Like { expr, pattern, .. })
@@ -1682,9 +1687,11 @@ impl Expr {
                     let like_type = find_first_non_null_data_type_expr_placeholder(
                         [expr.as_ref(), pattern.as_ref()].into_iter(),
                         schema,
-                    )?;
-                    rewrite_placeholder_type(expr.as_mut(), &like_type)?;
-                    rewrite_placeholder_type(pattern.as_mut(), &like_type)?;
+                    );
+                    if let Some(like_type) = like_type {
+                        rewrite_placeholder_type(expr.as_mut(), &like_type)?;
+                        rewrite_placeholder_type(pattern.as_mut(), &like_type)?;
+                    }
                 }
                 Expr::InSubquery(InSubquery {
                     expr,
@@ -2420,22 +2427,15 @@ fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
 fn find_first_non_null_data_type_expr_placeholder<'a>(
     exprs: impl Iterator<Item = &'a Expr>,
     schema: &DFSchema,
-) -> Result<DataType> {
+) -> Option<DataType> {
     for expr in exprs {
-        let data_type = match expr.get_type(schema) {
-            Ok(dt) => dt,
-            Err(e) => {
-                return Err(e.context(format!(
-                    "Can not find type of {expr} needed to infer placeholder type"
-                )));
-            }
+        match expr.get_type(schema) {
+            Ok(dt) if dt != DataType::Null => return Some(dt),
+            _ => {}
         };
-        if data_type != DataType::Null {
-            return Ok(data_type);
-        }
     }
 
-    Ok(DataType::Null)
+    None
 }
 
 #[macro_export]
@@ -2998,7 +2998,7 @@ mod test {
         LogicalPlan, LogicalTableSource, Projection, ScalarFunctionArgs, ScalarUDF,
         ScalarUDFImpl, TableScan, Volatility,
     };
-    use arrow::datatypes::{Field, Schema};
+    use arrow::datatypes::{Field, Schema, TimeUnit};
     use sqlparser::ast;
     use sqlparser::ast::{Ident, IdentWithAlias};
     use std::any::Any;
