@@ -1637,7 +1637,7 @@ impl Expr {
     pub fn infer_placeholder_types(self, schema: &DFSchema) -> Result<(Expr, bool)> {
         let mut has_placeholder = false;
         self.transform(|mut expr| {
-            let expr_type = expr.get_type(schema)?;
+            let expr_type = expr.get_type(schema).ok();
             #[expect(deprecated)]
             match &mut expr {
                 Expr::BinaryExpr(BinaryExpr { left, op: _, right }) => {
@@ -1729,10 +1729,14 @@ impl Expr {
                     }
                     for (when_expr, then_expr) in when_then_expr.iter_mut() {
                         rewrite_placeholder_type(when_expr.as_mut(), &when_type)?;
-                        rewrite_placeholder_type(then_expr.as_mut(), &expr_type)?;
+                        if let Some(expr_type) = &expr_type {
+                            rewrite_placeholder_type(then_expr.as_mut(), expr_type)?;
+                        }
                     }
                     if let Some(else_expr) = else_expr {
-                        rewrite_placeholder_type(else_expr.as_mut(), &expr_type)?;
+                        if let Some(expr_type) = &expr_type {
+                            rewrite_placeholder_type(else_expr.as_mut(), expr_type)?;
+                        }
                     }
                 }
                 // These expressions constrain any immediate placeholders to Boolean.
