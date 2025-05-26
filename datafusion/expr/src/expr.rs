@@ -1987,11 +1987,17 @@ impl Expr {
         self.transform(|mut expr| {
             // Don't throw error early, only if Expr type is needed in specific `match` arm.
             let expr_type_result = expr.get_type(schema);
+
+            #[expect(deprecated)]
             match &mut expr {
-                // Default to assuming the arguments are the same type
                 Expr::BinaryExpr(BinaryExpr { left, op: _, right }) => {
-                    rewrite_placeholder(left.as_mut(), right.as_ref(), schema)?;
-                    rewrite_placeholder(right.as_mut(), left.as_ref(), schema)?;
+                    let binary_expr_type =
+                        find_first_non_null_data_type_expr_placeholder(
+                            [left.as_ref(), right.as_ref()].into_iter(),
+                            schema,
+                        )?;
+                    rewrite_placeholder_type(left.as_mut(), &binary_expr_type)?;
+                    rewrite_placeholder_type(right.as_mut(), &binary_expr_type)?;
                 }
                 Expr::Between(Between {
                     expr,
@@ -1999,21 +2005,36 @@ impl Expr {
                     low,
                     high,
                 }) => {
-                    rewrite_placeholder(low.as_mut(), expr.as_ref(), schema)?;
-                    rewrite_placeholder(high.as_mut(), expr.as_ref(), schema)?;
+                    let between_type = find_first_non_null_data_type_expr_placeholder(
+                        [low.as_ref(), high.as_ref(), expr.as_ref()].into_iter(),
+                        schema,
+                    )?;
+                    rewrite_placeholder_type(expr.as_mut(), &between_type)?;
+                    rewrite_placeholder_type(low.as_mut(), &between_type)?;
+                    rewrite_placeholder_type(high.as_mut(), &between_type)?;
                 }
                 Expr::InList(InList {
                     expr,
                     list,
                     negated: _,
                 }) => {
+                    let in_list_type = find_first_non_null_data_type_expr_placeholder(
+                        [expr.as_ref()].into_iter().chain(list.iter()),
+                        schema,
+                    )?;
+                    rewrite_placeholder_type(expr.as_mut(), &in_list_type)?;
                     for item in list.iter_mut() {
-                        rewrite_placeholder(item, expr.as_ref(), schema)?;
+                        rewrite_placeholder_type(item, &in_list_type)?;
                     }
                 }
                 Expr::Like(Like { expr, pattern, .. })
                 | Expr::SimilarTo(Like { expr, pattern, .. }) => {
-                    rewrite_placeholder(pattern.as_mut(), expr.as_ref(), schema)?;
+                    let like_type = find_first_non_null_data_type_expr_placeholder(
+                        [expr.as_ref(), pattern.as_ref()].into_iter(),
+                        schema,
+                    )?;
+                    rewrite_placeholder_type(expr.as_mut(), &like_type)?;
+                    rewrite_placeholder_type(pattern.as_mut(), &like_type)?;
                 }
                 Expr::InSubquery(InSubquery {
                     expr,
@@ -2023,17 +2044,10 @@ impl Expr {
                     let subquery_schema = subquery.subquery.schema();
                     let fields = subquery_schema.fields();
 
-                    // only supports subquery with exactly 1 field
+                    // Subqueries used in IN expressions must have exactly 1 field
+                    // i.e. `SELECT * FROM foo WHERE 'some_val' IN (SELECT val FROM bar)`
                     if let [first_field] = &fields[..] {
-                        rewrite_placeholder(
-                            expr.as_mut(),
-                            &Expr::Column(Column {
-                                relation: None,
-                                name: first_field.name().clone(),
-                                spans: Spans::default(),
-                            }),
-                            schema,
-                        )?;
+                        rewrite_placeholder_type(expr.as_mut(), first_field.data_type())?;
                     }
                 }
                 Expr::Case(Case {
@@ -2072,10 +2086,49 @@ impl Expr {
                         rewrite_placeholder_type(else_expr.as_mut(), &expr_type)?;
                     }
                 }
+                // These expressions constrain any immediate placeholders to Boolean.
+                Expr::Not(expr)
+                | Expr::IsTrue(expr)
+                | Expr::IsFalse(expr)
+                | Expr::IsNotTrue(expr)
+                | Expr::IsNotFalse(expr)
+                | Expr::IsNotUnknown(expr) => {
+                    rewrite_placeholder_type(expr.as_mut(), &DataType::Boolean)?
+                }
+                // Note that the inner cast expression can technically be any data type
+                // that is coercible to the data type of the cast expression.
+                // However, returning `data_type` is preferable to returning DataType::Null
+                // for placeholder inference.
+                Expr::Cast(Cast { expr, data_type })
+                | Expr::TryCast(TryCast { expr, data_type }) => {
+                    rewrite_placeholder_type(expr.as_mut(), data_type)?;
+                }
+                // Negative expressions can technically be any numeric data type, but if we have
+                // an immediate placeholder, let's infer it as Int64.
+                Expr::Negative(expr) => {
+                    rewrite_placeholder_type(expr.as_mut(), &DataType::Int64)?
+                }
                 Expr::Placeholder(_) => {
                     has_placeholder = true;
                 }
-                _ => {}
+                // These expressions either cannot contain placeholders or
+                // do not constrain the type of the placeholder.
+                Expr::Alias(_)
+                | Expr::Column(_)
+                | Expr::ScalarVariable(_, _)
+                | Expr::Literal(_, _)
+                | Expr::IsNotNull(_)
+                | Expr::IsNull(_)
+                | Expr::IsUnknown(_)
+                | Expr::ScalarFunction(_)
+                | Expr::AggregateFunction(_)
+                | Expr::WindowFunction(_)
+                | Expr::Exists(_)
+                | Expr::ScalarSubquery(_)
+                | Expr::Wildcard { .. }
+                | Expr::GroupingSet(_)
+                | Expr::OuterReferenceColumn(_, _)
+                | Expr::Unnest(_) => {}
             }
             Ok(Transformed::yes(expr))
         })
@@ -2712,26 +2765,6 @@ impl HashNode for Expr {
     }
 }
 
-// Modifies expr if it is a placeholder with datatype of right
-fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Result<()> {
-    if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
-        if data_type.is_none() {
-            let other_dt = other.get_type(schema);
-            match other_dt {
-                Err(e) => {
-                    Err(e.context(format!(
-                        "Can not find type of {other} needed to infer type of {expr}"
-                    )))?;
-                }
-                Ok(dt) => {
-                    *data_type = Some(dt);
-                }
-            }
-        };
-    }
-    Ok(())
-}
-
 fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
     if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
         if data_type.is_none() {
@@ -2739,6 +2772,27 @@ fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
         };
     }
     Ok(())
+}
+
+fn find_first_non_null_data_type_expr_placeholder<'a>(
+    exprs: impl Iterator<Item = &'a Expr>,
+    schema: &DFSchema,
+) -> Result<DataType> {
+    for expr in exprs {
+        let data_type = match expr.get_type(schema) {
+            Ok(dt) => dt,
+            Err(e) => {
+                return Err(e.context(format!(
+                    "Can not find type of {expr} needed to infer placeholder type"
+                )));
+            }
+        };
+        if data_type != DataType::Null {
+            return Ok(data_type);
+        }
+    }
+
+    Ok(DataType::Null)
 }
 
 #[macro_export]
@@ -3596,6 +3650,50 @@ mod test {
     }
 
     #[test]
+    fn infer_placeholder_in_clause_with_placeholder_expr() {
+        // SELECT * FROM employees WHERE $1 IN (1, 2, 3);
+        let placeholder_expr = Expr::Placeholder(Placeholder {
+            id: "$1".to_string(),
+            data_type: None,
+        });
+        let in_list = Expr::InList(InList {
+            expr: Box::new(placeholder_expr),
+            list: vec![
+                Expr::Literal(ScalarValue::Int32(Some(1))),
+                Expr::Literal(ScalarValue::Int32(Some(2))),
+                Expr::Literal(ScalarValue::Int32(Some(3))),
+            ],
+            negated: false,
+        });
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("department_id", DataType::Int32, true),
+        ]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        let (inferred_expr, contains_placeholder) =
+            in_list.infer_placeholder_types(&df_schema).unwrap();
+
+        assert!(contains_placeholder);
+
+        match inferred_expr {
+            Expr::InList(in_list) => match *in_list.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int32),
+                        "Placeholder {} should infer Int32",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder expression"),
+            },
+            _ => panic!("Expected InList expression"),
+        }
+    }
+
+    #[test]
     fn infer_placeholder_in_subquery() -> Result<()> {
         // Schema for my_table: A (Int32), B (Int32)
         let schema = Arc::new(Schema::new(vec![
@@ -3713,6 +3811,62 @@ mod test {
         let (inferred_expr, _) = expr.infer_placeholder_types(&df_schema).unwrap();
         match inferred_expr {
             Expr::SimilarTo(like) => match *like.pattern {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Utf8),
+                        "Placeholder {} should infer Utf8",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder expression"),
+            },
+            _ => panic!("Expected SimilarTo expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_like_and_similar_to_expr_position() {
+        // $1 LIKE 'pattern%'
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        let like = Like {
+            expr: Box::new(Expr::Placeholder(Placeholder {
+                id: "$1".to_string(),
+                data_type: None,
+            })),
+            pattern: Box::new(lit("pattern%")),
+            negated: false,
+            case_insensitive: false,
+            escape_char: None,
+        };
+
+        let expr = Expr::Like(like.clone());
+
+        let (inferred_expr, _) = expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::Like(like) => match *like.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Utf8),
+                        "Placeholder {} should infer Utf8",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder"),
+            },
+            _ => panic!("Expected Like"),
+        }
+
+        // $1 SIMILAR TO 'pattern.*'
+        let expr = Expr::SimilarTo(like);
+
+        let (inferred_expr, _) = expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::SimilarTo(like) => match *like.expr {
                 Expr::Placeholder(placeholder) => {
                     assert_eq!(
                         placeholder.data_type,
@@ -4390,5 +4544,610 @@ mod test {
         assert!(matches!(inferred_expr, Expr::Case(_)));
 
         Ok(())
+    }
+
+    #[test]
+    fn infer_placeholder_between_all_positions() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("age", DataType::Int32, true),
+            Field::new("score", DataType::Float64, true),
+        ]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        // Test Case 1: $1 BETWEEN 18 AND 65 (placeholder in expr position)
+        let between_expr_pos = Expr::Between(Between::new(
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$1".to_string(),
+                data_type: None,
+            })),
+            false,
+            Box::new(lit(18i32)),
+            Box::new(lit(65i32)),
+        ));
+
+        let (inferred_expr, _) = between_expr_pos
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Between(between) => match *between.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int32),
+                        "Placeholder {} should infer Int32",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in expr position"),
+            },
+            _ => panic!("Expected Between expression"),
+        }
+
+        // Test Case 2: age BETWEEN $2 AND 65 (placeholder in low position)
+        let between_low_pos = Expr::Between(Between::new(
+            Box::new(col("age")),
+            false,
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$2".to_string(),
+                data_type: None,
+            })),
+            Box::new(lit(65i32)),
+        ));
+
+        let (inferred_expr, _) =
+            between_low_pos.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::Between(between) => match *between.low {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int32),
+                        "Placeholder {} should infer Int32",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in low position"),
+            },
+            _ => panic!("Expected Between expression"),
+        }
+
+        // Test Case 3: age BETWEEN 18 AND $3 (placeholder in high position)
+        let between_high_pos = Expr::Between(Between::new(
+            Box::new(col("age")),
+            false,
+            Box::new(lit(18i32)),
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$3".to_string(),
+                data_type: None,
+            })),
+        ));
+
+        let (inferred_expr, _) = between_high_pos
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Between(between) => match *between.high {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int32),
+                        "Placeholder {} should infer Int32",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in high position"),
+            },
+            _ => panic!("Expected Between expression"),
+        }
+
+        // Test Case 4: $4 BETWEEN $5 AND $6 (placeholders in all positions)
+        let between_all_placeholders = Expr::Between(Between::new(
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$4".to_string(),
+                data_type: None,
+            })),
+            false,
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$5".to_string(),
+                data_type: None,
+            })),
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$6".to_string(),
+                data_type: None,
+            })),
+        ));
+
+        let (inferred_expr, _) = between_all_placeholders
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+
+        // When all are placeholders with no type hints, they should get DataType::Null
+        // or remain unresolved since there's no context to infer from
+        match inferred_expr {
+            Expr::Between(between) => {
+                // All placeholders should be processed, even if types remain unresolved
+                assert!(matches!(*between.expr, Expr::Placeholder(_)));
+                assert!(matches!(*between.low, Expr::Placeholder(_)));
+                assert!(matches!(*between.high, Expr::Placeholder(_)));
+            }
+            _ => panic!("Expected Between expression"),
+        }
+
+        // Test Case 5: score BETWEEN $7 AND $8 (multiple placeholders with type hint from column)
+        let between_multi_placeholders = Expr::Between(Between::new(
+            Box::new(col("score")),
+            false,
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$7".to_string(),
+                data_type: None,
+            })),
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$8".to_string(),
+                data_type: None,
+            })),
+        ));
+
+        let (inferred_expr, _) = between_multi_placeholders
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Between(between) => {
+                // Both placeholders should infer Float64 from the score column
+                match (*between.low, *between.high) {
+                    (
+                        Expr::Placeholder(low_placeholder),
+                        Expr::Placeholder(high_placeholder),
+                    ) => {
+                        assert_eq!(
+                            low_placeholder.data_type,
+                            Some(DataType::Float64),
+                            "Placeholder {} should infer Float64",
+                            low_placeholder.id
+                        );
+                        assert_eq!(
+                            high_placeholder.data_type,
+                            Some(DataType::Float64),
+                            "Placeholder {} should infer Float64",
+                            high_placeholder.id
+                        );
+                    }
+                    _ => panic!("Expected Placeholders in low and high positions"),
+                }
+            }
+            _ => panic!("Expected Between expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_boolean_constraint_expressions() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "flag",
+            DataType::Boolean,
+            true,
+        )]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        // Test Case 1: NOT $1 - should infer Boolean
+        let not_expr = Expr::Not(Box::new(Expr::Placeholder(Placeholder {
+            id: "$1".to_string(),
+            data_type: None,
+        })));
+
+        let (inferred_expr, _) = not_expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::Not(inner_expr) => match *inner_expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Boolean),
+                        "Placeholder {} should infer Boolean for NOT",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in NOT expression"),
+            },
+            _ => panic!("Expected NOT expression"),
+        }
+
+        // Test Case 2: $2 IS TRUE - should infer Boolean
+        let is_true_expr = Expr::IsTrue(Box::new(Expr::Placeholder(Placeholder {
+            id: "$2".to_string(),
+            data_type: None,
+        })));
+
+        let (inferred_expr, _) =
+            is_true_expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::IsTrue(inner_expr) => match *inner_expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Boolean),
+                        "Placeholder {} should infer Boolean for IS TRUE",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in IS TRUE expression"),
+            },
+            _ => panic!("Expected IS TRUE expression"),
+        }
+
+        // Test Case 3: $3 IS FALSE - should infer Boolean
+        let is_false_expr = Expr::IsFalse(Box::new(Expr::Placeholder(Placeholder {
+            id: "$3".to_string(),
+            data_type: None,
+        })));
+
+        let (inferred_expr, _) =
+            is_false_expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::IsFalse(inner_expr) => match *inner_expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Boolean),
+                        "Placeholder {} should infer Boolean for IS FALSE",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in IS FALSE expression"),
+            },
+            _ => panic!("Expected IS FALSE expression"),
+        }
+
+        // Test Case 4: $4 IS NOT TRUE - should infer Boolean
+        let is_not_true_expr =
+            Expr::IsNotTrue(Box::new(Expr::Placeholder(Placeholder {
+                id: "$4".to_string(),
+                data_type: None,
+            })));
+
+        let (inferred_expr, _) = is_not_true_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::IsNotTrue(inner_expr) => match *inner_expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Boolean),
+                        "Placeholder {} should infer Boolean for IS NOT TRUE",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in IS NOT TRUE expression"),
+            },
+            _ => panic!("Expected IS NOT TRUE expression"),
+        }
+
+        // Test Case 5: $5 IS NOT FALSE - should infer Boolean
+        let is_not_false_expr =
+            Expr::IsNotFalse(Box::new(Expr::Placeholder(Placeholder {
+                id: "$5".to_string(),
+                data_type: None,
+            })));
+
+        let (inferred_expr, _) = is_not_false_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::IsNotFalse(inner_expr) => match *inner_expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Boolean),
+                        "Placeholder {} should infer Boolean for IS NOT FALSE",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in IS NOT FALSE expression"),
+            },
+            _ => panic!("Expected IS NOT FALSE expression"),
+        }
+
+        // Test Case 6: $6 IS NOT UNKNOWN - should infer Boolean
+        let is_not_unknown_expr =
+            Expr::IsNotUnknown(Box::new(Expr::Placeholder(Placeholder {
+                id: "$7".to_string(),
+                data_type: None,
+            })));
+
+        let (inferred_expr, _) = is_not_unknown_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::IsNotUnknown(inner_expr) => match *inner_expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Boolean),
+                        "Placeholder {} should infer Boolean for IS NOT UNKNOWN",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in IS NOT UNKNOWN expression"),
+            },
+            _ => panic!("Expected IS NOT UNKNOWN expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_cast_and_try_cast() {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        // Test Case 1: CAST($1 AS INT32) - should infer Int32
+        let cast_expr = Expr::Cast(Cast::new(
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$1".to_string(),
+                data_type: None,
+            })),
+            DataType::Int32,
+        ));
+
+        let (inferred_expr, _) = cast_expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::Cast(cast) => match *cast.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int32),
+                        "Placeholder {} should infer Int32 for CAST AS INT32",
+                        placeholder.id
+                    );
+                    assert_eq!(cast.data_type, DataType::Int32);
+                }
+                _ => panic!("Expected Placeholder in CAST expression"),
+            },
+            _ => panic!("Expected CAST expression"),
+        }
+
+        // Test Case 2: TRY_CAST($2 AS FLOAT64) - should infer Float64
+        let try_cast_expr = Expr::TryCast(TryCast::new(
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$2".to_string(),
+                data_type: None,
+            })),
+            DataType::Float64,
+        ));
+
+        let (inferred_expr, _) =
+            try_cast_expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::TryCast(try_cast) => match *try_cast.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Float64),
+                        "Placeholder {} should infer Float64 for TRY_CAST AS FLOAT64",
+                        placeholder.id
+                    );
+                    assert_eq!(try_cast.data_type, DataType::Float64);
+                }
+                _ => panic!("Expected Placeholder in TRY_CAST expression"),
+            },
+            _ => panic!("Expected TRY_CAST expression"),
+        }
+
+        // Test Case 3: CAST($3 AS TIMESTAMP) - should infer Timestamp
+        let cast_timestamp_expr = Expr::Cast(Cast::new(
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$3".to_string(),
+                data_type: None,
+            })),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        ));
+
+        let (inferred_expr, _) = cast_timestamp_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Cast(cast) => match *cast.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Timestamp(TimeUnit::Nanosecond, None)),
+                        "Placeholder {} should infer Timestamp for CAST AS TIMESTAMP",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in CAST expression"),
+            },
+            _ => panic!("Expected CAST expression"),
+        }
+
+        // Test Case 4: TRY_CAST($4 AS VARCHAR) - should infer Utf8
+        let try_cast_varchar_expr = Expr::TryCast(TryCast::new(
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$4".to_string(),
+                data_type: None,
+            })),
+            DataType::Utf8,
+        ));
+
+        let (inferred_expr, _) = try_cast_varchar_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::TryCast(try_cast) => match *try_cast.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Utf8),
+                        "Placeholder {} should infer Utf8 for TRY_CAST AS VARCHAR",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in TRY_CAST expression"),
+            },
+            _ => panic!("Expected TRY_CAST expression"),
+        }
+
+        // Test Case 5: Nested casts - CAST(TRY_CAST($5 AS INT32) AS FLOAT64)
+        let nested_cast_expr = Expr::Cast(Cast::new(
+            Box::new(Expr::TryCast(TryCast::new(
+                Box::new(Expr::Placeholder(Placeholder {
+                    id: "$5".to_string(),
+                    data_type: None,
+                })),
+                DataType::Int32,
+            ))),
+            DataType::Float64,
+        ));
+
+        let (inferred_expr, _) = nested_cast_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Cast(cast) => {
+                assert_eq!(cast.data_type, DataType::Float64);
+                match *cast.expr {
+                    Expr::TryCast(try_cast) => {
+                        assert_eq!(try_cast.data_type, DataType::Int32);
+                        match *try_cast.expr {
+                            Expr::Placeholder(placeholder) => {
+                                assert_eq!(
+                                    placeholder.data_type,
+                                    Some(DataType::Int32),
+                                    "Placeholder {} should infer Int32 from inner TRY_CAST",
+                                    placeholder.id
+                                );
+                            }
+                            _ => panic!("Expected Placeholder in nested TRY_CAST"),
+                        }
+                    }
+                    _ => panic!("Expected TRY_CAST in nested CAST expression"),
+                }
+            }
+            _ => panic!("Expected CAST expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_negative() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            true,
+        )]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        // Test Case 1: -$1 - should infer Int64 by default
+        let negative_expr = Expr::Negative(Box::new(Expr::Placeholder(Placeholder {
+            id: "$1".to_string(),
+            data_type: None,
+        })));
+
+        let (inferred_expr, _) =
+            negative_expr.infer_placeholder_types(&df_schema).unwrap();
+        match inferred_expr {
+            Expr::Negative(inner_expr) => match *inner_expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int64),
+                        "Placeholder {} should infer Int64 for negative expression",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder in negative expression"),
+            },
+            _ => panic!("Expected Negative expression"),
+        }
+
+        // Test Case 2: -(value * $2) - should not change placeholder inference based on context
+        let complex_negative_expr =
+            Expr::Negative(Box::new(Expr::BinaryExpr(BinaryExpr {
+                left: Box::new(col("value")),
+                op: Operator::Multiply,
+                right: Box::new(Expr::Placeholder(Placeholder {
+                    id: "$2".to_string(),
+                    data_type: None,
+                })),
+            })));
+
+        let (inferred_expr, _) = complex_negative_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Negative(inner_expr) => match *inner_expr {
+                Expr::BinaryExpr(binary_expr) => match *binary_expr.right {
+                    Expr::Placeholder(placeholder) => {
+                        assert_eq!(
+                            placeholder.data_type,
+                            Some(DataType::Int32),
+                            "Placeholder {} should infer Int32 from binary expression context",
+                            placeholder.id
+                        );
+                    }
+                    _ => panic!("Expected Placeholder in binary expression"),
+                },
+                _ => panic!("Expected BinaryExpr in negative expression"),
+            },
+            _ => panic!("Expected Negative expression"),
+        }
+
+        // Test Case 3: Nested negative expressions --$3
+        let double_negative_expr = Expr::Negative(Box::new(Expr::Negative(Box::new(
+            Expr::Placeholder(Placeholder {
+                id: "$3".to_string(),
+                data_type: None,
+            }),
+        ))));
+
+        let (inferred_expr, _) = double_negative_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Negative(outer_expr) => match *outer_expr {
+                Expr::Negative(inner_expr) => match *inner_expr {
+                    Expr::Placeholder(placeholder) => {
+                        assert_eq!(
+                            placeholder.data_type,
+                            Some(DataType::Int64),
+                            "Placeholder {} should infer Int64 for nested negative expression",
+                            placeholder.id
+                        );
+                    }
+                    _ => panic!("Expected Placeholder in inner negative expression"),
+                },
+                _ => panic!("Expected Negative expression in outer negative expression"),
+            },
+            _ => panic!("Expected Negative expression"),
+        }
+
+        // Test Case 4: Negative with cast - -CAST($4 AS FLOAT64)
+        let negative_cast_expr = Expr::Negative(Box::new(Expr::Cast(Cast::new(
+            Box::new(Expr::Placeholder(Placeholder {
+                id: "$4".to_string(),
+                data_type: None,
+            })),
+            DataType::Float64,
+        ))));
+
+        let (inferred_expr, _) = negative_cast_expr
+            .infer_placeholder_types(&df_schema)
+            .unwrap();
+        match inferred_expr {
+            Expr::Negative(inner_expr) => match *inner_expr {
+                Expr::Cast(cast) => {
+                    assert_eq!(cast.data_type, DataType::Float64);
+                    match *cast.expr {
+                        Expr::Placeholder(placeholder) => {
+                            assert_eq!(
+                                placeholder.data_type,
+                                Some(DataType::Float64),
+                                "Placeholder {} should infer Float64 from cast target type",
+                                placeholder.id
+                            );
+                        }
+                        _ => panic!("Expected Placeholder in cast expression"),
+                    }
+                }
+                _ => panic!("Expected Cast expression in negative expression"),
+            },
+            _ => panic!("Expected Negative expression"),
+        }
     }
 }
