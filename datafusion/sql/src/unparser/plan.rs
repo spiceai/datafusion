@@ -664,6 +664,23 @@ impl Unparser<'_> {
                 // The outer projection plan will handle projecting the correct columns.
                 let already_projected = select.already_projected();
 
+                if already_projected
+                    & matches!(
+                        join.join_type,
+                        JoinType::LeftSemi
+                            | JoinType::LeftAnti
+                            | JoinType::RightSemi
+                            | JoinType::RightAnti
+                    )
+                {
+                    return self.derive_with_dialect_alias(
+                        "derived_join",
+                        plan,
+                        relation,
+                        false,
+                    );
+                }
+
                 let left_plan =
                     match try_transform_to_simple_table_scan_with_filters(left_plan)? {
                         Some((plan, filters)) => {
