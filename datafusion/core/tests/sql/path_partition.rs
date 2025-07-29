@@ -597,7 +597,7 @@ async fn test_metadata_columns() -> Result<()> {
     ctx.register_table("t", table).unwrap();
 
     let result = ctx
-        .sql("SELECT id, size, location, last_modified FROM t WHERE size > 1500 ORDER BY id LIMIT 10")
+        .sql("SELECT id, size, location, last_modified FROM t WHERE size > 1500 ORDER BY id LIMIT 12")
         .await?
         .collect()
         .await?;
@@ -615,9 +615,12 @@ async fn test_metadata_columns() -> Result<()> {
         "| 2  | 1851 | year=2021/month=09/day=09/file.parquet | 1970-01-01T00:00:00Z |",
         "| 2  | 1851 | year=2021/month=10/day=09/file.parquet | 1970-01-01T00:00:00Z |",
         "| 2  | 1851 | year=2021/month=10/day=28/file.parquet | 1970-01-01T00:00:00Z |",
+        "| 3  | 1851 | year=2021/month=09/day=09/file.parquet | 1970-01-01T00:00:00Z |",
+        "| 3  | 1851 | year=2021/month=10/day=09/file.parquet | 1970-01-01T00:00:00Z |",
         "| 3  | 1851 | year=2021/month=10/day=28/file.parquet | 1970-01-01T00:00:00Z |",
         "+----+------+----------------------------------------+----------------------+",
     ];
+
     assert_batches_sorted_eq!(expected, &result);
 
     Ok(())
