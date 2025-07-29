@@ -545,7 +545,7 @@ impl FileStreamMetrics {
 
 #[cfg(test)]
 mod tests {
-    use crate::file_scan_config::{FileScanConfigBuilder, PartitionColumnProjector};
+    use crate::file_scan_config::FileScanConfigBuilder;
     use crate::tests::make_partition;
     use crate::PartitionedFile;
     use arrow::error::ArrowError;
