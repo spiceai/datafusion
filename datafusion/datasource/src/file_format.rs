@@ -37,6 +37,7 @@ use datafusion_session::Session;
 
 use async_trait::async_trait;
 use object_store::{ObjectMeta, ObjectStore};
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 /// Default max records to scan to infer the schema
 pub const DEFAULT_SCHEMA_INFER_MAX_RECORD: usize = 1000;
@@ -93,6 +94,7 @@ pub trait FileFormat: Send + Sync + fmt::Debug {
         &self,
         state: &dyn Session,
         conf: FileScanConfig,
+        filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>>;
 
     /// Take a list of files and the configuration to convert it to the
