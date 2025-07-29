@@ -1943,6 +1943,7 @@ dependencies = [
  "futures",
  "log",
  "object_store",
+ "tempfile",
  "tokio",
 ]
 

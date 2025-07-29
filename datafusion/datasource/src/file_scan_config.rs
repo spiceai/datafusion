@@ -713,7 +713,7 @@ impl FileScanConfig {
         match &self.projection {
             Some(proj) => proj.clone(),
             None => (0..self.file_schema.fields().len()
-                + self.metadata_cols.len())
+                + self.metadata_cols.len()
                 + self.table_partition_cols.len())
                 .collect(),
         }
