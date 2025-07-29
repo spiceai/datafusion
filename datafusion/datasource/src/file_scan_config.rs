@@ -833,6 +833,7 @@ impl FileScanConfig {
     }
 
     /// Set the metadata columns of the files
+    #[deprecated(since = "47.0.0", note = "use FileScanConfigBuilder instead")]
     pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
         self.metadata_cols = metadata_cols;
         self
@@ -1617,6 +1618,8 @@ mod tests {
     use datafusion_expr::{execution_props::ExecutionProps, SortExpr};
     use datafusion_physical_expr::create_physical_expr;
     use std::collections::HashMap;
+    use arrow::array::{StringArray, TimestampMicrosecondArray, UInt64Array};
+    use arrow::datatypes::TimeUnit;
     use object_store::path::Path;
 
     fn create_physical_sort_expr(
@@ -2318,7 +2321,7 @@ mod tests {
                 Arc::new(Int32Array::from(c.1.clone())),
             ],
         )
-        .unwrap()
+            .unwrap()
     }
 
     /// Create a test ObjectMeta with given path, size and a fixed timestamp
@@ -2347,9 +2350,9 @@ mod tests {
             file_schema.clone(),
             Arc::new(MockSource::default()),
         )
-        .with_projection(projection)
-        .with_metadata_cols(metadata_cols)
-        .build()
+            .with_projection(projection)
+            .with_metadata_cols(metadata_cols)
+            .build()
     }
 
     #[test]
@@ -2549,9 +2552,9 @@ mod tests {
             file_schema.clone(),
             Arc::new(MockSource::default()),
         )
-        .with_table_partition_cols(partition_cols)
-        .with_metadata_cols(metadata_cols)
-        .build();
+            .with_table_partition_cols(partition_cols)
+            .with_metadata_cols(metadata_cols)
+            .build();
 
         // Get projected schema
         let schema = conf.projected_schema();
@@ -2596,7 +2599,7 @@ mod tests {
         let projected_schema = Arc::new(Schema::new(projected_fields));
 
         // Create projector
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             Arc::clone(&projected_schema),
             &[], // No partition columns
             &metadata_cols,
@@ -2612,7 +2615,7 @@ mod tests {
             ])),
             vec![Arc::new(a_values), Arc::new(b_values)],
         )
-        .unwrap();
+            .unwrap();
 
         // Apply projection
         let result = projector.project(file_batch, &[], &object_meta).unwrap();
@@ -2698,7 +2701,7 @@ mod tests {
         let projected_schema = Arc::new(Schema::new(projected_fields));
 
         // Create projector
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             Arc::clone(&projected_schema),
             &partition_cols,
             &metadata_cols,
@@ -2710,7 +2713,7 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)])),
             vec![Arc::new(a_values)],
         )
-        .unwrap();
+            .unwrap();
 
         // Apply projection
         let result = projector
