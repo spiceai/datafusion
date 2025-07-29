@@ -1491,6 +1491,14 @@ impl LogicalPlan {
         let mut param_types: HashMap<String, Option<DataType>> = HashMap::new();
 
         self.apply_with_subqueries(|plan| {
+            if let LogicalPlan::Limit(Limit { fetch: Some(e), .. }) = plan {
+                if let Expr::Placeholder(Placeholder { id, data_type }) = &**e {
+                    param_types.insert(
+                        id.clone(),
+                        Some(data_type.clone().unwrap_or(DataType::Int64)),
+                    );
+                }
+            }
             plan.apply_expressions(|expr| {
                 expr.apply(|expr| {
                     if let Expr::Placeholder(Placeholder { id, data_type }) = expr {
@@ -1503,6 +1511,9 @@ impl LogicalPlan {
                             }
                             (_, Some(dt)) => {
                                 param_types.insert(id.clone(), Some(dt.clone()));
+                            }
+                            (Some(Some(_)), None) => {
+                                // we have already inferred the datatype
                             }
                             _ => {
                                 param_types.insert(id.clone(), None);
@@ -4967,6 +4978,43 @@ mod tests {
             );
             assert_eq!(join.filter, Some(lit(true)));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_resolved_placeholder_limit() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("A", DataType::Int32, true)]));
+        let source = Arc::new(LogicalTableSource::new(schema.clone()));
+
+        let placeholder_value = "$1";
+
+        // SELECT * FROM my_table LIMIT $1
+        let plan = LogicalPlan::Limit(Limit {
+            skip: None,
+            fetch: Some(Box::new(Expr::Placeholder(Placeholder {
+                id: placeholder_value.to_string(),
+                data_type: None,
+            }))),
+            input: Arc::new(LogicalPlan::TableScan(TableScan {
+                table_name: TableReference::from("my_table"),
+                source,
+                projected_schema: Arc::new(DFSchema::try_from(schema.clone())?),
+                projection: None,
+                filters: vec![],
+                fetch: None,
+            })),
+        });
+
+        let params = plan.get_parameter_types().expect("to infer type");
+        assert_eq!(params.len(), 1);
+
+        let parameter_type = params
+            .clone()
+            .get(placeholder_value)
+            .expect("to get type")
+            .clone();
+        assert_eq!(parameter_type, Some(DataType::Int64));
 
         Ok(())
     }
