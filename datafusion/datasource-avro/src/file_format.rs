@@ -42,6 +42,7 @@ use datafusion_session::Session;
 
 use async_trait::async_trait;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 #[derive(Default)]
 /// Factory struct used to create [`AvroFormat`]
@@ -149,6 +150,7 @@ impl FileFormat for AvroFormat {
         &self,
         _state: &dyn Session,
         conf: FileScanConfig,
+        _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let config = FileScanConfigBuilder::from(conf)
             .with_source(self.file_source())

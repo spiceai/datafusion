@@ -61,6 +61,7 @@ use futures::stream::BoxStream;
 use futures::{pin_mut, Stream, StreamExt, TryStreamExt};
 use object_store::{delimited::newline_delimited_stream, ObjectMeta, ObjectStore};
 use regex::Regex;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 #[derive(Default)]
 /// Factory used to create [`CsvFormat`]
@@ -407,6 +408,7 @@ impl FileFormat for CsvFormat {
         &self,
         state: &dyn Session,
         conf: FileScanConfig,
+        _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Consult configuration options for default values
         let has_header = self

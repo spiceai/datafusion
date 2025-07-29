@@ -756,7 +756,7 @@ fn roundtrip_parquet_exec_with_pruning_predicate() -> Result<()> {
     let mut options = TableParquetOptions::new();
     options.global.pushdown_filters = true;
 
-    let file_source = Arc::new(ParquetSource::new(options).with_predicate(predicate));
+    let file_source = Arc::new(ParquetSource::new(options).with_predicate(Arc::clone(&file_schema), predicate));
 
     let scan_config = FileScanConfigBuilder::new(
         ObjectStoreUrl::local_filesystem(),
@@ -816,7 +816,7 @@ fn roundtrip_parquet_exec_with_custom_predicate_expr() -> Result<()> {
     });
 
     let file_source =
-        Arc::new(ParquetSource::default().with_predicate(custom_predicate_expr));
+        Arc::new(ParquetSource::default().with_predicate(Arc::clone(&file_schema), custom_predicate_expr));
 
     let scan_config = FileScanConfigBuilder::new(
         ObjectStoreUrl::local_filesystem(),

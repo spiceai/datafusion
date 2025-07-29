@@ -184,7 +184,10 @@ impl TestParquetFile {
 
             let source = Arc::new(
                 ParquetSource::new(parquet_options)
-                    .with_predicate(Arc::clone(&physical_filter_expr)),
+                    .with_predicate(
+                        Arc::clone(&self.schema),
+                        Arc::clone(&physical_filter_expr)
+                    ),
             )
             .with_schema(Arc::clone(&self.schema));
             let config = scan_config_builder.with_source(source).build();

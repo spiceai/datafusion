@@ -30,7 +30,7 @@ use crate::datasource::{
 use crate::execution::context::SessionState;
 use datafusion_catalog::TableProvider;
 use datafusion_catalog_listing::metadata::apply_metadata_filters;
-use datafusion_common::{config_err, DataFusionError, Result};
+use datafusion_common::{config_err, DataFusionError, Result, ToDFSchema};
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::schema_adapter::DefaultSchemaAdapterFactory;
@@ -48,7 +48,7 @@ use datafusion_common::{
 use datafusion_execution::cache::{
     cache_manager::FileStatisticsCache, cache_unit::DefaultFileStatisticsCache,
 };
-use datafusion_physical_expr::{LexOrdering, PhysicalSortRequirement};
+use datafusion_physical_expr::{create_physical_expr, LexOrdering, PhysicalSortRequirement};
 
 use async_trait::async_trait;
 use datafusion_catalog::Session;
@@ -59,6 +59,7 @@ use datafusion_physical_expr_common::sort_expr::LexRequirement;
 use futures::{future, stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ObjectStore;
+use datafusion_expr::utils::conjunction;
 
 /// Configuration for creating a [`ListingTable`]
 ///
@@ -1104,6 +1105,7 @@ impl TableProvider for ListingTable {
                 .with_table_partition_cols(table_partition_cols)
                 .with_metadata_cols(metadata_cols)
                 .build(),
+                filters.as_ref()
             )
             .await
     }

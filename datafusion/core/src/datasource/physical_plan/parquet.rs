@@ -162,7 +162,7 @@ mod tests {
 
             let mut source = ParquetSource::default();
             if let Some(predicate) = predicate {
-                source = source.with_predicate(predicate);
+                source = source.with_predicate(Arc::clone(&table_schema), predicate);
             }
 
             if self.pushdown_predicate {

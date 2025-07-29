@@ -63,6 +63,7 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
 use tokio::io::AsyncWriteExt;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 /// Initial writing buffer size. Note this is just a size hint for efficiency. It
 /// will grow beyond the set value if needed.
@@ -173,6 +174,7 @@ impl FileFormat for ArrowFormat {
         &self,
         _state: &dyn Session,
         conf: FileScanConfig,
+        _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let source = Arc::new(ArrowSource::default());
         let config = FileScanConfigBuilder::from(conf)

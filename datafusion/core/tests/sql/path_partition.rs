@@ -39,7 +39,6 @@ use datafusion::{
 use datafusion_catalog::TableProvider;
 use datafusion_common::stats::Precision;
 use datafusion_common::test_util::batches_to_sort_string;
-use datafusion_common::ScalarValue;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_execution::config::SessionConfig;
@@ -55,6 +54,11 @@ use object_store::{
 };
 use object_store::{Attributes, MultipartUpload, PutMultipartOpts, PutPayload};
 use url::Url;
+use datafusion_common::ScalarValue;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource_parquet::source::ParquetSource;
+use datafusion_expr::{col, lit, Expr, Operator};
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 
 #[tokio::test]
 async fn parquet_partition_pruning_filter() -> Result<()> {

@@ -60,6 +60,7 @@ use async_trait::async_trait;
 use bytes::{Buf, Bytes};
 use datafusion_datasource::source::DataSourceExec;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 #[derive(Default)]
 /// Factory struct used to create [JsonFormat]
@@ -248,6 +249,7 @@ impl FileFormat for JsonFormat {
         &self,
         _state: &dyn Session,
         conf: FileScanConfig,
+        _filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let source = Arc::new(JsonSource::new());
         let conf = FileScanConfigBuilder::from(conf)

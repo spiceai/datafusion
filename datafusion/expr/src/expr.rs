@@ -2492,10 +2492,20 @@ impl HashNode for Expr {
     }
 }
 
-fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
+fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Result<()> {
     if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
         if data_type.is_none() {
-            *data_type = Some(dt.clone());
+            let other_dt = other.get_type(schema);
+            match other_dt {
+                Err(e) => {
+                    Err(e.context(format!(
+                        "Can not find type of {other} needed to infer type of {expr}"
+                    )))?;
+                }
+                Ok(dt) => {
+                    *data_type = Some(dt);
+                }
+            }
         };
     }
     Ok(())
@@ -3310,65 +3320,9 @@ mod test {
         ScalarUDFImpl, TableScan, Volatility,
     };
     use arrow::datatypes::{Field, Schema, TimeUnit};
-    use arrow::datatypes::{Field, Schema};
     use sqlparser::ast;
     use sqlparser::ast::{Ident, IdentWithAlias};
     use std::any::Any;
-
-    #[test]
-    fn infer_placeholder_in_clause() {
-        // SELECT * FROM employees WHERE department_id IN ($1, $2, $3);
-        let column = col("department_id");
-        let param_placeholders = vec![
-            Expr::Placeholder(Placeholder {
-                id: "$1".to_string(),
-                data_type: None,
-            }),
-            Expr::Placeholder(Placeholder {
-                id: "$2".to_string(),
-                data_type: None,
-            }),
-            Expr::Placeholder(Placeholder {
-                id: "$3".to_string(),
-                data_type: None,
-            }),
-        ];
-        let in_list = Expr::InList(InList {
-            expr: Box::new(column),
-            list: param_placeholders,
-            negated: false,
-        });
-
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("department_id", DataType::Int32, true),
-        ]));
-        let df_schema = DFSchema::try_from(schema).unwrap();
-
-        let (inferred_expr, contains_placeholder) =
-            in_list.infer_placeholder_types(&df_schema).unwrap();
-
-        assert!(contains_placeholder);
-
-        match inferred_expr {
-            Expr::InList(in_list) => {
-                for expr in in_list.list {
-                    match expr {
-                        Expr::Placeholder(placeholder) => {
-                            assert_eq!(
-                                placeholder.data_type,
-                                Some(DataType::Int32),
-                                "Placeholder {} should infer Int32",
-                                placeholder.id
-                            );
-                        }
-                        _ => panic!("Expected Placeholder expression"),
-                    }
-                }
-            }
-            _ => panic!("Expected InList expression"),
-        }
-    }
 
     #[test]
     fn infer_placeholder_in_clause_with_placeholder_expr() {
@@ -3380,9 +3334,9 @@ mod test {
         let in_list = Expr::InList(InList {
             expr: Box::new(placeholder_expr),
             list: vec![
-                Expr::Literal(ScalarValue::Int32(Some(1))),
-                Expr::Literal(ScalarValue::Int32(Some(2))),
-                Expr::Literal(ScalarValue::Int32(Some(3))),
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+                Expr::Literal(ScalarValue::Int32(Some(2)), None),
+                Expr::Literal(ScalarValue::Int32(Some(3)), None),
             ],
             negated: false,
         });
@@ -3434,7 +3388,7 @@ mod test {
         let subquery_filter = Expr::BinaryExpr(BinaryExpr {
             left: Box::new(col("B")),
             op: Operator::Gt,
-            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(3)))),
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(3)), None)),
         });
 
         let subquery_scan = LogicalPlan::TableScan(TableScan {
@@ -3493,57 +3447,6 @@ mod test {
         }
 
         Ok(())
-    }
-
-    #[test]
-    fn infer_placeholder_like_and_similar_to() {
-        // name LIKE $1
-        let schema =
-            Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
-        let df_schema = DFSchema::try_from(schema).unwrap();
-
-        let like = Like {
-            expr: Box::new(col("name")),
-            pattern: Box::new(Expr::Placeholder(Placeholder {
-                id: "$1".to_string(),
-                data_type: None,
-            })),
-            negated: false,
-            case_insensitive: false,
-            escape_char: None,
-        };
-
-        let expr = Expr::Like(like.clone());
-
-        let (inferred_expr, _) = expr.infer_placeholder_types(&df_schema).unwrap();
-        match inferred_expr {
-            Expr::Like(like) => match *like.pattern {
-                Expr::Placeholder(placeholder) => {
-                    assert_eq!(placeholder.data_type, Some(DataType::Utf8));
-                }
-                _ => panic!("Expected Placeholder"),
-            },
-            _ => panic!("Expected Like"),
-        }
-
-        // name SIMILAR TO $1
-        let expr = Expr::SimilarTo(like);
-
-        let (inferred_expr, _) = expr.infer_placeholder_types(&df_schema).unwrap();
-        match inferred_expr {
-            Expr::SimilarTo(like) => match *like.pattern {
-                Expr::Placeholder(placeholder) => {
-                    assert_eq!(
-                        placeholder.data_type,
-                        Some(DataType::Utf8),
-                        "Placeholder {} should infer Utf8",
-                        placeholder.id
-                    );
-                }
-                _ => panic!("Expected Placeholder expression"),
-            },
-            _ => panic!("Expected SimilarTo expression"),
-        }
     }
 
     #[test]

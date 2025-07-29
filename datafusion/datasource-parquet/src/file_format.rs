@@ -86,6 +86,7 @@ use parquet::format::FileMetaData;
 use parquet::schema::types::SchemaDescriptor;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 /// Initial writing buffer size. Note this is just a size hint for efficiency. It
 /// will grow beyond the set value if needed.
@@ -410,15 +411,28 @@ impl FileFormat for ParquetFormat {
         &self,
         _state: &dyn Session,
         conf: FileScanConfig,
+        filters: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        let mut predicate = None;
         let mut metadata_size_hint = None;
 
+        // If enable pruning then combine the filters to build the predicate.
+        // If disable pruning then set the predicate to None, thus readers
+        // will not prune data based on the statistics.
+        if self.enable_pruning() {
+            if let Some(pred) = filters.cloned() {
+                predicate = Some(pred);
+            }
+        }
         if let Some(metadata) = self.metadata_size_hint() {
             metadata_size_hint = Some(metadata);
         }
 
         let mut source = ParquetSource::new(self.options.clone());
 
+        if let Some(predicate) = predicate {
+            source = source.with_predicate(Arc::clone(&conf.file_schema), predicate);
+        }
         if let Some(metadata_size_hint) = metadata_size_hint {
             source = source.with_metadata_size_hint(metadata_size_hint)
         }
