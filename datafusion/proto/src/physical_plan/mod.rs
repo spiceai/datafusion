@@ -792,7 +792,10 @@ impl protobuf::PhysicalPlanNode {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let input: Arc<dyn ExecutionPlan> =
             into_physical_plan(&merge.input, registry, runtime, extension_codec)?;
-        Ok(Arc::new(CoalescePartitionsExec::new(input)))
+        Ok(Arc::new(
+            CoalescePartitionsExec::new(input)
+                .with_fetch(merge.fetch.map(|f| f as usize)),
+        ))
     }
 
     fn try_into_repartition_physical_plan(
@@ -1047,7 +1050,12 @@ impl protobuf::PhysicalPlanNode {
                                     let agg_udf = match &agg_node.fun_definition {
                                         Some(buf) => extension_codec
                                             .try_decode_udaf(udaf_name, buf)?,
-                                        None => registry.udaf(udaf_name)?,
+                                        None => {
+                                            registry.udaf(udaf_name).or_else(|_| {
+                                                extension_codec
+                                                    .try_decode_udaf(udaf_name, &[])
+                                            })?
+                                        }
                                     };
 
                                     AggregateExprBuilder::new(agg_udf, input_phy_expr)
@@ -2354,6 +2362,7 @@ impl protobuf::PhysicalPlanNode {
             physical_plan_type: Some(PhysicalPlanType::Merge(Box::new(
                 protobuf::CoalescePartitionsExecNode {
                     input: Some(Box::new(input)),
+                    fetch: exec.fetch().map(|f| f as u32),
                 },
             ))),
         })

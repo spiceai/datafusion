@@ -50,7 +50,7 @@ use datafusion_expr::{
     UserDefinedLogicalNode,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::sync::Arc;
+use std::{sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -369,12 +369,13 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         relation: &mut RelationBuilder,
         lateral: bool,
+        columns: Vec<Ident>,
     ) -> Result<()> {
-        if self.dialect.requires_derived_table_alias() {
+        if self.dialect.requires_derived_table_alias() || !columns.is_empty() {
             self.derive(
                 plan,
                 relation,
-                Some(self.new_table_alias(alias.to_string(), vec![])),
+                Some(self.new_table_alias(alias.to_string(), columns)),
                 lateral,
             )
         } else {
@@ -452,6 +453,18 @@ impl Unparser<'_> {
                     }
                 }
 
+                // If it's a unnest projection, we should provide the table column alias
+                // to provide a column name for the unnest relation.
+                let columns = if unnest_input_type.is_some() {
+                    p.expr
+                        .iter()
+                        .map(|e| {
+                            self.new_ident_quoted_if_needs(e.schema_name().to_string())
+                        })
+                        .collect()
+                } else {
+                    vec![]
+                };
                 // Projection can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
@@ -461,6 +474,7 @@ impl Unparser<'_> {
                         unnest_input_type
                             .filter(|t| matches!(t, UnnestInputType::OuterReference))
                             .is_some(),
+                        columns,
                     );
                 }
                 self.reconstruct_select_statement(plan, p, select)?;
@@ -494,6 +508,7 @@ impl Unparser<'_> {
                         plan,
                         relation,
                         false,
+                        vec![],
                     );
                 }
                 if let Some(fetch) = &limit.fetch {
@@ -532,6 +547,7 @@ impl Unparser<'_> {
                         plan,
                         relation,
                         false,
+                        vec![],
                     );
                 }
                 let Some(query_ref) = query else {
@@ -603,6 +619,7 @@ impl Unparser<'_> {
                         plan,
                         relation,
                         false,
+                        vec![],
                     );
                 }
 
@@ -893,6 +910,7 @@ impl Unparser<'_> {
                         plan,
                         relation,
                         false,
+                        vec![],
                     );
                 }
 
@@ -1010,6 +1028,7 @@ impl Unparser<'_> {
                         subquery.subquery.as_ref(),
                         relation,
                         true,
+                        vec![],
                     )
                 }
             }
@@ -1032,8 +1051,7 @@ impl Unparser<'_> {
         if let Expr::Alias(Alias { expr, .. }) = expr {
             if let Expr::Column(Column { name, .. }) = expr.as_ref() {
                 if let Some(prefix) = name.strip_prefix(UNNEST_PLACEHOLDER) {
-                    if prefix.starts_with(&format!("({}(", OUTER_REFERENCE_COLUMN_PREFIX))
-                    {
+                    if prefix.starts_with(&format!("({OUTER_REFERENCE_COLUMN_PREFIX}(")) {
                         return Some(UnnestInputType::OuterReference);
                     }
                     return Some(UnnestInputType::Scalar);
@@ -1120,6 +1138,7 @@ impl Unparser<'_> {
                         if project_vec.is_empty() {
                             builder = builder.project(vec![Expr::Literal(
                                 ScalarValue::Int64(Some(1)),
+                                None,
                             )])?;
                         } else {
                             let project_columns = project_vec

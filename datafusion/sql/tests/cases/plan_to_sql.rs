@@ -120,19 +120,17 @@ fn roundtrip_statement() -> Result<()> {
             "select ta.j1_id from j1 ta where ta.j1_id > 1;",
             "select ta.j1_id, tb.j2_string from j1 ta join j2 tb on (ta.j1_id = tb.j2_id);",
             "select ta.j1_id, tb.j2_string, tc.j3_string from j1 ta join j2 tb on (ta.j1_id = tb.j2_id) join j3 tc on (ta.j1_id = tc.j3_id);",
-            // Commented queries are failing since DF46 upgrade on atempt to convert unparsed ast back to plan. Initial plan to ast (sql) conversion is successful/correct.
-            // `Result::unwrap()` on an `Err` value: Collection([Internal("Not a compound identifier: [Ident { value: \"id\", quote_style: None, span: Span(Location(0,0)..Location(0,0)) }]"), Internal("Not a compound identifier: [Ident { value: \"first_name\", quote_style: None, span: Span(Location(0,0)..Location(0,0)) }]")])
-            // "select * from (select id, first_name from person)",
-            // "select * from (select id, first_name from (select * from person))",
-            // "select id, count(*) as cnt from (select id from person) group by id",
+            "select * from (select id, first_name from person)",
+            "select * from (select id, first_name from (select * from person))",
+            "select id, count(*) as cnt from (select id from person) group by id",
             "select (id-1)/2, count(*) / (sum(id/10)-1) as agg_expr from (select (id-1) as id from person) group by id",
             "select CAST(id/2 as VARCHAR) NOT LIKE 'foo*' from person where NOT EXISTS (select ta.j1_id, tb.j2_string from j1 ta join j2 tb on (ta.j1_id = tb.j2_id))",
             r#"select "First Name" from person_quoted_cols"#,
             "select DISTINCT id FROM person",
             "select DISTINCT on (id) id, first_name from person",
             "select DISTINCT on (id) id, first_name from person order by id",
-            // r#"select id, count("First Name") as cnt from (select id, "First Name" from person_quoted_cols) group by id"#,
-            // "select id, count(*) as cnt from (select p1.id as id from person p1 inner join person p2 on p1.id=p2.id) group by id",
+            r#"select id, count("First Name") as cnt from (select id, "First Name" from person_quoted_cols) group by id"#,
+            "select id, count(*) as cnt from (select p1.id as id from person p1 inner join person p2 on p1.id=p2.id) group by id",
             "select id, count(*), first_name from person group by first_name, id",
             "select id, sum(age), first_name from person group by first_name, id",
             "select id, count(*), first_name
@@ -147,16 +145,16 @@ fn roundtrip_statement() -> Result<()> {
             group by "Last Name", id
             having count_first_name>5 and count_first_name<10
             order by count_first_name, "Last Name""#,
-            // r#"select p.id, count("First Name") as count_first_name,
-            // "Last Name", sum(qp.id/p.id - (select sum(id) from person_quoted_cols) ) / (select count(*) from person)
-            // from (select id, "First Name", "Last Name" from person_quoted_cols) qp
-            // inner join (select * from person) p
-            // on p.id = qp.id
-            // where p.id!=3 and "First Name"=='test' and qp.id in
-            // (select id from (select id, count(*) from person group by id having count(*) > 0))
-            // group by "Last Name", p.id
-            // having count_first_name>5 and count_first_name<10
-            // order by count_first_name, "Last Name""#,
+            r#"select p.id, count("First Name") as count_first_name,
+            "Last Name", sum(qp.id/p.id - (select sum(id) from person_quoted_cols) ) / (select count(*) from person)
+            from (select id, "First Name", "Last Name" from person_quoted_cols) qp
+            inner join (select * from person) p
+            on p.id = qp.id
+            where p.id!=3 and "First Name"=='test' and qp.id in
+            (select id from (select id, count(*) from person group by id having count(*) > 0))
+            group by "Last Name", p.id
+            having count_first_name>5 and count_first_name<10
+            order by count_first_name, "Last Name""#,
             r#"SELECT j1_string as string FROM j1
             UNION ALL
             SELECT j2_string as string FROM j2"#,
@@ -215,7 +213,7 @@ fn roundtrip_statement() -> Result<()> {
             "SELECT [1, 2, 3][1]",
             "SELECT left[1] FROM array",
             "SELECT {a:1, b:2}",
-            // SELECT s.a FROM (SELECT {a:1, b:2} AS s)
+            "SELECT s.a FROM (SELECT {a:1, b:2} AS s)",
             "SELECT MAP {'a': 1, 'b': 2}"
     ];
 
@@ -771,7 +769,7 @@ fn roundtrip_statement_with_dialect_27() -> Result<(), DataFusionError> {
         sql: "SELECT * FROM UNNEST([1,2,3])",
         parser_dialect: GenericDialect {},
         unparser_dialect: UnparserDefaultDialect {},
-        expected: @r#"SELECT "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))" FROM (SELECT UNNEST([1, 2, 3]) AS "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))")"#,
+        expected: @r#"SELECT "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))" FROM (SELECT UNNEST([1, 2, 3]) AS "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))") AS derived_projection ("UNNEST(make_array(Int64(1),Int64(2),Int64(3)))")"#,
     );
     Ok(())
 }
@@ -793,7 +791,7 @@ fn roundtrip_statement_with_dialect_29() -> Result<(), DataFusionError> {
         sql: "SELECT * FROM UNNEST([1,2,3]), j1",
         parser_dialect: GenericDialect {},
         unparser_dialect: UnparserDefaultDialect {},
-        expected: @r#"SELECT "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))", j1.j1_id, j1.j1_string FROM (SELECT UNNEST([1, 2, 3]) AS "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))") CROSS JOIN j1"#,
+        expected: @r#"SELECT "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))", j1.j1_id, j1.j1_string FROM (SELECT UNNEST([1, 2, 3]) AS "UNNEST(make_array(Int64(1),Int64(2),Int64(3)))") AS derived_projection ("UNNEST(make_array(Int64(1),Int64(2),Int64(3)))") CROSS JOIN j1"#,
     );
     Ok(())
 }
@@ -1938,7 +1936,7 @@ fn test_complex_order_by_with_grouping() -> Result<()> {
     }, {
         assert_snapshot!(
             sql,
-            @r#"SELECT j1_id, j1_string, lochierarchy FROM (SELECT j1.j1_id, j1.j1_string, (grouping(j1.j1_id) + grouping(j1.j1_string)) AS lochierarchy, grouping(j1.j1_string), grouping(j1.j1_id) FROM j1 GROUP BY ROLLUP (j1.j1_id, j1.j1_string) ORDER BY (grouping(j1.j1_id) + grouping(j1.j1_string)) DESC NULLS FIRST, CASE WHEN ((grouping(j1.j1_id) + grouping(j1.j1_string)) = 0) THEN j1.j1_id END ASC NULLS LAST) LIMIT 100"#
+            @r#"SELECT j1.j1_id, j1.j1_string, lochierarchy FROM (SELECT j1.j1_id, j1.j1_string, (grouping(j1.j1_id) + grouping(j1.j1_string)) AS lochierarchy, grouping(j1.j1_string), grouping(j1.j1_id) FROM j1 GROUP BY ROLLUP (j1.j1_id, j1.j1_string) ORDER BY (grouping(j1.j1_id) + grouping(j1.j1_string)) DESC NULLS FIRST, CASE WHEN ((grouping(j1.j1_id) + grouping(j1.j1_string)) = 0) THEN j1.j1_id END ASC NULLS LAST) LIMIT 100"#
         );
     });
 

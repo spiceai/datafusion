@@ -37,12 +37,12 @@ use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_format::{FileFormat, FileFormatFactory};
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::source::DataSourceExec;
-use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
 
 use async_trait::async_trait;
 use object_store::{GetResultPayload, ObjectMeta, ObjectStore};
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 
 #[derive(Default)]
 /// Factory struct used to create [`AvroFormat`]

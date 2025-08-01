@@ -26,8 +26,6 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use datafusion::assert_batches_sorted_eq;
 use datafusion::datasource::listing::ListingTableUrl;
-use datafusion::datasource::physical_plan::ParquetSource;
-use datafusion::datasource::source::DataSourceExec;
 use datafusion::{
     datasource::{
         file_format::{csv::CsvFormat, parquet::ParquetFormat},
@@ -41,12 +39,9 @@ use datafusion::{
 use datafusion_catalog::TableProvider;
 use datafusion_common::stats::Precision;
 use datafusion_common::test_util::batches_to_sort_string;
-use datafusion_common::ScalarValue;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_execution::config::SessionConfig;
-use datafusion_expr::{col, lit, Expr, Operator};
-use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -59,6 +54,11 @@ use object_store::{
 };
 use object_store::{Attributes, MultipartUpload, PutMultipartOpts, PutPayload};
 use url::Url;
+use datafusion_common::ScalarValue;
+use datafusion_datasource::source::DataSourceExec;
+use datafusion_datasource_parquet::source::ParquetSource;
+use datafusion_expr::{col, lit, Expr, Operator};
+use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
 
 #[tokio::test]
 async fn parquet_partition_pruning_filter() -> Result<()> {
@@ -488,7 +488,9 @@ async fn parquet_multiple_nonstring_partitions() -> Result<()> {
 
 #[tokio::test]
 async fn parquet_statistics() -> Result<()> {
-    let ctx = SessionContext::new();
+    let mut config = SessionConfig::new();
+    config.options_mut().execution.collect_statistics = true;
+    let ctx = SessionContext::new_with_config(config);
 
     register_partitioned_alltypes_parquet(
         &ctx,
@@ -515,7 +517,7 @@ async fn parquet_statistics() -> Result<()> {
     let schema = physical_plan.schema();
     assert_eq!(schema.fields().len(), 4);
 
-    let stat_cols = physical_plan.statistics()?.column_statistics;
+    let stat_cols = physical_plan.partition_statistics(None)?.column_statistics;
     assert_eq!(stat_cols.len(), 4);
     // stats for the first col are read from the parquet file
     assert_eq!(stat_cols[0].null_count, Precision::Exact(3));
@@ -530,7 +532,7 @@ async fn parquet_statistics() -> Result<()> {
     let schema = physical_plan.schema();
     assert_eq!(schema.fields().len(), 2);
 
-    let stat_cols = physical_plan.statistics()?.column_statistics;
+    let stat_cols = physical_plan.partition_statistics(None)?.column_statistics;
     assert_eq!(stat_cols.len(), 2);
     // stats for the first col are read from the parquet file
     assert_eq!(stat_cols[0].null_count, Precision::Exact(1));
@@ -596,7 +598,7 @@ async fn test_metadata_columns() -> Result<()> {
     ctx.register_table("t", table).unwrap();
 
     let result = ctx
-        .sql("SELECT id, size, location, last_modified FROM t WHERE size > 1500 ORDER BY id LIMIT 10")
+        .sql("SELECT id, size, location, last_modified FROM t WHERE size > 1500 ORDER BY id LIMIT 12")
         .await?
         .collect()
         .await?;
@@ -614,9 +616,12 @@ async fn test_metadata_columns() -> Result<()> {
         "| 2  | 1851 | year=2021/month=09/day=09/file.parquet | 1970-01-01T00:00:00Z |",
         "| 2  | 1851 | year=2021/month=10/day=09/file.parquet | 1970-01-01T00:00:00Z |",
         "| 2  | 1851 | year=2021/month=10/day=28/file.parquet | 1970-01-01T00:00:00Z |",
+        "| 3  | 1851 | year=2021/month=09/day=09/file.parquet | 1970-01-01T00:00:00Z |",
+        "| 3  | 1851 | year=2021/month=10/day=09/file.parquet | 1970-01-01T00:00:00Z |",
         "| 3  | 1851 | year=2021/month=10/day=28/file.parquet | 1970-01-01T00:00:00Z |",
         "+----+------+----------------------------------------+----------------------+",
     ];
+
     assert_batches_sorted_eq!(expected, &result);
 
     Ok(())
@@ -780,7 +785,8 @@ async fn create_partitioned_alltypes_parquet_table(
                 .map(|x| (x.0.to_owned(), x.1.clone()))
                 .collect::<Vec<_>>(),
         )
-        .with_metadata_cols(metadata_cols.to_vec());
+        .with_metadata_cols(metadata_cols.to_vec())
+        .with_session_config_options(&ctx.copied_config());
 
     let table_path = ListingTableUrl::parse(table_path).unwrap();
     let store_path =

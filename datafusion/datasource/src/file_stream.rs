@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::file_meta::FileMeta;
-use crate::file_scan_config::{ExtendedColumnProjector, FileScanConfig};
+use crate::file_scan_config::{PartitionColumnProjector, FileScanConfig};
 use crate::PartitionedFile;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::error::Result;
@@ -60,7 +60,7 @@ pub struct FileStream {
     /// which can be resolved to a stream of `RecordBatch`.
     file_opener: Arc<dyn FileOpener>,
     /// The extended (partitioning + metadata) column projector
-    col_projector: ExtendedColumnProjector,
+    pc_projector: PartitionColumnProjector,
     /// The stream state
     state: FileStreamState,
     /// File stream specific metrics
@@ -79,15 +79,15 @@ impl FileStream {
         file_opener: Arc<dyn FileOpener>,
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
-        let (projected_schema, ..) = config.project();
-        let col_projector = ExtendedColumnProjector::new(
+        let projected_schema = config.projected_schema();
+        let pc_projector = PartitionColumnProjector::new(
             Arc::clone(&projected_schema),
             &config
                 .table_partition_cols
                 .iter()
                 .map(|x| x.name().clone())
                 .collect::<Vec<_>>(),
-            &config.metadata_cols,
+            &config.metadata_cols
         );
 
         let file_group = config.file_groups[partition].clone();
@@ -97,7 +97,7 @@ impl FileStream {
             projected_schema,
             remain: config.limit,
             file_opener,
-            col_projector,
+            pc_projector,
             state: FileStreamState::Idle,
             file_stream_metrics: FileStreamMetrics::new(metrics, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -237,7 +237,7 @@ impl FileStream {
                             self.file_stream_metrics.time_scanning_until_data.stop();
                             self.file_stream_metrics.time_scanning_total.stop();
                             let result = self
-                                .col_projector
+                                .pc_projector
                                 .project(batch, partition_values, object_meta)
                                 .map_err(|e| ArrowError::ExternalError(e.into()))
                                 .map(|batch| match &mut self.remain {
@@ -1009,7 +1009,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_extended_column_projector() -> Result<()> {
-        use crate::file_scan_config::ExtendedColumnProjector;
+        use crate::file_scan_config::PartitionColumnProjector;
         use crate::metadata::MetadataColumn;
         use arrow::array::{StringArray, UInt64Array};
         use arrow::datatypes::{DataType, Field, Schema};
@@ -1056,7 +1056,7 @@ mod tests {
         let partition_values = vec![ScalarValue::Utf8(Some("2023".to_string()))];
 
         // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             schema_with_partition.clone(),
             &["year".to_string()],
             &[],
@@ -1091,7 +1091,7 @@ mod tests {
         ]));
 
         // Create the projector with metadata columns
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             schema_with_metadata.clone(),
             &[],
             &[MetadataColumn::Location(None), MetadataColumn::Size],
@@ -1129,7 +1129,7 @@ mod tests {
         ]));
 
         // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             schema_combined.clone(),
             &["year".to_string()],
             &[MetadataColumn::Location(None), MetadataColumn::Size],
@@ -1169,7 +1169,7 @@ mod tests {
         ]));
 
         // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             schema_mixed.clone(),
             &["year".to_string()],
             &[MetadataColumn::Location(None), MetadataColumn::Size],
@@ -1261,7 +1261,7 @@ mod tests {
         )];
 
         // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             schema_with_dict.clone(),
             &["year".to_string()],
             &[],
@@ -1291,7 +1291,7 @@ mod tests {
         // Test 6: Auto-fix for non-dictionary partition values
 
         // Create a projector expecting dictionary-encoded values
-        let mut projector = ExtendedColumnProjector::new(
+        let mut projector = PartitionColumnProjector::new(
             schema_with_dict.clone(),
             &["year".to_string()],
             &[],

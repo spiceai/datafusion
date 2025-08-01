@@ -187,19 +187,20 @@ impl Unparser<'_> {
             Expr::Cast(Cast { expr, data_type }) => {
                 Ok(self.cast_to_sql(expr, data_type)?)
             }
-            Expr::Literal(value) => Ok(self.scalar_to_sql(value)?),
+            Expr::Literal(value, _) => Ok(self.scalar_to_sql(value)?),
             Expr::Alias(Alias { expr, name: _, .. }) => self.expr_to_sql_inner(expr),
-            Expr::WindowFunction(WindowFunction {
-                fun,
-                params:
-                    WindowFunctionParams {
-                        args,
-                        partition_by,
-                        order_by,
-                        window_frame,
-                        ..
-                    },
-            }) => {
+            Expr::WindowFunction(window_fun) => {
+                let WindowFunction {
+                    fun,
+                    params:
+                        WindowFunctionParams {
+                            args,
+                            partition_by,
+                            order_by,
+                            window_frame,
+                            ..
+                        },
+                } = window_fun.as_ref();
                 let func_name = fun.name();
 
                 let args = self.function_args_to_sql(args)?;
@@ -312,6 +313,7 @@ impl Unparser<'_> {
                     distinct,
                     args,
                     filter,
+                    order_by,
                     ..
                 } = &agg.params;
 
@@ -319,6 +321,16 @@ impl Unparser<'_> {
                 let filter = match filter {
                     Some(filter) => Some(Box::new(self.expr_to_sql_inner(filter)?)),
                     None => None,
+                };
+                let within_group = if agg.func.is_ordered_set_aggregate() {
+                    order_by
+                        .as_ref()
+                        .unwrap_or(&Vec::new())
+                        .iter()
+                        .map(|sort_expr| self.sort_to_sql(sort_expr))
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    Vec::new()
                 };
                 Ok(ast::Expr::Function(Function {
                     name: ObjectName::from(vec![Ident {
@@ -335,7 +347,7 @@ impl Unparser<'_> {
                     filter,
                     null_treatment: None,
                     over: None,
-                    within_group: vec![],
+                    within_group,
                     parameters: ast::FunctionArguments::None,
                     uses_odbc_syntax: false,
                 }))
@@ -590,7 +602,7 @@ impl Unparser<'_> {
             .chunks_exact(2)
             .map(|chunk| {
                 let key = match &chunk[0] {
-                    Expr::Literal(ScalarValue::Utf8(Some(s))) => self.new_ident_quoted_if_needs(s.to_string()),
+                    Expr::Literal(ScalarValue::Utf8(Some(s)), _) => self.new_ident_quoted_if_needs(s.to_string()),
                     _ => return internal_err!("named_struct expects even arguments to be strings, but received: {:?}", &chunk[0])
                 };
 
@@ -619,7 +631,7 @@ impl Unparser<'_> {
         };
 
         let field = match &args[1] {
-            Expr::Literal(lit) => self.new_ident_quoted_if_needs(lit.to_string()),
+            Expr::Literal(lit, _) => self.new_ident_quoted_if_needs(lit.to_string()),
             _ => {
                 return internal_err!(
                 "get_field expects second argument to be a string, but received: {:?}",
@@ -1122,16 +1134,16 @@ impl Unparser<'_> {
             ScalarValue::Float16(None) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Float32(Some(f)) => {
                 let f_val = match f.fract() {
-                    0.0 => format!("{:.1}", f),
-                    _ => format!("{}", f),
+                    0.0 => format!("{f:.1}"),
+                    _ => format!("{f}"),
                 };
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
             ScalarValue::Float32(None) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Float64(Some(f)) => {
                 let f_val = match f.fract() {
-                    0.0 => format!("{:.1}", f),
-                    _ => format!("{}", f),
+                    0.0 => format!("{f:.1}"),
+                    _ => format!("{f}"),
                 };
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
@@ -1899,87 +1911,87 @@ mod tests {
                 r#"a LIKE 'foo' ESCAPE 'o'"#,
             ),
             (
-                Expr::Literal(ScalarValue::Date64(Some(0))),
+                Expr::Literal(ScalarValue::Date64(Some(0)), None),
                 r#"CAST('1970-01-01 00:00:00' AS DATETIME)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Date64(Some(10000))),
+                Expr::Literal(ScalarValue::Date64(Some(10000)), None),
                 r#"CAST('1970-01-01 00:00:10' AS DATETIME)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Date64(Some(-10000))),
+                Expr::Literal(ScalarValue::Date64(Some(-10000)), None),
                 r#"CAST('1969-12-31 23:59:50' AS DATETIME)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Date32(Some(0))),
+                Expr::Literal(ScalarValue::Date32(Some(0)), None),
                 r#"CAST('1970-01-01' AS DATE)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Date32(Some(10))),
+                Expr::Literal(ScalarValue::Date32(Some(10)), None),
                 r#"CAST('1970-01-11' AS DATE)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Date32(Some(-1))),
+                Expr::Literal(ScalarValue::Date32(Some(-1)), None),
                 r#"CAST('1969-12-31' AS DATE)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampSecond(Some(10001), None)),
+                Expr::Literal(ScalarValue::TimestampSecond(Some(10001), None), None),
                 r#"CAST('1970-01-01 02:46:41' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampSecond(
-                    Some(10001),
-                    Some("+08:00".into()),
-                )),
+                Expr::Literal(
+                    ScalarValue::TimestampSecond(Some(10001), Some("+08:00".into())),
+                    None,
+                ),
                 r#"CAST('1970-01-01 10:46:41 +08:00' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampMillisecond(Some(10001), None)),
+                Expr::Literal(ScalarValue::TimestampMillisecond(Some(10001), None), None),
                 r#"CAST('1970-01-01 00:00:10.001' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampMillisecond(
-                    Some(10001),
-                    Some("+08:00".into()),
-                )),
+                Expr::Literal(
+                    ScalarValue::TimestampMillisecond(Some(10001), Some("+08:00".into())),
+                    None,
+                ),
                 r#"CAST('1970-01-01 08:00:10.001 +08:00' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampMicrosecond(Some(10001), None)),
+                Expr::Literal(ScalarValue::TimestampMicrosecond(Some(10001), None), None),
                 r#"CAST('1970-01-01 00:00:00.010001' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampMicrosecond(
-                    Some(10001),
-                    Some("+08:00".into()),
-                )),
+                Expr::Literal(
+                    ScalarValue::TimestampMicrosecond(Some(10001), Some("+08:00".into())),
+                    None,
+                ),
                 r#"CAST('1970-01-01 08:00:00.010001 +08:00' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampNanosecond(Some(10001), None)),
+                Expr::Literal(ScalarValue::TimestampNanosecond(Some(10001), None), None),
                 r#"CAST('1970-01-01 00:00:00.000010001' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::TimestampNanosecond(
-                    Some(10001),
-                    Some("+08:00".into()),
-                )),
+                Expr::Literal(
+                    ScalarValue::TimestampNanosecond(Some(10001), Some("+08:00".into())),
+                    None,
+                ),
                 r#"CAST('1970-01-01 08:00:00.000010001 +08:00' AS TIMESTAMP)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Time32Second(Some(10001))),
+                Expr::Literal(ScalarValue::Time32Second(Some(10001)), None),
                 r#"CAST('02:46:41' AS TIME)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Time32Millisecond(Some(10001))),
+                Expr::Literal(ScalarValue::Time32Millisecond(Some(10001)), None),
                 r#"CAST('00:00:10.001' AS TIME)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Time64Microsecond(Some(10001))),
+                Expr::Literal(ScalarValue::Time64Microsecond(Some(10001)), None),
                 r#"CAST('00:00:00.010001' AS TIME)"#,
             ),
             (
-                Expr::Literal(ScalarValue::Time64Nanosecond(Some(10001))),
+                Expr::Literal(ScalarValue::Time64Nanosecond(Some(10001)), None),
                 r#"CAST('00:00:00.000010001' AS TIME)"#,
             ),
             (sum(col("a")), r#"sum(a)"#),
@@ -2008,7 +2020,7 @@ mod tests {
                 "count(*) FILTER (WHERE true)",
             ),
             (
-                Expr::WindowFunction(WindowFunction {
+                Expr::from(WindowFunction {
                     fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
                     params: WindowFunctionParams {
                         args: vec![col("col")],
@@ -2022,7 +2034,7 @@ mod tests {
             ),
             (
                 #[expect(deprecated)]
-                Expr::WindowFunction(WindowFunction {
+                Expr::from(WindowFunction {
                     fun: WindowFunctionDefinition::AggregateUDF(count_udaf()),
                     params: WindowFunctionParams {
                         args: vec![Expr::Wildcard {
@@ -2124,19 +2136,17 @@ mod tests {
             (col("need quoted").eq(lit(1)), r#"("need quoted" = 1)"#),
             // See test_interval_scalar_to_expr for interval literals
             (
-                (col("a") + col("b")).gt(Expr::Literal(ScalarValue::Decimal128(
-                    Some(100123),
-                    28,
-                    3,
-                ))),
+                (col("a") + col("b")).gt(Expr::Literal(
+                    ScalarValue::Decimal128(Some(100123), 28, 3),
+                    None,
+                )),
                 r#"((a + b) > 100.123)"#,
             ),
             (
-                (col("a") + col("b")).gt(Expr::Literal(ScalarValue::Decimal256(
-                    Some(100123.into()),
-                    28,
-                    3,
-                ))),
+                (col("a") + col("b")).gt(Expr::Literal(
+                    ScalarValue::Decimal256(Some(100123.into()), 28, 3),
+                    None,
+                )),
                 r#"((a + b) > 100.123)"#,
             ),
             (
@@ -2172,28 +2182,39 @@ mod tests {
                 "MAP {'a': 1, 'b': 2}",
             ),
             (
-                Expr::Literal(ScalarValue::Dictionary(
-                    Box::new(DataType::Int32),
-                    Box::new(ScalarValue::Utf8(Some("foo".into()))),
-                )),
+                Expr::Literal(
+                    ScalarValue::Dictionary(
+                        Box::new(DataType::Int32),
+                        Box::new(ScalarValue::Utf8(Some("foo".into()))),
+                    ),
+                    None,
+                ),
                 "'foo'",
             ),
             (
-                Expr::Literal(ScalarValue::List(Arc::new(
-                    ListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(vec![
+                Expr::Literal(
+                    ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<
+                        Int32Type,
+                        _,
+                        _,
+                    >(vec![Some(vec![
                         Some(1),
                         Some(2),
                         Some(3),
-                    ])]),
-                ))),
+                    ])]))),
+                    None,
+                ),
                 "[1, 2, 3]",
             ),
             (
-                Expr::Literal(ScalarValue::LargeList(Arc::new(
-                    LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![Some(
-                        vec![Some(1), Some(2), Some(3)],
-                    )]),
-                ))),
+                Expr::Literal(
+                    ScalarValue::LargeList(Arc::new(
+                        LargeListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                            Some(vec![Some(1), Some(2), Some(3)]),
+                        ]),
+                    )),
+                    None,
+                ),
                 "[1, 2, 3]",
             ),
             (
@@ -2217,7 +2238,7 @@ mod tests {
         for (expr, expected) in tests {
             let ast = expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             assert_eq!(actual, expected);
         }
@@ -2235,7 +2256,7 @@ mod tests {
         let expr = col("a").gt(lit(4));
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
 
         let expected = r#"('a' > 4)"#;
         assert_eq!(actual, expected);
@@ -2251,7 +2272,7 @@ mod tests {
         let expr = col("a").gt(lit(4));
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
 
         let expected = r#"(a > 4)"#;
         assert_eq!(actual, expected);
@@ -2275,7 +2296,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             let expected = format!(r#"CAST(a AS {identifier})"#);
             assert_eq!(actual, expected);
@@ -2300,7 +2321,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             let expected = format!(r#"CAST(a AS {identifier})"#);
             assert_eq!(actual, expected);
@@ -2322,7 +2343,7 @@ mod tests {
             let unparser = Unparser::new(&dialect);
             let ast = unparser.sort_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             assert_eq!(actual, expected);
         }
@@ -2498,11 +2519,17 @@ mod tests {
     #[test]
     fn test_float_scalar_to_expr() {
         let tests = [
-            (Expr::Literal(ScalarValue::Float64(Some(3f64))), "3.0"),
-            (Expr::Literal(ScalarValue::Float64(Some(3.1f64))), "3.1"),
-            (Expr::Literal(ScalarValue::Float32(Some(-2f32))), "-2.0"),
+            (Expr::Literal(ScalarValue::Float64(Some(3f64)), None), "3.0"),
             (
-                Expr::Literal(ScalarValue::Float32(Some(-2.989f32))),
+                Expr::Literal(ScalarValue::Float64(Some(3.1f64)), None),
+                "3.1",
+            ),
+            (
+                Expr::Literal(ScalarValue::Float32(Some(-2f32)), None),
+                "-2.0",
+            ),
+            (
+                Expr::Literal(ScalarValue::Float32(Some(-2.989f32)), None),
                 "-2.989",
             ),
         ];
@@ -2522,18 +2549,20 @@ mod tests {
         let tests = [
             (
                 Expr::Cast(Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(
-                        "blah".to_string(),
-                    )))),
+                    expr: Box::new(Expr::Literal(
+                        ScalarValue::Utf8(Some("blah".to_string())),
+                        None,
+                    )),
                     data_type: DataType::Binary,
                 }),
                 "'blah'",
             ),
             (
                 Expr::Cast(Cast {
-                    expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(
-                        "blah".to_string(),
-                    )))),
+                    expr: Box::new(Expr::Literal(
+                        ScalarValue::Utf8(Some("blah".to_string())),
+                        None,
+                    )),
                     data_type: DataType::BinaryView,
                 }),
                 "'blah'",
@@ -2572,7 +2601,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2625,10 +2654,13 @@ mod tests {
             let expr = ScalarUDF::new_from_impl(
                 datafusion_functions::datetime::date_part::DatePartFunc::new(),
             )
-            .call(vec![Expr::Literal(ScalarValue::new_utf8(unit)), col("x")]);
+            .call(vec![
+                Expr::Literal(ScalarValue::new_utf8(unit), None),
+                col("x"),
+            ]);
 
             let ast = unparser.expr_to_sql(&expr)?;
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
 
             assert_eq!(actual, expected);
         }
@@ -2655,7 +2687,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2683,7 +2715,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2722,7 +2754,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2745,13 +2777,13 @@ mod tests {
             (&mysql_dialect, "DATETIME"),
         ] {
             let unparser = Unparser::new(dialect);
-            let expr = Expr::Literal(ScalarValue::TimestampMillisecond(
-                Some(1738285549123),
+            let expr = Expr::Literal(
+                ScalarValue::TimestampMillisecond(Some(1738285549123), None),
                 None,
-            ));
+            );
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST('2025-01-31 01:05:49.123' AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2778,7 +2810,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
@@ -2804,7 +2836,7 @@ mod tests {
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = expected.to_string();
 
             assert_eq!(actual, expected);
@@ -2816,9 +2848,10 @@ mod tests {
     fn test_cast_value_to_dict_expr() {
         let tests = [(
             Expr::Cast(Cast {
-                expr: Box::new(Expr::Literal(ScalarValue::Utf8(Some(
-                    "variation".to_string(),
-                )))),
+                expr: Box::new(Expr::Literal(
+                    ScalarValue::Utf8(Some("variation".to_string())),
+                    None,
+                )),
                 data_type: DataType::Dictionary(Box::new(Int8), Box::new(DataType::Utf8)),
             }),
             "'variation'",
@@ -2856,12 +2889,12 @@ mod tests {
                         expr: Box::new(col("a")),
                         data_type: DataType::Float64,
                     }),
-                    Expr::Literal(ScalarValue::Int64(Some(2))),
+                    Expr::Literal(ScalarValue::Int64(Some(2)), None),
                 ],
             });
             let ast = unparser.expr_to_sql(&expr)?;
 
-            let actual = format!("{}", ast);
+            let actual = format!("{ast}");
             let expected = format!(r#"round(CAST("a" AS {identifier}), 2)"#);
 
             assert_eq!(actual, expected);
@@ -2891,7 +2924,7 @@ mod tests {
             let func = WindowFunctionDefinition::WindowUDF(rank_udwf());
             let mut window_func = WindowFunction::new(func, vec![]);
             window_func.params.order_by = vec![Sort::new(col("a"), true, true)];
-            let expr = Expr::WindowFunction(window_func);
+            let expr = Expr::from(window_func);
             let ast = unparser.expr_to_sql(&expr)?;
 
             let actual = ast.to_string();
@@ -2996,7 +3029,7 @@ mod tests {
                     datafusion_functions::datetime::date_trunc::DateTruncFunc::new(),
                 )),
                 args: vec![
-                    Expr::Literal(ScalarValue::Utf8(Some(precision.to_string()))),
+                    Expr::Literal(ScalarValue::Utf8(Some(precision.to_string())), None),
                     col("date_col"),
                 ],
             });
@@ -3041,7 +3074,7 @@ mod tests {
         let expr = cast(col("a"), DataType::Utf8View);
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"CAST(a AS CHAR)"#.to_string();
 
         assert_eq!(actual, expected);
@@ -3049,7 +3082,7 @@ mod tests {
         let expr = col("a").eq(lit(ScalarValue::Utf8View(Some("hello".to_string()))));
         let ast = unparser.expr_to_sql(&expr)?;
 
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"(a = 'hello')"#.to_string();
 
         assert_eq!(actual, expected);
@@ -3057,7 +3090,7 @@ mod tests {
         let expr = col("a").is_not_null();
 
         let ast = unparser.expr_to_sql(&expr)?;
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"a IS NOT NULL"#.to_string();
 
         assert_eq!(actual, expected);
@@ -3065,7 +3098,7 @@ mod tests {
         let expr = col("a").is_null();
 
         let ast = unparser.expr_to_sql(&expr)?;
-        let actual = format!("{}", ast);
+        let actual = format!("{ast}");
         let expected = r#"a IS NULL"#.to_string();
 
         assert_eq!(actual, expected);

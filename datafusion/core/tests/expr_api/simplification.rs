@@ -282,10 +282,13 @@ fn select_date_plus_interval() -> Result<()> {
 
     let date_plus_interval_expr = to_timestamp_expr(ts_string)
         .cast_to(&DataType::Date32, schema)?
-        + Expr::Literal(ScalarValue::IntervalDayTime(Some(IntervalDayTime {
-            days: 123,
-            milliseconds: 0,
-        })));
+        + Expr::Literal(
+            ScalarValue::IntervalDayTime(Some(IntervalDayTime {
+                days: 123,
+                milliseconds: 0,
+            })),
+            None,
+        );
 
     let plan = LogicalPlanBuilder::from(table_scan.clone())
         .project(vec![date_plus_interval_expr])?
@@ -547,9 +550,9 @@ fn test_simplify_with_cycle_count(
     };
     let simplifier = ExprSimplifier::new(info);
     let (simplified_expr, count) = simplifier
-        .simplify_with_cycle_count(input_expr.clone())
+        .simplify_with_cycle_count_transformed(input_expr.clone())
         .expect("successfully evaluated");
-
+    let simplified_expr = simplified_expr.data;
     assert_eq!(
         simplified_expr, expected_expr,
         "Mismatch evaluating {input_expr}\n  Expected:{expected_expr}\n  Got:{simplified_expr}"
