@@ -213,3 +213,12 @@ used_underscore_binding = "warn"
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(tarpaulin)"] }
 unused_qualifications = "deny"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1648ebba6de7ce5ec3575dab54d1238a6f21da6c" } # spiceai-55.2
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1648ebba6de7ce5ec3575dab54d1238a6f21da6c" } # spiceai-55.2
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1648ebba6de7ce5ec3575dab54d1238a6f21da6c" } # spiceai-55.2
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1648ebba6de7ce5ec3575dab54d1238a6f21da6c" } # spiceai-55.2
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1648ebba6de7ce5ec3575dab54d1238a6f21da6c" } # spiceai-55.2
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1648ebba6de7ce5ec3575dab54d1238a6f21da6c" } # spiceai-55.2
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "1648ebba6de7ce5ec3575dab54d1238a6f21da6c" } # spiceai-55.2
