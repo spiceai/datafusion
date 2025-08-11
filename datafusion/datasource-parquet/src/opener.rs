@@ -42,7 +42,7 @@ use log::debug;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::AsyncFileReader;
 use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
-use parquet::file::metadata::ParquetMetaDataReader;
+use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
 /// Implements [`FileOpener`] for a parquet file
 pub(super) struct ParquetOpener {
@@ -74,6 +74,8 @@ pub(super) struct ParquetOpener {
     /// Should the page index be read from parquet files, if present, to skip
     /// data pages
     pub enable_page_index: bool,
+    /// Should the Parquet reader tolerate missing page indexes?
+    pub tolerate_missing_page_index: bool,
     /// Should the bloom filter be read from parquet, if present, to skip row
     /// groups
     pub enable_bloom_filter: bool,
@@ -124,6 +126,7 @@ impl FileOpener for ParquetOpener {
             .global_counter("num_predicate_creation_errors");
 
         let enable_page_index = self.enable_page_index;
+        let tolerate_missing_page_index = self.tolerate_missing_page_index;
 
         Ok(Box::pin(async move {
             // Don't load the page index yet. Since it is not stored inline in
@@ -191,11 +194,16 @@ impl FileOpener for ParquetOpener {
             // code above may not have read the page index structures yet. If we
             // need them for reading and they aren't yet loaded, we need to load them now.
             if should_enable_page_index(enable_page_index, &page_pruning_predicate) {
+                let page_index_policy = if tolerate_missing_page_index {
+                    PageIndexPolicy::Optional
+                } else {
+                    PageIndexPolicy::Required
+                };
                 reader_metadata = load_page_index(
                     reader_metadata,
                     &mut async_file_reader,
-                    // Since we're manually loading the page index the option here should not matter but we pass it in for consistency
-                    options.with_page_index(true),
+                    options.with_page_index_policy(page_index_policy),
+                    page_index_policy,
                 )
                 .await?;
             }
@@ -420,6 +428,7 @@ async fn load_page_index<T: AsyncFileReader>(
     reader_metadata: ArrowReaderMetadata,
     input: &mut T,
     options: ArrowReaderOptions,
+    page_index_policy: PageIndexPolicy,
 ) -> Result<ArrowReaderMetadata> {
     let parquet_metadata = reader_metadata.metadata();
     let missing_column_index = parquet_metadata.column_index().is_none();
@@ -432,8 +441,9 @@ async fn load_page_index<T: AsyncFileReader>(
     if missing_column_index || missing_offset_index {
         let m = Arc::try_unwrap(Arc::clone(parquet_metadata))
             .unwrap_or_else(|e| e.as_ref().clone());
-        let mut reader =
-            ParquetMetaDataReader::new_with_metadata(m).with_page_indexes(true);
+        let mut reader = ParquetMetaDataReader::new_with_metadata(m)
+            .with_page_index_policy(page_index_policy);
+
         reader.load_page_index(input).await?;
         let new_parquet_metadata = reader.finish()?;
         let new_arrow_reader =
