@@ -389,6 +389,26 @@ impl ParquetSource {
         self.table_parquet_options.global.enable_page_index
     }
 
+    /// If enabled, the reader will not error if
+    /// the page index is missing from a parquet
+    /// file and `enable_page_index` is true.
+    pub fn with_tolerate_missing_page_index(
+        mut self,
+        tolerate_missing_page_index: bool,
+    ) -> Self {
+        self.table_parquet_options
+            .global
+            .tolerate_missing_page_index = tolerate_missing_page_index;
+        self
+    }
+
+    /// Return the value described in [`Self::with_tolerate_missing_page_index`]
+    fn tolerate_missing_page_index(&self) -> bool {
+        self.table_parquet_options
+            .global
+            .tolerate_missing_page_index
+    }
+
     /// If enabled, the reader will read by the bloom filter
     pub fn with_bloom_filter_on_read(mut self, bloom_filter_on_read: bool) -> Self {
         self.table_parquet_options.global.bloom_filter_on_read = bloom_filter_on_read;
@@ -540,6 +560,7 @@ impl FileSource for ParquetSource {
             pushdown_filters: self.pushdown_filters(),
             reorder_filters: self.reorder_filters(),
             enable_page_index: self.enable_page_index(),
+            tolerate_missing_page_index: self.tolerate_missing_page_index(),
             enable_bloom_filter: self.bloom_filter_on_read(),
             enable_row_group_stats_pruning: self.table_parquet_options.global.pruning,
             schema_adapter_factory,

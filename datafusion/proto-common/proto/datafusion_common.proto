@@ -554,6 +554,8 @@ message ParquetOptions {
   oneof coerce_int96_opt {
     string coerce_int96 = 32;
   }
+
+  bool tolerate_missing_page_index = 33; // default = false
 }
 
 enum JoinSide {
