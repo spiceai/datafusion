@@ -770,6 +770,9 @@ pub struct ParquetOptions {
     pub max_row_group_size: u64,
     #[prost(string, tag = "16")]
     pub created_by: ::prost::alloc::string::String,
+    /// default = false
+    #[prost(bool, tag = "33")]
+    pub tolerate_missing_page_index: bool,
     #[prost(oneof = "parquet_options::MetadataSizeHintOpt", tags = "4")]
     pub metadata_size_hint_opt: ::core::option::Option<
         parquet_options::MetadataSizeHintOpt,
