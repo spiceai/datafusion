@@ -1830,11 +1830,16 @@ impl Expr {
     pub fn infer_placeholder_types(self, schema: &DFSchema) -> Result<(Expr, bool)> {
         let mut has_placeholder = false;
         self.transform(|mut expr| {
+            #[expect(deprecated)]
             match &mut expr {
-                // Default to assuming the arguments are the same type
                 Expr::BinaryExpr(BinaryExpr { left, op: _, right }) => {
-                    rewrite_placeholder(left.as_mut(), right.as_ref(), schema)?;
-                    rewrite_placeholder(right.as_mut(), left.as_ref(), schema)?;
+                    let binary_expr_type =
+                        find_first_non_null_data_type_expr_placeholder(
+                            [left.as_ref(), right.as_ref()].into_iter(),
+                            schema,
+                        )?;
+                    rewrite_placeholder_type(left.as_mut(), &binary_expr_type)?;
+                    rewrite_placeholder_type(right.as_mut(), &binary_expr_type)?;
                 }
                 Expr::Between(Between {
                     expr,
@@ -1842,26 +1847,129 @@ impl Expr {
                     low,
                     high,
                 }) => {
-                    rewrite_placeholder(low.as_mut(), expr.as_ref(), schema)?;
-                    rewrite_placeholder(high.as_mut(), expr.as_ref(), schema)?;
+                    let between_type = find_first_non_null_data_type_expr_placeholder(
+                        [low.as_ref(), high.as_ref(), expr.as_ref()].into_iter(),
+                        schema,
+                    )?;
+                    rewrite_placeholder_type(expr.as_mut(), &between_type)?;
+                    rewrite_placeholder_type(low.as_mut(), &between_type)?;
+                    rewrite_placeholder_type(high.as_mut(), &between_type)?;
                 }
                 Expr::InList(InList {
                     expr,
                     list,
                     negated: _,
                 }) => {
+                    let in_list_type = find_first_non_null_data_type_expr_placeholder(
+                        [expr.as_ref()].into_iter().chain(list.iter()),
+                        schema,
+                    )?;
+                    rewrite_placeholder_type(expr.as_mut(), &in_list_type)?;
                     for item in list.iter_mut() {
-                        rewrite_placeholder(item, expr.as_ref(), schema)?;
+                        rewrite_placeholder_type(item, &in_list_type)?;
                     }
                 }
                 Expr::Like(Like { expr, pattern, .. })
                 | Expr::SimilarTo(Like { expr, pattern, .. }) => {
-                    rewrite_placeholder(pattern.as_mut(), expr.as_ref(), schema)?;
+                    let like_type = find_first_non_null_data_type_expr_placeholder(
+                        [expr.as_ref(), pattern.as_ref()].into_iter(),
+                        schema,
+                    )?;
+                    rewrite_placeholder_type(expr.as_mut(), &like_type)?;
+                    rewrite_placeholder_type(pattern.as_mut(), &like_type)?;
+                }
+                Expr::InSubquery(InSubquery {
+                    expr,
+                    subquery,
+                    negated: _,
+                }) => {
+                    let subquery_schema = subquery.subquery.schema();
+                    let fields = subquery_schema.fields();
+
+                    // Subqueries used in IN expressions must have exactly 1 field
+                    // i.e. `SELECT * FROM foo WHERE 'some_val' IN (SELECT val FROM bar)`
+                    if let [first_field] = &fields[..] {
+                        rewrite_placeholder_type(expr.as_mut(), first_field.data_type())?;
+                    }
+                }
+                Expr::Case(Case {
+                    expr,
+                    when_then_expr,
+                    else_expr,
+                }) => {
+                    // If `expr` is present, then it must match the types of each WHEN expression.
+                    // If `expr` is not present, then the type of each WHEN expression must evaluate to a boolean.
+                    // The types of the THEN and ELSE expressions must match `expr_type` (which is the final type of the CASE expression).
+                    let when_type = match expr {
+                        Some(expr) => {
+                            let mut when_type = expr.get_type(schema)?;
+                            if when_type == DataType::Null {
+                                for (when_expr, _) in when_then_expr.iter() {
+                                    let when_expr_type = when_expr.get_type(schema)?;
+                                    if when_expr_type != DataType::Null {
+                                        when_type = when_expr_type;
+                                        break;
+                                    }
+                                }
+                            }
+                            when_type
+                        }
+                        None => DataType::Boolean,
+                    };
+                    if let Some(expr) = expr {
+                        rewrite_placeholder_type(expr.as_mut(), &when_type)?;
+                    }
+                    for (when_expr, then_expr) in when_then_expr.iter_mut() {
+                        rewrite_placeholder_type(when_expr.as_mut(), &when_type)?;
+                        rewrite_placeholder_type(then_expr.as_mut(), &when_type)?;
+                    }
+                    if let Some(else_expr) = else_expr {
+                        rewrite_placeholder_type(else_expr.as_mut(), &when_type)?;
+                    }
+                }
+                // These expressions constrain any immediate placeholders to Boolean.
+                Expr::Not(expr)
+                | Expr::IsTrue(expr)
+                | Expr::IsFalse(expr)
+                | Expr::IsNotTrue(expr)
+                | Expr::IsNotFalse(expr)
+                | Expr::IsNotUnknown(expr) => {
+                    rewrite_placeholder_type(expr.as_mut(), &DataType::Boolean)?
+                }
+                // Note that the inner cast expression can technically be any data type
+                // that is coercible to the data type of the cast expression.
+                // However, returning `data_type` is preferable to returning DataType::Null
+                // for placeholder inference.
+                Expr::Cast(Cast { expr, data_type })
+                | Expr::TryCast(TryCast { expr, data_type }) => {
+                    rewrite_placeholder_type(expr.as_mut(), data_type)?;
+                }
+                // Negative expressions can technically be any numeric data type, but if we have
+                // an immediate placeholder, let's infer it as Int64.
+                Expr::Negative(expr) => {
+                    rewrite_placeholder_type(expr.as_mut(), &DataType::Int64)?
                 }
                 Expr::Placeholder(_) => {
                     has_placeholder = true;
                 }
-                _ => {}
+                // These expressions either cannot contain placeholders or
+                // do not constrain the type of the placeholder.
+                Expr::Alias(_)
+                | Expr::Column(_)
+                | Expr::ScalarVariable(_, _)
+                | Expr::Literal(_, _)
+                | Expr::IsNotNull(_)
+                | Expr::IsNull(_)
+                | Expr::IsUnknown(_)
+                | Expr::ScalarFunction(_)
+                | Expr::AggregateFunction(_)
+                | Expr::WindowFunction(_)
+                | Expr::Exists(_)
+                | Expr::ScalarSubquery(_)
+                | Expr::Wildcard { .. }
+                | Expr::GroupingSet(_)
+                | Expr::OuterReferenceColumn(_, _)
+                | Expr::Unnest(_) => {}
             }
             Ok(Transformed::yes(expr))
         })
@@ -2492,20 +2600,10 @@ impl HashNode for Expr {
     }
 }
 
-fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Result<()> {
+fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
     if let Expr::Placeholder(Placeholder { id: _, data_type }) = expr {
         if data_type.is_none() {
-            let other_dt = other.get_type(schema);
-            match other_dt {
-                Err(e) => {
-                    Err(e.context(format!(
-                        "Can not find type of {other} needed to infer type of {expr}"
-                    )))?;
-                }
-                Ok(dt) => {
-                    *data_type = Some(dt);
-                }
-            }
+            *data_type = Some(dt.clone());
         };
     }
     Ok(())
@@ -2514,15 +2612,28 @@ fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Resu
 fn find_first_non_null_data_type_expr_placeholder<'a>(
     exprs: impl Iterator<Item = &'a Expr>,
     schema: &DFSchema,
-) -> Option<DataType> {
+) -> Result<DataType> {
+    let mut failed_expr = None;
     for expr in exprs {
-        match expr.get_type(schema) {
-            Ok(dt) if dt != DataType::Null => return Some(dt),
-            _ => {}
+        let data_type = match expr.get_type(schema) {
+            Ok(dt) => dt,
+            Err(e) => {
+                failed_expr = Some((expr, e));
+                continue;
+            }
         };
+        if data_type != DataType::Null {
+            return Ok(data_type);
+        }
     }
 
-    None
+    if let Some((expr, e)) = failed_expr {
+        return Err(e.context(format!(
+            "Can not find type of {expr} needed to infer placeholder type"
+        )));
+    }
+
+    Ok(DataType::Null)
 }
 
 #[macro_export]
