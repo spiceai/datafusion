@@ -153,7 +153,7 @@ SELECT * FROM generate_series(1, 5, NULL)
 query TT
 EXPLAIN SELECT * FROM generate_series(1, 5)
 ----
-logical_plan TableScan: generate_series() projection=[value]
+logical_plan TableScan: generate_series(Int64(1), Int64(5)) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=1, end=5, batch_size=8192]
 
 #
@@ -276,7 +276,7 @@ SELECT * FROM range(1, 5, NULL)
 query TT
 EXPLAIN SELECT * FROM range(1, 5)
 ----
-logical_plan TableScan: range() projection=[value]
+logical_plan TableScan: range(Int64(1), Int64(5)) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[range: start=1, end=5, batch_size=8192]
 
 #
@@ -374,7 +374,7 @@ SELECT * FROM range(TIMESTAMP '2023-01-03T00:00:00', TIMESTAMP '2023-01-01T00:00
 
 # Single timestamp (start == end)
 query P
-SELECT * FROM range(TIMESTAMP '2023-01-01T00:00:00', TIMESTAMP '2023-01-01T00:00:00', INTERVAL '1' DAY)  
+SELECT * FROM range(TIMESTAMP '2023-01-01T00:00:00', TIMESTAMP '2023-01-01T00:00:00', INTERVAL '1' DAY)
 ----
 
 # Timestamp range with NULL values
@@ -443,7 +443,7 @@ SELECT * FROM generate_series(DATE '1992-09-01', DATE '1992-09-03', INTERVAL '1'
 query TT
 EXPLAIN SELECT * FROM generate_series(DATE '1992-09-01', DATE '1992-09-03', INTERVAL '1' DAY);
 ----
-logical_plan TableScan: generate_series() projection=[value]
+logical_plan TableScan: generate_series(CAST(Utf8("1992-09-01") AS Date32), CAST(Utf8("1992-09-03") AS Date32), IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 1, nanoseconds: 0 }")) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=715305600000000000, end=715478400000000000, batch_size=8192]
 
 # Backwards date range
@@ -463,7 +463,7 @@ SELECT * FROM range(DATE '1992-09-01', NULL::DATE, INTERVAL '1' MONTH)
 query TT
 EXPLAIN SELECT * FROM range(DATE '1992-09-01', NULL::DATE, INTERVAL '1' MONTH)
 ----
-logical_plan TableScan: range() projection=[value]
+logical_plan TableScan: range(CAST(Utf8("1992-09-01") AS Date32), CAST(NULL AS Date32), IntervalMonthDayNano("IntervalMonthDayNano { months: 1, days: 0, nanoseconds: 0 }")) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[range: empty]
 
 query P

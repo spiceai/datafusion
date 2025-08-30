@@ -61,12 +61,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             }
                         })
                         .collect::<Vec<_>>();
+                    let table_name_arg_str = args
+                        .iter()
+                        .map(|e| e.to_string())
+                        .reduce(|a, b| format!("{a}, {b}"))
+                        .unwrap_or_default();
                     let provider = self
                         .context_provider
                         .get_table_function_source(&tbl_func_name, args)?;
                     let plan = LogicalPlanBuilder::scan(
                         TableReference::Bare {
-                            table: format!("{tbl_func_name}()").into(),
+                            table: format!("{tbl_func_name}({table_name_arg_str})",)
+                                .into(),
                         },
                         provider,
                         None,
