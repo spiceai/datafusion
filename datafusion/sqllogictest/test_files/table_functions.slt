@@ -153,7 +153,7 @@ SELECT * FROM generate_series(1, 5, NULL)
 query TT
 EXPLAIN SELECT * FROM generate_series(1, 5)
 ----
-logical_plan TableScan: tmp_table projection=[value]
+logical_plan TableScan: generate_series(Int64(1), Int64(5)) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=1, end=5, batch_size=8192]
 
 #
@@ -270,7 +270,7 @@ SELECT * FROM range(1, 5, NULL)
 query TT
 EXPLAIN SELECT * FROM range(1, 5)
 ----
-logical_plan TableScan: tmp_table projection=[value]
+logical_plan TableScan: range(Int64(1), Int64(5)) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[range: start=1, end=5, batch_size=8192]
 
 #
