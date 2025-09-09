@@ -2779,17 +2779,29 @@ fn find_first_non_null_data_type_expr_placeholder<'a>(
     exprs: impl Iterator<Item = &'a Expr>,
     schema: &DFSchema,
 ) -> Result<DataType> {
+    // Keep track of if any `Expr` is a placeholder. If not, don't error.
+    let mut contains_placeholder = false;
+    let mut failed_expr = None;
     for expr in exprs {
+        contains_placeholder =
+            contains_placeholder || matches!(expr, Expr::Placeholder(_));
         let data_type = match expr.get_type(schema) {
             Ok(dt) => dt,
             Err(e) => {
-                return Err(e.context(format!(
-                    "Can not find type of {expr} needed to infer placeholder type"
-                )));
+                failed_expr = Some((expr, e));
+                continue;
             }
         };
         if data_type != DataType::Null {
             return Ok(data_type);
+        }
+    }
+
+    if let Some((expr, e)) = failed_expr {
+        if contains_placeholder {
+            return Err(e.context(format!(
+                "Can not find type of {expr} needed to infer placeholder type"
+            )));
         }
     }
 
