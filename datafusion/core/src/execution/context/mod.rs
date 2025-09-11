@@ -70,6 +70,7 @@ use datafusion_common::{
     tree_node::{TreeNodeRecursion, TreeNodeVisitor},
     DFSchema, ParamValues, ScalarValue, SchemaReference, TableReference,
 };
+use datafusion_datasource::file_format::FileFormatFactory;
 pub use datafusion_execution::config::SessionConfig;
 use datafusion_execution::registry::SerializerRegistry;
 pub use datafusion_execution::TaskContext;
@@ -1665,6 +1666,17 @@ impl SessionContext {
         self.state
             .write()
             .register_table_options_extension(extension)
+    }
+
+    /// Adds or updates a [FileFormatFactory] which can be used with COPY TO or
+    /// CREATE EXTERNAL TABLE statements for reading and writing files of custom
+    /// formats.
+    pub fn register_file_format(
+        &self,
+        format: Arc<dyn FileFormatFactory>,
+        overwrite: bool,
+    ) -> Result<(), DataFusionError> {
+        self.state.write().register_file_format(format, overwrite)
     }
 }
 
