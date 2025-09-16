@@ -3155,17 +3155,17 @@ mod tests {
                 Arc::clone(&default_dialect),
                 ScalarValue::TimestampMillisecond(
                     Some(1757934000123),
-                    Some("+00:00".into()),
+                    Some("+01:00".into()),
                 ),
-                "CAST('2025-09-15 11:00:00.123 +00:00' AS TIMESTAMP)",
+                "CAST('2025-09-15 12:00:00.123 +01:00' AS TIMESTAMP)",
             ),
             (
                 Arc::clone(&default_dialect),
                 ScalarValue::TimestampMicrosecond(
                     Some(1757934000123456),
-                    Some("+00:00".into()),
+                    Some("-01:00".into()),
                 ),
-                "CAST('2025-09-15 11:00:00.123456 +00:00' AS TIMESTAMP)",
+                "CAST('2025-09-15 10:00:00.123456 -01:00' AS TIMESTAMP)",
             ),
             (
                 Arc::clone(&default_dialect),
@@ -3187,17 +3187,17 @@ mod tests {
                 Arc::clone(&duckdb_dialect),
                 ScalarValue::TimestampMillisecond(
                     Some(1757934000123),
-                    Some("+00:00".into()),
+                    Some("+01:00".into()),
                 ),
-                "CAST('2025-09-15 11:00:00.123+00:00' AS TIMESTAMP)",
+                "CAST('2025-09-15 12:00:00.123+01:00' AS TIMESTAMP)",
             ),
             (
                 Arc::clone(&duckdb_dialect),
                 ScalarValue::TimestampMicrosecond(
                     Some(1757934000123456),
-                    Some("+00:00".into()),
+                    Some("-01:00".into()),
                 ),
-                "CAST('2025-09-15 11:00:00.123456+00:00' AS TIMESTAMP)",
+                "CAST('2025-09-15 10:00:00.123456-01:00' AS TIMESTAMP)",
             ),
             (
                 Arc::clone(&duckdb_dialect),
