@@ -34,7 +34,9 @@ use arrow::array::{
     },
     ArrayRef, Date32Array, Date64Array, PrimitiveArray,
 };
-use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
+use arrow::datatypes::{
+    ArrowTimestampType, DataType, Decimal128Type, Decimal256Type, DecimalType,
+};
 use arrow::util::display::array_value_to_string;
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, plan_err, Column, Result,
@@ -1020,7 +1022,7 @@ impl Unparser<'_> {
         }
     }
 
-    fn handle_timestamp<T: ArrowTemporalType>(
+    fn handle_timestamp<T: ArrowTimestampType>(
         &self,
         v: &ScalarValue,
         tz: &Option<Arc<str>>,
@@ -1028,6 +1030,8 @@ impl Unparser<'_> {
     where
         i64: From<T::Native>,
     {
+        let unit = T::UNIT;
+
         let ts = if let Some(tz) = tz {
             v.to_array()?
                 .as_any()
@@ -1039,6 +1043,7 @@ impl Unparser<'_> {
                 .ok_or(internal_datafusion_err!(
                     "Unable to convert {v:?} to DateTime"
                 ))?
+                .format(self.dialect.timestamp_with_tz_format_for_unit(unit))
                 .to_string()
         } else {
             v.to_array()?
@@ -1051,6 +1056,7 @@ impl Unparser<'_> {
                 .ok_or(internal_datafusion_err!(
                     "Unable to convert {v:?} to DateTime"
                 ))?
+                .format(self.dialect.naive_timestamp_format_for_unit(unit))
                 .to_string()
         };
 
@@ -3127,6 +3133,39 @@ mod tests {
             assert_eq!(actual, expected);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_timestamp_with_tz_format() -> Result<()> {
+        let default_dialect: Arc<dyn Dialect> =
+            Arc::new(CustomDialectBuilder::new().build());
+
+        let duckdb_default: Arc<dyn Dialect> = Arc::new(DuckDBDialect::new());
+
+        for (dialect, expected) in [
+            (
+                default_dialect,
+                "CAST('2025-09-15 11:00:00.000 +00:00' AS TIMESTAMP)",
+            ),
+            (
+                duckdb_default,
+                "CAST('2025-09-15 11:00:00.000+00:00' AS TIMESTAMP)",
+            ),
+        ] {
+            let unparser = Unparser::new(dialect.as_ref());
+
+            let expr = Expr::Literal(
+                ScalarValue::TimestampMillisecond(
+                    Some(1757934000000),
+                    Some("+00:00".into()),
+                ),
+                None,
+            );
+
+            let actual = format!("{}", unparser.expr_to_sql(&expr)?);
+            assert_eq!(actual, expected);
+        }
         Ok(())
     }
 }

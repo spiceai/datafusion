@@ -197,6 +197,28 @@ pub trait Dialect: Send + Sync {
     fn unnest_as_table_factor(&self) -> bool {
         false
     }
+
+    /// The format string to use for unparsing timestamps with time zone information.
+    /// Most dialects use "%Y-%m-%d %H:%M:%S %:z" to represent timestamps with time zone offset.
+    fn timestamp_with_tz_format_for_unit(&self, unit: TimeUnit) -> &str {
+        match unit {
+            TimeUnit::Second => "%Y-%m-%d %H:%M:%S %:z",
+            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f %:z",
+            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f %:z",
+            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f %:z",
+        }
+    }
+
+    /// The format string to use for unparsing naive timestamps (without time zone information).
+    /// Most dialects use "%Y-%m-%d %H:%M:%S" to represent timestamps without time zone.
+    fn naive_timestamp_format_for_unit(&self, unit: TimeUnit) -> &str {
+        match unit {
+            TimeUnit::Second => "%Y-%m-%d %H:%M:%S",
+            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f",
+            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f",
+            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f",
+        }
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -393,6 +415,15 @@ impl Dialect for DuckDBDialect {
         }
 
         Ok(None)
+    }
+
+    fn timestamp_with_tz_format_for_unit(&self, unit: TimeUnit) -> &str {
+        match unit {
+            TimeUnit::Second => "%Y-%m-%d %H:%M:%S%:z",
+            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f%:z",
+            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f%:z",
+            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f%:z",
+        }
     }
 }
 
