@@ -199,7 +199,6 @@ pub trait Dialect: Send + Sync {
     }
 
     /// The format string to use for unparsing timestamps with time zone information.
-    /// Most dialects use "%Y-%m-%d %H:%M:%S %:z" to represent timestamps with time zone offset.
     fn timestamp_with_tz_format_for_unit(&self, unit: TimeUnit) -> &str {
         match unit {
             TimeUnit::Second => "%Y-%m-%d %H:%M:%S %:z",
@@ -210,7 +209,6 @@ pub trait Dialect: Send + Sync {
     }
 
     /// The format string to use for unparsing naive timestamps (without time zone information).
-    /// Most dialects use "%Y-%m-%d %H:%M:%S" to represent timestamps without time zone.
     fn naive_timestamp_format_for_unit(&self, unit: TimeUnit) -> &str {
         match unit {
             TimeUnit::Second => "%Y-%m-%d %H:%M:%S",
