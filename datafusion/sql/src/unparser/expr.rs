@@ -3140,27 +3140,77 @@ mod tests {
         let default_dialect: Arc<dyn Dialect> =
             Arc::new(CustomDialectBuilder::new().build());
 
-        let duckdb_default: Arc<dyn Dialect> = Arc::new(DuckDBDialect::new());
+        let duckdb_dialect: Arc<dyn Dialect> = Arc::new(DuckDBDialect::new());
 
-        for (dialect, expected) in [
+        for (dialect, scalar, expected) in [
             (
-                default_dialect,
-                "CAST('2025-09-15 11:00:00.000 +00:00' AS TIMESTAMP)",
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampSecond(
+                    Some(1757934000),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00 +00:00' AS TIMESTAMP)",
             ),
             (
-                duckdb_default,
-                "CAST('2025-09-15 11:00:00.000+00:00' AS TIMESTAMP)",
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampMillisecond(
+                    Some(1757934000123),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123 +00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampMicrosecond(
+                    Some(1757934000123456),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123456 +00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&default_dialect),
+                ScalarValue::TimestampNanosecond(
+                    Some(1757934000123456789),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123456789 +00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampSecond(
+                    Some(1757934000),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00+00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampMillisecond(
+                    Some(1757934000123),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123+00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampMicrosecond(
+                    Some(1757934000123456),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123456+00:00' AS TIMESTAMP)",
+            ),
+            (
+                Arc::clone(&duckdb_dialect),
+                ScalarValue::TimestampNanosecond(
+                    Some(1757934000123456789),
+                    Some("+00:00".into()),
+                ),
+                "CAST('2025-09-15 11:00:00.123456789+00:00' AS TIMESTAMP)",
             ),
         ] {
             let unparser = Unparser::new(dialect.as_ref());
 
-            let expr = Expr::Literal(
-                ScalarValue::TimestampMillisecond(
-                    Some(1757934000000),
-                    Some("+00:00".into()),
-                ),
-                None,
-            );
+            let expr = Expr::Literal(scalar, None);
 
             let actual = format!("{}", unparser.expr_to_sql(&expr)?);
             assert_eq!(actual, expected);
