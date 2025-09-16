@@ -1056,7 +1056,6 @@ impl Unparser<'_> {
                 .ok_or(internal_datafusion_err!(
                     "Unable to convert {v:?} to DateTime"
                 ))?
-                .format(self.dialect.naive_timestamp_format_for_unit(unit))
                 .to_string()
         };
 

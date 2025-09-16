@@ -207,16 +207,6 @@ pub trait Dialect: Send + Sync {
             TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f %:z",
         }
     }
-
-    /// The format string to use for unparsing naive timestamps (without time zone information).
-    fn naive_timestamp_format_for_unit(&self, unit: TimeUnit) -> &str {
-        match unit {
-            TimeUnit::Second => "%Y-%m-%d %H:%M:%S",
-            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f",
-            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f",
-            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f",
-        }
-    }
 }
 
 /// `IntervalStyle` to use for unparsing
