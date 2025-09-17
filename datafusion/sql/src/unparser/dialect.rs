@@ -204,6 +204,16 @@ pub trait Dialect: Send + Sync {
     fn col_alias_overrides(&self, _alias: &str) -> Result<Option<String>> {
         Ok(None)
     }
+
+    /// The format string to use for unparsing timestamps with time zone information.
+    fn timestamp_with_tz_format_for_unit(&self, unit: TimeUnit) -> &str {
+        match unit {
+            TimeUnit::Second => "%Y-%m-%d %H:%M:%S %:z",
+            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f %:z",
+            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f %:z",
+            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f %:z",
+        }
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -400,6 +410,15 @@ impl Dialect for DuckDBDialect {
         }
 
         Ok(None)
+    }
+
+    fn timestamp_with_tz_format_for_unit(&self, unit: TimeUnit) -> &str {
+        match unit {
+            TimeUnit::Second => "%Y-%m-%d %H:%M:%S%:z",
+            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f%:z",
+            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f%:z",
+            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f%:z",
+        }
     }
 }
 
