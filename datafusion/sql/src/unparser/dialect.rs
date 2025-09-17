@@ -21,7 +21,9 @@ use super::{
     utils::character_length_to_sql, utils::date_part_to_sql,
     utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql, Unparser,
 };
+use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
+use chrono::DateTime;
 use datafusion_common::Result;
 use datafusion_expr::Expr;
 use regex::Regex;
@@ -205,14 +207,9 @@ pub trait Dialect: Send + Sync {
         Ok(None)
     }
 
-    /// The format string to use for unparsing timestamps with time zone information.
-    fn timestamp_with_tz_format_for_unit(&self, unit: TimeUnit) -> &str {
-        match unit {
-            TimeUnit::Second => "%Y-%m-%d %H:%M:%S %:z",
-            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f %:z",
-            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f %:z",
-            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f %:z",
-        }
+    /// Allows the dialect to override logic of formatting datetime with tz into string.
+    fn timestamp_with_tz_to_string(&self, dt: DateTime<Tz>, _unit: TimeUnit) -> String {
+        dt.to_string()
     }
 }
 
@@ -412,13 +409,15 @@ impl Dialect for DuckDBDialect {
         Ok(None)
     }
 
-    fn timestamp_with_tz_format_for_unit(&self, unit: TimeUnit) -> &str {
-        match unit {
+    fn timestamp_with_tz_to_string(&self, dt: DateTime<Tz>, unit: TimeUnit) -> String {
+        let format = match unit {
             TimeUnit::Second => "%Y-%m-%d %H:%M:%S%:z",
             TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f%:z",
             TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f%:z",
             TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f%:z",
-        }
+        };
+
+        dt.format(format).to_string()
     }
 }
 
