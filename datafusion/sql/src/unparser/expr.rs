@@ -1045,7 +1045,7 @@ impl Unparser<'_> {
         }
     }
 
-    fn handle_timestamp<T: ArrowTimestampType>(
+    fn handle_timestamp<T: ArrowTemporalType>(
         &self,
         v: &ScalarValue,
         tz: &Option<Arc<str>>,
@@ -1053,7 +1053,15 @@ impl Unparser<'_> {
     where
         i64: From<T::Native>,
     {
-        let time_unit = T::UNIT;
+        let time_unit = match T::DATA_TYPE {
+            DataType::Timestamp(unit, _) => unit,
+            _ => {
+                return Err(internal_datafusion_err!(
+                    "Expected Timestamp, got {:?}",
+                    T::DATA_TYPE
+                ))
+            }
+        };
 
         let ts = if let Some(tz) = tz {
             let dt = v
@@ -1080,16 +1088,6 @@ impl Unparser<'_> {
                     "Unable to convert {v:?} to DateTime"
                 ))?
                 .to_string()
-        };
-
-        let time_unit = match T::DATA_TYPE {
-            DataType::Timestamp(unit, _) => unit,
-            _ => {
-                return Err(internal_datafusion_err!(
-                    "Expected Timestamp, got {:?}",
-                    T::DATA_TYPE
-                ))
-            }
         };
 
         Ok(ast::Expr::Cast {
