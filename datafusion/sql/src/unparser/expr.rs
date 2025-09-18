@@ -3158,11 +3158,16 @@ mod tests {
     fn test_cast_timestamp_sqlite() -> Result<()> {
         let sqlite_dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect {});
 
-        for (dialect, expected) in [(sqlite_dialect, "CAST(`a` AS TEXT)")] {
+        for (dialect, expected) in [
+            (sqlite_dialect, "CAST(`a` AS TEXT)"),
+        ] {
             let unparser = Unparser::new(dialect.as_ref());
             let expr = Expr::Cast(Cast {
                 expr: Box::new(col("a")),
-                data_type: DataType::Timestamp(TimeUnit::Nanosecond, None),
+                data_type: DataType::Timestamp(
+                    TimeUnit::Nanosecond,
+                    None,
+                ),
             });
 
             let ast = unparser.expr_to_sql(&expr)?;
