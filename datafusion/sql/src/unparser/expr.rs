@@ -34,9 +34,7 @@ use arrow::array::{
     },
     ArrayRef, Date32Array, Date64Array, PrimitiveArray,
 };
-use arrow::datatypes::{
-    ArrowTimestampType, DataType, Decimal128Type, Decimal256Type, DecimalType,
-};
+use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, DecimalType};
 use arrow::util::display::array_value_to_string;
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, plan_err, Column, Result,
