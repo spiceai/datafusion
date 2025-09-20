@@ -1270,10 +1270,6 @@ impl TableProvider for ListingTable {
                 can_be_evaluated_for_extended_col_pruning(&metadata_col_names, filter)
             });
 
-        println!("partition_filters={partition_filters:?}");
-        println!("metadata_filters={metadata_filters:?}");
-        println!("filters={filters:?}");
-
         // We should not limit the number of partitioned files to scan if there are filters and limit
         // at the same time. This is because the limit should be applied after the filters are applied.
         let statistic_file_limit = if filters.is_empty() { limit } else { None };
