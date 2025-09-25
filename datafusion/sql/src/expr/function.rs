@@ -16,13 +16,14 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
 use datafusion_common::{
     internal_datafusion_err, internal_err, not_impl_err, plan_datafusion_err, plan_err,
     DFSchema, Dependency, Diagnostic, Result, Span,
 };
-use datafusion_expr::expr::{ScalarFunction, Unnest, WildcardOptions};
+use datafusion_expr::expr::{FieldMetadata, ScalarFunction, Unnest, WildcardOptions};
 use datafusion_expr::planner::{PlannerResult, RawAggregateExpr, RawWindowExpr};
 use datafusion_expr::{
     expr, Expr, ExprFunctionExt, ExprSchemable, WindowFrame, WindowFunctionDefinition,
@@ -558,6 +559,22 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 arg: FunctionArgExpr::Expr(arg),
                 operator: _,
             } => self.sql_expr_to_logical_expr(arg, schema, planner_context),
+            FunctionArg::ExprNamed {
+                name: SQLExpr::Identifier(ident),
+                arg: FunctionArgExpr::Expr(arg),
+                operator: _,
+            } => match self.sql_expr_to_logical_expr(arg, schema, planner_context) {
+                Ok(Expr::Literal(scalar, meta)) => {
+                    let spice_metadata = FieldMetadata::new(BTreeMap::from([(
+                        "spice.parameter_name".to_string(),
+                        ident.value,
+                    )]));
+                    let mut meta = meta.unwrap_or(FieldMetadata::default());
+                    meta.extend(spice_metadata);
+                    Ok(Expr::Literal(scalar, Some(meta)))
+                }
+                other => other,
+            },
             FunctionArg::Named {
                 name: _,
                 arg: FunctionArgExpr::Wildcard,
