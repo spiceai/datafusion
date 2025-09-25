@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
 use datafusion_common::{
@@ -23,7 +24,7 @@ use datafusion_common::{
     DFSchema, Dependency, Diagnostic, Result, Span,
 };
 use datafusion_expr::expr::{
-    NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction,
+    FieldMetadata, NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction,
 };
 use datafusion_expr::planner::{PlannerResult, RawAggregateExpr, RawWindowExpr};
 use datafusion_expr::{expr, Expr, ExprSchemable, WindowFrame, WindowFunctionDefinition};
@@ -711,6 +712,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 let arg_name = crate::utils::normalize_ident(name);
                 Ok((expr, Some(arg_name)))
             }
+            FunctionArg::ExprNamed {
+                name: SQLExpr::Identifier(ident),
+                arg: FunctionArgExpr::Expr(arg),
+                operator: _,
+            } => match self.sql_expr_to_logical_expr(arg, schema, planner_context) {
+                Ok(Expr::Literal(scalar, meta)) => {
+                    let spice_metadata = FieldMetadata::new(BTreeMap::from([(
+                        "spice.parameter_name".to_string(),
+                        ident.value.clone(),
+                    )]));
+                    let mut meta = meta.unwrap_or_else(FieldMetadata::default);
+                    meta.extend(spice_metadata);
+                    Ok((Expr::Literal(scalar, Some(meta)), Some(ident.value)))
+                }
+                Ok(expr) => Ok((expr, Some(ident.value))),
+                Err(e) => Err(e),
+            },
             FunctionArg::Named {
                 name,
                 arg: FunctionArgExpr::Wildcard,
@@ -750,16 +768,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     options: Box::new(WildcardOptions::default()),
                 };
                 Ok((expr, None))
-            }
-            // PostgreSQL dialect uses ExprNamed variant with expression for name
-            FunctionArg::ExprNamed {
-                name: SQLExpr::Identifier(name),
-                arg: FunctionArgExpr::Expr(arg),
-                operator: _,
-            } => {
-                let expr = self.sql_expr_to_logical_expr(arg, schema, planner_context)?;
-                let arg_name = crate::utils::normalize_ident(name);
-                Ok((expr, Some(arg_name)))
             }
             FunctionArg::ExprNamed {
                 name: SQLExpr::Identifier(name),
