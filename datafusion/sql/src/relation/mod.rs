@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
@@ -24,9 +25,12 @@ use datafusion_common::{
     not_impl_err, plan_err, DFSchema, Diagnostic, Result, Span, Spans, TableReference,
 };
 use datafusion_expr::builder::subquery_alias;
+use datafusion_expr::expr::FieldMetadata;
 use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
 use datafusion_expr::{Subquery, SubqueryAlias};
-use sqlparser::ast::{FunctionArg, FunctionArgExpr, Spanned, TableFactor};
+use sqlparser::ast::{
+    Expr as SQLExpr, FunctionArg, FunctionArgExpr, Spanned, TableFactor,
+};
 
 mod join;
 
@@ -48,15 +52,36 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let args = func_args
                         .args
                         .into_iter()
-                        .flat_map(|arg| {
-                            if let FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) = arg
-                            {
-                                self.sql_expr_to_logical_expr(
+                        .flat_map(|arg| match arg {
+                            FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self
+                                .sql_expr_to_logical_expr(
                                     expr,
                                     &DFSchema::empty(),
                                     planner_context,
-                                )
-                            } else {
+                                ),
+                            FunctionArg::ExprNamed {
+                                name: SQLExpr::Identifier(ident),
+                                arg: FunctionArgExpr::Expr(arg),
+                                operator: _,
+                            } => match self.sql_expr_to_logical_expr(
+                                arg,
+                                &DFSchema::empty(),
+                                planner_context,
+                            ) {
+                                Ok(Expr::Literal(scalar, meta)) => {
+                                    let spice_metadata =
+                                        FieldMetadata::new(BTreeMap::from([(
+                                            "spice.parameter_name".to_string(),
+                                            ident.value,
+                                        )]));
+                                    let mut meta =
+                                        meta.unwrap_or(FieldMetadata::default());
+                                    meta.extend(spice_metadata);
+                                    Ok(Expr::Literal(scalar, Some(meta)))
+                                }
+                                other => other,
+                            },
+                            _ => {
                                 plan_err!("Unsupported function argument type: {:?}", arg)
                             }
                         })
