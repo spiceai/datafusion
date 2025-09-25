@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::planner::{ContextProvider, PlannerContext, SqlToRel};
+use std::collections::BTreeMap;
 
 use arrow::datatypes::DataType;
 use datafusion_common::{
@@ -28,6 +29,8 @@ use datafusion_expr::{
     expr,
     expr::{NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction},
     planner::{PlannerResult, RawAggregateExpr, RawWindowExpr},
+use datafusion_expr::expr::{
+    FieldMetadata, NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction,
 };
 use sqlparser::ast::{
     DuplicateTreatment, Expr as SQLExpr, Function as SQLFunction, FunctionArg,
@@ -761,6 +764,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 };
                 Ok((expr, Some(arg_name)))
             }
+            FunctionArg::ExprNamed {
+                name: SQLExpr::Identifier(ident),
+                arg: FunctionArgExpr::Expr(arg),
+                operator: _,
+            } => match self.sql_expr_to_logical_expr(arg, schema, planner_context) {
+                Ok(Expr::Literal(scalar, meta)) => {
+                    let spice_metadata = FieldMetadata::new(BTreeMap::from([(
+                        "spice.parameter_name".to_string(),
+                        ident.value.clone(),
+                    )]));
+                    let mut meta = meta.unwrap_or_else(FieldMetadata::default);
+                    meta.extend(spice_metadata);
+                    Ok((Expr::Literal(scalar, Some(meta)), Some(ident.value)))
+                }
+                Ok(expr) => Ok((expr, Some(ident.value))),
+                Err(e) => Err(e),
+            },
             FunctionArg::Named {
                 name,
                 arg: FunctionArgExpr::Wildcard,
