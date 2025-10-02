@@ -1498,8 +1498,6 @@ impl ListingTable {
                 let z= apply_metadata_filters(par_file, metadata_filters, &metadata_cols)
                     .transpose();
 
-                println!("For zz partition_file={path:?}, I got z.is_some()={}. z.is_some_and(|zz| zz.is_OK())={}",  z.is_some(), z.as_ref().is_some_and(|zz| zz.is_ok()));
-
                 z
             })
             .map(|part_file| async {
