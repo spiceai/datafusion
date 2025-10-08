@@ -2828,7 +2828,7 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], None).await?;
+        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], &[], None).await?;
         assert_eq!(file_list.len(), 1);
 
         let files = file_list[0].clone();
