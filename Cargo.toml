@@ -232,3 +232,12 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     "cfg(tarpaulin_include)",
 ] }
 unused_qualifications = "deny"
+
+[patch.crates-io]
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }        # spiceai-56
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }    # spiceai-56
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" } # spiceai-56
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9f9c372ff5744488226462e3ea7d94ff47909833" }      # spiceai-56
