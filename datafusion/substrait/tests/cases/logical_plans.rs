@@ -165,7 +165,7 @@ mod tests {
             assert_snapshot!(
                 plan,
                 @r#"
-            Projection: left.A, left.[UUID] AS C, right.D, Utf8(NULL) AS [UUID] AS E
+            Projection: left.A, left.[UUID] AS C, right.D, Utf8(NULL) AS E
               Left Join: left.A = right.A
                 SubqueryAlias: left
                   Union

@@ -1296,10 +1296,6 @@ impl TableProvider for ListingTable {
                 can_be_evaluated_for_extended_col_pruning(&metadata_col_names, filter)
             });
 
-        println!("partition_filters={partition_filters:?}");
-        println!("metadata_filters={metadata_filters:?}");
-        println!("filters={filters:?}");
-
         // We should not limit the number of partitioned files to scan if there are filters and limit
         // at the same time. This is because the limit should be applied after the filters are applied.
         let statistic_file_limit = if filters.is_empty() { limit } else { None };
@@ -2848,9 +2844,7 @@ mod tests {
 
         let opt = ListingOptions::new(Arc::new(JsonFormat::default()))
             .with_file_extension_opt(Some(""))
-            .with_table_partition_cols(vec![
-                ("pid".to_string(), DataType::Int32)
-            ]);
+            .with_table_partition_cols(vec![("pid".to_string(), DataType::Int32)]);
 
         let table_path = ListingTableUrl::parse("test:///bucket/test/").unwrap();
         let schema = Schema::new(vec![Field::new("a", DataType::Boolean, false)]);
@@ -2860,17 +2854,25 @@ mod tests {
 
         let table = ListingTable::try_new(config)?;
 
-        let (file_list, _) = table.list_files_for_scan(&ctx.state(), &[], &[], None).await?;
+        let (file_list, _) = table
+            .list_files_for_scan(&ctx.state(), &[], &[], None)
+            .await?;
         assert_eq!(file_list.len(), 1);
 
         let files = file_list[0].clone();
 
-        assert_eq!(files.iter().map(|f| f.path().to_string()).collect::<Vec<_>>(), vec![
-            "bucket/test/pid=1/file1",
-            "bucket/test/pid=1/file2",
-            "bucket/test/pid=2/file3",
-            "bucket/test/pid=2/file4",
-        ]);
+        assert_eq!(
+            files
+                .iter()
+                .map(|f| f.path().to_string())
+                .collect::<Vec<_>>(),
+            vec![
+                "bucket/test/pid=1/file1",
+                "bucket/test/pid=1/file2",
+                "bucket/test/pid=2/file3",
+                "bucket/test/pid=2/file4",
+            ]
+        );
 
         Ok(())
     }
