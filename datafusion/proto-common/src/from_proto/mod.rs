@@ -930,7 +930,6 @@ impl TryFrom<&protobuf::ParquetOptions> for ParquetOptions {
         #[allow(deprecated)] // max_statistics_size
         Ok(ParquetOptions {
             enable_page_index: value.enable_page_index,
-            tolerate_missing_page_index: value.tolerate_missing_page_index,
             pruning: value.pruning,
             skip_metadata: value.skip_metadata,
             metadata_size_hint: value

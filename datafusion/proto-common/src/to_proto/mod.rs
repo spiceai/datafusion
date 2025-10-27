@@ -813,7 +813,6 @@ impl TryFrom<&ParquetOptions> for protobuf::ParquetOptions {
     fn try_from(value: &ParquetOptions) -> datafusion_common::Result<Self, Self::Error> {
         Ok(protobuf::ParquetOptions {
             enable_page_index: value.enable_page_index,
-            tolerate_missing_page_index: value.tolerate_missing_page_index,
             pruning: value.pruning,
             skip_metadata: value.skip_metadata,
             metadata_size_hint_opt: value.metadata_size_hint.map(|v| protobuf::parquet_options::MetadataSizeHintOpt::MetadataSizeHint(v as u64)),

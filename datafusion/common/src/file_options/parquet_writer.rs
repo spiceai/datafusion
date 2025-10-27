@@ -220,7 +220,6 @@ impl ParquetOptions {
 
             // not in WriterProperties
             enable_page_index: _,
-            tolerate_missing_page_index: _,
             pruning: _,
             skip_metadata: _,
             metadata_size_hint: _,
@@ -486,7 +485,6 @@ mod tests {
 
             // not in WriterProperties, but itemizing here to not skip newly added props
             enable_page_index: defaults.enable_page_index,
-            tolerate_missing_page_index: defaults.tolerate_missing_page_index,
             pruning: defaults.pruning,
             skip_metadata: defaults.skip_metadata,
             metadata_size_hint: defaults.metadata_size_hint,
@@ -596,8 +594,6 @@ mod tests {
 
                 // not in WriterProperties
                 enable_page_index: global_options_defaults.enable_page_index,
-                tolerate_missing_page_index: global_options_defaults
-                    .tolerate_missing_page_index,
                 pruning: global_options_defaults.pruning,
                 skip_metadata: global_options_defaults.skip_metadata,
                 metadata_size_hint: global_options_defaults.metadata_size_hint,
