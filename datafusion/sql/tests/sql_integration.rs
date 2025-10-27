@@ -3838,9 +3838,7 @@ fn group_by_ambiguous_name() {
 
     assert_snapshot!(
         err,
-        @r###"
-        Schema error: Ambiguous reference to unqualified field age
-        "###
+        @"Schema error: Ambiguous reference to unqualified field age"
     );
 }
 

@@ -101,11 +101,11 @@ mod tests {
 
         assert_snapshot!(
         plan,
-        @r#"
-            Projection: row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS EXPR$0, row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW__temp__0 AS ALIASED
-              WindowAggr: windowExpr=[[row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
-                TableScan: DATA
-            "#
+        @r"
+        Projection: row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS EXPR$0, row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW AS ALIASED
+          WindowAggr: windowExpr=[[row_number() ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW]]
+            TableScan: DATA
+        "
                 );
 
         // Trigger execution to ensure plan validity
@@ -165,7 +165,7 @@ mod tests {
             assert_snapshot!(
                 plan,
                 @r#"
-            Projection: left.A, left.[UUID] AS C, right.D, Utf8(NULL) AS [UUID] AS E
+            Projection: left.A, left.[UUID] AS C, right.D, Utf8(NULL) AS E
               Left Join: left.A = right.A
                 SubqueryAlias: left
                   Union

@@ -5852,7 +5852,7 @@ NULL
 # array_has([], 1) -> 'false' (empty array should return false)
 # array_has(null, 1) -> 'null' (null array should return null)
 query ?T
-SELECT column1, COALESCE(CAST(array_has(column1, column2) AS VARCHAR), 'null') 
+SELECT column1, COALESCE(CAST(array_has(column1, column2) AS VARCHAR), 'null')
 from array_has_table_empty;
 ----
 [1, 3, 5] true
@@ -6113,7 +6113,7 @@ true false false true
 false true false false
 NULL NULL false false
 false false NULL false
-false false false NULL 
+false false false NULL
 
 query BBBB
 select array_has_all(make_array(1,2,3), []),
@@ -6197,8 +6197,8 @@ logical_plan
 03)----SubqueryAlias: test
 04)------SubqueryAlias: t
 05)--------Projection:
-06)----------Filter: substr(CAST(md5(CAST(generate_series().value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
-07)------------TableScan: generate_series() projection=[value]
+06)----------Filter: substr(CAST(md5(CAST(generate_series(Int64(1), Int64(100000)).value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
+07)------------TableScan: generate_series(Int64(1), Int64(100000)) projection=[value]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
 02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
@@ -6226,8 +6226,8 @@ logical_plan
 03)----SubqueryAlias: test
 04)------SubqueryAlias: t
 05)--------Projection:
-06)----------Filter: substr(CAST(md5(CAST(generate_series().value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
-07)------------TableScan: generate_series() projection=[value]
+06)----------Filter: substr(CAST(md5(CAST(generate_series(Int64(1), Int64(100000)).value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
+07)------------TableScan: generate_series(Int64(1), Int64(100000)) projection=[value]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
 02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
@@ -6255,8 +6255,8 @@ logical_plan
 03)----SubqueryAlias: test
 04)------SubqueryAlias: t
 05)--------Projection:
-06)----------Filter: substr(CAST(md5(CAST(generate_series().value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
-07)------------TableScan: generate_series() projection=[value]
+06)----------Filter: substr(CAST(md5(CAST(generate_series(Int64(1), Int64(100000)).value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
+07)------------TableScan: generate_series(Int64(1), Int64(100000)) projection=[value]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
 02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
@@ -6286,8 +6286,8 @@ logical_plan
 03)----SubqueryAlias: test
 04)------SubqueryAlias: t
 05)--------Projection:
-06)----------Filter: array_has(LargeList([7f4b18de3cfeb9b4ac78c381ee2ad278, a, b, c]), substr(CAST(md5(CAST(generate_series().value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)))
-07)------------TableScan: generate_series() projection=[value]
+06)----------Filter: array_has(LargeList([7f4b18de3cfeb9b4ac78c381ee2ad278, a, b, c]), substr(CAST(md5(CAST(generate_series(Int64(1), Int64(100000)).value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)))
+07)------------TableScan: generate_series(Int64(1), Int64(100000)) projection=[value]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
 02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
@@ -6315,8 +6315,8 @@ logical_plan
 03)----SubqueryAlias: test
 04)------SubqueryAlias: t
 05)--------Projection:
-06)----------Filter: substr(CAST(md5(CAST(generate_series().value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
-07)------------TableScan: generate_series() projection=[value]
+06)----------Filter: substr(CAST(md5(CAST(generate_series(Int64(1), Int64(100000)).value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IN ([Utf8View("7f4b18de3cfeb9b4ac78c381ee2ad278"), Utf8View("a"), Utf8View("b"), Utf8View("c")])
+07)------------TableScan: generate_series(Int64(1), Int64(100000)) projection=[value]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
 02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
@@ -6346,8 +6346,8 @@ logical_plan
 03)----SubqueryAlias: test
 04)------SubqueryAlias: t
 05)--------Projection:
-06)----------Filter: substr(CAST(md5(CAST(generate_series().value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IS NOT NULL OR Boolean(NULL)
-07)------------TableScan: generate_series() projection=[value]
+06)----------Filter: substr(CAST(md5(CAST(generate_series(Int64(1), Int64(100000)).value AS Utf8View)) AS Utf8View), Int64(1), Int64(32)) IS NOT NULL OR Boolean(NULL)
+07)------------TableScan: generate_series(Int64(1), Int64(100000)) projection=[value]
 physical_plan
 01)ProjectionExec: expr=[count(Int64(1))@0 as count(*)]
 02)--AggregateExec: mode=Final, gby=[], aggr=[count(Int64(1))]
@@ -7978,7 +7978,7 @@ select array_reverse(arrow_cast(make_array(1, 2, 3), 'LargeList(Int64)')), array
 [3, 2, 1] [1]
 
 query ????
-select array_reverse(arrow_cast(make_array(1, 2, 3), 'FixedSizeList(3, Int64)')), 
+select array_reverse(arrow_cast(make_array(1, 2, 3), 'FixedSizeList(3, Int64)')),
   array_reverse(arrow_cast(make_array(1), 'FixedSizeList(1, Int64)')),
   array_reverse(arrow_cast(make_array(1, NULL, 3), 'FixedSizeList(3, Int64)')),
   array_reverse(arrow_cast(make_array(NULL, NULL, NULL), 'FixedSizeList(3, Int64)'));
