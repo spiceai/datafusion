@@ -362,6 +362,7 @@ impl TableParquetOptionsProto {
         TableParquetOptionsProto {
             global: Some(ParquetOptionsProto {
                 enable_page_index: global_options.global.enable_page_index,
+                tolerate_missing_page_index: global_options.global.tolerate_missing_page_index,
                 pruning: global_options.global.pruning,
                 skip_metadata: global_options.global.skip_metadata,
                 metadata_size_hint_opt: global_options.global.metadata_size_hint.map(|size| {
@@ -455,6 +456,7 @@ impl From<&ParquetOptionsProto> for ParquetOptions {
         #[allow(deprecated)] // max_statistics_size
         ParquetOptions {
             enable_page_index: proto.enable_page_index,
+            tolerate_missing_page_index: proto.tolerate_missing_page_index,
             pruning: proto.pruning,
             skip_metadata: proto.skip_metadata,
             metadata_size_hint: proto.metadata_size_hint_opt.as_ref().map(|opt| match opt {

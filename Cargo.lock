@@ -253,6 +253,7 @@ dependencies = [
  "arrow-json",
  "arrow-ord",
  "arrow-pyarrow",
+ "arrow-pyarrow",
  "arrow-row",
  "arrow-schema",
  "arrow-select",

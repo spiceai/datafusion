@@ -5580,6 +5580,9 @@ impl serde::Serialize for ParquetOptions {
         if !self.created_by.is_empty() {
             len += 1;
         }
+        if self.tolerate_missing_page_index {
+            len += 1;
+        }
         if self.metadata_size_hint_opt.is_some() {
             len += 1;
         }
@@ -5684,6 +5687,9 @@ impl serde::Serialize for ParquetOptions {
         }
         if !self.created_by.is_empty() {
             struct_ser.serialize_field("createdBy", &self.created_by)?;
+        }
+        if self.tolerate_missing_page_index {
+            struct_ser.serialize_field("tolerateMissingPageIndex", &self.tolerate_missing_page_index)?;
         }
         if let Some(v) = self.metadata_size_hint_opt.as_ref() {
             match v {
@@ -5812,6 +5818,8 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             "maxRowGroupSize",
             "created_by",
             "createdBy",
+            "tolerate_missing_page_index",
+            "tolerateMissingPageIndex",
             "metadata_size_hint",
             "metadataSizeHint",
             "compression",
@@ -5854,6 +5862,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
             DataPageRowCountLimit,
             MaxRowGroupSize,
             CreatedBy,
+            TolerateMissingPageIndex,
             MetadataSizeHint,
             Compression,
             DictionaryEnabled,
@@ -5905,6 +5914,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             "dataPageRowCountLimit" | "data_page_row_count_limit" => Ok(GeneratedField::DataPageRowCountLimit),
                             "maxRowGroupSize" | "max_row_group_size" => Ok(GeneratedField::MaxRowGroupSize),
                             "createdBy" | "created_by" => Ok(GeneratedField::CreatedBy),
+                            "tolerateMissingPageIndex" | "tolerate_missing_page_index" => Ok(GeneratedField::TolerateMissingPageIndex),
                             "metadataSizeHint" | "metadata_size_hint" => Ok(GeneratedField::MetadataSizeHint),
                             "compression" => Ok(GeneratedField::Compression),
                             "dictionaryEnabled" | "dictionary_enabled" => Ok(GeneratedField::DictionaryEnabled),
@@ -5954,6 +5964,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                 let mut data_page_row_count_limit__ = None;
                 let mut max_row_group_size__ = None;
                 let mut created_by__ = None;
+                let mut tolerate_missing_page_index__ = None;
                 let mut metadata_size_hint_opt__ = None;
                 let mut compression_opt__ = None;
                 let mut dictionary_enabled_opt__ = None;
@@ -6100,6 +6111,12 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                             }
                             created_by__ = Some(map_.next_value()?);
                         }
+                        GeneratedField::TolerateMissingPageIndex => {
+                            if tolerate_missing_page_index__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("tolerateMissingPageIndex"));
+                            }
+                            tolerate_missing_page_index__ = Some(map_.next_value()?);
+                        }
                         GeneratedField::MetadataSizeHint => {
                             if metadata_size_hint_opt__.is_some() {
                                 return Err(serde::de::Error::duplicate_field("metadataSizeHint"));
@@ -6183,6 +6200,7 @@ impl<'de> serde::Deserialize<'de> for ParquetOptions {
                     data_page_row_count_limit: data_page_row_count_limit__.unwrap_or_default(),
                     max_row_group_size: max_row_group_size__.unwrap_or_default(),
                     created_by: created_by__.unwrap_or_default(),
+                    tolerate_missing_page_index: tolerate_missing_page_index__.unwrap_or_default(),
                     metadata_size_hint_opt: metadata_size_hint_opt__,
                     compression_opt: compression_opt__,
                     dictionary_enabled_opt: dictionary_enabled_opt__,
