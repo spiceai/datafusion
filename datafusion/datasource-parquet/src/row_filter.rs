@@ -324,6 +324,8 @@ impl<'schema> PushdownChecker<'schema> {
                 return Some(TreeNodeRecursion::Jump);
             }
         } else {
+            println!("Column '{column_name}' is a projection or partition column?");
+
             // If the column does not exist in the (un-projected) table schema then
             // it must be a projected column.
             self.projected_columns = true;
