@@ -1141,6 +1141,7 @@ impl ExecutionPlan for HashJoinExec {
         // However it's a cheap check and serves to inform future devs touching this function that they need to be really
         // careful pushing down filters through non-inner joins.
         if self.join_type != JoinType::Inner {
+            println!("Join type is not inner: {:?}", self.join_type);
             // Other types of joins can support *some* filters, but restrictions are complex and error prone.
             // For now we don't support them.
             // See the logical optimizer rules for more details: datafusion/optimizer/src/push_down_filter.rs
@@ -1153,10 +1154,16 @@ impl ExecutionPlan for HashJoinExec {
         assert_eq!(child_pushdown_result.self_filters.len(), 2); // Should always be 2, we have 2 children
         let right_child_self_filters = &child_pushdown_result.self_filters[1]; // We only push down filters to the right child
                                                                                // We expect 0 or 1 self filters
+        println!("Right child self filters: {:?}", right_child_self_filters);
+        println!(
+            "Left child self filters: {:?}",
+            child_pushdown_result.self_filters[0]
+        );
         if let Some(filter) = right_child_self_filters.first() {
             // Note that we don't check PushdDownPredicate::discrimnant because even if nothing said
             // "yes, I can fully evaluate this filter" things might still use it for statistics -> it's worth updating
             let predicate = Arc::clone(&filter.predicate);
+            println!("Pushing down dynamic filter: {:?}", predicate);
             if let Ok(dynamic_filter) =
                 Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
             {
