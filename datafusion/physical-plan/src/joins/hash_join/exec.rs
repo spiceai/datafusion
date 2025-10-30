@@ -1121,10 +1121,6 @@ impl ExecutionPlan for HashJoinExec {
             "HashJoin gathered Left filters: {:?}",
             left_child.self_filters
         );
-        println!(
-            "HashJoin gathered Right filters: {:?}",
-            right_child.self_filters
-        );
 
         // Add dynamic filters in Post phase if enabled
         if matches!(phase, FilterPushdownPhase::Post)
@@ -1134,6 +1130,11 @@ impl ExecutionPlan for HashJoinExec {
             let dynamic_filter = Self::create_dynamic_filter(&self.on);
             right_child = right_child.with_self_filter(dynamic_filter);
         }
+
+        println!(
+            "HashJoin gathered Right filters: {:?}",
+            right_child.self_filters
+        );
 
         Ok(FilterDescription::new()
             .with_child(left_child)
