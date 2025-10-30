@@ -41,7 +41,8 @@ use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_plan::filter_pushdown::{
-    ChildPushdownResult, FilterPushdownPhase, FilterPushdownPropagation, PushedDown,
+    ChildPushdownResult, FilterDescription, FilterPushdownPhase,
+    FilterPushdownPropagation, PushedDown,
 };
 
 /// A source of data, typically a list of files or memory
@@ -328,12 +329,29 @@ impl ExecutionPlan for DataSourceExec {
         }
     }
 
+    fn gather_filters_for_pushdown(
+        &self,
+        _phase: FilterPushdownPhase,
+        parent_filters: Vec<Arc<dyn PhysicalExpr>>,
+        _config: &ConfigOptions,
+    ) -> Result<FilterDescription> {
+        println!(
+            "Gathering filters for pushdown in DataSourceExec: {:?}",
+            parent_filters
+        );
+        Ok(FilterDescription::all_unsupported(
+            &parent_filters,
+            &self.children(),
+        ))
+    }
+
     fn handle_child_pushdown_result(
         &self,
         _phase: FilterPushdownPhase,
         child_pushdown_result: ChildPushdownResult,
         config: &ConfigOptions,
     ) -> Result<FilterPushdownPropagation<Arc<dyn ExecutionPlan>>> {
+        println!("Handle pushdown result from DataSourceExec");
         // Push any remaining filters into our data source
         let parent_filters = child_pushdown_result
             .parent_filters

@@ -717,7 +717,10 @@ impl FileSource for ParquetSource {
         filters: Vec<Arc<dyn PhysicalExpr>>,
         config: &ConfigOptions,
     ) -> datafusion_common::Result<FilterPushdownPropagation<Arc<dyn FileSource>>> {
-        println!("Input filters for pushdown: {:?}", filters);
+        println!(
+            "try_pushdown_filters Input filters for pushdown: {:?}",
+            filters
+        );
 
         let Some(file_schema) = self.file_schema.clone() else {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
@@ -735,6 +738,8 @@ impl FileSource for ParquetSource {
         let table_pushdown_enabled = self.pushdown_filters();
         let pushdown_filters = table_pushdown_enabled || config_pushdown_enabled;
 
+        println!("pushdown_filters: {pushdown_filters}");
+
         let mut source = self.clone();
         let filters: Vec<PushedDownPredicate> = filters
             .into_iter()
@@ -750,6 +755,7 @@ impl FileSource for ParquetSource {
             .iter()
             .all(|f| matches!(f.discriminant, PushedDown::No))
         {
+            println!("No filters can be pushed down");
             // No filters can be pushed down, so we can just return the remaining filters
             // and avoid replacing the source in the physical plan.
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(

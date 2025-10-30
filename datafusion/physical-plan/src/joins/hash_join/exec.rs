@@ -1160,6 +1160,7 @@ impl ExecutionPlan for HashJoinExec {
             if let Ok(dynamic_filter) =
                 Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
             {
+                println!("Pushing down dynamic filter through HashJoinExec");
                 // We successfully pushed down our self filter - we need to make a new node with the dynamic filter
                 let new_node = Arc::new(HashJoinExec {
                     left: Arc::clone(&self.left),
