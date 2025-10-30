@@ -2049,8 +2049,6 @@ impl DefaultPhysicalPlanner {
         F: FnMut(&dyn ExecutionPlan, &dyn PhysicalOptimizerRule),
     {
         let optimizers = session_state.physical_optimizers();
-        println!("Found {} physical optimizers", optimizers.len());
-
         debug!(
             "Input physical plan:\n{}\n",
             displayable(plan.as_ref()).indent(false)
@@ -2066,8 +2064,6 @@ impl DefaultPhysicalPlanner {
 
         let mut new_plan = Arc::clone(&plan);
         for optimizer in optimizers {
-            println!("Running optimizer: {}", optimizer.name());
-
             let before_schema = new_plan.schema();
             new_plan = optimizer
                 .optimize(new_plan, session_state.config_options())
