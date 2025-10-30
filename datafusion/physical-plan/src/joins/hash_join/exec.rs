@@ -1100,6 +1100,7 @@ impl ExecutionPlan for HashJoinExec {
         // See the logical optimizer rules for more details: datafusion/optimizer/src/push_down_filter.rs
         // See https://github.com/apache/datafusion/issues/16973 for tracking.
         if self.join_type != JoinType::Inner {
+            println!("Non inner join filters aren't supported");
             return Ok(FilterDescription::all_unsupported(
                 &parent_filters,
                 &self.children(),
@@ -1115,6 +1116,15 @@ impl ExecutionPlan for HashJoinExec {
             &parent_filters,
             self.right(),
         )?;
+
+        println!(
+            "HashJoin gathered Left filters: {:?}",
+            left_child.self_filters
+        );
+        println!(
+            "HashJoin gathered Right filters: {:?}",
+            right_child.self_filters
+        );
 
         // Add dynamic filters in Post phase if enabled
         if matches!(phase, FilterPushdownPhase::Post)
@@ -1140,6 +1150,7 @@ impl ExecutionPlan for HashJoinExec {
         // non-inner joins in `gather_filters_for_pushdown`.
         // However it's a cheap check and serves to inform future devs touching this function that they need to be really
         // careful pushing down filters through non-inner joins.
+        println!("HashJoin pushing down child filters");
         if self.join_type != JoinType::Inner {
             // Other types of joins can support *some* filters, but restrictions are complex and error prone.
             // For now we don't support them.
@@ -1149,6 +1160,10 @@ impl ExecutionPlan for HashJoinExec {
             ));
         }
 
+        println!(
+            "HashJoin handling child pushdown result: {:?}",
+            child_pushdown_result
+        );
         let mut result = FilterPushdownPropagation::if_any(child_pushdown_result.clone());
         assert_eq!(child_pushdown_result.self_filters.len(), 2); // Should always be 2, we have 2 children
         let right_child_self_filters = &child_pushdown_result.self_filters[1]; // We only push down filters to the right child
