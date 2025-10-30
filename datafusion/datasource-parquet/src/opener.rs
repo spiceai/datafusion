@@ -118,6 +118,8 @@ impl FileOpener for ParquetOpener {
         let file_metrics =
             ParquetFileMetrics::new(self.partition_index, &file_name, &self.metrics);
 
+        println!("Opening parquet file with predicate: {:?}", self.predicate);
+
         let metadata_size_hint = file_meta.metadata_size_hint.or(self.metadata_size_hint);
 
         let mut async_file_reader: Box<dyn AsyncFileReader> =
@@ -833,6 +835,7 @@ mod test {
                 expr_adapter_factory: Some(Arc::new(DefaultPhysicalExprAdapterFactory)),
                 #[cfg(feature = "parquet_encryption")]
                 encryption_factory: None,
+                tolerate_missing_page_index: true,
             }
         };
 
@@ -921,6 +924,7 @@ mod test {
                 expr_adapter_factory: Some(Arc::new(DefaultPhysicalExprAdapterFactory)),
                 #[cfg(feature = "parquet_encryption")]
                 encryption_factory: None,
+                tolerate_missing_page_index: true,
             }
         };
 
@@ -1025,6 +1029,7 @@ mod test {
                 expr_adapter_factory: Some(Arc::new(DefaultPhysicalExprAdapterFactory)),
                 #[cfg(feature = "parquet_encryption")]
                 encryption_factory: None,
+                tolerate_missing_page_index: true,
             }
         };
         let make_meta = || FileMeta {
@@ -1139,6 +1144,7 @@ mod test {
                 expr_adapter_factory: Some(Arc::new(DefaultPhysicalExprAdapterFactory)),
                 #[cfg(feature = "parquet_encryption")]
                 encryption_factory: None,
+                tolerate_missing_page_index: true,
             }
         };
 
@@ -1254,6 +1260,7 @@ mod test {
                 expr_adapter_factory: Some(Arc::new(DefaultPhysicalExprAdapterFactory)),
                 #[cfg(feature = "parquet_encryption")]
                 encryption_factory: None,
+                tolerate_missing_page_index: true,
             }
         };
 
@@ -1436,6 +1443,7 @@ mod test {
             expr_adapter_factory: None,
             #[cfg(feature = "parquet_encryption")]
             encryption_factory: None,
+            tolerate_missing_page_index: true,
         };
 
         let predicate = logical2physical(&col("a").eq(lit(1u64)), &table_schema);
