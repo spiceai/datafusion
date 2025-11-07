@@ -464,12 +464,10 @@ where
         // Since dynamic filters may have been updated, see if we can stop
         // reading this stream entirely.
         if self.file_pruner.should_prune()? {
-            println!("Pruning file");
             self.files_ranges_pruned_statistics.add(1);
             self.done = true;
             Ok(None)
         } else {
-            println!("Not pruning file");
             // Return the adapted batch
             Ok(Some(batch))
         }
