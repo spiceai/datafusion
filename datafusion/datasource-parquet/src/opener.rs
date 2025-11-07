@@ -438,7 +438,7 @@ impl FileOpener for ParquetOpener {
 /// This can terminate the scan early when some dynamic filters is updated after
 /// the scan starts, so we discover after the scan starts that the file can be
 /// pruned (can't have matching rows).
-struct EarlyStoppingStream<S> {
+pub struct EarlyStoppingStream<S> {
     /// Has the stream finished processing? All subsequent polls will return
     /// None
     done: bool,
