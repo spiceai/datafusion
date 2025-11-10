@@ -918,9 +918,9 @@ impl ListingOptions {
     /// ```
     pub fn with_object_versioning_type(
         mut self,
-        object_versioning_type: ObjectVersionType,
+        object_versioning_type: Option<ObjectVersionType>,
     ) -> Self {
-        self.object_versioning_type = Some(object_versioning_type);
+        self.object_versioning_type = object_versioning_type;
         self
     }
 }
