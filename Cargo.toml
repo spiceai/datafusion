@@ -234,12 +234,12 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 unused_qualifications = "deny"
 
 [patch.crates-io]
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3ff6db81f484d75f8d0088e4e5665324a0c7eacd" }        # spiceai-56
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3ff6db81f484d75f8d0088e4e5665324a0c7eacd" } # spiceai-56
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3ff6db81f484d75f8d0088e4e5665324a0c7eacd" } # spiceai-56
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3ff6db81f484d75f8d0088e4e5665324a0c7eacd" }    # spiceai-56
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3ff6db81f484d75f8d0088e4e5665324a0c7eacd" }    # spiceai-56
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3ff6db81f484d75f8d0088e4e5665324a0c7eacd" } # spiceai-56
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "3ff6db81f484d75f8d0088e4e5665324a0c7eacd" }      # spiceai-56
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }        # spiceai-56
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }    # spiceai-56
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" } # spiceai-56
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "bfada495edbfc6ddcdabd3d2d93ac6e013552acd" }      # spiceai-56
 
 object_store = { git = "https://github.com/apache/arrow-rs-object-store", rev = "f0a772cd49d2ebb1f19f487ccd93d705f48dc891" }

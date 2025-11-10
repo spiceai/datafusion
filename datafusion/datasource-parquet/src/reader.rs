@@ -156,7 +156,7 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
             metrics,
         );
         let store = Arc::clone(&self.store);
-        let mut inner = ParquetObjectReader::new(store, file_meta.object_meta)
+        let mut inner = ParquetObjectReader::new_with_meta(store, file_meta.object_meta)
             .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
@@ -218,8 +218,9 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         );
         let store = Arc::clone(&self.store);
 
-        let mut inner = ParquetObjectReader::new(store, file_meta.object_meta.clone())
-            .with_object_versioning_type(self.object_versioning_type.clone());
+        let mut inner =
+            ParquetObjectReader::new_with_meta(store, file_meta.object_meta.clone())
+                .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
             inner = inner.with_footer_size_hint(hint)

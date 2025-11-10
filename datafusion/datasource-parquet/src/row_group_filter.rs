@@ -1534,7 +1534,7 @@ mod tests {
         let metrics = ExecutionPlanMetricsSet::new();
         let file_metrics =
             ParquetFileMetrics::new(0, object_meta.location.as_ref(), &metrics);
-        let inner = ParquetObjectReader::new(Arc::new(in_memory), object_meta);
+        let inner = ParquetObjectReader::new_with_meta(Arc::new(in_memory), object_meta);
 
         let reader = ParquetFileReader {
             inner,
