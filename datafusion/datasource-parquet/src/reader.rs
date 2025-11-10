@@ -29,6 +29,7 @@ use futures::future::BoxFuture;
 use futures::FutureExt;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::async_reader::ObjectVersionType;
 use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
 use parquet::file::metadata::ParquetMetaData;
 use std::any::Any;
@@ -77,12 +78,24 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
 #[derive(Debug)]
 pub struct DefaultParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl DefaultParquetFileReaderFactory {
     /// Create a new `DefaultParquetFileReaderFactory`.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            object_versioning_type: None,
+        }
+    }
+
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
     }
 }
 
@@ -143,8 +156,8 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
             metrics,
         );
         let store = Arc::clone(&self.store);
-        let mut inner = ParquetObjectReader::new(store, file_meta.object_meta.location)
-            .with_file_size(file_meta.object_meta.size);
+        let mut inner = ParquetObjectReader::new_with_meta(store, file_meta.object_meta)
+            .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
             inner = inner.with_footer_size_hint(hint)
@@ -166,6 +179,7 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
 pub struct CachedParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
     metadata_cache: Arc<dyn FileMetadataCache>,
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl CachedParquetFileReaderFactory {
@@ -176,7 +190,16 @@ impl CachedParquetFileReaderFactory {
         Self {
             store,
             metadata_cache,
+            object_versioning_type: None,
         }
+    }
+
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
     }
 }
 
@@ -196,8 +219,8 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         let store = Arc::clone(&self.store);
 
         let mut inner =
-            ParquetObjectReader::new(store, file_meta.object_meta.location.clone())
-                .with_file_size(file_meta.object_meta.size);
+            ParquetObjectReader::new_with_meta(store, file_meta.object_meta.clone())
+                .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
             inner = inner.with_footer_size_hint(hint)
