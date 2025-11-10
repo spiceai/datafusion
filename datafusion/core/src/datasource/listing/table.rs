@@ -61,6 +61,7 @@ use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use futures::{future, stream, Stream, StreamExt, TryStreamExt};
 use itertools::Itertools;
 use object_store::ObjectStore;
+use parquet::arrow::async_reader::ObjectVersionType;
 
 /// Indicates the source of the schema for a [`ListingTable`]
 // PartialEq required for assert_eq! in tests
@@ -488,6 +489,9 @@ pub struct ListingOptions {
     /// Additional columns to include in the table schema, based on the metadata of the files.
     /// See [Self::with_metadata_cols] for details.
     pub metadata_cols: Vec<MetadataColumn>,
+    /// Whether to retrieve objects based on the version of etag property at the time the object was listed.
+    /// Specifying this option ensures that objects listed during planning are consistent with objects read during execution.
+    pub object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl ListingOptions {
@@ -506,6 +510,7 @@ impl ListingOptions {
             target_partitions: 1,
             file_sort_order: vec![],
             metadata_cols: vec![],
+            object_versioning_type: None,
         }
     }
 
@@ -893,6 +898,30 @@ impl ListingOptions {
                 plan_err!("Found mixed partition values on disk {:?}", sorted_diff)
             }
         }
+    }
+
+    /// Set object versioning type on [`ListingOptions`] and returns self.
+    ///
+    /// See [`ObjectVersionType`] for details.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use std::sync::Arc;
+    /// # use datafusion::datasource::{listing::{ListingOptions, ObjectVersionType}, file_format::parquet::ParquetFormat};
+    /// let listing_options = ListingOptions::new(Arc::new(
+    ///     ParquetFormat::default()
+    ///   ))
+    ///   .with_object_versioning_type(ObjectVersionType::ETag);
+    ///
+    /// assert_eq!(listing_options.object_versioning_type, Some(ObjectVersionType::ETag));
+    /// ```
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: ObjectVersionType,
+    ) -> Self {
+        self.object_versioning_type = Some(object_versioning_type);
+        self
     }
 }
 
@@ -1378,6 +1407,7 @@ impl TableProvider for ListingTable {
                 .with_table_partition_cols(table_partition_cols)
                 .with_expr_adapter(self.expr_adapter_factory.clone())
                 .with_metadata_cols(metadata_cols)
+                .with_object_versioning_type(self.options.object_versioning_type.clone())
                 .build(),
             )
             .await

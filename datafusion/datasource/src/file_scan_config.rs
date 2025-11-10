@@ -48,6 +48,7 @@ use datafusion_physical_plan::{
 };
 use log::{debug, warn};
 use object_store::ObjectMeta;
+use parquet::arrow::async_reader::ObjectVersionType;
 
 use crate::file_groups::FileGroup;
 #[allow(unused_imports)]
@@ -202,6 +203,9 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// Object versioning type for reading files.
+    /// This is used to handle different versions of objects in object stores.
+    pub object_versioning_type: Option<ObjectVersionType>,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -282,6 +286,7 @@ pub struct FileScanConfigBuilder {
     new_lines_in_values: Option<bool>,
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl FileScanConfigBuilder {
@@ -312,6 +317,7 @@ impl FileScanConfigBuilder {
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
+            object_versioning_type: None,
         }
     }
 
@@ -440,6 +446,16 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Set the object versioning type for reading files.
+    /// This is used to handle different versions of objects in object stores.
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
+    }
+
     /// Build the final [`FileScanConfig`] with all the configured settings.
     ///
     /// This method takes ownership of the builder and returns the constructed `FileScanConfig`.
@@ -461,6 +477,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            object_versioning_type,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -489,6 +506,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            object_versioning_type,
         }
     }
 }
@@ -511,6 +529,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
+            object_versioning_type: config.object_versioning_type,
         }
     }
 }
@@ -756,6 +775,7 @@ impl FileScanConfig {
             file_source: Arc::clone(&file_source),
             batch_size: None,
             expr_adapter_factory: None,
+            object_versioning_type: None,
         }
     }
 
