@@ -908,11 +908,12 @@ impl ListingOptions {
     ///
     /// ```rust
     /// # use std::sync::Arc;
-    /// # use datafusion::datasource::{listing::{ListingOptions, ObjectVersionType}, file_format::parquet::ParquetFormat};
+    /// # use datafusion::datasource::{listing::ListingOptions, file_format::parquet::ParquetFormat};
+    /// # use parquet::arrow::async_reader::ObjectVersionType;
     /// let listing_options = ListingOptions::new(Arc::new(
     ///     ParquetFormat::default()
     ///   ))
-    ///   .with_object_versioning_type(ObjectVersionType::ETag);
+    ///   .with_object_versioning_type(Some(ObjectVersionType::ETag));
     ///
     /// assert_eq!(listing_options.object_versioning_type, Some(ObjectVersionType::ETag));
     /// ```

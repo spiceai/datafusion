@@ -61,6 +61,8 @@ impl CacheAccessor<Path, Arc<Statistics>> for DefaultFileStatisticsCache {
                 let (saved_meta, statistics) = s.value();
                 if saved_meta.size != e.size
                     || saved_meta.last_modified != e.last_modified
+                    || saved_meta.version != e.version
+                    || saved_meta.e_tag != e.e_tag
                 {
                     // file has changed
                     None
@@ -190,8 +192,8 @@ impl DefaultFilesMetadataCacheState {
         }
     }
 
-    /// Returns the respective entry from the cache, if it exists and the `size` and `last_modified`
-    /// properties from [`ObjectMeta`] match.
+    /// Returns the respective entry from the cache, if it exists and the `size`, `last_modified`,
+    /// `version`, and `e_tag` properties from [`ObjectMeta`] match.
     /// If the entry exists, it becomes the most recently used.
     fn get(&mut self, k: &ObjectMeta) -> Option<Arc<dyn FileMetadata>> {
         self.lru_queue
@@ -199,6 +201,8 @@ impl DefaultFilesMetadataCacheState {
             .map(|(object_meta, metadata)| {
                 if object_meta.size != k.size
                     || object_meta.last_modified != k.last_modified
+                    || object_meta.version != k.version
+                    || object_meta.e_tag != k.e_tag
                 {
                     None
                 } else {
@@ -209,14 +213,17 @@ impl DefaultFilesMetadataCacheState {
             .unwrap_or(None)
     }
 
-    /// Checks if the metadata is currently cached (entry exists and the `size` and `last_modified`
-    /// properties of [`ObjectMeta`] match).
+    /// Checks if the metadata is currently cached (entry exists and the `size`, `last_modified`,
+    /// `version`, and `e_tag` properties of [`ObjectMeta`] match).
     /// The LRU queue is not updated.
     fn contains_key(&self, k: &ObjectMeta) -> bool {
         self.lru_queue
             .peek(&k.location)
             .map(|(object_meta, _)| {
-                object_meta.size == k.size && object_meta.last_modified == k.last_modified
+                object_meta.size == k.size
+                    && object_meta.last_modified == k.last_modified
+                    && object_meta.version == k.version
+                    && object_meta.e_tag == k.e_tag
             })
             .unwrap_or(false)
     }
@@ -487,6 +494,59 @@ mod tests {
     }
 
     #[test]
+    fn test_statistics_cache_version_etag() {
+        let meta = ObjectMeta {
+            location: Path::from("test"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("etag1".to_string()),
+            version: Some("v1".to_string()),
+        };
+        let cache = DefaultFileStatisticsCache::default();
+        assert!(cache.get_with_extra(&meta.location, &meta).is_none());
+
+        cache.put_with_extra(
+            &meta.location,
+            Statistics::new_unknown(&Schema::new(vec![Field::new(
+                "test_column",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            )]))
+            .into(),
+            &meta,
+        );
+        assert!(cache.get_with_extra(&meta.location, &meta).is_some());
+
+        // e_tag changed - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+
+        // version changed - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.version = Some("v2".to_string());
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+
+        // both version and e_tag changed - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.version = Some("v2".to_string());
+        meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+
+        // e_tag changed from Some to None - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.e_tag = None;
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+
+        // version changed from Some to None - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.version = None;
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+    }
+
+    #[test]
     fn test_list_file_cache() {
         let meta = ObjectMeta {
             location: Path::from("test"),
@@ -588,6 +648,63 @@ mod tests {
         assert_eq!(cache.len(), 2);
         cache.clear();
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_default_file_metadata_cache_version_etag() {
+        let object_meta = ObjectMeta {
+            location: Path::from("test"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("etag1".to_string()),
+            version: Some("v1".to_string()),
+        };
+
+        let metadata: Arc<dyn FileMetadata> = Arc::new(TestFileMetadata {
+            metadata: "retrieved_metadata".to_owned(),
+        });
+
+        let cache = DefaultFilesMetadataCache::new(1024 * 1024);
+
+        // put
+        cache.put(&object_meta, Arc::clone(&metadata));
+
+        // get and contains of a valid entry
+        assert!(cache.contains_key(&object_meta));
+        assert!(cache.get(&object_meta).is_some());
+
+        // e_tag changed - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+
+        // version changed - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.version = Some("v2".to_string());
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+
+        // both version and e_tag changed - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.version = Some("v2".to_string());
+        object_meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+
+        // e_tag changed from Some to None - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.e_tag = None;
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+
+        // version changed from Some to None - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.version = None;
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
     }
 
     fn generate_test_metadata_with_size(
