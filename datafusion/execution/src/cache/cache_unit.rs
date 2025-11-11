@@ -60,13 +60,8 @@ fn is_same_file_version(cached: &ObjectMeta, current: &ObjectMeta) -> bool {
         return true;
     }
     
-    // Check if version presence differs (one has it, other doesn't) - different files
-    if cached_version.is_some() != current_version.is_some() {
-        return false;
-    }
-    
-    // Check if etag presence differs (one has it, other doesn't) - different files  
-    if cached_etag.is_some() != current_etag.is_some() {
+    // Check if version or etag presence differs (one has it, other doesn't) - different files
+    if (cached_version.is_some() != current_version.is_some()) || (cached_etag.is_some() != current_etag.is_some()) {
         return false;
     }
     
