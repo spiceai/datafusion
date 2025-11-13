@@ -1252,6 +1252,7 @@ impl CollectLeftAccumulator {
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
         self.min.update_batch(std::slice::from_ref(&array))?;
         self.max.update_batch(std::slice::from_ref(&array))?;
+        println!("New bounds: min={:?}, max={:?}", self.min, self.max);
         Ok(())
     }
 
