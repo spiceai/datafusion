@@ -483,10 +483,18 @@ impl HashJoinStream {
 
         // mark joined left-side indices as visited, if required by join type
         if need_produce_result_in_final(self.join_type) {
-            let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
-            left_indices.iter().flatten().for_each(|x| {
-                bitmap.set_bit(x as usize, true);
-            });
+            if left_indices.len() > 0 {
+                let flattened_indices = left_indices
+                    .iter()
+                    .flatten()
+                    .map(|v| v as usize)
+                    .collect::<Vec<_>>();
+
+                let mut bitmap = build_side.left_data.visited_indices_bitmap().lock();
+                flattened_indices.iter().for_each(|&idx| {
+                    bitmap.set_bit(idx, true);
+                });
+            }
         }
 
         // The goals of index alignment for different join types are:

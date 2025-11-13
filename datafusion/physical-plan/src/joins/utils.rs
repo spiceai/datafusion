@@ -1704,21 +1704,35 @@ pub(super) fn equal_rows_arr(
         return Ok((Vec::<u64>::new().into(), Vec::<u32>::new().into()));
     };
 
+    // Build the equality filter incrementally and short-circuit early
+    // when we know a row can't match. This avoids unnecessary take() operations
+    // on remaining columns once we know rows don't match.
     let arr_left = take(first_left.as_ref(), indices_left, None)?;
     let arr_right = take(first_right.as_ref(), indices_right, None)?;
 
     let mut equal: BooleanArray = eq_dyn_null(&arr_left, &arr_right, null_equality)?;
 
-    // Use map and try_fold to iterate over the remaining pairs of arrays.
-    // In each iteration, take is used on the pair of arrays and their equality is determined.
-    // The results are then folded (combined) using the and function to get a final equality result.
-    equal = iter
-        .map(|(left, right)| {
-            let arr_left = take(left.as_ref(), indices_left, None)?;
-            let arr_right = take(right.as_ref(), indices_right, None)?;
-            eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)
-        })
-        .try_fold(equal, |acc, equal2| and(&acc, &equal2?))?;
+    // Early exit if no rows match on first column
+    if equal.true_count() == 0 {
+        return Ok((Vec::<u64>::new().into(), Vec::<u32>::new().into()));
+    }
+
+    // For remaining columns, we can incrementally filter and only process rows
+    // that still have potential to match
+    for (left, right) in iter {
+        // If we've filtered everything out, stop processing
+        if equal.true_count() == 0 {
+            break;
+        }
+
+        let arr_left = take(left.as_ref(), indices_left, None)?;
+        let arr_right = take(right.as_ref(), indices_right, None)?;
+        let column_equal =
+            eq_dyn_null(arr_left.as_ref(), arr_right.as_ref(), null_equality)?;
+
+        // Combine with existing equality result
+        equal = and(&equal, &column_equal)?;
+    }
 
     let filter_builder = FilterBuilder::new(&equal).optimize().build();
 

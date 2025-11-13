@@ -260,21 +260,23 @@ macro_rules! chain_traverse {
     (
         $input_indices:ident, $match_indices:ident,
         $hash_values:ident, $next_chain:ident,
-        $input_idx:ident, $chain_idx:ident, $remaining_output:ident, $one:ident, $zero:ident
+        $input_idx:ident, $chain_idx:ident, $remaining_output:ident, $one:ident, $zero:ident,
+        $hash_values_len:ident, $input_idx_u32:ident
     ) => {{
         // now `one` and `zero` are in scope from the outer function
         let mut match_row_idx = $chain_idx - $one;
         loop {
-            $match_indices.push(match_row_idx.into());
-            $input_indices.push($input_idx as u32);
+            // Convert once per iteration instead of twice
+            let match_row_idx_u64 = match_row_idx.into();
+            $match_indices.push(match_row_idx_u64);
+            $input_indices.push($input_idx_u32);
             $remaining_output -= 1;
 
-            let next = $next_chain[match_row_idx.into() as usize];
+            let next = $next_chain[match_row_idx_u64 as usize];
 
             if $remaining_output == 0 {
                 // we compare against `zero` (of type T) here too
-                let next_offset = if $input_idx == $hash_values.len() - 1 && next == $zero
-                {
+                let next_offset = if $input_idx == $hash_values_len - 1 && next == $zero {
                     None
                 } else {
                     Some(($input_idx, Some(next.into())))
@@ -406,6 +408,7 @@ where
     }
 
     let mut remaining_output = limit;
+    let hash_values_len = hash_values.len();
 
     // Calculate initial `hash_values` index before iterating
     let to_skip = match offset {
@@ -418,6 +421,7 @@ where
         // to start with the next index
         (idx, Some(next_idx)) => {
             let next_idx: T = T::try_from(next_idx as usize).unwrap();
+            let idx_u32 = idx as u32;
             chain_traverse!(
                 input_indices,
                 match_indices,
@@ -427,7 +431,9 @@ where
                 next_idx,
                 remaining_output,
                 one,
-                zero
+                zero,
+                hash_values_len,
+                idx_u32
             );
             idx + 1
         }
@@ -435,8 +441,9 @@ where
 
     let mut row_idx = to_skip;
     for &hash in &hash_values[to_skip..] {
-        if let Some((_, idx)) = map.find(hash, |(h, _)| hash == *h) {
+        if let Some((_, idx)) = map.find(hash, |&(h, _)| hash == h) {
             let idx: T = *idx;
+            let row_idx_u32 = row_idx as u32;
             chain_traverse!(
                 input_indices,
                 match_indices,
@@ -446,7 +453,9 @@ where
                 idx,
                 remaining_output,
                 one,
-                zero
+                zero,
+                hash_values_len,
+                row_idx_u32
             );
         }
         row_idx += 1;
