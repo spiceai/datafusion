@@ -54,21 +54,23 @@ use crate::{
     PlanProperties, SendableRecordBatchStream, Statistics,
 };
 
-use arrow::array::{ArrayRef, BooleanBufferBuilder};
+use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
-use arrow_schema::DataType;
+use arrow_schema::{DataType, SortOptions};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
     internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
+    ScalarValue,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion_functions_aggregate_common::min_max::{max_batch, min_batch};
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
 };
@@ -1189,6 +1191,18 @@ impl ExecutionPlan for HashJoinExec {
     }
 }
 
+fn chunk_array(array: &dyn Array, chunk_size: usize) -> Vec<ArrayRef> {
+    let len = array.len();
+    let mut chunks = Vec::new();
+
+    for offset in (0..len).step_by(chunk_size) {
+        let length = chunk_size.min(len - offset);
+        chunks.push(array.slice(offset, length));
+    }
+
+    chunks
+}
+
 /// Accumulator for collecting min/max bounds from build-side data during hash join.
 ///
 /// This struct encapsulates the logic for progressively computing column bounds
@@ -1205,6 +1219,8 @@ struct CollectLeftAccumulator {
     min: MinAccumulator,
     /// Accumulator for tracking the maximum value across all batches
     max: MaxAccumulator,
+
+    clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
 }
 
 impl CollectLeftAccumulator {
@@ -1235,6 +1251,7 @@ impl CollectLeftAccumulator {
             expr,
             min: MinAccumulator::try_new(&data_type)?,
             max: MaxAccumulator::try_new(&data_type)?,
+            clustered_bounds: Vec::new(),
         })
     }
 
@@ -1250,9 +1267,23 @@ impl CollectLeftAccumulator {
     /// Ok(()) if the update succeeds, or an error if expression evaluation fails
     fn update_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+
+        // sort the array for 1-d clustering
+        let array = arrow::compute::sort(&array, None)?;
+
+        // WIP: naive clustering - just break up the contiguous min-max into 4 sets of bounds
+        let num_clusters = 4;
+        let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
+        let array_chunks = chunk_array(&*array, cluster_size);
+        for cluster in array_chunks {
+            let min_value = min_batch(&cluster)?;
+            let max_value = max_batch(&cluster)?;
+            self.clustered_bounds.push((min_value, max_value));
+        }
+
         self.min.update_batch(std::slice::from_ref(&array))?;
         self.max.update_batch(std::slice::from_ref(&array))?;
-        println!("New bounds: min={:?}, max={:?}", self.min, self.max);
+        // println!("New bounds: min={:?}, max={:?}", self.min, self.max);
         Ok(())
     }
 
@@ -1263,6 +1294,12 @@ impl CollectLeftAccumulator {
     /// # Returns
     /// The `ColumnBounds` containing the minimum and maximum values observed
     fn evaluate(mut self) -> Result<ColumnBounds> {
+        println!("Collected clustered bounds: {:?}", self.clustered_bounds);
+        println!(
+            "Default min-max bounds: min={:?}, max={:?}",
+            self.min, self.max
+        );
+
         Ok(ColumnBounds::new(
             self.min.evaluate()?,
             self.max.evaluate()?,
