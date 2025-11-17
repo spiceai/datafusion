@@ -1203,7 +1203,7 @@ fn chunk_array(array: &dyn Array, chunk_size: usize) -> Vec<ArrayRef> {
     chunks
 }
 
-const CLUSTERED_BATCH_BUFFER_SIZE: usize = 1024 * 100; // 100k rows for bounds calculation
+const CLUSTERED_BATCH_BUFFER_SIZE: usize = 1024 * 300; // 300k rows for bounds calculation
 
 /// Accumulator for collecting min/max bounds from build-side data during hash join.
 ///
@@ -1284,6 +1284,11 @@ impl CollectLeftAccumulator {
             let min_value = min_batch(&cluster)?;
             let max_value = max_batch(&cluster)?;
 
+            println!(
+                "Calculated cluster min={:?}, max={:?}",
+                min_value, max_value
+            );
+
             if let Some((existing_min, existing_max)) = self
                 .clustered_bounds
                 .iter_mut()
@@ -1321,20 +1326,7 @@ impl CollectLeftAccumulator {
         self.min.update_batch(std::slice::from_ref(&array))?;
         self.max.update_batch(std::slice::from_ref(&array))?;
 
-        if self
-            .buffered_batches
-            .iter()
-            .map(|b| b.num_rows())
-            .sum::<usize>()
-            + batch.num_rows()
-            < CLUSTERED_BATCH_BUFFER_SIZE
-        {
-            // buffer the batch for later clustered bounds calculation
-            self.buffered_batches.push(batch.clone());
-        } else {
-            self.buffered_batches.push(batch.clone());
-            self.evaluate_cluster()?;
-        }
+        self.buffered_batches.push(batch.clone());
         Ok(())
     }
 
