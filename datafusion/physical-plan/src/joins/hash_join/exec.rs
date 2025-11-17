@@ -1223,7 +1223,7 @@ struct CollectLeftAccumulator {
     max: MaxAccumulator,
 
     clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
-    buffered_batches: Vec<&'static RecordBatch>,
+    buffered_batches: Vec<RecordBatch>,
 }
 
 impl CollectLeftAccumulator {
@@ -1270,8 +1270,6 @@ impl CollectLeftAccumulator {
     /// # Returns
     /// Ok(()) if the update succeeds, or an error if expression evaluation fails
     fn update_batch(&mut self, batch: &RecordBatch) -> Result<()> {
-        let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-
         if self
             .buffered_batches
             .iter()
@@ -1282,14 +1280,11 @@ impl CollectLeftAccumulator {
         {
             // buffer the batch for later clustered bounds calculation
             // SAFETY: extending lifetime to 'static is safe because we never hold on to the reference beyond the lifetime of self
-            let static_batch: &'static RecordBatch =
-                unsafe { std::mem::transmute(batch) };
-            self.buffered_batches.push(static_batch);
+            self.buffered_batches.push(batch.clone());
             return Ok(());
         } else {
             // collect the batches into a concat-ed batch, and clear the buffer
-            let buffered_batch =
-                concat_batches(&batch.schema(), self.buffered_batches.clone())?;
+            let buffered_batch = concat_batches(&batch.schema(), &self.buffered_batches)?;
             self.buffered_batches.clear();
 
             let array = self
@@ -1328,6 +1323,7 @@ impl CollectLeftAccumulator {
             }
         }
 
+        let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
         self.min.update_batch(std::slice::from_ref(&array))?;
         self.max.update_batch(std::slice::from_ref(&array))?;
         // println!("New bounds: min={:?}, max={:?}", self.min, self.max);
