@@ -1271,13 +1271,39 @@ impl CollectLeftAccumulator {
         // sort the array for 1-d clustering
         let array = arrow::compute::sort(&array, None)?;
 
-        // WIP: naive clustering - just break up the contiguous min-max into 4 sets of bounds
-        let num_clusters = 4;
+        // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
+        let num_clusters = 8;
         let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
         let array_chunks = chunk_array(&*array, cluster_size);
         for cluster in array_chunks {
             let min_value = min_batch(&cluster)?;
             let max_value = max_batch(&cluster)?;
+
+            // check if this min/max is already covered by an existing clustered bound
+            if self
+                .clustered_bounds
+                .iter()
+                .any(|(min, max)| min_value >= *min && max_value <= *max)
+            {
+                continue;
+            }
+
+            // if the min/max is not fully covered, but partially overlaps with an existing bound, we can merge them
+            if let Some((existing_min, existing_max)) = self
+                .clustered_bounds
+                .iter_mut()
+                .find(|(min, max)| !(max_value < *min || min_value > *max))
+            {
+                // merge the bounds
+                if min_value < *existing_min {
+                    *existing_min = min_value.clone();
+                }
+                if max_value > *existing_max {
+                    *existing_max = max_value.clone();
+                }
+                continue;
+            }
+
             self.clustered_bounds.push((min_value, max_value));
         }
 
