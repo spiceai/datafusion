@@ -1289,10 +1289,12 @@ impl CollectLeftAccumulator {
                 min_value, max_value
             );
 
-            if let Some((existing_min, existing_max)) = self
-                .clustered_bounds
-                .iter_mut()
-                .find(|(min, max)| min_value >= *min || max_value <= *max)
+            if let Some((existing_min, existing_max)) =
+                self.clustered_bounds.iter_mut().find(|(min, max)| {
+                    let min_overlaps = min_value <= *max && min_value >= *min;
+                    let max_overlaps = max_value >= *min && max_value <= *max;
+                    min_overlaps || max_overlaps
+                })
             {
                 println!(
                     "Existing comparison range: min={:?}, max={:?}",
