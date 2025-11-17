@@ -41,11 +41,25 @@ pub(crate) struct ColumnBounds {
     min: ScalarValue,
     /// The maximum value observed for this column  
     max: ScalarValue,
+
+    clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
 }
 
 impl ColumnBounds {
     pub(crate) fn new(min: ScalarValue, max: ScalarValue) -> Self {
-        Self { min, max }
+        Self {
+            min,
+            max,
+            clustered_bounds: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_clustered_bounds(
+        mut self,
+        clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
+    ) -> Self {
+        self.clustered_bounds = clustered_bounds;
+        self
     }
 }
 
@@ -204,6 +218,32 @@ impl SharedBoundsAccumulator {
 
             for (col_idx, right_expr) in self.on_right.iter().enumerate() {
                 if let Some(column_bounds) = partition_bounds.get_column_bounds(col_idx) {
+                    if column_bounds.clustered_bounds.len() > 0 {
+                        for (min, max) in &column_bounds.clustered_bounds {
+                            // Create predicate: col >= min AND col <= max
+                            let min_expr = Arc::new(BinaryExpr::new(
+                                Arc::clone(right_expr),
+                                Operator::GtEq,
+                                lit(min.clone()),
+                            ))
+                                as Arc<dyn PhysicalExpr>;
+                            let max_expr = Arc::new(BinaryExpr::new(
+                                Arc::clone(right_expr),
+                                Operator::LtEq,
+                                lit(max.clone()),
+                            ))
+                                as Arc<dyn PhysicalExpr>;
+                            let range_expr = Arc::new(BinaryExpr::new(
+                                min_expr,
+                                Operator::And,
+                                max_expr,
+                            ))
+                                as Arc<dyn PhysicalExpr>;
+                            column_predicates.push(range_expr);
+                        }
+                        continue;
+                    }
+
                     // Create predicate: col >= min AND col <= max
                     let min_expr = Arc::new(BinaryExpr::new(
                         Arc::clone(right_expr),

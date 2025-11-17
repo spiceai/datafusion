@@ -1353,10 +1353,10 @@ impl CollectLeftAccumulator {
             self.min, self.max
         );
 
-        Ok(ColumnBounds::new(
-            self.min.evaluate()?,
-            self.max.evaluate()?,
-        ))
+        Ok(
+            ColumnBounds::new(self.min.evaluate()?, self.max.evaluate()?)
+                .with_clustered_bounds(self.clustered_bounds),
+        )
     }
 }
 
