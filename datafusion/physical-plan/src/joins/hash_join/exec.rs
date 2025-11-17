@@ -1259,6 +1259,53 @@ impl CollectLeftAccumulator {
         })
     }
 
+    fn evaluate_cluster(&mut self) -> Result<()> {
+        // collect the batches into a concat-ed batch, and clear the buffer
+        let Some(batch) = self.buffered_batches.first() else {
+            return Ok(());
+        };
+
+        let buffered_batch = concat_batches(&batch.schema(), &self.buffered_batches)?;
+        self.buffered_batches.clear();
+
+        let array = self
+            .expr
+            .evaluate(&buffered_batch)?
+            .into_array(buffered_batch.num_rows())?;
+
+        // sort the array for 1-d clustering
+        let array = arrow::compute::sort(&array, None)?;
+
+        // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
+        let num_clusters = 8;
+        let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
+        let array_chunks = chunk_array(&*array, cluster_size);
+        for cluster in array_chunks {
+            let min_value = min_batch(&cluster)?;
+            let max_value = max_batch(&cluster)?;
+
+            if let Some((existing_min, existing_max)) = self
+                .clustered_bounds
+                .iter_mut()
+                .find(|(min, max)| min_value >= *min || max_value <= *max)
+            {
+                if min_value < *existing_min {
+                    *existing_min = min_value.clone();
+                }
+
+                if max_value > *existing_max {
+                    *existing_max = max_value.clone();
+                }
+
+                continue;
+            }
+
+            self.clustered_bounds.push((min_value, max_value));
+        }
+
+        Ok(())
+    }
+
     /// Updates the accumulators with values from a new batch.
     ///
     /// Evaluates the expression on the batch and updates both min and max
@@ -1270,6 +1317,10 @@ impl CollectLeftAccumulator {
     /// # Returns
     /// Ok(()) if the update succeeds, or an error if expression evaluation fails
     fn update_batch(&mut self, batch: &RecordBatch) -> Result<()> {
+        let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
+        self.min.update_batch(std::slice::from_ref(&array))?;
+        self.max.update_batch(std::slice::from_ref(&array))?;
+
         if self
             .buffered_batches
             .iter()
@@ -1279,54 +1330,11 @@ impl CollectLeftAccumulator {
             < CLUSTERED_BATCH_BUFFER_SIZE
         {
             // buffer the batch for later clustered bounds calculation
-            // SAFETY: extending lifetime to 'static is safe because we never hold on to the reference beyond the lifetime of self
             self.buffered_batches.push(batch.clone());
-            return Ok(());
         } else {
-            // collect the batches into a concat-ed batch, and clear the buffer
-            let buffered_batch = concat_batches(&batch.schema(), &self.buffered_batches)?;
-            self.buffered_batches.clear();
-
-            let array = self
-                .expr
-                .evaluate(&buffered_batch)?
-                .into_array(buffered_batch.num_rows())?;
-
-            // sort the array for 1-d clustering
-            let array = arrow::compute::sort(&array, None)?;
-
-            // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
-            let num_clusters = 8;
-            let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
-            let array_chunks = chunk_array(&*array, cluster_size);
-            for cluster in array_chunks {
-                let min_value = min_batch(&cluster)?;
-                let max_value = max_batch(&cluster)?;
-
-                if let Some((existing_min, existing_max)) = self
-                    .clustered_bounds
-                    .iter_mut()
-                    .find(|(min, max)| min_value >= *min || max_value <= *max)
-                {
-                    if min_value < *existing_min {
-                        *existing_min = min_value.clone();
-                    }
-
-                    if max_value > *existing_max {
-                        *existing_max = max_value.clone();
-                    }
-
-                    continue;
-                }
-
-                self.clustered_bounds.push((min_value, max_value));
-            }
+            self.buffered_batches.push(batch.clone());
+            self.evaluate_cluster()?;
         }
-
-        let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
-        self.min.update_batch(std::slice::from_ref(&array))?;
-        self.max.update_batch(std::slice::from_ref(&array))?;
-        // println!("New bounds: min={:?}, max={:?}", self.min, self.max);
         Ok(())
     }
 
@@ -1337,6 +1345,10 @@ impl CollectLeftAccumulator {
     /// # Returns
     /// The `ColumnBounds` containing the minimum and maximum values observed
     fn evaluate(mut self) -> Result<ColumnBounds> {
+        if self.buffered_batches.len() > 0 {
+            self.evaluate_cluster()?;
+        }
+
         println!("Collected clustered bounds: {:?}", self.clustered_bounds);
         println!(
             "Default min-max bounds: min={:?}, max={:?}",
