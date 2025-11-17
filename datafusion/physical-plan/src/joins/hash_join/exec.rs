@@ -1294,6 +1294,10 @@ impl CollectLeftAccumulator {
                 .iter_mut()
                 .find(|(min, max)| min_value >= *min || max_value <= *max)
             {
+                println!(
+                    "Existing comparison range: min={:?}, max={:?}",
+                    existing_min, existing_max
+                );
                 if min_value < *existing_min {
                     *existing_min = min_value.clone();
                 }
