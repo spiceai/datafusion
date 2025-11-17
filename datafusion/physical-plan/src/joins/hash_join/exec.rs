@@ -1203,6 +1203,8 @@ fn chunk_array(array: &dyn Array, chunk_size: usize) -> Vec<ArrayRef> {
     chunks
 }
 
+const CLUSTERED_BATCH_BUFFER_SIZE: usize = 1024 * 100; // 100k rows for bounds calculation
+
 /// Accumulator for collecting min/max bounds from build-side data during hash join.
 ///
 /// This struct encapsulates the logic for progressively computing column bounds
@@ -1221,6 +1223,7 @@ struct CollectLeftAccumulator {
     max: MaxAccumulator,
 
     clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
+    buffered_batches: Vec<&'static RecordBatch>,
 }
 
 impl CollectLeftAccumulator {
@@ -1252,6 +1255,7 @@ impl CollectLeftAccumulator {
             min: MinAccumulator::try_new(&data_type)?,
             max: MaxAccumulator::try_new(&data_type)?,
             clustered_bounds: Vec::new(),
+            buffered_batches: Vec::new(),
         })
     }
 
@@ -1268,43 +1272,60 @@ impl CollectLeftAccumulator {
     fn update_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
 
-        // sort the array for 1-d clustering
-        let array = arrow::compute::sort(&array, None)?;
+        if self
+            .buffered_batches
+            .iter()
+            .map(|b| b.num_rows())
+            .sum::<usize>()
+            + batch.num_rows()
+            < CLUSTERED_BATCH_BUFFER_SIZE
+        {
+            // buffer the batch for later clustered bounds calculation
+            // SAFETY: extending lifetime to 'static is safe because we never hold on to the reference beyond the lifetime of self
+            let static_batch: &'static RecordBatch =
+                unsafe { std::mem::transmute(batch) };
+            self.buffered_batches.push(static_batch);
+            return Ok(());
+        } else {
+            // collect the batches into a concat-ed batch, and clear the buffer
+            let buffered_batch =
+                concat_batches(&batch.schema(), self.buffered_batches.clone())?;
+            self.buffered_batches.clear();
 
-        // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
-        let num_clusters = 8;
-        let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
-        let array_chunks = chunk_array(&*array, cluster_size);
-        for cluster in array_chunks {
-            let min_value = min_batch(&cluster)?;
-            let max_value = max_batch(&cluster)?;
+            let array = self
+                .expr
+                .evaluate(&buffered_batch)?
+                .into_array(buffered_batch.num_rows())?;
 
-            // check if this min/max is already covered by an existing clustered bound
-            if self
-                .clustered_bounds
-                .iter()
-                .any(|(min, max)| min_value >= *min && max_value <= *max)
-            {
-                continue;
-            }
+            // sort the array for 1-d clustering
+            let array = arrow::compute::sort(&array, None)?;
 
-            // if the min/max is not fully covered, but partially overlaps with an existing bound, we can merge them
-            if let Some((existing_min, existing_max)) = self
-                .clustered_bounds
-                .iter_mut()
-                .find(|(min, max)| !(max_value < *min || min_value > *max))
-            {
-                // merge the bounds
-                if min_value < *existing_min {
-                    *existing_min = min_value.clone();
+            // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
+            let num_clusters = 8;
+            let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
+            let array_chunks = chunk_array(&*array, cluster_size);
+            for cluster in array_chunks {
+                let min_value = min_batch(&cluster)?;
+                let max_value = max_batch(&cluster)?;
+
+                if let Some((existing_min, existing_max)) = self
+                    .clustered_bounds
+                    .iter_mut()
+                    .find(|(min, max)| min_value >= *min || max_value <= *max)
+                {
+                    if min_value < *existing_min {
+                        *existing_min = min_value.clone();
+                    }
+
+                    if max_value > *existing_max {
+                        *existing_max = max_value.clone();
+                    }
+
+                    continue;
                 }
-                if max_value > *existing_max {
-                    *existing_max = max_value.clone();
-                }
-                continue;
-            }
 
-            self.clustered_bounds.push((min_value, max_value));
+                self.clustered_bounds.push((min_value, max_value));
+            }
         }
 
         self.min.update_batch(std::slice::from_ref(&array))?;
