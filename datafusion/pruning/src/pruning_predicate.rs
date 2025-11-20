@@ -391,11 +391,13 @@ pub fn build_pruning_predicate(
     match PruningPredicate::try_new(predicate, Arc::clone(file_schema)) {
         Ok(pruning_predicate) => {
             if !pruning_predicate.always_true() {
+                println!("Pruning predicate is always true");
                 return Some(Arc::new(pruning_predicate));
             }
         }
         Err(e) => {
             debug!("Could not create pruning predicate for: {e}");
+            println!("Could not create pruning predicate: {e}");
             predicate_creation_errors.add(1);
         }
     }
