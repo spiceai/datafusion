@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1223,7 +1224,7 @@ struct CollectLeftAccumulator {
     max: MaxAccumulator,
 
     clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
-    buffered_batches: Vec<RecordBatch>,
+    pub buffered_batches: Vec<RecordBatch>,
 }
 
 impl CollectLeftAccumulator {
@@ -1259,19 +1260,20 @@ impl CollectLeftAccumulator {
         })
     }
 
-    fn evaluate_cluster(&mut self) -> Result<()> {
+    fn evaluate_cluster(
+        expr: Arc<dyn PhysicalExpr>,
+        batches: Vec<RecordBatch>,
+    ) -> Result<Vec<(ScalarValue, ScalarValue)>> {
         // collect the batches into a concat-ed batch, and clear the buffer
-        let Some(batch) = self.buffered_batches.first() else {
-            return Ok(());
+        let Some(batch) = batches.first() else {
+            return Ok(Vec::new());
         };
 
-        let buffered_batch = concat_batches(&batch.schema(), &self.buffered_batches)?;
-        self.buffered_batches.clear();
+        let buffered_batch = concat_batches(&batch.schema(), &batches)?;
 
         println!("Found {} rows for clustering", buffered_batch.num_rows());
 
-        let array = self
-            .expr
+        let array = expr
             .evaluate(&buffered_batch)?
             .into_array(buffered_batch.num_rows())?;
 
@@ -1282,6 +1284,7 @@ impl CollectLeftAccumulator {
         let num_clusters = 32;
         let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
         let array_chunks = chunk_array(&*array, cluster_size);
+        let mut clustered_bounds = Vec::new();
         for cluster in array_chunks {
             let min_value = min_batch(&cluster)?;
             let max_value = max_batch(&cluster)?;
@@ -1292,7 +1295,7 @@ impl CollectLeftAccumulator {
             );
 
             if let Some((existing_min, existing_max)) =
-                self.clustered_bounds.iter_mut().find(|(min, max)| {
+                clustered_bounds.iter_mut().find(|(min, max)| {
                     let min_overlaps = min_value <= *max && min_value >= *min;
                     let max_overlaps = max_value >= *min && max_value <= *max;
                     min_overlaps || max_overlaps
@@ -1313,10 +1316,10 @@ impl CollectLeftAccumulator {
                 continue;
             }
 
-            self.clustered_bounds.push((min_value, max_value));
+            clustered_bounds.push((min_value, max_value));
         }
 
-        Ok(())
+        Ok(clustered_bounds)
     }
 
     /// Updates the accumulators with values from a new batch.
@@ -1334,7 +1337,7 @@ impl CollectLeftAccumulator {
         self.min.update_batch(std::slice::from_ref(&array))?;
         self.max.update_batch(std::slice::from_ref(&array))?;
 
-        // self.buffered_batches.push(batch.clone());
+        self.buffered_batches.push(batch.clone());
         Ok(())
     }
 
@@ -1379,8 +1382,8 @@ impl BuildSideState {
         schema: &SchemaRef,
         should_compute_bounds: bool,
     ) -> Result<Self> {
-        println!("on left expressions: {:?}", on_left);
-        println!("on left expression count: {}", on_left.len());
+        // println!("on left expressions: {:?}", on_left);
+        // println!("on left expression count: {}", on_left.len());
         Ok(Self {
             batches: Vec::new(),
             num_rows: 0,
@@ -1554,10 +1557,39 @@ async fn collect_left_input(
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
         Some(accumulators) if num_rows > 0 => {
-            let bounds = accumulators
-                .into_iter()
-                .map(CollectLeftAccumulator::evaluate)
-                .collect::<Result<Vec<_>>>()?;
+            let mut expr_grouped_bounds: HashMap<Arc<dyn PhysicalExpr>, ColumnBounds> =
+                HashMap::new();
+
+            let mut expr_grouped_batches: HashMap<
+                Arc<dyn PhysicalExpr>,
+                Vec<RecordBatch>,
+            > = HashMap::new();
+            for accumulator in accumulators {
+                let expr = accumulator.expr.clone();
+                let batches = accumulator.buffered_batches.clone();
+                let column_bounds = accumulator.evaluate()?;
+                expr_grouped_bounds.insert(expr.clone(), column_bounds);
+
+                if let Some(existing_batches) = expr_grouped_batches.get_mut(&expr) {
+                    // extend the existing batches
+                    existing_batches.extend(batches);
+                } else {
+                    expr_grouped_batches.insert(expr.clone(), batches);
+                }
+            }
+
+            let mut bounds = Vec::new();
+            for (expr, batches) in expr_grouped_batches {
+                let cluster_bounds =
+                    CollectLeftAccumulator::evaluate_cluster(expr.clone(), batches)?;
+
+                if let Some(existing_bound) = expr_grouped_bounds.get_mut(&expr) {
+                    let new_bound =
+                        existing_bound.clone().with_clustered_bounds(cluster_bounds);
+                    bounds.push(new_bound);
+                }
+            }
+
             Some(bounds)
         }
         _ => None,
