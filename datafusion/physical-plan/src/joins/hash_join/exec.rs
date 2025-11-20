@@ -1268,6 +1268,8 @@ impl CollectLeftAccumulator {
         let buffered_batch = concat_batches(&batch.schema(), &self.buffered_batches)?;
         self.buffered_batches.clear();
 
+        println!("Found {} rows for clustering", buffered_batch.num_rows());
+
         let array = self
             .expr
             .evaluate(&buffered_batch)?
@@ -1277,7 +1279,7 @@ impl CollectLeftAccumulator {
         let array = arrow::compute::sort(&array, None)?;
 
         // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
-        let num_clusters = 8;
+        let num_clusters = 32;
         let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
         let array_chunks = chunk_array(&*array, cluster_size);
         for cluster in array_chunks {
