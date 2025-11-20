@@ -1281,7 +1281,7 @@ impl CollectLeftAccumulator {
         let array = arrow::compute::sort(&array, None)?;
 
         // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
-        let num_clusters = 32;
+        let num_clusters = 64;
         let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
         let array_chunks = chunk_array(&*array, cluster_size);
         let mut clustered_bounds = Vec::new();
@@ -1289,10 +1289,10 @@ impl CollectLeftAccumulator {
             let min_value = min_batch(&cluster)?;
             let max_value = max_batch(&cluster)?;
 
-            println!(
-                "Calculated cluster min={:?}, max={:?}",
-                min_value, max_value
-            );
+            // println!(
+            //     "Calculated cluster min={:?}, max={:?}",
+            //     min_value, max_value
+            // );
 
             if let Some((existing_min, existing_max)) =
                 clustered_bounds.iter_mut().find(|(min, max)| {
@@ -1301,10 +1301,10 @@ impl CollectLeftAccumulator {
                     min_overlaps || max_overlaps
                 })
             {
-                println!(
-                    "Existing comparison range: min={:?}, max={:?}",
-                    existing_min, existing_max
-                );
+                // println!(
+                //     "Existing comparison range: min={:?}, max={:?}",
+                //     existing_min, existing_max
+                // );
                 if min_value < *existing_min {
                     *existing_min = min_value.clone();
                 }
