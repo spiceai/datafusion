@@ -31,7 +31,6 @@ use arrow::{
 // pub use for backwards compatibility
 pub use datafusion_common::pruning::PruningStatistics;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
-use datafusion_physical_plan::joins::CompactInListExpr;
 use datafusion_physical_plan::metrics::Count;
 use log::{debug, trace};
 
