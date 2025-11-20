@@ -71,7 +71,6 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
-use datafusion_functions_aggregate_common::min_max::{max_batch, min_batch};
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
 };
@@ -1192,19 +1191,154 @@ impl ExecutionPlan for HashJoinExec {
     }
 }
 
-fn chunk_array(array: &dyn Array, chunk_size: usize) -> Vec<ArrayRef> {
-    let len = array.len();
-    let mut chunks = Vec::new();
+/// Computes optimal 1-dimensional breaks in a sorted array using Jenks Natural Breaks optimization.
+///
+/// This implementation uses dynamic programming to find break points that minimize
+/// within-cluster variance and maximize between-cluster variance, producing tighter
+/// bounds than naive equal-sized chunking.
+///
+/// # Arguments
+/// * `sorted_array` - A sorted Arrow array (must be numeric type)
+/// * `num_breaks` - Number of clusters to create (typically 8)
+///
+/// # Returns
+/// Vector of (min, max) scalar value pairs representing the bounds of each cluster.
+///
+/// # Algorithm
+/// Uses the Fisher-Jenks algorithm with O(n²k) time complexity where:
+/// - n = number of elements
+/// - k = number of clusters
+///
+/// For large arrays (>10k elements), uses sampling to maintain performance.
+fn compute_jenks_breaks(
+    sorted_array: &dyn Array,
+    num_breaks: usize,
+) -> Result<Vec<(ScalarValue, ScalarValue)>> {
+    let n = sorted_array.len();
 
-    for offset in (0..len).step_by(chunk_size) {
-        let length = chunk_size.min(len - offset);
-        chunks.push(array.slice(offset, length));
+    if n == 0 || num_breaks == 0 {
+        return Ok(Vec::new());
     }
 
-    chunks
+    if num_breaks >= n {
+        // Each element becomes its own cluster
+        let mut bounds = Vec::new();
+        for i in 0..n {
+            let value = ScalarValue::try_from_array(sorted_array, i)?;
+            bounds.push((value.clone(), value));
+        }
+        return Ok(bounds);
+    }
+
+    // Sample large arrays to keep computation reasonable
+    let (values, sample_rate) = if n > 10000 {
+        let sample_size = 10000;
+        let step = n / sample_size;
+        let mut sampled = Vec::with_capacity(sample_size);
+        for i in (0..n).step_by(step) {
+            sampled.push(ScalarValue::try_from_array(sorted_array, i)?);
+        }
+        (sampled, step)
+    } else {
+        let mut values = Vec::with_capacity(n);
+        for i in 0..n {
+            values.push(ScalarValue::try_from_array(sorted_array, i)?);
+        }
+        (values, 1)
+    };
+
+    let n_samples = values.len();
+
+    // Dynamic programming matrices
+    // variance_matrix[i][j] = variance of elements from i to j
+    let mut variance_matrix = vec![vec![0.0; n_samples]; n_samples];
+
+    // Precompute variance for all possible ranges
+    for i in 0..n_samples {
+        let mut sum = 0.0;
+        let mut sum_sq = 0.0;
+
+        for j in i..n_samples {
+            let val = scalar_to_f64(&values[j])?;
+            sum += val;
+            sum_sq += val * val;
+
+            let count = (j - i + 1) as f64;
+            let mean = sum / count;
+            let variance = (sum_sq / count) - (mean * mean);
+            variance_matrix[i][j] = variance * count; // Store weighted variance
+        }
+    }
+
+    // dp[k][j] = minimum variance when dividing elements 0..j into k+1 clusters
+    let mut dp = vec![vec![f64::INFINITY; n_samples]; num_breaks];
+    let mut backtrack = vec![vec![0; n_samples]; num_breaks];
+
+    // Base case: first cluster
+    for j in 0..n_samples {
+        dp[0][j] = variance_matrix[0][j];
+    }
+
+    // Fill DP table
+    for k in 1..num_breaks {
+        for j in k..n_samples {
+            for i in (k - 1)..j {
+                let cost = dp[k - 1][i] + variance_matrix[i + 1][j];
+                if cost < dp[k][j] {
+                    dp[k][j] = cost;
+                    backtrack[k][j] = i + 1;
+                }
+            }
+        }
+    }
+
+    // Backtrack to find break points
+    let mut break_points = vec![n_samples];
+    let mut current_break = n_samples - 1;
+
+    for k in (1..num_breaks).rev() {
+        current_break = backtrack[k][current_break];
+        break_points.push(current_break);
+    }
+    break_points.push(0);
+    break_points.reverse();
+
+    // Convert break points to (min, max) bounds, mapping back to original array
+    let mut bounds = Vec::new();
+    for i in 0..(break_points.len() - 1) {
+        let start_idx = break_points[i] * sample_rate;
+        let end_idx =
+            ((break_points[i + 1] - 1) * sample_rate).min(sorted_array.len() - 1);
+
+        let min_value = ScalarValue::try_from_array(sorted_array, start_idx)?;
+        let max_value = ScalarValue::try_from_array(sorted_array, end_idx)?;
+        bounds.push((min_value, max_value));
+    }
+
+    Ok(bounds)
 }
 
-const CLUSTERED_BATCH_BUFFER_SIZE: usize = 1024 * 300; // 300k rows for bounds calculation
+/// Helper function to convert ScalarValue to f64 for variance calculations
+fn scalar_to_f64(scalar: &ScalarValue) -> Result<f64> {
+    match scalar {
+        ScalarValue::Int8(Some(v)) => Ok(*v as f64),
+        ScalarValue::Int16(Some(v)) => Ok(*v as f64),
+        ScalarValue::Int32(Some(v)) => Ok(*v as f64),
+        ScalarValue::Int64(Some(v)) => Ok(*v as f64),
+        ScalarValue::UInt8(Some(v)) => Ok(*v as f64),
+        ScalarValue::UInt16(Some(v)) => Ok(*v as f64),
+        ScalarValue::UInt32(Some(v)) => Ok(*v as f64),
+        ScalarValue::UInt64(Some(v)) => Ok(*v as f64),
+        ScalarValue::Float32(Some(v)) => Ok(*v as f64),
+        ScalarValue::Float64(Some(v)) => Ok(*v),
+        ScalarValue::Date32(Some(v)) => Ok(*v as f64),
+        ScalarValue::Date64(Some(v)) => Ok(*v as f64),
+        ScalarValue::Decimal128(Some(v), _, scale) => {
+            Ok(*v as f64 / 10_f64.powi(*scale as i32))
+        }
+        _ => internal_err!("Unsupported scalar type for clustering: {:?}", scalar),
+    }
+}
 
 /// Accumulator for collecting min/max bounds from build-side data during hash join.
 ///
@@ -1222,8 +1356,7 @@ struct CollectLeftAccumulator {
     min: MinAccumulator,
     /// Accumulator for tracking the maximum value across all batches
     max: MaxAccumulator,
-
-    clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
+    /// Buffered batches for clustering analysis
     pub buffered_batches: Vec<RecordBatch>,
 }
 
@@ -1255,7 +1388,6 @@ impl CollectLeftAccumulator {
             expr,
             min: MinAccumulator::try_new(&data_type)?,
             max: MaxAccumulator::try_new(&data_type)?,
-            clustered_bounds: Vec::new(),
             buffered_batches: Vec::new(),
         })
     }
@@ -1280,46 +1412,15 @@ impl CollectLeftAccumulator {
         // sort the array for 1-d clustering
         let array = arrow::compute::sort(&array, None)?;
 
-        // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
+        // Use Jenks Natural Breaks for optimal clustering
         let num_clusters = 8;
-        let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
-        let array_chunks = chunk_array(&*array, cluster_size);
-        let mut clustered_bounds = Vec::new();
-        for cluster in array_chunks {
-            let min_value = min_batch(&cluster)?;
-            let max_value = max_batch(&cluster)?;
+        let clustered_bounds = compute_jenks_breaks(&*array, num_clusters)?;
 
-            // println!(
-            //     "Calculated cluster min={:?}, max={:?}",
-            //     min_value, max_value
-            // );
-
-            if let Some((existing_min, existing_max)) =
-                clustered_bounds.iter_mut().find(|(min, max)| {
-                    let min_overlaps = min_value <= *max && min_value >= *min;
-                    let max_overlaps = max_value >= *min && max_value <= *max;
-                    min_overlaps || max_overlaps
-                })
-            {
-                // println!(
-                //     "Existing comparison range: min={:?}, max={:?}",
-                //     existing_min, existing_max
-                // );
-                if min_value < *existing_min {
-                    *existing_min = min_value.clone();
-                }
-
-                if max_value > *existing_max {
-                    *existing_max = max_value.clone();
-                }
-
-                continue;
-            }
-
-            clustered_bounds.push((min_value, max_value));
-        }
-
-        println!("Generated bounds clusters: {:?}", clustered_bounds);
+        println!(
+            "Generated {} Jenks optimal bounds clusters: {:?}",
+            clustered_bounds.len(),
+            clustered_bounds
+        );
 
         Ok(clustered_bounds)
     }
