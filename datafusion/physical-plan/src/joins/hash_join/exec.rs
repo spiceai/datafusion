@@ -1223,7 +1223,7 @@ struct CollectLeftAccumulator {
     max: MaxAccumulator,
 
     clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
-    pub buffered_batches: Vec<RecordBatch>,
+    buffered_batches: Vec<RecordBatch>,
 }
 
 impl CollectLeftAccumulator {
@@ -1259,47 +1259,53 @@ impl CollectLeftAccumulator {
         })
     }
 
-    fn evaluate_cluster(
-        expr: Arc<dyn PhysicalExpr>,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Vec<(ScalarValue, ScalarValue)>> {
+    fn evaluate_cluster(&mut self) -> Result<()> {
         // collect the batches into a concat-ed batch, and clear the buffer
-        let Some(batch) = batches.first() else {
-            return Ok(Vec::new());
+        let Some(batch) = self.buffered_batches.first() else {
+            return Ok(());
         };
 
-        let buffered_batch = concat_batches(&batch.schema(), &batches)?;
+        let buffered_batch = concat_batches(&batch.schema(), &self.buffered_batches)?;
+        self.buffered_batches.clear();
 
-        println!("Found {} rows for clustering", buffered_batch.num_rows());
-
-        let array = expr
+        let array = self
+            .expr
             .evaluate(&buffered_batch)?
             .into_array(buffered_batch.num_rows())?;
 
-        // sort the array
+        // sort the array for 1-d clustering
         let array = arrow::compute::sort(&array, None)?;
 
-        // split the array into all contiguous ranges of items. for example [1, 2, 4, 6, 7, 8, 9, 11, 12, 13] would be split into ranges of:
-        // [(1, 2), (4, 4), (6, 9), (11, 13)]
-        let mut clustered_bounds = Vec::new();
-        let mut start_index = 0;
-        let len = array.len();
-        while start_index < len {
-            let start_value = ScalarValue::try_from_array(&array, start_index)?;
-            let mut end_index = start_index + 1;
-            while end_index < len {
-                let current_value = ScalarValue::try_from_array(&array, end_index)?;
-                if current_value != start_value {
-                    break;
+        // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
+        let num_clusters = 8;
+        let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
+        let array_chunks = chunk_array(&*array, cluster_size);
+        for cluster in array_chunks {
+            let min_value = min_batch(&cluster)?;
+            let max_value = max_batch(&cluster)?;
+
+            if let Some((existing_min, existing_max)) =
+                self.clustered_bounds.iter_mut().find(|(min, max)| {
+                    let min_overlaps = min_value <= *max && min_value >= *min;
+                    let max_overlaps = max_value >= *min && max_value <= *max;
+                    min_overlaps || max_overlaps
+                })
+            {
+                if min_value < *existing_min {
+                    *existing_min = min_value.clone();
                 }
-                end_index += 1;
+
+                if max_value > *existing_max {
+                    *existing_max = max_value.clone();
+                }
+
+                continue;
             }
-            let end_value = ScalarValue::try_from_array(&array, end_index - 1)?;
-            clustered_bounds.push((start_value, end_value));
-            start_index = end_index;
+
+            self.clustered_bounds.push((min_value, max_value));
         }
 
-        Ok(clustered_bounds)
+        Ok(())
     }
 
     /// Updates the accumulators with values from a new batch.
@@ -1329,8 +1335,7 @@ impl CollectLeftAccumulator {
     /// The `ColumnBounds` containing the minimum and maximum values observed
     fn evaluate(mut self) -> Result<ColumnBounds> {
         if self.buffered_batches.len() > 0 {
-            self.clustered_bounds =
-                Self::evaluate_cluster(self.expr.clone(), self.buffered_batches)?;
+            self.evaluate_cluster()?;
         }
 
         println!("Collected clustered bounds: {:?}", self.clustered_bounds);
@@ -1364,8 +1369,6 @@ impl BuildSideState {
         schema: &SchemaRef,
         should_compute_bounds: bool,
     ) -> Result<Self> {
-        // println!("on left expressions: {:?}", on_left);
-        // println!("on left expression count: {}", on_left.len());
         Ok(Self {
             batches: Vec::new(),
             num_rows: 0,

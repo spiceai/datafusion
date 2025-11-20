@@ -111,7 +111,10 @@ impl FilePruner {
                     pruning,
                     stats_pruning,
                 ]));
+            } else {
+                println!("No file statistics available");
             }
+
             match pruning_predicate.prune(pruning.as_ref()) {
                 Ok(values) => {
                     assert!(values.len() == 1);
@@ -123,12 +126,13 @@ impl FilePruner {
                 // Stats filter array could not be built, so we can't prune
                 Err(e) => {
                     debug!("Ignoring error building pruning predicate for file: {e}");
+                    println!("Failed to create pruning predicate: {e}");
                     self.predicate_creation_errors.add(1);
                 }
             }
+        } else {
+            println!("No pruning predicate");
         }
-
-        println!("No pruning predicate");
 
         Ok(false)
     }
