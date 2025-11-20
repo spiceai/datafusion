@@ -1281,7 +1281,7 @@ impl CollectLeftAccumulator {
         let array = arrow::compute::sort(&array, None)?;
 
         // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
-        let num_clusters = 64;
+        let num_clusters = 8;
         let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
         let array_chunks = chunk_array(&*array, cluster_size);
         let mut clustered_bounds = Vec::new();
@@ -1318,6 +1318,8 @@ impl CollectLeftAccumulator {
 
             clustered_bounds.push((min_value, max_value));
         }
+
+        println!("Generated bounds clusters: {:?}", clustered_bounds);
 
         Ok(clustered_bounds)
     }
