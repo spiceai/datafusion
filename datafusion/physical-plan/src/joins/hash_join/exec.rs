@@ -1334,7 +1334,7 @@ impl CollectLeftAccumulator {
         self.min.update_batch(std::slice::from_ref(&array))?;
         self.max.update_batch(std::slice::from_ref(&array))?;
 
-        self.buffered_batches.push(batch.clone());
+        // self.buffered_batches.push(batch.clone());
         Ok(())
     }
 
@@ -1345,19 +1345,18 @@ impl CollectLeftAccumulator {
     /// # Returns
     /// The `ColumnBounds` containing the minimum and maximum values observed
     fn evaluate(mut self) -> Result<ColumnBounds> {
-        if self.buffered_batches.len() > 0 {
-            self.evaluate_cluster()?;
-        }
+        // if self.buffered_batches.len() > 0 {
+        //     self.evaluate_cluster()?;
+        // }
 
-        println!("Collected clustered bounds: {:?}", self.clustered_bounds);
-        println!(
-            "Default min-max bounds: min={:?}, max={:?}",
-            self.min, self.max
-        );
+        // println!("Collected clustered bounds: {:?}", self.clustered_bounds);
+        // println!(
+        //     "Default min-max bounds: min={:?}, max={:?}",
+        //     self.min, self.max
+        // );
 
         Ok(
-            ColumnBounds::new(self.min.evaluate()?, self.max.evaluate()?)
-                .with_clustered_bounds(self.clustered_bounds),
+            ColumnBounds::new(self.min.evaluate()?, self.max.evaluate()?), // .with_clustered_bounds(self.clustered_bounds),
         )
     }
 }
@@ -1380,6 +1379,8 @@ impl BuildSideState {
         schema: &SchemaRef,
         should_compute_bounds: bool,
     ) -> Result<Self> {
+        println!("on left expressions: {:?}", on_left);
+        println!("on left expression count: {}", on_left.len());
         Ok(Self {
             batches: Vec::new(),
             num_rows: 0,
