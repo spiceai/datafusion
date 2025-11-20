@@ -20,7 +20,6 @@
 use arrow::array::BooleanBufferBuilder;
 pub use cross_join::CrossJoinExec;
 use datafusion_physical_expr::PhysicalExprRef;
-pub use hash_join::CompactInListExpr;
 pub use hash_join::HashJoinExec;
 pub use nested_loop_join::NestedLoopJoinExec;
 use parking_lot::Mutex;

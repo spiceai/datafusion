@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -71,6 +70,7 @@ use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
 use datafusion_expr::Accumulator;
 use datafusion_functions_aggregate::min_max::{MaxAccumulator, MinAccumulator};
+use datafusion_functions_aggregate_common::min_max::{max_batch, min_batch};
 use datafusion_physical_expr::equivalence::{
     join_equivalence_properties, ProjectionMapping,
 };
@@ -1191,154 +1191,19 @@ impl ExecutionPlan for HashJoinExec {
     }
 }
 
-/// Computes optimal 1-dimensional breaks in a sorted array using Jenks Natural Breaks optimization.
-///
-/// This implementation uses dynamic programming to find break points that minimize
-/// within-cluster variance and maximize between-cluster variance, producing tighter
-/// bounds than naive equal-sized chunking.
-///
-/// # Arguments
-/// * `sorted_array` - A sorted Arrow array (must be numeric type)
-/// * `num_breaks` - Number of clusters to create (typically 8)
-///
-/// # Returns
-/// Vector of (min, max) scalar value pairs representing the bounds of each cluster.
-///
-/// # Algorithm
-/// Uses the Fisher-Jenks algorithm with O(n²k) time complexity where:
-/// - n = number of elements
-/// - k = number of clusters
-///
-/// For large arrays (>10k elements), uses sampling to maintain performance.
-fn compute_jenks_breaks(
-    sorted_array: &dyn Array,
-    num_breaks: usize,
-) -> Result<Vec<(ScalarValue, ScalarValue)>> {
-    let n = sorted_array.len();
+fn chunk_array(array: &dyn Array, chunk_size: usize) -> Vec<ArrayRef> {
+    let len = array.len();
+    let mut chunks = Vec::new();
 
-    if n == 0 || num_breaks == 0 {
-        return Ok(Vec::new());
+    for offset in (0..len).step_by(chunk_size) {
+        let length = chunk_size.min(len - offset);
+        chunks.push(array.slice(offset, length));
     }
 
-    if num_breaks >= n {
-        // Each element becomes its own cluster
-        let mut bounds = Vec::new();
-        for i in 0..n {
-            let value = ScalarValue::try_from_array(sorted_array, i)?;
-            bounds.push((value.clone(), value));
-        }
-        return Ok(bounds);
-    }
-
-    // Sample large arrays to keep computation reasonable
-    let (values, sample_rate) = if n > 10000 {
-        let sample_size = 10000;
-        let step = n / sample_size;
-        let mut sampled = Vec::with_capacity(sample_size);
-        for i in (0..n).step_by(step) {
-            sampled.push(ScalarValue::try_from_array(sorted_array, i)?);
-        }
-        (sampled, step)
-    } else {
-        let mut values = Vec::with_capacity(n);
-        for i in 0..n {
-            values.push(ScalarValue::try_from_array(sorted_array, i)?);
-        }
-        (values, 1)
-    };
-
-    let n_samples = values.len();
-
-    // Dynamic programming matrices
-    // variance_matrix[i][j] = variance of elements from i to j
-    let mut variance_matrix = vec![vec![0.0; n_samples]; n_samples];
-
-    // Precompute variance for all possible ranges
-    for i in 0..n_samples {
-        let mut sum = 0.0;
-        let mut sum_sq = 0.0;
-
-        for j in i..n_samples {
-            let val = scalar_to_f64(&values[j])?;
-            sum += val;
-            sum_sq += val * val;
-
-            let count = (j - i + 1) as f64;
-            let mean = sum / count;
-            let variance = (sum_sq / count) - (mean * mean);
-            variance_matrix[i][j] = variance * count; // Store weighted variance
-        }
-    }
-
-    // dp[k][j] = minimum variance when dividing elements 0..j into k+1 clusters
-    let mut dp = vec![vec![f64::INFINITY; n_samples]; num_breaks];
-    let mut backtrack = vec![vec![0; n_samples]; num_breaks];
-
-    // Base case: first cluster
-    for j in 0..n_samples {
-        dp[0][j] = variance_matrix[0][j];
-    }
-
-    // Fill DP table
-    for k in 1..num_breaks {
-        for j in k..n_samples {
-            for i in (k - 1)..j {
-                let cost = dp[k - 1][i] + variance_matrix[i + 1][j];
-                if cost < dp[k][j] {
-                    dp[k][j] = cost;
-                    backtrack[k][j] = i + 1;
-                }
-            }
-        }
-    }
-
-    // Backtrack to find break points
-    let mut break_points = vec![n_samples];
-    let mut current_break = n_samples - 1;
-
-    for k in (1..num_breaks).rev() {
-        current_break = backtrack[k][current_break];
-        break_points.push(current_break);
-    }
-    break_points.push(0);
-    break_points.reverse();
-
-    // Convert break points to (min, max) bounds, mapping back to original array
-    let mut bounds = Vec::new();
-    for i in 0..(break_points.len() - 1) {
-        let start_idx = break_points[i] * sample_rate;
-        let end_idx =
-            ((break_points[i + 1] - 1) * sample_rate).min(sorted_array.len() - 1);
-
-        let min_value = ScalarValue::try_from_array(sorted_array, start_idx)?;
-        let max_value = ScalarValue::try_from_array(sorted_array, end_idx)?;
-        bounds.push((min_value, max_value));
-    }
-
-    Ok(bounds)
+    chunks
 }
 
-/// Helper function to convert ScalarValue to f64 for variance calculations
-fn scalar_to_f64(scalar: &ScalarValue) -> Result<f64> {
-    match scalar {
-        ScalarValue::Int8(Some(v)) => Ok(*v as f64),
-        ScalarValue::Int16(Some(v)) => Ok(*v as f64),
-        ScalarValue::Int32(Some(v)) => Ok(*v as f64),
-        ScalarValue::Int64(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt8(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt16(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt32(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt64(Some(v)) => Ok(*v as f64),
-        ScalarValue::Float32(Some(v)) => Ok(*v as f64),
-        ScalarValue::Float64(Some(v)) => Ok(*v),
-        ScalarValue::Date32(Some(v)) => Ok(*v as f64),
-        ScalarValue::Date64(Some(v)) => Ok(*v as f64),
-        ScalarValue::Decimal128(Some(v), _, scale) => {
-            Ok(*v as f64 / 10_f64.powi(*scale as i32))
-        }
-        _ => internal_err!("Unsupported scalar type for clustering: {:?}", scalar),
-    }
-}
+const CLUSTERED_BATCH_BUFFER_SIZE: usize = 1024 * 300; // 300k rows for bounds calculation
 
 /// Accumulator for collecting min/max bounds from build-side data during hash join.
 ///
@@ -1356,7 +1221,8 @@ struct CollectLeftAccumulator {
     min: MinAccumulator,
     /// Accumulator for tracking the maximum value across all batches
     max: MaxAccumulator,
-    /// Buffered batches for clustering analysis
+
+    clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
     pub buffered_batches: Vec<RecordBatch>,
 }
 
@@ -1388,6 +1254,7 @@ impl CollectLeftAccumulator {
             expr,
             min: MinAccumulator::try_new(&data_type)?,
             max: MaxAccumulator::try_new(&data_type)?,
+            clustered_bounds: Vec::new(),
             buffered_batches: Vec::new(),
         })
     }
@@ -1395,10 +1262,10 @@ impl CollectLeftAccumulator {
     fn evaluate_cluster(
         expr: Arc<dyn PhysicalExpr>,
         batches: Vec<RecordBatch>,
-    ) -> Result<Arc<dyn Array>> {
+    ) -> Result<Vec<(ScalarValue, ScalarValue)>> {
         // collect the batches into a concat-ed batch, and clear the buffer
         let Some(batch) = batches.first() else {
-            unreachable!();
+            return Ok(Vec::new());
         };
 
         let buffered_batch = concat_batches(&batch.schema(), &batches)?;
@@ -1409,21 +1276,30 @@ impl CollectLeftAccumulator {
             .evaluate(&buffered_batch)?
             .into_array(buffered_batch.num_rows())?;
 
-        // sort the array for 1-d clustering
+        // sort the array
         let array = arrow::compute::sort(&array, None)?;
-        Ok(array)
 
-        // Use Jenks Natural Breaks for optimal clustering
-        // let num_clusters = 8;
-        // let clustered_bounds = compute_jenks_breaks(&*array, num_clusters)?;
+        // split the array into all contiguous ranges of items. for example [1, 2, 4, 6, 7, 8, 9, 11, 12, 13] would be split into ranges of:
+        // [(1, 2), (4, 4), (6, 9), (11, 13)]
+        let mut clustered_bounds = Vec::new();
+        let mut start_index = 0;
+        let len = array.len();
+        while start_index < len {
+            let start_value = ScalarValue::try_from_array(&array, start_index)?;
+            let mut end_index = start_index + 1;
+            while end_index < len {
+                let current_value = ScalarValue::try_from_array(&array, end_index)?;
+                if current_value != start_value {
+                    break;
+                }
+                end_index += 1;
+            }
+            let end_value = ScalarValue::try_from_array(&array, end_index - 1)?;
+            clustered_bounds.push((start_value, end_value));
+            start_index = end_index;
+        }
 
-        // println!(
-        //     "Generated {} Jenks optimal bounds clusters: {:?}",
-        //     clustered_bounds.len(),
-        //     clustered_bounds
-        // );
-
-        // Ok(clustered_bounds)
+        Ok(clustered_bounds)
     }
 
     /// Updates the accumulators with values from a new batch.
@@ -1452,18 +1328,20 @@ impl CollectLeftAccumulator {
     /// # Returns
     /// The `ColumnBounds` containing the minimum and maximum values observed
     fn evaluate(mut self) -> Result<ColumnBounds> {
-        // if self.buffered_batches.len() > 0 {
-        //     self.evaluate_cluster()?;
-        // }
+        if self.buffered_batches.len() > 0 {
+            self.clustered_bounds =
+                Self::evaluate_cluster(self.expr.clone(), self.buffered_batches)?;
+        }
 
-        // println!("Collected clustered bounds: {:?}", self.clustered_bounds);
-        // println!(
-        //     "Default min-max bounds: min={:?}, max={:?}",
-        //     self.min, self.max
-        // );
+        println!("Collected clustered bounds: {:?}", self.clustered_bounds);
+        println!(
+            "Default min-max bounds: min={:?}, max={:?}",
+            self.min, self.max
+        );
 
         Ok(
-            ColumnBounds::new(self.min.evaluate()?, self.max.evaluate()?), // .with_clustered_bounds(self.clustered_bounds),
+            ColumnBounds::new(self.min.evaluate()?, self.max.evaluate()?)
+                .with_clustered_bounds(self.clustered_bounds),
         )
     }
 }
@@ -1661,39 +1539,10 @@ async fn collect_left_input(
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
         Some(accumulators) if num_rows > 0 => {
-            let mut expr_grouped_bounds: HashMap<Arc<dyn PhysicalExpr>, ColumnBounds> =
-                HashMap::new();
-
-            let mut expr_grouped_batches: HashMap<
-                Arc<dyn PhysicalExpr>,
-                Vec<RecordBatch>,
-            > = HashMap::new();
-            for accumulator in accumulators {
-                let expr = accumulator.expr.clone();
-                let batches = accumulator.buffered_batches.clone();
-                let column_bounds = accumulator.evaluate()?;
-                expr_grouped_bounds.insert(expr.clone(), column_bounds);
-
-                if let Some(existing_batches) = expr_grouped_batches.get_mut(&expr) {
-                    // extend the existing batches
-                    existing_batches.extend(batches);
-                } else {
-                    expr_grouped_batches.insert(expr.clone(), batches);
-                }
-            }
-
-            let mut bounds = Vec::new();
-            for (expr, batches) in expr_grouped_batches {
-                let expr_values =
-                    CollectLeftAccumulator::evaluate_cluster(expr.clone(), batches)?;
-
-                if let Some(existing_bound) = expr_grouped_bounds.get_mut(&expr) {
-                    let new_bound =
-                        existing_bound.clone().with_expr_array(Some(expr_values));
-                    bounds.push(new_bound);
-                }
-            }
-
+            let bounds = accumulators
+                .into_iter()
+                .map(CollectLeftAccumulator::evaluate)
+                .collect::<Result<Vec<_>>>()?;
             Some(bounds)
         }
         _ => None,
