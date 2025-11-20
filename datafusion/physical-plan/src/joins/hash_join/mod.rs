@@ -18,6 +18,7 @@
 //! [`HashJoinExec`] Partitioned Hash Join Operator
 
 pub use exec::HashJoinExec;
+pub use shared_bounds::CompactInListExpr;
 
 mod exec;
 mod shared_bounds;

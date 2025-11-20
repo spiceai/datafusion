@@ -46,8 +46,8 @@ use parking_lot::Mutex;
 /// This struct delegates all PhysicalExpr operations to the inner InListExpr
 /// but provides a custom Display implementation for better explain plan readability.
 #[derive(Debug, Clone)]
-struct CompactInListExpr {
-    inner: Arc<InListExpr>,
+pub struct CompactInListExpr {
+    pub inner: Arc<InListExpr>,
 }
 
 impl CompactInListExpr {
