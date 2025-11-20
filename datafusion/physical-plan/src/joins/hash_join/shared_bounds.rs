@@ -18,7 +18,9 @@
 //! Utilities for shared bounds. Used in dynamic filter pushdown in Hash Joins.
 // TODO: include the link to the Dynamic Filter blog post.
 
+use std::any::Any;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use crate::joins::PartitionMode;
@@ -26,8 +28,10 @@ use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
 
 use arrow::array::Array;
+use arrow::datatypes::Schema;
+use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, ScalarValue};
-use datafusion_expr::Operator;
+use datafusion_expr::{ColumnarValue, Operator};
 use datafusion_physical_expr::expressions::InListExpr;
 use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::expressions::{lit, BinaryExpr, DynamicFilterPhysicalExpr};
@@ -35,6 +39,87 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
 use itertools::Itertools;
 use parking_lot::Mutex;
+
+/// A wrapper around InListExpr that displays a summarized count in explain plans
+/// instead of listing all items, which could be millions of values.
+///
+/// This struct delegates all PhysicalExpr operations to the inner InListExpr
+/// but provides a custom Display implementation for better explain plan readability.
+#[derive(Debug, Clone)]
+struct CompactInListExpr {
+    inner: Arc<InListExpr>,
+}
+
+impl CompactInListExpr {
+    fn new(inner: Arc<InListExpr>) -> Self {
+        Self { inner }
+    }
+}
+
+impl fmt::Display for CompactInListExpr {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let item_count = self.inner.list().len();
+        if self.inner.negated() {
+            write!(f, "{} NOT IN (<{} items>)", self.inner.expr(), item_count)
+        } else {
+            write!(f, "{} IN (<{} items>)", self.inner.expr(), item_count)
+        }
+    }
+}
+
+impl PhysicalExpr for CompactInListExpr {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn data_type(&self, input_schema: &Schema) -> Result<arrow::datatypes::DataType> {
+        self.inner.data_type(input_schema)
+    }
+
+    fn nullable(&self, input_schema: &Schema) -> Result<bool> {
+        self.inner.nullable(input_schema)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        self.inner.evaluate(batch)
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        self.inner.children()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        // Create a new InListExpr with updated children
+        let new_inner = Arc::new(InListExpr::new(
+            Arc::clone(&children[0]),
+            children[1..].to_vec(),
+            self.inner.negated(),
+            None,
+        ));
+        Ok(Arc::new(CompactInListExpr::new(new_inner)))
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.inner.fmt_sql(f)
+    }
+}
+
+impl PartialEq for CompactInListExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.inner.eq(&other.inner)
+    }
+}
+
+impl Eq for CompactInListExpr {}
+
+impl Hash for CompactInListExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.inner.hash(state);
+    }
+}
 
 /// Represents the minimum and maximum values for a specific column.
 /// Used in dynamic filter pushdown to establish value boundaries.
@@ -230,14 +315,17 @@ impl SharedBoundsAccumulator {
                             .collect();
 
                         // Create IN list predicate: col IN (expr_values)
+                        // Wrap in CompactInListExpr to avoid displaying millions of items in explain plans
                         let in_list_expr = Arc::new(InListExpr::new(
                             Arc::clone(right_expr),
                             expr_values,
                             false,
                             None,
-                        ))
-                            as Arc<dyn PhysicalExpr>;
-                        column_predicates.push(in_list_expr);
+                        ));
+                        let compact_in_list =
+                            Arc::new(CompactInListExpr::new(in_list_expr))
+                                as Arc<dyn PhysicalExpr>;
+                        column_predicates.push(compact_in_list);
                         continue;
                     }
 
@@ -329,5 +417,130 @@ impl SharedBoundsAccumulator {
 impl fmt::Debug for SharedBoundsAccumulator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedBoundsAccumulator")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion_common::cast::as_boolean_array;
+    use datafusion_physical_expr::expressions::Column;
+
+    #[test]
+    fn test_compact_in_list_display() {
+        // Create a column expression
+        let col_expr = Arc::new(Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
+
+        // Create a list of literal values (simulating a large list)
+        let values: Vec<Arc<dyn PhysicalExpr>> = (0..1000)
+            .map(|i| Arc::new(Literal::new(ScalarValue::Int32(Some(i)))) as _)
+            .collect();
+
+        // Create an InListExpr
+        let in_list = Arc::new(InListExpr::new(
+            Arc::clone(&col_expr),
+            values.clone(),
+            false,
+            None,
+        ));
+
+        // Create a CompactInListExpr
+        let compact_in_list = CompactInListExpr::new(Arc::clone(&in_list));
+
+        // Test Display implementation
+        let display_str = format!("{}", compact_in_list);
+        assert!(
+            display_str.contains("<1000 items>"),
+            "Display should show item count, got: {}",
+            display_str
+        );
+        assert!(
+            display_str.contains("IN"),
+            "Display should contain IN keyword, got: {}",
+            display_str
+        );
+
+        // Test that the regular InListExpr shows the full list (for comparison)
+        let regular_display = format!("{}", in_list);
+        assert!(
+            !regular_display.contains("<1000 items>"),
+            "Regular InListExpr should not use compact format"
+        );
+    }
+
+    #[test]
+    fn test_compact_in_list_display_negated() {
+        let col_expr = Arc::new(Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
+
+        let values: Vec<Arc<dyn PhysicalExpr>> = (0..500)
+            .map(|i| Arc::new(Literal::new(ScalarValue::Int32(Some(i)))) as _)
+            .collect();
+
+        // Create a negated InListExpr
+        let in_list = Arc::new(InListExpr::new(
+            Arc::clone(&col_expr),
+            values,
+            true, // negated
+            None,
+        ));
+
+        let compact_in_list = CompactInListExpr::new(in_list);
+        let display_str = format!("{}", compact_in_list);
+
+        assert!(
+            display_str.contains("NOT IN"),
+            "Display should show NOT IN for negated, got: {}",
+            display_str
+        );
+        assert!(
+            display_str.contains("<500 items>"),
+            "Display should show item count, got: {}",
+            display_str
+        );
+    }
+
+    #[test]
+    fn test_compact_in_list_functionality() {
+        use arrow::array::Int32Array;
+        use arrow::record_batch::RecordBatch;
+
+        // Create a schema and record batch
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col1",
+            DataType::Int32,
+            false,
+        )]));
+        let col_expr = Arc::new(Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
+
+        let values: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(Literal::new(ScalarValue::Int32(Some(1)))) as _,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(2)))) as _,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(3)))) as _,
+        ];
+
+        let in_list =
+            Arc::new(InListExpr::new(Arc::clone(&col_expr), values, false, None));
+
+        let compact_in_list =
+            Arc::new(CompactInListExpr::new(in_list)) as Arc<dyn PhysicalExpr>;
+
+        // Create test data: [1, 2, 4, 5]
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 4, 5]))],
+        )
+        .unwrap();
+
+        // Evaluate the expression
+        let result = compact_in_list.evaluate(&batch).unwrap();
+        let result_array = result.into_array(4).unwrap();
+        let bool_array = as_boolean_array(&result_array).unwrap();
+
+        // Should return [true, true, false, false] for values [1, 2, 4, 5]
+        assert_eq!(bool_array.value(0), true);
+        assert_eq!(bool_array.value(1), true);
+        assert_eq!(bool_array.value(2), false);
+        assert_eq!(bool_array.value(3), false);
     }
 }
