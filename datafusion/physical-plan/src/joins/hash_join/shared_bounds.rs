@@ -25,8 +25,11 @@ use crate::joins::PartitionMode;
 use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
 
+use arrow::array::Array;
 use datafusion_common::{Result, ScalarValue};
 use datafusion_expr::Operator;
+use datafusion_physical_expr::expressions::InListExpr;
+use datafusion_physical_expr::expressions::Literal;
 use datafusion_physical_expr::expressions::{lit, BinaryExpr, DynamicFilterPhysicalExpr};
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 
@@ -42,7 +45,7 @@ pub(crate) struct ColumnBounds {
     /// The maximum value observed for this column  
     max: ScalarValue,
 
-    clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
+    expr_array: Option<Arc<dyn Array>>,
 }
 
 impl ColumnBounds {
@@ -50,15 +53,12 @@ impl ColumnBounds {
         Self {
             min,
             max,
-            clustered_bounds: Vec::new(),
+            expr_array: None,
         }
     }
 
-    pub(crate) fn with_clustered_bounds(
-        mut self,
-        clustered_bounds: Vec<(ScalarValue, ScalarValue)>,
-    ) -> Self {
-        self.clustered_bounds = clustered_bounds;
+    pub(crate) fn with_expr_array(mut self, expr_array: Option<Arc<dyn Array>>) -> Self {
+        self.expr_array = expr_array;
         self
     }
 }
@@ -218,29 +218,26 @@ impl SharedBoundsAccumulator {
 
             for (col_idx, right_expr) in self.on_right.iter().enumerate() {
                 if let Some(column_bounds) = partition_bounds.get_column_bounds(col_idx) {
-                    if column_bounds.clustered_bounds.len() > 0 {
-                        for (min, max) in &column_bounds.clustered_bounds {
-                            // Create predicate: col >= min AND col <= max
-                            let min_expr = Arc::new(BinaryExpr::new(
-                                Arc::clone(right_expr),
-                                Operator::GtEq,
-                                lit(min.clone()),
-                            ))
-                                as Arc<dyn PhysicalExpr>;
-                            let max_expr = Arc::new(BinaryExpr::new(
-                                Arc::clone(right_expr),
-                                Operator::LtEq,
-                                lit(max.clone()),
-                            ))
-                                as Arc<dyn PhysicalExpr>;
-                            let range_expr = Arc::new(BinaryExpr::new(
-                                min_expr,
-                                Operator::And,
-                                max_expr,
-                            ))
-                                as Arc<dyn PhysicalExpr>;
-                            column_predicates.push(range_expr);
-                        }
+                    if let Some(expr_values) = &column_bounds.expr_array {
+                        // convert the dyn Array into a PhysicalExpr of Vec<ScalarValue>
+                        let expr_values: Vec<ScalarValue> = (0..expr_values.len())
+                            .map(|i| ScalarValue::try_from_array(expr_values.as_ref(), i))
+                            .collect::<Result<Vec<ScalarValue>>>()?;
+
+                        let expr_values: Vec<Arc<dyn PhysicalExpr>> = expr_values
+                            .into_iter()
+                            .map(|sv| Arc::new(Literal::new(sv)) as _)
+                            .collect();
+
+                        // Create IN list predicate: col IN (expr_values)
+                        let in_list_expr = Arc::new(InListExpr::new(
+                            Arc::clone(right_expr),
+                            expr_values,
+                            false,
+                            None,
+                        ))
+                            as Arc<dyn PhysicalExpr>;
+                        column_predicates.push(in_list_expr);
                         continue;
                     }
 

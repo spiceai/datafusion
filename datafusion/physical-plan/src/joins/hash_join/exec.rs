@@ -1395,10 +1395,10 @@ impl CollectLeftAccumulator {
     fn evaluate_cluster(
         expr: Arc<dyn PhysicalExpr>,
         batches: Vec<RecordBatch>,
-    ) -> Result<Vec<(ScalarValue, ScalarValue)>> {
+    ) -> Result<Arc<dyn Array>> {
         // collect the batches into a concat-ed batch, and clear the buffer
         let Some(batch) = batches.first() else {
-            return Ok(Vec::new());
+            unreachable!();
         };
 
         let buffered_batch = concat_batches(&batch.schema(), &batches)?;
@@ -1411,18 +1411,19 @@ impl CollectLeftAccumulator {
 
         // sort the array for 1-d clustering
         let array = arrow::compute::sort(&array, None)?;
+        Ok(array)
 
         // Use Jenks Natural Breaks for optimal clustering
-        let num_clusters = 8;
-        let clustered_bounds = compute_jenks_breaks(&*array, num_clusters)?;
+        // let num_clusters = 8;
+        // let clustered_bounds = compute_jenks_breaks(&*array, num_clusters)?;
 
-        println!(
-            "Generated {} Jenks optimal bounds clusters: {:?}",
-            clustered_bounds.len(),
-            clustered_bounds
-        );
+        // println!(
+        //     "Generated {} Jenks optimal bounds clusters: {:?}",
+        //     clustered_bounds.len(),
+        //     clustered_bounds
+        // );
 
-        Ok(clustered_bounds)
+        // Ok(clustered_bounds)
     }
 
     /// Updates the accumulators with values from a new batch.
@@ -1683,12 +1684,12 @@ async fn collect_left_input(
 
             let mut bounds = Vec::new();
             for (expr, batches) in expr_grouped_batches {
-                let cluster_bounds =
+                let expr_values =
                     CollectLeftAccumulator::evaluate_cluster(expr.clone(), batches)?;
 
                 if let Some(existing_bound) = expr_grouped_bounds.get_mut(&expr) {
                     let new_bound =
-                        existing_bound.clone().with_clustered_bounds(cluster_bounds);
+                        existing_bound.clone().with_expr_array(Some(expr_values));
                     bounds.push(new_bound);
                 }
             }
