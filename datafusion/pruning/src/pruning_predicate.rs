@@ -392,8 +392,6 @@ pub fn build_pruning_predicate(
         Ok(pruning_predicate) => {
             if !pruning_predicate.always_true() {
                 return Some(Arc::new(pruning_predicate));
-            } else {
-                println!("Pruning predicate is always true: {pruning_predicate:?}");
             }
         }
         Err(e) => {

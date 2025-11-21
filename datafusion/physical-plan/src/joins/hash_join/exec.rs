@@ -1282,6 +1282,8 @@ fn cluster_by_gaps(
         ));
     }
 
+    println!("Pre-merge clusters: {:?}", clusters);
+
     // Optionally merge clusters with small gaps relative to their range
     merge_small_gaps(&mut clusters, max_gap_ratio);
 
@@ -1305,6 +1307,11 @@ fn merge_small_gaps(clusters: &mut Vec<(ScalarValue, ScalarValue)>, max_gap_rati
 
                 // Merge if gap is small relative to range
                 if (gap as f64) < (merged_range as f64 * max_gap_ratio) {
+                    println!(
+                        "Merging clusters {:?} and {:?}",
+                        clusters[i],
+                        clusters[i + 1]
+                    );
                     let new_max = clusters[i + 1].1.clone();
                     clusters[i].1 = new_max;
                     clusters.remove(i + 1);
@@ -1372,7 +1379,7 @@ impl CollectLeftAccumulator {
         }
 
         // Use gap-based clustering
-        let new_clusters = cluster_by_gaps(&values, 12, 0.1); // 10% gap tolerance
+        let new_clusters = cluster_by_gaps(&values, 8, 0.05); // 5% gap tolerance
 
         // Merge with existing bounds
         for (min_value, max_value) in new_clusters {
