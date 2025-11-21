@@ -1331,7 +1331,7 @@ impl CollectLeftAccumulator {
 
         // Use gap-based clustering with absolute threshold
         // For your data (IDs between 1-50M with 200k values), try 10000-100000
-        let new_clusters = cluster_by_gaps(&values, 1000);
+        let new_clusters = cluster_by_gaps(&values, 5000);
 
         // Merge with existing bounds
         for (min_value, max_value) in new_clusters {
