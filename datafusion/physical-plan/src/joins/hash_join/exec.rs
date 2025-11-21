@@ -1226,6 +1226,96 @@ struct CollectLeftAccumulator {
     buffered_batches: Vec<RecordBatch>,
 }
 
+/// Fast gap-based clustering for sparse IDs
+/// Groups IDs where gaps between consecutive values are small
+fn cluster_by_gaps(
+    sorted_ids: &[ScalarValue],
+    max_clusters: usize,
+    max_gap_ratio: f64, // e.g., 0.1 means gap can be 10% of cluster range
+) -> Vec<(ScalarValue, ScalarValue)> {
+    if sorted_ids.is_empty() {
+        return Vec::new();
+    }
+
+    if sorted_ids.len() == 1 {
+        return vec![(sorted_ids[0].clone(), sorted_ids[0].clone())];
+    }
+
+    // Calculate gaps between consecutive IDs
+    let mut gaps: Vec<(usize, i64)> = Vec::new();
+    for i in 1..sorted_ids.len() {
+        if let (ScalarValue::Int64(Some(prev)), ScalarValue::Int64(Some(curr))) =
+            (&sorted_ids[i - 1], &sorted_ids[i])
+        {
+            gaps.push((i, curr - prev));
+        }
+    }
+
+    // Sort gaps by size (largest first)
+    gaps.sort_by_key(|(_, gap)| -gap);
+
+    // Take the (max_clusters - 1) largest gaps as split points
+    let num_splits = (max_clusters - 1).min(gaps.len());
+    let mut split_indices: Vec<usize> =
+        gaps.iter().take(num_splits).map(|(idx, _)| *idx).collect();
+    split_indices.sort_unstable();
+
+    // Build clusters from split points
+    let mut clusters = Vec::new();
+    let mut start_idx = 0;
+
+    for &split_idx in &split_indices {
+        if split_idx > start_idx {
+            clusters.push((
+                sorted_ids[start_idx].clone(),
+                sorted_ids[split_idx - 1].clone(),
+            ));
+            start_idx = split_idx;
+        }
+    }
+
+    // Add final cluster
+    if start_idx < sorted_ids.len() {
+        clusters.push((
+            sorted_ids[start_idx].clone(),
+            sorted_ids[sorted_ids.len() - 1].clone(),
+        ));
+    }
+
+    // Optionally merge clusters with small gaps relative to their range
+    merge_small_gaps(&mut clusters, max_gap_ratio);
+
+    clusters
+}
+
+/// Merge adjacent clusters if the gap between them is small relative to the cluster range
+fn merge_small_gaps(clusters: &mut Vec<(ScalarValue, ScalarValue)>, max_gap_ratio: f64) {
+    let mut i = 0;
+    while i + 1 < clusters.len() {
+        if let (
+            (_, ScalarValue::Int64(Some(max1))),
+            (ScalarValue::Int64(Some(min2)), _),
+        ) = (&clusters[i], &clusters[i + 1])
+        {
+            let gap = min2 - max1;
+
+            // Calculate the range of the merged cluster
+            if let ScalarValue::Int64(Some(min1)) = &clusters[i].0 {
+                let merged_range = min2 - min1;
+
+                // Merge if gap is small relative to range
+                if (gap as f64) < (merged_range as f64 * max_gap_ratio) {
+                    let new_max = clusters[i + 1].1.clone();
+                    clusters[i].1 = new_max;
+                    clusters.remove(i + 1);
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+}
+
 impl CollectLeftAccumulator {
     /// Creates a new accumulator for tracking bounds of a join key expression.
     ///
@@ -1260,7 +1350,6 @@ impl CollectLeftAccumulator {
     }
 
     fn evaluate_cluster(&mut self) -> Result<()> {
-        // collect the batches into a concat-ed batch, and clear the buffer
         let Some(batch) = self.buffered_batches.first() else {
             return Ok(());
         };
@@ -1273,17 +1362,20 @@ impl CollectLeftAccumulator {
             .evaluate(&buffered_batch)?
             .into_array(buffered_batch.num_rows())?;
 
-        // sort the array for 1-d clustering
+        // Sort the array for 1-d clustering
         let array = arrow::compute::sort(&array, None)?;
 
-        // WIP: naive clustering - just break up the contiguous min-max into 8 sets of bounds
-        let num_clusters = 8;
-        let cluster_size = (array.len() + num_clusters - 1) / num_clusters;
-        let array_chunks = chunk_array(&*array, cluster_size);
-        for cluster in array_chunks {
-            let min_value = min_batch(&cluster)?;
-            let max_value = max_batch(&cluster)?;
+        // Convert to ScalarValues for clustering
+        let mut values = Vec::with_capacity(array.len());
+        for i in 0..array.len() {
+            values.push(ScalarValue::try_from_array(&array, i)?);
+        }
 
+        // Use gap-based clustering
+        let new_clusters = cluster_by_gaps(&values, 12, 0.1); // 10% gap tolerance
+
+        // Merge with existing bounds
+        for (min_value, max_value) in new_clusters {
             if let Some((existing_min, existing_max)) =
                 self.clustered_bounds.iter_mut().find(|(min, max)| {
                     let min_overlaps = min_value <= *max && min_value >= *min;
@@ -1294,15 +1386,12 @@ impl CollectLeftAccumulator {
                 if min_value < *existing_min {
                     *existing_min = min_value.clone();
                 }
-
                 if max_value > *existing_max {
                     *existing_max = max_value.clone();
                 }
-
-                continue;
+            } else {
+                self.clustered_bounds.push((min_value, max_value));
             }
-
-            self.clustered_bounds.push((min_value, max_value));
         }
 
         Ok(())
