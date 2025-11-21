@@ -1462,34 +1462,40 @@ fn build_predicate_expression(
     }
     if let Some(compact_list) = expr_any.downcast_ref::<CompactInListExpr>() {
         let in_list = compact_list.inner.clone();
-        let eq_op = if in_list.negated() {
-            Operator::NotEq
+        if !in_list.list().is_empty()
+            && in_list.list().len() <= MAX_LIST_VALUE_SIZE_REWRITE
+        {
+            let eq_op = if in_list.negated() {
+                Operator::NotEq
+            } else {
+                Operator::Eq
+            };
+            let re_op = if in_list.negated() {
+                Operator::And
+            } else {
+                Operator::Or
+            };
+            let change_expr = in_list
+                .list()
+                .iter()
+                .map(|e| {
+                    Arc::new(phys_expr::BinaryExpr::new(
+                        Arc::clone(in_list.expr()),
+                        eq_op,
+                        Arc::clone(e),
+                    )) as _
+                })
+                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)) as _)
+                .unwrap();
+            return build_predicate_expression(
+                &change_expr,
+                schema,
+                required_columns,
+                unhandled_hook,
+            );
         } else {
-            Operator::Eq
-        };
-        let re_op = if in_list.negated() {
-            Operator::And
-        } else {
-            Operator::Or
-        };
-        let change_expr = in_list
-            .list()
-            .iter()
-            .map(|e| {
-                Arc::new(phys_expr::BinaryExpr::new(
-                    Arc::clone(in_list.expr()),
-                    eq_op,
-                    Arc::clone(e),
-                )) as _
-            })
-            .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)) as _)
-            .unwrap();
-        return build_predicate_expression(
-            &change_expr,
-            schema,
-            required_columns,
-            unhandled_hook,
-        );
+            return in_list;
+        }
     }
 
     let (left, op, right) = {
