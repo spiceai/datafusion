@@ -1892,7 +1892,7 @@ fn wrap_null_count_check_expr(
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum StatisticsType {
+pub enum StatisticsType {
     Min,
     Max,
     NullCount,
