@@ -128,8 +128,6 @@ impl FilePruner {
             }
         }
 
-        println!("No pruning predicate");
-
         Ok(false)
     }
 }
