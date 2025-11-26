@@ -361,7 +361,7 @@ pub struct HashJoinExec<A: CollectLeftAccumulator + 'static = MinMaxLeftAccumula
     /// Set when dynamic filter pushdown is detected in handle_child_pushdown_result.
     /// HashJoinExec also needs to keep a shared bounds accumulator for coordinating updates.
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
-
+    /// Phantom data for the bounds accumulator type
     _phantom_accumulator: PhantomData<A>,
 }
 
