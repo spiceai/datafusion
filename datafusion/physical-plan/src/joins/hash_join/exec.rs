@@ -1266,12 +1266,42 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
     }
 }
 
+/// Trait defining an accumulator for collecting build-side data during hash joins.
+///
+/// The accumulator is responsible for processing batches of data from the build side, and computing or storing intermediate results needed for dynamic filtering.
+///
+/// For example, the [`MinMaxLeftAccumulator`] implementation collects minimum and maximum values for join key expressions across all build-side batches.
 pub trait CollectLeftAccumulator: Send + Sync {
+    /// Creates a new accumulator for the given expression and schema.
+    ///
+    /// # Arguments
+    /// * `expr` - The physical expression to track bounds for
+    /// * `schema` - The schema of the input data
+    ///
+    /// # Returns
+    /// A new `CollectLeftAccumulator` instance configured for the expression's data type
     fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> Result<Self>
     where
         Self: Sized;
 
+    /// Updates the accumulator with values from a new batch.
+    ///
+    /// Evaluates the expression on the batch and updates both min and max
+    /// accumulators with the resulting values.
+    ///
+    /// # Arguments
+    /// * `batch` - The record batch to process
+    ///
+    /// # Returns
+    /// Ok(()) if the update succeeds, or an error if updating fails.
     fn update_batch(&mut self, batch: &RecordBatch) -> Result<()>;
+
+    /// Finalizes the accumulation and returns the computed bounds.
+    ///
+    /// Consumes self to extract the final bounds from the accumulators.
+    ///
+    /// # Returns
+    /// The `ColumnBounds` containing the bounds observed
     fn evaluate(self) -> Result<Arc<dyn ColumnBounds>>;
 }
 
@@ -1294,14 +1324,6 @@ pub struct MinMaxLeftAccumulator {
 }
 
 impl CollectLeftAccumulator for MinMaxLeftAccumulator {
-    /// Creates a new accumulator for tracking bounds of a join key expression.
-    ///
-    /// # Arguments
-    /// * `expr` - The physical expression to track bounds for
-    /// * `schema` - The schema of the input data
-    ///
-    /// # Returns
-    /// A new `CollectLeftAccumulator` instance configured for the expression's data type
     fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> Result<Self> {
         /// Recursively unwraps dictionary types to get the underlying value type.
         fn dictionary_value_type(data_type: &DataType) -> DataType {
@@ -1324,16 +1346,8 @@ impl CollectLeftAccumulator for MinMaxLeftAccumulator {
         })
     }
 
-    /// Updates the accumulators with values from a new batch.
-    ///
     /// Evaluates the expression on the batch and updates both min and max
     /// accumulators with the resulting values.
-    ///
-    /// # Arguments
-    /// * `batch` - The record batch to process
-    ///
-    /// # Returns
-    /// Ok(()) if the update succeeds, or an error if expression evaluation fails
     fn update_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
         self.min.update_batch(std::slice::from_ref(&array))?;
@@ -1341,12 +1355,6 @@ impl CollectLeftAccumulator for MinMaxLeftAccumulator {
         Ok(())
     }
 
-    /// Finalizes the accumulation and returns the computed bounds.
-    ///
-    /// Consumes self to extract the final min and max values from the accumulators.
-    ///
-    /// # Returns
-    /// The `ColumnBounds` containing the minimum and maximum values observed
     fn evaluate(mut self) -> Result<Arc<dyn ColumnBounds>> {
         Ok(Arc::new(MinMaxColumnBounds::new(
             self.min.evaluate()?,
