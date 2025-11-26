@@ -18,7 +18,7 @@
 //! Utilities for shared bounds. Used in dynamic filter pushdown in Hash Joins.
 // TODO: include the link to the Dynamic Filter blog post.
 
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 
 use crate::joins::PartitionMode;
@@ -33,19 +33,61 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 use itertools::Itertools;
 use parking_lot::Mutex;
 
+/// Trait representing some set of bounds for a column used in join dynamic filtering.
+///
+/// Bounds could be min/max values, or some other type of custom bounds that can be represented by a physical expression.
+///
+/// Refer to the [`MinMaxColumnBounds`] implementation for an example of min/max bounds.
+pub trait ColumnBounds: Send + Sync + Debug {
+    /// Creates a physical expression representing the bounds for this column (left expression).
+    ///
+    /// # Arguments
+    ///
+    /// * `left_expr` - The left side physical expression for which to create bounds.
+    ///
+    /// # Returns
+    /// `Ok(Arc<dyn PhysicalExpr>)` if creating the bounds expression succeeds, or an error otherwise.
+    fn physical_expr(
+        &self,
+        left_expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>>;
+}
+
 /// Represents the minimum and maximum values for a specific column.
 /// Used in dynamic filter pushdown to establish value boundaries.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ColumnBounds {
+pub(crate) struct MinMaxColumnBounds {
     /// The minimum value observed for this column
     min: ScalarValue,
     /// The maximum value observed for this column  
     max: ScalarValue,
 }
 
-impl ColumnBounds {
+impl MinMaxColumnBounds {
     pub(crate) fn new(min: ScalarValue, max: ScalarValue) -> Self {
         Self { min, max }
+    }
+}
+
+impl ColumnBounds for MinMaxColumnBounds {
+    fn physical_expr(
+        &self,
+        left_expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        // Create predicate: col >= min AND col <= max
+        let min_expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&left_expr),
+            Operator::GtEq,
+            lit(self.min.clone()),
+        )) as Arc<dyn PhysicalExpr>;
+        let max_expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&left_expr),
+            Operator::LtEq,
+            lit(self.max.clone()),
+        )) as Arc<dyn PhysicalExpr>;
+        let range_expr = Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
+            as Arc<dyn PhysicalExpr>;
+        Ok(range_expr)
     }
 }
 
@@ -57,11 +99,14 @@ pub(crate) struct PartitionBounds {
     partition: usize,
     /// Min/max bounds for each join key column in this partition.
     /// Index corresponds to the join key expression index.
-    column_bounds: Vec<ColumnBounds>,
+    column_bounds: Vec<Arc<dyn ColumnBounds>>,
 }
 
 impl PartitionBounds {
-    pub(crate) fn new(partition: usize, column_bounds: Vec<ColumnBounds>) -> Self {
+    pub(crate) fn new(
+        partition: usize,
+        column_bounds: Vec<Arc<dyn ColumnBounds>>,
+    ) -> Self {
         Self {
             partition,
             column_bounds,
@@ -72,7 +117,10 @@ impl PartitionBounds {
         self.column_bounds.len()
     }
 
-    pub(crate) fn get_column_bounds(&self, index: usize) -> Option<&ColumnBounds> {
+    pub(crate) fn get_column_bounds(
+        &self,
+        index: usize,
+    ) -> Option<&Arc<dyn ColumnBounds>> {
         self.column_bounds.get(index)
     }
 }
@@ -204,21 +252,9 @@ impl SharedBoundsAccumulator {
 
             for (col_idx, right_expr) in self.on_right.iter().enumerate() {
                 if let Some(column_bounds) = partition_bounds.get_column_bounds(col_idx) {
-                    // Create predicate: col >= min AND col <= max
-                    let min_expr = Arc::new(BinaryExpr::new(
-                        Arc::clone(right_expr),
-                        Operator::GtEq,
-                        lit(column_bounds.min.clone()),
-                    )) as Arc<dyn PhysicalExpr>;
-                    let max_expr = Arc::new(BinaryExpr::new(
-                        Arc::clone(right_expr),
-                        Operator::LtEq,
-                        lit(column_bounds.max.clone()),
-                    )) as Arc<dyn PhysicalExpr>;
-                    let range_expr =
-                        Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
-                            as Arc<dyn PhysicalExpr>;
-                    column_predicates.push(range_expr);
+                    let bounds_expr =
+                        column_bounds.physical_expr(Arc::clone(right_expr))?;
+                    column_predicates.push(bounds_expr);
                 }
             }
 
@@ -261,7 +297,7 @@ impl SharedBoundsAccumulator {
     pub(crate) fn report_partition_bounds(
         &self,
         partition: usize,
-        partition_bounds: Option<Vec<ColumnBounds>>,
+        partition_bounds: Option<Vec<Arc<dyn ColumnBounds>>>,
     ) -> Result<()> {
         let mut inner = self.inner.lock();
 
@@ -289,7 +325,7 @@ impl SharedBoundsAccumulator {
     }
 }
 
-impl fmt::Debug for SharedBoundsAccumulator {
+impl Debug for SharedBoundsAccumulator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedBoundsAccumulator")
     }
