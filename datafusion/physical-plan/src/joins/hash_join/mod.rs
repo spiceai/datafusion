@@ -18,7 +18,8 @@
 //! [`HashJoinExec`] Partitioned Hash Join Operator
 
 pub use exec::HashJoinExec;
-pub use shared_bounds::CompactInListExpr;
+pub use exec::{CollectLeftAccumulator, MinMaxLeftAccumulator};
+pub use shared_bounds::ColumnBounds;
 
 mod exec;
 mod shared_bounds;

@@ -15,8 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -27,7 +27,9 @@ use crate::filter_pushdown::{
     ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation,
 };
-use crate::joins::hash_join::shared_bounds::{ColumnBounds, SharedBoundsAccumulator};
+use crate::joins::hash_join::shared_bounds::{
+    ColumnBounds, MinMaxColumnBounds, SharedBoundsAccumulator,
+};
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
 };
@@ -55,17 +57,16 @@ use crate::{
     PlanProperties, SendableRecordBatchStream, Statistics,
 };
 
-use arrow::array::{Array, ArrayRef, BooleanBufferBuilder};
+use arrow::array::{ArrayRef, BooleanBufferBuilder};
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use arrow::util::bit_util;
-use arrow_schema::{DataType, SortOptions};
+use arrow_schema::DataType;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{
     internal_err, plan_err, project_schema, JoinSide, JoinType, NullEquality, Result,
-    ScalarValue,
 };
 use datafusion_execution::memory_pool::{MemoryConsumer, MemoryReservation};
 use datafusion_execution::TaskContext;
@@ -105,7 +106,7 @@ pub(super) struct JoinLeftData {
     /// The MemoryReservation ensures proper tracking of memory resources throughout the join operation's lifecycle.
     _reservation: MemoryReservation,
     /// Bounds computed from the build side for dynamic filter pushdown
-    pub(super) bounds: Option<Vec<ColumnBounds>>,
+    pub(super) bounds: Option<Vec<Arc<dyn ColumnBounds>>>,
 }
 
 impl JoinLeftData {
@@ -117,7 +118,7 @@ impl JoinLeftData {
         visited_indices_bitmap: SharedBitmapBuilder,
         probe_threads_counter: AtomicUsize,
         reservation: MemoryReservation,
-        bounds: Option<Vec<ColumnBounds>>,
+        bounds: Option<Vec<Arc<dyn ColumnBounds>>>,
     ) -> Self {
         Self {
             hash_map,
@@ -321,7 +322,7 @@ impl JoinLeftData {
 /// Note this structure includes a [`OnceAsync`] that is used to coordinate the
 /// loading of the left side with the processing in each output stream.
 /// Therefore it can not be [`Clone`]
-pub struct HashJoinExec {
+pub struct HashJoinExec<A: CollectLeftAccumulator + 'static = MinMaxLeftAccumulator> {
     /// left (build) side which gets hashed
     pub left: Arc<dyn ExecutionPlan>,
     /// right (probe) side which are filtered by the hash table
@@ -360,6 +361,8 @@ pub struct HashJoinExec {
     /// Set when dynamic filter pushdown is detected in handle_child_pushdown_result.
     /// HashJoinExec also needs to keep a shared bounds accumulator for coordinating updates.
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
+
+    _phantom_accumulator: PhantomData<A>,
 }
 
 #[derive(Clone)]
@@ -371,7 +374,7 @@ struct HashJoinExecDynamicFilter {
     bounds_accumulator: OnceLock<Arc<SharedBoundsAccumulator>>,
 }
 
-impl fmt::Debug for HashJoinExec {
+impl<A: CollectLeftAccumulator> fmt::Debug for HashJoinExec<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HashJoinExec")
             .field("left", &self.left)
@@ -393,14 +396,14 @@ impl fmt::Debug for HashJoinExec {
     }
 }
 
-impl EmbeddedProjection for HashJoinExec {
+impl<A: CollectLeftAccumulator + 'static> EmbeddedProjection for HashJoinExec<A> {
     fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
         self.with_projection(projection)
     }
 }
 
-impl HashJoinExec {
-    /// Tries to create a new [HashJoinExec].
+impl HashJoinExec<MinMaxLeftAccumulator> {
+    /// Tries to create a new [HashJoinExec] with a default `MinMaxLeftAccumulator` bounds accumulator.
     ///
     /// # Error
     /// This function errors when it is not possible to join the left and right sides on keys `on`.
@@ -462,6 +465,75 @@ impl HashJoinExec {
             null_equality,
             cache,
             dynamic_filter: None,
+            _phantom_accumulator: PhantomData,
+        })
+    }
+}
+
+impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
+    /// Tries to create a new [HashJoinExec] with a custom bounds accumulator.
+    ///
+    /// # Error
+    /// This function errors when it is not possible to join the left and right sides on keys `on`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_new_with_accumulator(
+        left: Arc<dyn ExecutionPlan>,
+        right: Arc<dyn ExecutionPlan>,
+        on: JoinOn,
+        filter: Option<JoinFilter>,
+        join_type: &JoinType,
+        projection: Option<Vec<usize>>,
+        partition_mode: PartitionMode,
+        null_equality: NullEquality,
+    ) -> Result<Self> {
+        let left_schema = left.schema();
+        let right_schema = right.schema();
+        if on.is_empty() {
+            return plan_err!("On constraints in HashJoinExec should be non-empty");
+        }
+
+        check_join_is_valid(&left_schema, &right_schema, &on)?;
+
+        let (join_schema, column_indices) =
+            build_join_schema(&left_schema, &right_schema, join_type);
+
+        let random_state = HASH_JOIN_SEED;
+
+        let join_schema = Arc::new(join_schema);
+
+        //  check if the projection is valid
+        can_project(&join_schema, projection.as_ref())?;
+
+        let cache = Self::compute_properties(
+            &left,
+            &right,
+            Arc::clone(&join_schema),
+            *join_type,
+            &on,
+            partition_mode,
+            projection.as_ref(),
+        )?;
+
+        // Initialize both dynamic filter and bounds accumulator to None
+        // They will be set later if dynamic filtering is enabled
+
+        Ok(HashJoinExec {
+            left,
+            right,
+            on,
+            filter,
+            join_type: *join_type,
+            join_schema,
+            left_fut: Default::default(),
+            random_state,
+            mode: partition_mode,
+            metrics: ExecutionPlanMetricsSet::new(),
+            projection,
+            column_indices,
+            null_equality,
+            cache,
+            dynamic_filter: None,
+            _phantom_accumulator: PhantomData,
         })
     }
 
@@ -551,7 +623,7 @@ impl HashJoinExec {
             },
             None => None,
         };
-        Self::try_new(
+        Self::try_new_with_accumulator(
             Arc::clone(&self.left),
             Arc::clone(&self.right),
             self.on.clone(),
@@ -667,7 +739,7 @@ impl HashJoinExec {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         let left = self.left();
         let right = self.right();
-        let new_join = HashJoinExec::try_new(
+        let new_join = HashJoinExec::<A>::try_new_with_accumulator(
             Arc::clone(right),
             Arc::clone(left),
             self.on()
@@ -701,7 +773,7 @@ impl HashJoinExec {
     }
 }
 
-impl DisplayAs for HashJoinExec {
+impl<A: CollectLeftAccumulator + 'static> DisplayAs for HashJoinExec<A> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -765,7 +837,7 @@ impl DisplayAs for HashJoinExec {
     }
 }
 
-impl ExecutionPlan for HashJoinExec {
+impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
     fn name(&self) -> &'static str {
         "HashJoinExec"
     }
@@ -835,7 +907,7 @@ impl ExecutionPlan for HashJoinExec {
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(HashJoinExec {
+        Ok(Arc::new(HashJoinExec::<A> {
             left: Arc::clone(&children[0]),
             right: Arc::clone(&children[1]),
             on: self.on.clone(),
@@ -860,11 +932,12 @@ impl ExecutionPlan for HashJoinExec {
             )?,
             // Keep the dynamic filter, bounds accumulator will be reset
             dynamic_filter: self.dynamic_filter.clone(),
+            _phantom_accumulator: PhantomData,
         }))
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(HashJoinExec {
+        Ok(Arc::new(HashJoinExec::<A> {
             left: Arc::clone(&self.left),
             right: Arc::clone(&self.right),
             on: self.on.clone(),
@@ -882,6 +955,7 @@ impl ExecutionPlan for HashJoinExec {
             cache: self.cache.clone(),
             // Reset dynamic filter and bounds accumulator to initial state
             dynamic_filter: None,
+            _phantom_accumulator: PhantomData,
         }))
     }
 
@@ -923,7 +997,7 @@ impl ExecutionPlan for HashJoinExec {
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
 
-                Ok(collect_left_input(
+                Ok(collect_left_input::<MinMaxLeftAccumulator>(
                     self.random_state.clone(),
                     left_stream,
                     on_left.clone(),
@@ -941,7 +1015,7 @@ impl ExecutionPlan for HashJoinExec {
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
                         .register(context.memory_pool());
 
-                OnceFut::new(collect_left_input(
+                OnceFut::new(collect_left_input::<MinMaxLeftAccumulator>(
                     self.random_state.clone(),
                     left_stream,
                     on_left.clone(),
@@ -1164,7 +1238,7 @@ impl ExecutionPlan for HashJoinExec {
                 Arc::downcast::<DynamicFilterPhysicalExpr>(predicate)
             {
                 // We successfully pushed down our self filter - we need to make a new node with the dynamic filter
-                let new_node = Arc::new(HashJoinExec {
+                let new_node = Arc::new(HashJoinExec::<A> {
                     left: Arc::clone(&self.left),
                     right: Arc::clone(&self.right),
                     on: self.on.clone(),
@@ -1183,6 +1257,7 @@ impl ExecutionPlan for HashJoinExec {
                         filter: dynamic_filter,
                         bounds_accumulator: OnceLock::new(),
                     }),
+                    _phantom_accumulator: PhantomData,
                 });
                 result = result.with_updated_node(new_node as Arc<dyn ExecutionPlan>);
             }
@@ -1191,153 +1266,13 @@ impl ExecutionPlan for HashJoinExec {
     }
 }
 
-/// Computes optimal 1-dimensional breaks in a sorted array using Jenks Natural Breaks optimization.
-///
-/// This implementation uses dynamic programming to find break points that minimize
-/// within-cluster variance and maximize between-cluster variance, producing tighter
-/// bounds than naive equal-sized chunking.
-///
-/// # Arguments
-/// * `sorted_array` - A sorted Arrow array (must be numeric type)
-/// * `num_breaks` - Number of clusters to create (typically 8)
-///
-/// # Returns
-/// Vector of (min, max) scalar value pairs representing the bounds of each cluster.
-///
-/// # Algorithm
-/// Uses the Fisher-Jenks algorithm with O(n²k) time complexity where:
-/// - n = number of elements
-/// - k = number of clusters
-///
-/// For large arrays (>10k elements), uses sampling to maintain performance.
-fn compute_jenks_breaks(
-    sorted_array: &dyn Array,
-    num_breaks: usize,
-) -> Result<Vec<(ScalarValue, ScalarValue)>> {
-    let n = sorted_array.len();
+pub trait CollectLeftAccumulator: Send + Sync {
+    fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> Result<Self>
+    where
+        Self: Sized;
 
-    if n == 0 || num_breaks == 0 {
-        return Ok(Vec::new());
-    }
-
-    if num_breaks >= n {
-        // Each element becomes its own cluster
-        let mut bounds = Vec::new();
-        for i in 0..n {
-            let value = ScalarValue::try_from_array(sorted_array, i)?;
-            bounds.push((value.clone(), value));
-        }
-        return Ok(bounds);
-    }
-
-    // Sample large arrays to keep computation reasonable
-    let (values, sample_rate) = if n > 10000 {
-        let sample_size = 10000;
-        let step = n / sample_size;
-        let mut sampled = Vec::with_capacity(sample_size);
-        for i in (0..n).step_by(step) {
-            sampled.push(ScalarValue::try_from_array(sorted_array, i)?);
-        }
-        (sampled, step)
-    } else {
-        let mut values = Vec::with_capacity(n);
-        for i in 0..n {
-            values.push(ScalarValue::try_from_array(sorted_array, i)?);
-        }
-        (values, 1)
-    };
-
-    let n_samples = values.len();
-
-    // Dynamic programming matrices
-    // variance_matrix[i][j] = variance of elements from i to j
-    let mut variance_matrix = vec![vec![0.0; n_samples]; n_samples];
-
-    // Precompute variance for all possible ranges
-    for i in 0..n_samples {
-        let mut sum = 0.0;
-        let mut sum_sq = 0.0;
-
-        for j in i..n_samples {
-            let val = scalar_to_f64(&values[j])?;
-            sum += val;
-            sum_sq += val * val;
-
-            let count = (j - i + 1) as f64;
-            let mean = sum / count;
-            let variance = (sum_sq / count) - (mean * mean);
-            variance_matrix[i][j] = variance * count; // Store weighted variance
-        }
-    }
-
-    // dp[k][j] = minimum variance when dividing elements 0..j into k+1 clusters
-    let mut dp = vec![vec![f64::INFINITY; n_samples]; num_breaks];
-    let mut backtrack = vec![vec![0; n_samples]; num_breaks];
-
-    // Base case: first cluster
-    for j in 0..n_samples {
-        dp[0][j] = variance_matrix[0][j];
-    }
-
-    // Fill DP table
-    for k in 1..num_breaks {
-        for j in k..n_samples {
-            for i in (k - 1)..j {
-                let cost = dp[k - 1][i] + variance_matrix[i + 1][j];
-                if cost < dp[k][j] {
-                    dp[k][j] = cost;
-                    backtrack[k][j] = i + 1;
-                }
-            }
-        }
-    }
-
-    // Backtrack to find break points
-    let mut break_points = vec![n_samples];
-    let mut current_break = n_samples - 1;
-
-    for k in (1..num_breaks).rev() {
-        current_break = backtrack[k][current_break];
-        break_points.push(current_break);
-    }
-    break_points.push(0);
-    break_points.reverse();
-
-    // Convert break points to (min, max) bounds, mapping back to original array
-    let mut bounds = Vec::new();
-    for i in 0..(break_points.len() - 1) {
-        let start_idx = break_points[i] * sample_rate;
-        let end_idx =
-            ((break_points[i + 1] - 1) * sample_rate).min(sorted_array.len() - 1);
-
-        let min_value = ScalarValue::try_from_array(sorted_array, start_idx)?;
-        let max_value = ScalarValue::try_from_array(sorted_array, end_idx)?;
-        bounds.push((min_value, max_value));
-    }
-
-    Ok(bounds)
-}
-
-/// Helper function to convert ScalarValue to f64 for variance calculations
-fn scalar_to_f64(scalar: &ScalarValue) -> Result<f64> {
-    match scalar {
-        ScalarValue::Int8(Some(v)) => Ok(*v as f64),
-        ScalarValue::Int16(Some(v)) => Ok(*v as f64),
-        ScalarValue::Int32(Some(v)) => Ok(*v as f64),
-        ScalarValue::Int64(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt8(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt16(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt32(Some(v)) => Ok(*v as f64),
-        ScalarValue::UInt64(Some(v)) => Ok(*v as f64),
-        ScalarValue::Float32(Some(v)) => Ok(*v as f64),
-        ScalarValue::Float64(Some(v)) => Ok(*v),
-        ScalarValue::Date32(Some(v)) => Ok(*v as f64),
-        ScalarValue::Date64(Some(v)) => Ok(*v as f64),
-        ScalarValue::Decimal128(Some(v), _, scale) => {
-            Ok(*v as f64 / 10_f64.powi(*scale as i32))
-        }
-        _ => internal_err!("Unsupported scalar type for clustering: {:?}", scalar),
-    }
+    fn update_batch(&mut self, batch: &RecordBatch) -> Result<()>;
+    fn evaluate(self) -> Result<Arc<dyn ColumnBounds>>;
 }
 
 /// Accumulator for collecting min/max bounds from build-side data during hash join.
@@ -1349,18 +1284,16 @@ fn scalar_to_f64(scalar: &ScalarValue) -> Result<f64> {
 /// The bounds are used for dynamic filter pushdown optimization, where filters
 /// based on the actual data ranges can be pushed down to the probe side to
 /// eliminate unnecessary data early.
-struct CollectLeftAccumulator {
+pub struct MinMaxLeftAccumulator {
     /// The physical expression to evaluate for each batch
     expr: Arc<dyn PhysicalExpr>,
     /// Accumulator for tracking the minimum value across all batches
     min: MinAccumulator,
     /// Accumulator for tracking the maximum value across all batches
     max: MaxAccumulator,
-    /// Buffered batches for clustering analysis
-    pub buffered_batches: Vec<RecordBatch>,
 }
 
-impl CollectLeftAccumulator {
+impl CollectLeftAccumulator for MinMaxLeftAccumulator {
     /// Creates a new accumulator for tracking bounds of a join key expression.
     ///
     /// # Arguments
@@ -1388,42 +1321,7 @@ impl CollectLeftAccumulator {
             expr,
             min: MinAccumulator::try_new(&data_type)?,
             max: MaxAccumulator::try_new(&data_type)?,
-            buffered_batches: Vec::new(),
         })
-    }
-
-    fn evaluate_cluster(
-        expr: Arc<dyn PhysicalExpr>,
-        batches: Vec<RecordBatch>,
-    ) -> Result<Arc<dyn Array>> {
-        // collect the batches into a concat-ed batch, and clear the buffer
-        let Some(batch) = batches.first() else {
-            unreachable!();
-        };
-
-        let buffered_batch = concat_batches(&batch.schema(), &batches)?;
-
-        println!("Found {} rows for clustering", buffered_batch.num_rows());
-
-        let array = expr
-            .evaluate(&buffered_batch)?
-            .into_array(buffered_batch.num_rows())?;
-
-        // sort the array for 1-d clustering
-        let array = arrow::compute::sort(&array, None)?;
-        Ok(array)
-
-        // Use Jenks Natural Breaks for optimal clustering
-        // let num_clusters = 8;
-        // let clustered_bounds = compute_jenks_breaks(&*array, num_clusters)?;
-
-        // println!(
-        //     "Generated {} Jenks optimal bounds clusters: {:?}",
-        //     clustered_bounds.len(),
-        //     clustered_bounds
-        // );
-
-        // Ok(clustered_bounds)
     }
 
     /// Updates the accumulators with values from a new batch.
@@ -1440,8 +1338,6 @@ impl CollectLeftAccumulator {
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
         self.min.update_batch(std::slice::from_ref(&array))?;
         self.max.update_batch(std::slice::from_ref(&array))?;
-
-        self.buffered_batches.push(batch.clone());
         Ok(())
     }
 
@@ -1451,33 +1347,24 @@ impl CollectLeftAccumulator {
     ///
     /// # Returns
     /// The `ColumnBounds` containing the minimum and maximum values observed
-    fn evaluate(mut self) -> Result<ColumnBounds> {
-        // if self.buffered_batches.len() > 0 {
-        //     self.evaluate_cluster()?;
-        // }
-
-        // println!("Collected clustered bounds: {:?}", self.clustered_bounds);
-        // println!(
-        //     "Default min-max bounds: min={:?}, max={:?}",
-        //     self.min, self.max
-        // );
-
-        Ok(
-            ColumnBounds::new(self.min.evaluate()?, self.max.evaluate()?), // .with_clustered_bounds(self.clustered_bounds),
-        )
+    fn evaluate(mut self) -> Result<Arc<dyn ColumnBounds>> {
+        Ok(Arc::new(MinMaxColumnBounds::new(
+            self.min.evaluate()?,
+            self.max.evaluate()?,
+        )))
     }
 }
 
 /// State for collecting the build-side data during hash join
-struct BuildSideState {
+struct BuildSideState<A: CollectLeftAccumulator> {
     batches: Vec<RecordBatch>,
     num_rows: usize,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
-    bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
+    bounds_accumulators: Option<Vec<A>>,
 }
 
-impl BuildSideState {
+impl<A: CollectLeftAccumulator> BuildSideState<A> {
     /// Create a new BuildSideState with optional accumulators for bounds computation
     fn try_new(
         metrics: BuildProbeJoinMetrics,
@@ -1486,8 +1373,6 @@ impl BuildSideState {
         schema: &SchemaRef,
         should_compute_bounds: bool,
     ) -> Result<Self> {
-        // println!("on left expressions: {:?}", on_left);
-        // println!("on left expression count: {}", on_left.len());
         Ok(Self {
             batches: Vec::new(),
             num_rows: 0,
@@ -1497,9 +1382,7 @@ impl BuildSideState {
                 .then(|| {
                     on_left
                         .iter()
-                        .map(|expr| {
-                            CollectLeftAccumulator::try_new(Arc::clone(expr), schema)
-                        })
+                        .map(|expr| A::try_new(Arc::clone(expr), schema))
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -1536,7 +1419,7 @@ impl BuildSideState {
 /// `JoinLeftData` containing the hash map, consolidated batch, join key values,
 /// visited indices bitmap, and computed bounds (if requested).
 #[allow(clippy::too_many_arguments)]
-async fn collect_left_input(
+async fn collect_left_input<A: CollectLeftAccumulator>(
     random_state: RandomState,
     left_stream: SendableRecordBatchStream,
     on_left: Vec<PhysicalExprRef>,
@@ -1551,7 +1434,7 @@ async fn collect_left_input(
     // This operation performs 2 steps at once:
     // 1. creates a [JoinHashMap] of all batches from the stream
     // 2. stores the batches in a vector.
-    let initial = BuildSideState::try_new(
+    let initial = BuildSideState::<A>::try_new(
         metrics,
         reservation,
         on_left.clone(),
@@ -1585,7 +1468,7 @@ async fn collect_left_input(
         .await?;
 
     // Extract fields from state
-    let BuildSideState {
+    let BuildSideState::<A> {
         batches,
         num_rows,
         metrics,
@@ -1660,42 +1543,12 @@ async fn collect_left_input(
 
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
-        Some(accumulators) if num_rows > 0 => {
-            let mut expr_grouped_bounds: HashMap<Arc<dyn PhysicalExpr>, ColumnBounds> =
-                HashMap::new();
-
-            let mut expr_grouped_batches: HashMap<
-                Arc<dyn PhysicalExpr>,
-                Vec<RecordBatch>,
-            > = HashMap::new();
-            for accumulator in accumulators {
-                let expr = accumulator.expr.clone();
-                let batches = accumulator.buffered_batches.clone();
-                let column_bounds = accumulator.evaluate()?;
-                expr_grouped_bounds.insert(expr.clone(), column_bounds);
-
-                if let Some(existing_batches) = expr_grouped_batches.get_mut(&expr) {
-                    // extend the existing batches
-                    existing_batches.extend(batches);
-                } else {
-                    expr_grouped_batches.insert(expr.clone(), batches);
-                }
-            }
-
-            let mut bounds = Vec::new();
-            for (expr, batches) in expr_grouped_batches {
-                let expr_values =
-                    CollectLeftAccumulator::evaluate_cluster(expr.clone(), batches)?;
-
-                if let Some(existing_bound) = expr_grouped_bounds.get_mut(&expr) {
-                    let new_bound =
-                        existing_bound.clone().with_expr_array(Some(expr_values));
-                    bounds.push(new_bound);
-                }
-            }
-
-            Some(bounds)
-        }
+        Some(accumulators) if num_rows > 0 => Some(
+            accumulators
+                .into_iter()
+                .map(|a| a.evaluate())
+                .collect::<Result<Vec<_>>>()?,
+        ),
         _ => None,
     };
 
