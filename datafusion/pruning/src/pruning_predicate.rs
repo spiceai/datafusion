@@ -31,7 +31,6 @@ use arrow::{
 // pub use for backwards compatibility
 pub use datafusion_common::pruning::PruningStatistics;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
-use datafusion_physical_plan::joins::CompactInListExpr;
 use datafusion_physical_plan::metrics::Count;
 use log::{debug, trace};
 
@@ -1458,43 +1457,6 @@ fn build_predicate_expression(
             );
         } else {
             return unhandled_hook.handle(expr);
-        }
-    }
-    if let Some(compact_list) = expr_any.downcast_ref::<CompactInListExpr>() {
-        let in_list = compact_list.inner.clone();
-        if !in_list.list().is_empty()
-            && in_list.list().len() <= MAX_LIST_VALUE_SIZE_REWRITE
-        {
-            let eq_op = if in_list.negated() {
-                Operator::NotEq
-            } else {
-                Operator::Eq
-            };
-            let re_op = if in_list.negated() {
-                Operator::And
-            } else {
-                Operator::Or
-            };
-            let change_expr = in_list
-                .list()
-                .iter()
-                .map(|e| {
-                    Arc::new(phys_expr::BinaryExpr::new(
-                        Arc::clone(in_list.expr()),
-                        eq_op,
-                        Arc::clone(e),
-                    )) as _
-                })
-                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)) as _)
-                .unwrap();
-            return build_predicate_expression(
-                &change_expr,
-                schema,
-                required_columns,
-                unhandled_hook,
-            );
-        } else {
-            return in_list;
         }
     }
 
