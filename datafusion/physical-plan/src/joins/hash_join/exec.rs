@@ -997,7 +997,7 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
 
-                Ok(collect_left_input::<MinMaxLeftAccumulator>(
+                Ok(collect_left_input::<A>(
                     self.random_state.clone(),
                     left_stream,
                     on_left.clone(),
@@ -1015,7 +1015,7 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
                         .register(context.memory_pool());
 
-                OnceFut::new(collect_left_input::<MinMaxLeftAccumulator>(
+                OnceFut::new(collect_left_input::<A>(
                     self.random_state.clone(),
                     left_stream,
                     on_left.clone(),
