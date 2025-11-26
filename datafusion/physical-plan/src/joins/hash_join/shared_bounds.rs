@@ -33,7 +33,20 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef};
 use itertools::Itertools;
 use parking_lot::Mutex;
 
+/// Trait representing some set of bounds for a column used in join dynamic filtering.
+///
+/// Bounds could be min/max values, or some other type of custom bounds that can be represented by a physical expression.
+///
+/// Refer to the [`MinMaxColumnBounds`] implementation for an example of min/max bounds.
 pub trait ColumnBounds: Send + Sync + Debug {
+    /// Creates a physical expression representing the bounds for this column (left expression).
+    ///
+    /// # Arguments
+    ///
+    /// * `left_expr` - The left side physical expression for which to create bounds.
+    ///
+    /// # Returns
+    /// `Ok(Arc<dyn PhysicalExpr>)` if creating the bounds expression succeeds, or an error otherwise.
     fn physical_expr(
         &self,
         left_expr: Arc<dyn PhysicalExpr>,
