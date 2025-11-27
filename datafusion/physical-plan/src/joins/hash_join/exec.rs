@@ -1304,7 +1304,7 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
 /// For example, the [`MinMaxLeftAccumulator`] implementation collects minimum and maximum values for join key expressions across all build-side batches.
 pub trait CollectLeftAccumulator: Send + Sync {
     /// Returns the name of the accumulator.
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Returns the static name of the accumulator type.
     fn static_name() -> &'static str
@@ -1366,7 +1366,7 @@ pub struct MinMaxLeftAccumulator {
 }
 
 impl CollectLeftAccumulator for MinMaxLeftAccumulator {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "MinMaxLeftAccumulator"
     }
 
