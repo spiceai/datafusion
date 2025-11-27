@@ -540,8 +540,8 @@ impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
 
     pub fn recreate_with_accumulator<B: CollectLeftAccumulator + 'static>(
         &self,
-    ) -> Result<HashJoinExec<B>> {
-        Ok(HashJoinExec {
+    ) -> HashJoinExec<B> {
+        HashJoinExec {
             left: Arc::clone(&self.left),
             right: Arc::clone(&self.right),
             on: self.on.clone(),
@@ -558,7 +558,7 @@ impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
             cache: self.cache.clone(),
             dynamic_filter: self.dynamic_filter.clone(),
             _phantom_accumulator: PhantomData,
-        })
+        }
     }
 
     fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
