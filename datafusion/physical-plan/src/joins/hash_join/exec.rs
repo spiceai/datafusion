@@ -391,6 +391,7 @@ impl<A: CollectLeftAccumulator> fmt::Debug for HashJoinExec<A> {
             .field("column_indices", &self.column_indices)
             .field("null_equality", &self.null_equality)
             .field("cache", &self.cache)
+            .field("accumulator", &A::static_name())
             // Explicitly exclude dynamic_filter to avoid runtime state differences in tests
             .finish()
     }
@@ -535,6 +536,29 @@ impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
             dynamic_filter: None,
             _phantom_accumulator: PhantomData,
         })
+    }
+
+    pub fn recreate_with_accumulator<B: CollectLeftAccumulator + 'static>(
+        &self,
+    ) -> HashJoinExec<B> {
+        HashJoinExec {
+            left: Arc::clone(&self.left),
+            right: Arc::clone(&self.right),
+            on: self.on.clone(),
+            filter: self.filter.clone(),
+            join_type: self.join_type,
+            join_schema: Arc::clone(&self.join_schema),
+            left_fut: Arc::clone(&self.left_fut),
+            random_state: HASH_JOIN_SEED,
+            mode: self.mode,
+            metrics: self.metrics.clone(),
+            projection: self.projection.clone(),
+            column_indices: self.column_indices.clone(),
+            null_equality: self.null_equality,
+            cache: self.cache.clone(),
+            dynamic_filter: self.dynamic_filter.clone(),
+            _phantom_accumulator: PhantomData,
+        }
     }
 
     fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
@@ -807,8 +831,13 @@ impl<A: CollectLeftAccumulator + 'static> DisplayAs for HashJoinExec<A> {
                     .join(", ");
                 write!(
                     f,
-                    "HashJoinExec: mode={:?}, join_type={:?}, on=[{}]{}{}",
-                    self.mode, self.join_type, on, display_filter, display_projections,
+                    "HashJoinExec: mode={mode:?}, join_type={join_type:?}, accumulator={accumulator}, on=[{on}]{display_filter}{display_projections}",
+                    mode = self.mode,
+                    join_type = self.join_type,
+                    accumulator = A::static_name(),
+                    on = on,
+                    display_filter = display_filter,
+                    display_projections = display_projections,
                 )
             }
             DisplayFormatType::TreeRender => {
@@ -830,6 +859,8 @@ impl<A: CollectLeftAccumulator + 'static> DisplayAs for HashJoinExec<A> {
                 if let Some(filter) = self.filter.as_ref() {
                     writeln!(f, "filter={filter}")?;
                 }
+
+                writeln!(f, "accumulator={}", A::static_name())?;
 
                 Ok(())
             }
@@ -1272,6 +1303,17 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
 ///
 /// For example, the [`MinMaxLeftAccumulator`] implementation collects minimum and maximum values for join key expressions across all build-side batches.
 pub trait CollectLeftAccumulator: Send + Sync {
+    /// Returns the name of the accumulator.
+    fn name(&self) -> &'static str;
+
+    /// Returns the static name of the accumulator type.
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        std::any::type_name::<Self>()
+    }
+
     /// Creates a new accumulator for the given expression and schema.
     ///
     /// # Arguments
@@ -1324,6 +1366,17 @@ pub struct MinMaxLeftAccumulator {
 }
 
 impl CollectLeftAccumulator for MinMaxLeftAccumulator {
+    fn name(&self) -> &'static str {
+        "MinMaxLeftAccumulator"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "MinMaxLeftAccumulator"
+    }
+
     fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> Result<Self> {
         /// Recursively unwraps dictionary types to get the underlying value type.
         fn dictionary_value_type(data_type: &DataType) -> DataType {
