@@ -538,6 +538,29 @@ impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
         })
     }
 
+    pub fn recreate_with_accumulator<B: CollectLeftAccumulator + 'static>(
+        &self,
+    ) -> Result<HashJoinExec<B>> {
+        Ok(HashJoinExec {
+            left: Arc::clone(&self.left),
+            right: Arc::clone(&self.right),
+            on: self.on.clone(),
+            filter: self.filter.clone(),
+            join_type: self.join_type,
+            join_schema: Arc::clone(&self.join_schema),
+            left_fut: Default::default(),
+            random_state: HASH_JOIN_SEED,
+            mode: self.mode,
+            metrics: self.metrics.clone(),
+            projection: self.projection.clone(),
+            column_indices: self.column_indices.clone(),
+            null_equality: self.null_equality,
+            cache: self.cache.clone(),
+            dynamic_filter: self.dynamic_filter.clone(),
+            _phantom_accumulator: PhantomData,
+        })
+    }
+
     fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
         // Extract the right-side keys (probe side keys) from the `on` clauses
         // Dynamic filter will be created from build side values (left side) and applied to probe side (right side)
