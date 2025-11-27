@@ -422,7 +422,6 @@ impl HashJoinStream {
             self.bounds_waiter = Some(OnceFut::new(async move {
                 bounds_accumulator
                     .report_partition_bounds(left_side_partition_id, left_data_bounds)
-                    .await
             }));
             self.state = HashJoinStreamState::WaitPartitionBoundsReport;
         } else {
