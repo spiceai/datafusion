@@ -526,6 +526,10 @@ impl HashJoinStream {
 
             self.build_waiter = Some(OnceFut::new(async move {
                 build_accumulator.report_build_data(build_data).await
+            let left_data_bounds = left_data.bounds.clone();
+            self.bounds_waiter = Some(OnceFut::new(async move {
+                bounds_accumulator
+                    .report_partition_bounds(left_side_partition_id, left_data_bounds)
             }));
             self.state = HashJoinStreamState::WaitPartitionBoundsReport;
         } else {
