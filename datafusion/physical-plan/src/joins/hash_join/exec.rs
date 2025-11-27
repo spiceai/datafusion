@@ -548,7 +548,7 @@ impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
             filter: self.filter.clone(),
             join_type: self.join_type,
             join_schema: Arc::clone(&self.join_schema),
-            left_fut: Default::default(),
+            left_fut: Arc::clone(&self.left_fut),
             random_state: HASH_JOIN_SEED,
             mode: self.mode,
             metrics: self.metrics.clone(),
