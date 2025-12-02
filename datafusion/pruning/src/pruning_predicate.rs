@@ -828,7 +828,7 @@ impl RequiredColumns {
     }
 
     /// rewrite col --> col_min
-    fn min_column_expr(
+    pub fn min_column_expr(
         &mut self,
         column: &phys_expr::Column,
         column_expr: &Arc<dyn PhysicalExpr>,
@@ -838,7 +838,7 @@ impl RequiredColumns {
     }
 
     /// rewrite col --> col_max
-    fn max_column_expr(
+    pub fn max_column_expr(
         &mut self,
         column: &phys_expr::Column,
         column_expr: &Arc<dyn PhysicalExpr>,
@@ -848,7 +848,7 @@ impl RequiredColumns {
     }
 
     /// rewrite col --> col_null_count
-    fn null_count_column_expr(
+    pub fn null_count_column_expr(
         &mut self,
         column: &phys_expr::Column,
         column_expr: &Arc<dyn PhysicalExpr>,
@@ -858,7 +858,7 @@ impl RequiredColumns {
     }
 
     /// rewrite col --> col_row_count
-    fn row_count_column_expr(
+    pub fn row_count_column_expr(
         &mut self,
         column: &phys_expr::Column,
         column_expr: &Arc<dyn PhysicalExpr>,
