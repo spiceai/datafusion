@@ -786,21 +786,12 @@ impl RequiredColumns {
         }
     }
 
-    /// Rewrites column_expr so that all appearances of column
-    /// are replaced with a reference to either the min or max
-    /// statistics column, while keeping track that a reference to the statistics
-    /// column is required
-    ///
-    /// for example, an expression like `col("foo") > 5`, when called
-    /// with Max would result in an expression like `col("foo_max") >
-    /// 5` with the appropriate entry noted in self.columns
-    fn stat_column_expr(
+    pub fn stat_column(
         &mut self,
         column: &phys_expr::Column,
-        column_expr: &Arc<dyn PhysicalExpr>,
         field: &Field,
         stat_type: StatisticsType,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
+    ) -> Result<phys_expr::Column> {
         let (idx, need_to_insert) = match self.find_stat_column(column, stat_type) {
             Some(idx) => (idx, false),
             None => (self.columns.len(), true),
@@ -824,6 +815,26 @@ impl RequiredColumns {
                 Field::new(stat_column.name(), field.data_type().clone(), nullable);
             self.columns.push((column.clone(), stat_type, stat_field));
         }
+
+        Ok(stat_column)
+    }
+
+    /// Rewrites column_expr so that all appearances of column
+    /// are replaced with a reference to either the min or max
+    /// statistics column, while keeping track that a reference to the statistics
+    /// column is required
+    ///
+    /// for example, an expression like `col("foo") > 5`, when called
+    /// with Max would result in an expression like `col("foo_max") >
+    /// 5` with the appropriate entry noted in self.columns
+    fn stat_column_expr(
+        &mut self,
+        column: &phys_expr::Column,
+        column_expr: &Arc<dyn PhysicalExpr>,
+        field: &Field,
+        stat_type: StatisticsType,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        let stat_column = self.stat_column(column, field, stat_type)?;
         rewrite_column_expr(Arc::clone(column_expr), column, &stat_column)
     }
 
