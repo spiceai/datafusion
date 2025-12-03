@@ -57,11 +57,25 @@ pub struct InListExpr {
 
 impl Debug for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        f.debug_struct("InListExpr")
-            .field("expr", &self.expr)
-            .field("list", &self.list)
-            .field("negated", &self.negated)
-            .finish()
+        let mut s = f.debug_struct("InListExpr");
+
+        s.field("expr", &self.expr);
+        s.field("negated", &self.negated);
+
+        if self.list.len() <= 5 {
+            s.field("list", &self.list);
+        } else {
+            s.field(
+                "list",
+                &format!(
+                    "[{:?}, .., {:?}]",
+                    self.list[0],
+                    self.list[self.list.len() - 1]
+                ),
+            );
+        }
+
+        s.finish()
     }
 }
 
@@ -308,16 +322,26 @@ impl InListExpr {
 
 impl std::fmt::Display for InListExpr {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let list = if self.list.len() <= 5 {
+            format!("{:?}", self.list.clone())
+        } else {
+            format!(
+                "[{:?}, .., {:?}]",
+                self.list[0],
+                self.list[self.list.len() - 1]
+            )
+        };
+
         if self.negated {
             if self.static_filter.is_some() {
-                write!(f, "{} NOT IN (SET) ({:?})", self.expr, self.list)
+                write!(f, "{} NOT IN (SET) ({list})", self.expr)
             } else {
-                write!(f, "{} NOT IN ({:?})", self.expr, self.list)
+                write!(f, "{} NOT IN ({list})", self.expr)
             }
         } else if self.static_filter.is_some() {
-            write!(f, "Use {} IN (SET) ({:?})", self.expr, self.list)
+            write!(f, "Use {} IN (SET) ({list})", self.expr)
         } else {
-            write!(f, "{} IN ({:?})", self.expr, self.list)
+            write!(f, "{} IN ({list})", self.expr)
         }
     }
 }
