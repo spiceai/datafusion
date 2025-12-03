@@ -319,6 +319,9 @@ impl SharedBoundsAccumulator {
         if completed == total_partitions && !inner.bounds.is_empty() {
             let filter_expr = self.create_filter_from_partition_bounds(&inner.bounds)?;
             self.dynamic_filter.update(filter_expr)?;
+        } else {
+            println!("completed {}/{} partitions", completed, total_partitions);
+            println!("current bounds: {:?}", inner.bounds);
         }
 
         Ok(())
