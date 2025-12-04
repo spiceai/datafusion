@@ -321,7 +321,6 @@ impl SharedBoundsAccumulator {
             self.dynamic_filter.update(filter_expr)?;
         } else {
             println!("completed {}/{} partitions", completed, total_partitions);
-            println!("current bounds: {:?}", inner.bounds);
         }
 
         Ok(())
