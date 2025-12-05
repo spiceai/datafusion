@@ -98,11 +98,11 @@ use datafusion_common::config::TableParquetOptions;
 use datafusion_common::{internal_err, not_impl_err, DataFusionError, Result};
 use datafusion_expr::{AggregateUDF, ScalarUDF, WindowUDF};
 
+use datafusion::physical_expr::async_scalar_function::AsyncFuncExpr;
+use datafusion::physical_plan::async_func::AsyncFuncExec;
 use datafusion::prelude::SessionContext;
 use prost::bytes::BufMut;
 use prost::Message;
-use datafusion::physical_expr::async_scalar_function::AsyncFuncExpr;
-use datafusion::physical_plan::async_func::AsyncFuncExec;
 
 pub mod from_proto;
 pub mod to_proto;
@@ -305,14 +305,13 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
             PhysicalPlanType::SortMergeJoin(sort_join) => {
                 self.try_into_sort_join(sort_join, ctx, runtime, extension_codec)
             }
-            PhysicalPlanType::AsyncFunc(async_func) => {
-                self.try_into_async_func_physical_plan(
+            PhysicalPlanType::AsyncFunc(async_func) => self
+                .try_into_async_func_physical_plan(
                     async_func,
                     ctx,
                     runtime,
                     extension_codec,
-                )
-            }
+                ),
         }
     }
 
@@ -522,6 +521,13 @@ impl AsExecutionPlan for protobuf::PhysicalPlanNode {
             {
                 return Ok(node);
             }
+        }
+
+        if let Some(exec) = plan.downcast_ref::<AsyncFuncExec>() {
+            return protobuf::PhysicalPlanNode::try_from_async_func_exec(
+                exec,
+                extension_codec,
+            );
         }
 
         let mut buf: Vec<u8> = vec![];

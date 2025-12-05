@@ -2570,6 +2570,7 @@ name = "datafusion-proto"
 version = "50.3.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "chrono",
  "datafusion",
  "datafusion-common",
