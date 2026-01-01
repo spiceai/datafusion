@@ -1223,16 +1223,17 @@ mod tests {
             .unwrap();
         assert_eq!(id_array.value(0), 1);
 
+        // Check year column (partition value)
         let year_idx = *field_indices.get("year").unwrap();
         let year_col = projected_batch.column(year_idx);
         let year_array = year_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(year_array.value(0), "a");
+        assert_eq!(year_array.value(0), "2023");
 
-        // Check value column
+        // Check value column (file data)
         let value_idx = *field_indices.get("value").unwrap();
         let value_col = projected_batch.column(value_idx);
         let value_array = value_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(value_array.value(0), "2023");
+        assert_eq!(value_array.value(0), "a");
 
         // Check size column
         let size_idx = *field_indices.get("size").unwrap();
