@@ -1368,58 +1368,90 @@ impl ExtendedColumnProjector {
         // Start with the columns from the file batch
         let mut cols = file_batch.columns().to_vec();
 
-        // Insert partition columns
-        for &(pidx, sidx) in &self.projected_partition_indexes {
-            // Get the partition value from the provided values
-            let p_value = partition_values.get(pidx).ok_or_else(|| {
-                DataFusionError::Execution(
-                    "Invalid partitioning found on disk".to_string(),
-                )
-            })?;
-
-            let mut partition_value = Cow::Borrowed(p_value);
-
-            // Check if user forgot to dict-encode the partition value and apply auto-fix if needed
-            let field = self.projected_schema.field(sidx);
-            let expected_data_type = field.data_type();
-            let actual_data_type = partition_value.data_type();
-            if let DataType::Dictionary(key_type, _) = expected_data_type {
-                if !matches!(actual_data_type, DataType::Dictionary(_, _)) {
-                    warn!("Partition value for column {} was not dictionary-encoded, applied auto-fix.", field.name());
-                    partition_value = Cow::Owned(ScalarValue::Dictionary(
-                        key_type.clone(),
-                        Box::new(partition_value.as_ref().clone()),
-                    ));
-                }
-            }
-
-            // Create array and insert at the correct schema position
-            cols.insert(
-                sidx,
-                create_output_array(
-                    &mut self.key_buffer_cache,
-                    partition_value.as_ref(),
-                    file_batch.num_rows(),
-                )?,
-            );
+        // Collect all columns to insert (both partition and metadata) with their schema indices
+        // We need to insert them in ascending order by schema index to avoid index shifting issues
+        enum InsertColumn<'a> {
+            Partition { pidx: usize, sidx: usize },
+            Metadata { sidx: usize, field_name: &'a str },
         }
 
-        // Insert metadata columns
+        let mut inserts: Vec<InsertColumn> = Vec::with_capacity(
+            self.projected_partition_indexes.len()
+                + self.projected_metadata_indexes.len(),
+        );
+
+        for &(pidx, sidx) in &self.projected_partition_indexes {
+            inserts.push(InsertColumn::Partition { pidx, sidx });
+        }
+
         for &sidx in &self.projected_metadata_indexes {
-            // Get the metadata column type from the field name
             let field_name = self.projected_schema.field(sidx).name();
-            let metadata_col = self.metadata_map.get(field_name).ok_or_else(|| {
-                DataFusionError::Execution(format!(
-                    "Invalid metadata column: {}",
-                    field_name
-                ))
-            })?;
+            inserts.push(InsertColumn::Metadata { sidx, field_name });
+        }
 
-            // Convert metadata to scalar value based on the column type
-            let scalar_value = metadata_col.to_scalar_value(metadata);
+        // Sort by schema index to ensure correct insertion order
+        inserts.sort_by_key(|insert| match insert {
+            InsertColumn::Partition { sidx, .. } => *sidx,
+            InsertColumn::Metadata { sidx, .. } => *sidx,
+        });
 
-            // Create array and insert at the correct schema position
-            cols.insert(sidx, scalar_value.to_array_of_size(file_batch.num_rows())?);
+        // Insert columns in sorted order
+        for insert in inserts {
+            match insert {
+                InsertColumn::Partition { pidx, sidx } => {
+                    // Get the partition value from the provided values
+                    let p_value = partition_values.get(pidx).ok_or_else(|| {
+                        DataFusionError::Execution(
+                            "Invalid partitioning found on disk".to_string(),
+                        )
+                    })?;
+
+                    let mut partition_value = Cow::Borrowed(p_value);
+
+                    // Check if user forgot to dict-encode the partition value and apply auto-fix if needed
+                    let field = self.projected_schema.field(sidx);
+                    let expected_data_type = field.data_type();
+                    let actual_data_type = partition_value.data_type();
+                    if let DataType::Dictionary(key_type, _) = expected_data_type {
+                        if !matches!(actual_data_type, DataType::Dictionary(_, _)) {
+                            warn!("Partition value for column {} was not dictionary-encoded, applied auto-fix.", field.name());
+                            partition_value = Cow::Owned(ScalarValue::Dictionary(
+                                key_type.clone(),
+                                Box::new(partition_value.as_ref().clone()),
+                            ));
+                        }
+                    }
+
+                    // Create array and insert at the correct schema position
+                    cols.insert(
+                        sidx,
+                        create_output_array(
+                            &mut self.key_buffer_cache,
+                            partition_value.as_ref(),
+                            file_batch.num_rows(),
+                        )?,
+                    );
+                }
+                InsertColumn::Metadata { sidx, field_name } => {
+                    // Get the metadata column type from the field name
+                    let metadata_col =
+                        self.metadata_map.get(field_name).ok_or_else(|| {
+                            DataFusionError::Execution(format!(
+                                "Invalid metadata column: {}",
+                                field_name
+                            ))
+                        })?;
+
+                    // Convert metadata to scalar value based on the column type
+                    let scalar_value = metadata_col.to_scalar_value(metadata);
+
+                    // Create array and insert at the correct schema position
+                    cols.insert(
+                        sidx,
+                        scalar_value.to_array_of_size(file_batch.num_rows())?,
+                    );
+                }
+            }
         }
 
         // Create a new record batch with all columns in the correct order
@@ -2975,6 +3007,543 @@ mod tests {
         );
         assert_eq!(new_config.constraints, Constraints::default());
         assert!(new_config.new_lines_in_values);
+    }
+
+    /// Regression test for the bug where metadata and partition columns were
+    /// inserted incorrectly when their schema indices were interleaved.
+    ///
+    /// The bug was that partition columns were inserted first (using their schema indices),
+    /// then metadata columns were inserted (also using their schema indices). But after
+    /// inserting partition columns, the indices shift, causing metadata columns to be
+    /// inserted at wrong positions.
+    ///
+    /// This test creates a schema where:
+    /// - file column at index 0
+    /// - metadata column at index 1 (location)
+    /// - partition column at index 2 (year)
+    /// - metadata column at index 3 (size)
+    /// - partition column at index 4 (month)
+    ///
+    /// Without the fix, the columns would be inserted in wrong positions.
+    #[test]
+    fn test_partition_metadata_interleaved_schema_indices() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::Int32,
+            false,
+        )]));
+
+        // Create partition and metadata columns
+        let partition_cols = vec!["year".to_string(), "month".to_string()];
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
+
+        // Create a projected schema where partition and metadata columns are interleaved:
+        // [data, location, year, size, month]
+        let projected_fields = vec![
+            Field::new("data", DataType::Int32, false), // index 0 - file
+            metadata_cols[0].field(),                   // index 1 - location (metadata)
+            Field::new(
+                "year",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Int32),
+                ),
+                true,
+            ), // index 2 - year (partition)
+            metadata_cols[1].field(),                   // index 3 - size (metadata)
+            Field::new(
+                "month",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Int32),
+                ),
+                true,
+            ), // index 4 - month (partition)
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        // Create projector
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &partition_cols,
+            &metadata_cols,
+        );
+
+        // Create test data
+        let file_batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Int32Array::from(vec![100, 200, 300]))],
+        )
+        .unwrap();
+
+        let partition_values = vec![
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::Int32(Some(2024))),
+            ),
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::Int32(Some(6))),
+            ),
+        ];
+
+        let object_meta = create_test_object_meta("test/file.parquet", 2048);
+
+        // Apply projection
+        let result = projector
+            .project(file_batch, &partition_values, &object_meta)
+            .unwrap();
+
+        // Verify the schema matches expected order
+        assert_eq!(result.num_columns(), 5);
+        assert_eq!(result.schema().field(0).name(), "data");
+        assert_eq!(result.schema().field(1).name(), "location");
+        assert_eq!(result.schema().field(2).name(), "year");
+        assert_eq!(result.schema().field(3).name(), "size");
+        assert_eq!(result.schema().field(4).name(), "month");
+
+        // Verify the values are correct in each column
+        let data_col = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(data_col.value(0), 100);
+        assert_eq!(data_col.value(1), 200);
+        assert_eq!(data_col.value(2), 300);
+
+        let location_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(location_col.value(0), "test/file.parquet");
+
+        let size_col = result
+            .column(3)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(size_col.value(0), 2048);
+    }
+
+    /// Test where metadata column comes before partition column in schema
+    #[test]
+    fn test_metadata_before_partition_in_schema() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+
+        let partition_cols = vec!["part".to_string()];
+        let metadata_cols = vec![MetadataColumn::Size];
+
+        // Schema: [value, size, part]
+        let projected_fields = vec![
+            Field::new("value", DataType::Int32, false),
+            metadata_cols[0].field(), // index 1 - metadata
+            Field::new(
+                "part",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ), // index 2 - partition
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &partition_cols,
+            &metadata_cols,
+        );
+
+        let file_batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Int32Array::from(vec![42]))],
+        )
+        .unwrap();
+
+        let partition_values = vec![ScalarValue::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(ScalarValue::from("A")),
+        )];
+
+        let object_meta = create_test_object_meta("path/to/file", 512);
+
+        let result = projector
+            .project(file_batch, &partition_values, &object_meta)
+            .unwrap();
+
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.schema().field(0).name(), "value");
+        assert_eq!(result.schema().field(1).name(), "size");
+        assert_eq!(result.schema().field(2).name(), "part");
+
+        // Verify values
+        let size_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(size_col.value(0), 512);
+    }
+
+    /// Test where partition column comes before metadata column in schema
+    #[test]
+    fn test_partition_before_metadata_in_schema() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int32,
+            false,
+        )]));
+
+        let partition_cols = vec!["part".to_string()];
+        let metadata_cols = vec![MetadataColumn::Location(None)];
+
+        // Schema: [value, part, location]
+        let projected_fields = vec![
+            Field::new("value", DataType::Int32, false),
+            Field::new(
+                "part",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ), // index 1 - partition
+            metadata_cols[0].field(), // index 2 - metadata
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &partition_cols,
+            &metadata_cols,
+        );
+
+        let file_batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Int32Array::from(vec![99]))],
+        )
+        .unwrap();
+
+        let partition_values = vec![ScalarValue::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(ScalarValue::from("B")),
+        )];
+
+        let object_meta = create_test_object_meta("another/path", 256);
+
+        let result = projector
+            .project(file_batch, &partition_values, &object_meta)
+            .unwrap();
+
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.schema().field(0).name(), "value");
+        assert_eq!(result.schema().field(1).name(), "part");
+        assert_eq!(result.schema().field(2).name(), "location");
+
+        let location_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(location_col.value(0), "another/path");
+    }
+
+    /// Test with multiple file columns and interleaved partition/metadata columns
+    #[test]
+    fn test_multiple_file_cols_with_interleaved_partition_metadata() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("col_a", DataType::Int32, false),
+            Field::new("col_b", DataType::Int32, false),
+            Field::new("col_c", DataType::Int32, false),
+        ]));
+
+        let partition_cols = vec!["p1".to_string(), "p2".to_string()];
+        let metadata_cols = vec![MetadataColumn::Size, MetadataColumn::LastModified];
+
+        // Schema: [col_a, size, col_b, p1, last_modified, col_c, p2]
+        let projected_fields = vec![
+            Field::new("col_a", DataType::Int32, false), // 0 - file
+            metadata_cols[0].field(),                    // 1 - size (metadata)
+            Field::new("col_b", DataType::Int32, false), // 2 - file
+            Field::new(
+                "p1",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ), // 3 - partition
+            metadata_cols[1].field(),                    // 4 - last_modified (metadata)
+            Field::new("col_c", DataType::Int32, false), // 5 - file
+            Field::new(
+                "p2",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ), // 6 - partition
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &partition_cols,
+            &metadata_cols,
+        );
+
+        let file_batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(Int32Array::from(vec![10, 20])),
+                Arc::new(Int32Array::from(vec![100, 200])),
+            ],
+        )
+        .unwrap();
+
+        let partition_values = vec![
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::from("X")),
+            ),
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::from("Y")),
+            ),
+        ];
+
+        let object_meta = create_test_object_meta("complex/path", 4096);
+
+        let result = projector
+            .project(file_batch, &partition_values, &object_meta)
+            .unwrap();
+
+        // Verify schema order
+        assert_eq!(result.num_columns(), 7);
+        assert_eq!(result.schema().field(0).name(), "col_a");
+        assert_eq!(result.schema().field(1).name(), "size");
+        assert_eq!(result.schema().field(2).name(), "col_b");
+        assert_eq!(result.schema().field(3).name(), "p1");
+        assert_eq!(result.schema().field(4).name(), "last_modified");
+        assert_eq!(result.schema().field(5).name(), "col_c");
+        assert_eq!(result.schema().field(6).name(), "p2");
+
+        // Verify file column values
+        let col_a = result
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col_a.value(0), 1);
+        assert_eq!(col_a.value(1), 2);
+
+        let col_b = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col_b.value(0), 10);
+        assert_eq!(col_b.value(1), 20);
+
+        let col_c = result
+            .column(5)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(col_c.value(0), 100);
+        assert_eq!(col_c.value(1), 200);
+
+        // Verify metadata column values
+        let size_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(size_col.value(0), 4096);
+        assert_eq!(size_col.value(1), 4096);
+    }
+
+    /// Test with only partition columns (no metadata)
+    #[test]
+    fn test_only_partition_columns() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::Int32,
+            false,
+        )]));
+
+        let partition_cols = vec!["p1".to_string(), "p2".to_string()];
+
+        // Schema: [data, p1, p2]
+        let projected_fields = vec![
+            Field::new("data", DataType::Int32, false),
+            Field::new(
+                "p1",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ),
+            Field::new(
+                "p2",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ),
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &partition_cols,
+            &[], // No metadata columns
+        );
+
+        let file_batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+
+        let partition_values = vec![
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::from("val1")),
+            ),
+            ScalarValue::Dictionary(
+                Box::new(DataType::UInt16),
+                Box::new(ScalarValue::from("val2")),
+            ),
+        ];
+
+        let object_meta = create_test_object_meta("file", 100);
+
+        let result = projector
+            .project(file_batch, &partition_values, &object_meta)
+            .unwrap();
+
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.schema().field(0).name(), "data");
+        assert_eq!(result.schema().field(1).name(), "p1");
+        assert_eq!(result.schema().field(2).name(), "p2");
+    }
+
+    /// Test with only metadata columns (no partitions)
+    #[test]
+    fn test_only_metadata_columns() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::Int32,
+            false,
+        )]));
+
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
+
+        // Schema: [data, location, size]
+        let projected_fields = vec![
+            Field::new("data", DataType::Int32, false),
+            metadata_cols[0].field(),
+            metadata_cols[1].field(),
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &[], // No partition columns
+            &metadata_cols,
+        );
+
+        let file_batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(Int32Array::from(vec![7, 8, 9]))],
+        )
+        .unwrap();
+
+        let object_meta = create_test_object_meta("meta/file.dat", 999);
+
+        let result = projector.project(file_batch, &[], &object_meta).unwrap();
+
+        assert_eq!(result.num_columns(), 3);
+        assert_eq!(result.schema().field(0).name(), "data");
+        assert_eq!(result.schema().field(1).name(), "location");
+        assert_eq!(result.schema().field(2).name(), "size");
+
+        let location_col = result
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(location_col.value(0), "meta/file.dat");
+
+        let size_col = result
+            .column(2)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap();
+        assert_eq!(size_col.value(0), 999);
+    }
+
+    /// Test with no file columns, only partition and metadata
+    #[test]
+    fn test_no_file_columns() {
+        let file_schema = Arc::new(Schema::empty());
+
+        let partition_cols = vec!["part".to_string()];
+        let metadata_cols = vec![MetadataColumn::Size];
+
+        // Schema: [part, size]
+        let projected_fields = vec![
+            Field::new(
+                "part",
+                DataType::Dictionary(
+                    Box::new(DataType::UInt16),
+                    Box::new(DataType::Utf8),
+                ),
+                true,
+            ),
+            metadata_cols[0].field(),
+        ];
+        let projected_schema = Arc::new(Schema::new(projected_fields));
+
+        let mut projector = ExtendedColumnProjector::new(
+            Arc::clone(&projected_schema),
+            &partition_cols,
+            &metadata_cols,
+        );
+
+        // Create an empty batch with 5 rows using RecordBatchOptions
+        let file_batch = RecordBatch::try_new_with_options(
+            Arc::clone(&file_schema),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(5)),
+        )
+        .unwrap();
+
+        let partition_values = vec![ScalarValue::Dictionary(
+            Box::new(DataType::UInt16),
+            Box::new(ScalarValue::from("partition_value")),
+        )];
+
+        let object_meta = create_test_object_meta("empty_file", 0);
+
+        let result = projector
+            .project(file_batch, &partition_values, &object_meta)
+            .unwrap();
+
+        assert_eq!(result.num_columns(), 2);
+        assert_eq!(result.num_rows(), 5);
+        assert_eq!(result.schema().field(0).name(), "part");
+        assert_eq!(result.schema().field(1).name(), "size");
     }
 
     #[test]
