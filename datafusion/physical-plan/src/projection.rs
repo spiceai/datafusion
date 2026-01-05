@@ -398,7 +398,11 @@ fn stats_projection(
     let mut column_statistics = vec![];
     for expr in exprs {
         let col_stats = if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-            stats.column_statistics[col.index()].clone()
+            stats
+                .column_statistics
+                .get(col.index())
+                .cloned()
+                .unwrap_or_else(ColumnStatistics::new_unknown)
         } else {
             // TODO stats: estimate more statistics from expressions
             // (expressions should compute their statistics themselves)

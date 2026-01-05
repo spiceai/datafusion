@@ -38,9 +38,9 @@ pub mod file_scan_config;
 pub mod file_sink_config;
 pub mod file_stream;
 pub mod memory;
+pub mod metadata;
 pub mod schema_adapter;
 pub mod sink;
-pub mod metadata;
 pub mod source;
 mod statistics;
 
@@ -439,10 +439,20 @@ pub fn verify_sort_integrity(file_groups: &[FileGroup]) -> bool {
             if let (Some(prev_stats), Some(curr_stats)) =
                 (&prev_file.statistics, &curr_file.statistics)
             {
-                let prev_max = &prev_stats.column_statistics[0].max_value;
-                let curr_min = &curr_stats.column_statistics[0].min_value;
-                if curr_min.get_value().unwrap() <= prev_max.get_value().unwrap() {
-                    return false;
+                let (Some(prev_col_stats), Some(curr_col_stats)) = (
+                    prev_stats.column_statistics.first(),
+                    curr_stats.column_statistics.first(),
+                ) else {
+                    continue;
+                };
+                let prev_max = &prev_col_stats.max_value;
+                let curr_min = &curr_col_stats.min_value;
+                if let (Some(curr_min_val), Some(prev_max_val)) =
+                    (curr_min.get_value(), prev_max.get_value())
+                {
+                    if curr_min_val <= prev_max_val {
+                        return false;
+                    }
                 }
             }
         }
