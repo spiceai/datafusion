@@ -3788,6 +3788,7 @@ mod test {
         let placeholder_expr = Expr::Placeholder(Placeholder {
             id: "$1".to_string(),
             field: None,
+            data_type: None,
         });
         let in_list = Expr::InList(InList {
             expr: Box::new(placeholder_expr),
@@ -3816,6 +3817,8 @@ mod test {
                     assert_eq!(
                         placeholder.field.as_ref().unwrap().data_type(),
                         &DataType::Int32,
+                        placeholder.data_type,
+                        Some(DataType::Int32),
                         "Placeholder {} should infer Int32",
                         placeholder.id
                     );
@@ -3840,6 +3843,7 @@ mod test {
         let placeholder = Expr::Placeholder(Placeholder {
             id: "$1".to_string(),
             field: None,
+            data_type: None,
         });
 
         // Subquery: SELECT A FROM my_table WHERE B > 3
@@ -3896,6 +3900,8 @@ mod test {
                     assert_eq!(
                         placeholder.field.as_ref().unwrap().data_type(),
                         &DataType::Int32,
+                        placeholder.data_type,
+                        Some(DataType::Int32),
                         "Placeholder $1 should infer Int32"
                     );
                 }
