@@ -891,6 +891,7 @@ mod test {
                 enable_bloom_filter: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
+                tolerate_missing_page_index: false,
                 coerce_int96: None,
                 #[cfg(feature = "parquet_encryption")]
                 file_decryption_properties: None,
@@ -964,6 +965,7 @@ mod test {
                 enable_bloom_filter: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
+                tolerate_missing_page_index: false,
                 coerce_int96: None,
                 #[cfg(feature = "parquet_encryption")]
                 file_decryption_properties: None,
@@ -1053,6 +1055,7 @@ mod test {
                 enable_bloom_filter: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
+                tolerate_missing_page_index: false,
                 coerce_int96: None,
                 #[cfg(feature = "parquet_encryption")]
                 file_decryption_properties: None,
@@ -1145,6 +1148,7 @@ mod test {
                 enable_bloom_filter: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: false, // note that this is false!
+                tolerate_missing_page_index: false,
                 coerce_int96: None,
                 #[cfg(feature = "parquet_encryption")]
                 file_decryption_properties: None,
@@ -1237,6 +1241,7 @@ mod test {
                 enable_bloom_filter: false,
                 schema_adapter_factory: Arc::new(DefaultSchemaAdapterFactory),
                 enable_row_group_stats_pruning: true,
+                tolerate_missing_page_index: false,
                 coerce_int96: None,
                 #[cfg(feature = "parquet_encryption")]
                 file_decryption_properties: None,
@@ -1387,6 +1392,7 @@ mod test {
             enable_bloom_filter: false,
             schema_adapter_factory: Arc::new(CustomSchemaAdapterFactory),
             enable_row_group_stats_pruning: false,
+            tolerate_missing_page_index: false,
             coerce_int96: None,
             #[cfg(feature = "parquet_encryption")]
             file_decryption_properties: None,

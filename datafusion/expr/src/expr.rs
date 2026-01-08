@@ -3575,6 +3575,131 @@ mod test {
     }
 
     #[test]
+    fn infer_placeholder_in_clause_with_placeholder_expr() {
+        // SELECT * FROM employees WHERE $1 IN (1, 2, 3);
+        let placeholder_expr = Expr::Placeholder(Placeholder {
+            id: "$1".to_string(),
+            data_type: None,
+        });
+        let in_list = Expr::InList(InList {
+            expr: Box::new(placeholder_expr),
+            list: vec![
+                Expr::Literal(ScalarValue::Int32(Some(1)), None),
+                Expr::Literal(ScalarValue::Int32(Some(2)), None),
+                Expr::Literal(ScalarValue::Int32(Some(3)), None),
+            ],
+            negated: false,
+        });
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, true),
+            Field::new("department_id", DataType::Int32, true),
+        ]));
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        let (inferred_expr, contains_placeholder) =
+            in_list.infer_placeholder_types(&df_schema).unwrap();
+
+        assert!(contains_placeholder);
+
+        match inferred_expr {
+            Expr::InList(in_list) => match *in_list.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int32),
+                        "Placeholder {} should infer Int32",
+                        placeholder.id
+                    );
+                }
+                _ => panic!("Expected Placeholder expression"),
+            },
+            _ => panic!("Expected InList expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_in_subquery() -> Result<()> {
+        // Schema for my_table: A (Int32), B (Int32)
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("A", DataType::Int32, true),
+            Field::new("B", DataType::Int32, true),
+        ]));
+
+        let source = Arc::new(LogicalTableSource::new(Arc::clone(&schema)));
+
+        // Simulate: SELECT * FROM my_table WHERE $1 IN (SELECT A FROM my_table WHERE B > 3);
+        let placeholder = Expr::Placeholder(Placeholder {
+            id: "$1".to_string(),
+            data_type: None,
+        });
+
+        // Subquery: SELECT A FROM my_table WHERE B > 3
+        let subquery_filter = Expr::BinaryExpr(BinaryExpr {
+            left: Box::new(col("B")),
+            op: Operator::Gt,
+            right: Box::new(Expr::Literal(ScalarValue::Int32(Some(3)), None)),
+        });
+
+        let subquery_scan = LogicalPlan::TableScan(TableScan {
+            table_name: TableReference::from("my_table"),
+            source,
+            projected_schema: Arc::new(DFSchema::try_from(schema.as_ref().clone())?),
+            projection: None,
+            filters: vec![subquery_filter.clone()],
+            fetch: None,
+        });
+
+        let projected_fields = vec![Field::new("A", DataType::Int32, true)];
+        let projected_schema = Arc::new(DFSchema::from_unqualified_fields(
+            projected_fields.into(),
+            Default::default(),
+        )?);
+
+        let subquery = Subquery {
+            subquery: Arc::new(LogicalPlan::Projection(Projection {
+                expr: vec![col("A")],
+                input: Arc::new(subquery_scan),
+                schema: projected_schema,
+            })),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        };
+
+        let in_subquery = Expr::InSubquery(InSubquery {
+            expr: Box::new(placeholder),
+            subquery,
+            negated: false,
+        });
+
+        let df_schema = DFSchema::try_from(schema)?;
+
+        let (inferred_expr, contains_placeholder) =
+            in_subquery.infer_placeholder_types(&df_schema)?;
+
+        assert!(
+            contains_placeholder,
+            "Expression should contain a placeholder"
+        );
+
+        match inferred_expr {
+            Expr::InSubquery(in_subquery) => match *in_subquery.expr {
+                Expr::Placeholder(placeholder) => {
+                    assert_eq!(
+                        placeholder.data_type,
+                        Some(DataType::Int32),
+                        "Placeholder $1 should infer Int32"
+                    );
+                }
+                _ => panic!("Expected Placeholder expression in InSubquery"),
+            },
+            _ => panic!("Expected InSubquery expression"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn infer_placeholder_like_and_similar_to() {
         // name LIKE $1
         let schema =
