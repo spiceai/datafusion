@@ -819,7 +819,11 @@ impl FileScanConfig {
             .into_iter()
             .map(|idx| {
                 if idx < self.file_schema.fields().len() {
-                    statistics.column_statistics[idx].clone()
+                    statistics
+                        .column_statistics
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or_else(ColumnStatistics::new_unknown)
                 } else {
                     // TODO provide accurate stat for partition column (#1186)
                     ColumnStatistics::new_unknown()
