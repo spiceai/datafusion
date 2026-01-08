@@ -882,15 +882,14 @@ impl AggregateExec {
 
             for (idx, (expr, _)) in self.group_by.expr.iter().enumerate() {
                 if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                    column_statistics[idx].max_value = child_statistics.column_statistics
-                        [col.index()]
-                    .max_value
-                    .clone();
-
-                    column_statistics[idx].min_value = child_statistics.column_statistics
-                        [col.index()]
-                    .min_value
-                    .clone();
+                    if let Some(child_col_stats) =
+                        child_statistics.column_statistics.get(col.index())
+                    {
+                        column_statistics[idx].max_value =
+                            child_col_stats.max_value.clone();
+                        column_statistics[idx].min_value =
+                            child_col_stats.min_value.clone();
+                    }
                 }
             }
 
