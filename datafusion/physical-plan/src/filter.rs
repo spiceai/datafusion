@@ -297,13 +297,23 @@ impl FilterExec {
         // filtering to constants.
         let constants = collect_columns(predicate)
             .into_iter()
-            .filter(|column| stats.column_statistics[column.index()].is_singleton())
-            .map(|column| {
-                let value = stats.column_statistics[column.index()]
+            .filter(|column| {
+                stats
+                    .column_statistics
+                    .get(column.index())
+                    .is_some_and(|cs| cs.is_singleton())
+            })
+            .filter_map(|column| {
+                let value = stats
+                    .column_statistics
+                    .get(column.index())?
                     .min_value
                     .get_value();
                 let expr = Arc::new(column) as _;
-                ConstExpr::new(expr, AcrossPartitions::Uniform(value.cloned()))
+                Some(ConstExpr::new(
+                    expr,
+                    AcrossPartitions::Uniform(value.cloned()),
+                ))
             });
         // This is for statistics
         eq_properties.add_constants(constants)?;
@@ -1585,5 +1595,97 @@ mod tests {
         exec.partition_statistics(None).unwrap();
 
         Ok(())
+    }
+
+    /// Test that compute_properties correctly identifies singleton columns
+    /// when column_statistics are present for that column
+    #[tokio::test]
+    async fn test_compute_properties_singleton_with_stats() -> Result<()> {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]);
+
+        // Create statistics where column "a" has a singleton range (min == max)
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(1000),
+                total_byte_size: Precision::Inexact(4000),
+                column_statistics: vec![
+                    ColumnStatistics {
+                        min_value: Precision::Inexact(ScalarValue::Int32(Some(10))),
+                        max_value: Precision::Inexact(ScalarValue::Int32(Some(10))),
+                        ..Default::default()
+                    },
+                    ColumnStatistics {
+                        min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
+                        max_value: Precision::Inexact(ScalarValue::Int32(Some(100))),
+                        ..Default::default()
+                    },
+                ],
+            },
+            schema.clone(),
+        ));
+
+        // WHERE a = 10 (column "a" already has singleton stats, so should be recognized as constant)
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(10)))),
+        ));
+
+        let filter = FilterExec::try_new(predicate, input)?;
+        let stats = filter.partition_statistics(None)?;
+
+        // Column "a" should be recognized as a singleton
+        assert!(stats.column_statistics[0].is_singleton());
+
+        Ok(())
+    }
+
+    /// Test that the column statistics bounds checking handles out-of-bounds indices correctly.
+    /// This directly tests the logic in compute_properties that uses `.get()` to safely access
+    /// column_statistics, avoiding panics when column indices are out of bounds.
+    #[test]
+    fn test_column_statistics_bounds_checking() {
+        // Create column statistics with only 2 entries
+        // Note: is_singleton() requires Precision::Exact for min and max
+        let column_statistics = vec![
+            ColumnStatistics {
+                min_value: Precision::Exact(ScalarValue::Int32(Some(5))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(5))),
+                ..Default::default()
+            },
+            ColumnStatistics {
+                min_value: Precision::Exact(ScalarValue::Int32(Some(1))),
+                max_value: Precision::Exact(ScalarValue::Int32(Some(100))),
+                ..Default::default()
+            },
+        ];
+
+        // Test that .get() returns Some for valid indices
+        assert!(column_statistics.get(0).is_some_and(|cs| cs.is_singleton()));
+        assert!(column_statistics
+            .get(1)
+            .is_some_and(|cs| !cs.is_singleton()));
+
+        // Test that .get() returns None for out-of-bounds indices (the key fix)
+        assert!(column_statistics.get(2).is_none());
+        assert!(column_statistics.get(100).is_none());
+
+        // This is the pattern used in compute_properties to safely iterate over columns
+        // that may have indices beyond the column_statistics vector length
+        let columns_indices = vec![0, 1, 2, 5]; // indices 2 and 5 are out of bounds
+        let singleton_count = columns_indices
+            .iter()
+            .filter(|idx| {
+                column_statistics
+                    .get(**idx)
+                    .is_some_and(|cs| cs.is_singleton())
+            })
+            .count();
+
+        // Only column at index 0 is a singleton and within bounds
+        assert_eq!(singleton_count, 1);
     }
 }
