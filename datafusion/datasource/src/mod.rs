@@ -591,3 +591,4 @@ mod tests {
         assert!(url.contains(&Path::parse("/var/data/mytable/").unwrap(), false));
     }
 }
+pub mod metadata;
