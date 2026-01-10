@@ -69,6 +69,8 @@ use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
 use log::{debug, warn};
+#[cfg(feature = "parquet")]
+use parquet::arrow::async_reader::ObjectVersionType;
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -201,6 +203,10 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// Object versioning type for reading files.
+    /// This is used to handle different versions of objects in object stores.
+    #[cfg(feature = "parquet")]
+    pub object_versioning_type: Option<ObjectVersionType>,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -276,6 +282,8 @@ pub struct FileScanConfigBuilder {
     new_lines_in_values: Option<bool>,
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    #[cfg(feature = "parquet")]
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl FileScanConfigBuilder {
@@ -304,6 +312,8 @@ impl FileScanConfigBuilder {
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
+            #[cfg(feature = "parquet")]
+            object_versioning_type: None,
         }
     }
 
@@ -444,6 +454,17 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Set the object versioning type for reading files.
+    /// This is used to handle different versions of objects in object stores.
+    #[cfg(feature = "parquet")]
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
+    }
+
     /// Build the final [`FileScanConfig`] with all the configured settings.
     ///
     /// This method takes ownership of the builder and returns the constructed `FileScanConfig`.
@@ -463,6 +484,8 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            #[cfg(feature = "parquet")]
+            object_versioning_type,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -495,6 +518,8 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            #[cfg(feature = "parquet")]
+            object_versioning_type,
         }
     }
 }
@@ -517,6 +542,8 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
+            #[cfg(feature = "parquet")]
+            object_versioning_type: config.object_versioning_type,
         }
     }
 }

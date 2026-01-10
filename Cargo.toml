@@ -91,19 +91,19 @@ ahash = { version = "0.8", default-features = false, features = [
     "runtime-rng",
 ] }
 apache-avro = { version = "0.20", default-features = false }
-arrow = { version = "57.0.0", features = [
+arrow = { version = "57.1.0", features = [
     "prettyprint",
     "chrono-tz",
 ] }
-arrow-buffer = { version = "57.0.0", default-features = false }
-arrow-flight = { version = "57.0.0", features = [
+arrow-buffer = { version = "57.1.0", default-features = false }
+arrow-flight = { version = "57.1.0", features = [
     "flight-sql-experimental",
 ] }
-arrow-ipc = { version = "57.0.0", default-features = false, features = [
+arrow-ipc = { version = "57.1.0", default-features = false, features = [
     "lz4",
 ] }
-arrow-ord = { version = "57.0.0", default-features = false }
-arrow-schema = { version = "57.0.0", default-features = false }
+arrow-ord = { version = "57.1.0", default-features = false }
+arrow-schema = { version = "57.1.0", default-features = false }
 async-trait = "0.1.89"
 bigdecimal = "0.4.8"
 bytes = "1.10"
@@ -162,7 +162,7 @@ log = "^0.4"
 num-traits = { version = "0.2" }
 object_store = { version = "0.12.4", default-features = false }
 parking_lot = "0.12"
-parquet = { version = "57.0.0", default-features = false, features = [
+parquet = { version = "57.1.0", default-features = false, features = [
     "arrow",
     "async",
     "object_store",
@@ -262,3 +262,22 @@ incremental = false
 inherits = "release"
 debug = true
 strip = false
+
+# spiceai patch section for arrow-rs with ObjectVersionType support
+[patch.crates-io]
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
