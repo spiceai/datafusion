@@ -612,7 +612,7 @@ impl PruningPredicate {
 
 /// Builds the return `Vec` for [`PruningPredicate::prune`].
 #[derive(Debug)]
-struct BoolVecBuilder {
+pub struct BoolVecBuilder {
     /// One element per container. Each element is
     /// * `true`: if the container has row that may pass the predicate
     /// * `false`: if the container has rows that DEFINITELY DO NOT pass the predicate
@@ -621,7 +621,7 @@ struct BoolVecBuilder {
 
 impl BoolVecBuilder {
     /// Create a new `BoolVecBuilder` with `num_containers` elements
-    fn new(num_containers: usize) -> Self {
+    pub fn new(num_containers: usize) -> Self {
         Self {
             // assume by default all containers may pass the predicate
             inner: vec![true; num_containers],
@@ -652,7 +652,7 @@ impl BoolVecBuilder {
     ///
     /// # Panics
     /// If `value` is not boolean
-    fn combine_value(&mut self, value: ColumnarValue) {
+    pub fn combine_value(&mut self, value: ColumnarValue) {
         match value {
             ColumnarValue::Array(array) => {
                 self.combine_array(array.as_boolean());
@@ -669,12 +669,12 @@ impl BoolVecBuilder {
     }
 
     /// Convert this builder into a Vec of bools
-    fn build(self) -> Vec<bool> {
+    pub fn build(self) -> Vec<bool> {
         self.inner
     }
 
     /// Check all containers has rows that DEFINITELY DO NOT pass the predicate
-    fn check_all_pruned(&self) -> bool {
+    pub fn check_all_pruned(&self) -> bool {
         self.inner.iter().all(|&x| !x)
     }
 }
@@ -899,7 +899,7 @@ impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
 /// -------+--------
 ///   5    | 1000
 /// ```
-fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
+pub fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
     statistics: &S,
     required_columns: &RequiredColumns,
 ) -> Result<RecordBatch> {
@@ -1854,7 +1854,7 @@ fn wrap_null_count_check_expr(
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum StatisticsType {
+pub enum StatisticsType {
     Min,
     Max,
     NullCount,
