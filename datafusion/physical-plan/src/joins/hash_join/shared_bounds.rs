@@ -18,7 +18,7 @@
 //! Utilities for shared build-side information. Used in dynamic filter pushdown in Hash Joins.
 // TODO: include the link to the Dynamic Filter blog post.
 
-use std::fmt;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 
 use crate::ExecutionPlan;
@@ -42,21 +42,62 @@ use datafusion_physical_expr::expressions::{
 use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, ScalarFunctionExpr};
 
 use parking_lot::Mutex;
-use tokio::sync::Barrier;
+
+/// Trait representing some set of bounds for a column used in join dynamic filtering.
+///
+/// Bounds could be min/max values, or some other type of custom bounds that can be represented by a physical expression.
+///
+/// Refer to the [`MinMaxColumnBounds`] implementation for an example of min/max bounds.
+pub trait ColumnBounds: Send + Sync + Debug {
+    /// Creates a physical expression representing the bounds for this column (left expression).
+    ///
+    /// # Arguments
+    ///
+    /// * `left_expr` - The left side physical expression for which to create bounds.
+    ///
+    /// # Returns
+    /// `Ok(Arc<dyn PhysicalExpr>)` if creating the bounds expression succeeds, or an error otherwise.
+    fn physical_expr(
+        &self,
+        left_expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>>;
+}
 
 /// Represents the minimum and maximum values for a specific column.
 /// Used in dynamic filter pushdown to establish value boundaries.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ColumnBounds {
+pub(crate) struct MinMaxColumnBounds {
     /// The minimum value observed for this column
     min: ScalarValue,
     /// The maximum value observed for this column  
     max: ScalarValue,
 }
 
-impl ColumnBounds {
+impl MinMaxColumnBounds {
     pub(crate) fn new(min: ScalarValue, max: ScalarValue) -> Self {
         Self { min, max }
+    }
+}
+
+impl ColumnBounds for MinMaxColumnBounds {
+    fn physical_expr(
+        &self,
+        left_expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        // Create predicate: col >= min AND col <= max
+        let min_expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&left_expr),
+            Operator::GtEq,
+            lit(self.min.clone()),
+        )) as Arc<dyn PhysicalExpr>;
+        let max_expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&left_expr),
+            Operator::LtEq,
+            lit(self.max.clone()),
+        )) as Arc<dyn PhysicalExpr>;
+        let range_expr = Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
+            as Arc<dyn PhysicalExpr>;
+        Ok(range_expr)
     }
 }
 
@@ -66,15 +107,30 @@ impl ColumnBounds {
 pub(crate) struct PartitionBounds {
     /// Min/max bounds for each join key column in this partition.
     /// Index corresponds to the join key expression index.
-    column_bounds: Vec<ColumnBounds>,
+    column_bounds: Vec<Arc<dyn ColumnBounds>>,
 }
 
 impl PartitionBounds {
     pub(crate) fn new(column_bounds: Vec<ColumnBounds>) -> Self {
         Self { column_bounds }
+    pub(crate) fn new(
+        partition: usize,
+        column_bounds: Vec<Arc<dyn ColumnBounds>>,
+    ) -> Self {
+        Self {
+            partition,
+            column_bounds,
+        }
     }
 
-    pub(crate) fn get_column_bounds(&self, index: usize) -> Option<&ColumnBounds> {
+    pub(crate) fn len(&self) -> usize {
+        self.column_bounds.len()
+    }
+
+    pub(crate) fn get_column_bounds(
+        &self,
+        index: usize,
+    ) -> Option<&Arc<dyn ColumnBounds>> {
         self.column_bounds.get(index)
     }
 }
@@ -209,6 +265,10 @@ fn create_bounds_predicate(
 /// - **Hash Maps (Partitioned mode)**: Collects Arc references to hash tables from each partition.
 ///   Creates a `PartitionedHashLookupPhysicalExpr` that routes rows to the correct partition's hash table.
 /// - **Bounds (CollectLeft mode)**: Collects min/max bounds and creates range predicates.
+/// 1. Each partition computes bounds from its build-side data
+/// 2. Bounds are stored in the shared HashMap (indexed by partition_id)  
+/// 3. A counter tracks how many partitions have reported their bounds
+/// 4. When the last partition reports (completed == total), bounds are merged and filter is updated
 ///
 /// ## Partition Counting
 ///
@@ -224,6 +284,13 @@ pub(crate) struct SharedBuildAccumulator {
     /// Build-side data protected by a single mutex to avoid ordering concerns
     inner: Mutex<AccumulatedBuildData>,
     barrier: Barrier,
+pub(crate) struct SharedBoundsAccumulator {
+    /// Shared state protected by a single mutex to avoid ordering concerns
+    inner: Mutex<SharedBoundsState>,
+    /// Total number of partitions.
+    /// Need to know this so that we can update the dynamic filter once we are done
+    /// building *all* of the hash tables.
+    total_partitions: usize,
     /// Dynamic filter for pushdown to probe side
     dynamic_filter: Arc<DynamicFilterPhysicalExpr>,
     /// Right side join expressions needed for creating filter expressions
@@ -244,6 +311,13 @@ pub(crate) enum PushdownStrategy {
     HashTable(Arc<dyn JoinHashMapType>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
+/// State protected by SharedBoundsAccumulator's mutex
+struct SharedBoundsState {
+    /// Bounds from completed partitions.
+    /// Each element represents the column bounds computed by one partition.
+    bounds: Vec<PartitionBounds>,
+    /// Number of partitions that have reported completion.
+    completed_partitions: usize,
 }
 
 /// Build-side data reported by a single partition
@@ -286,10 +360,8 @@ impl SharedBuildAccumulator {
     /// ## Partition Mode Execution Patterns
     ///
     /// - **CollectLeft**: Build side is collected ONCE from partition 0 and shared via `OnceFut`
-    ///   across all output partitions. Each output partition calls `collect_build_side` to access the shared build data.
-    ///   Although this results in multiple invocations, the  `report_partition_bounds` function contains deduplication logic to handle them safely.
-    ///   Expected calls = number of output partitions.
-    ///
+    ///   across all output partitions. Each output partition calls `collect_build_side` to access
+    ///   the shared build data. Expected calls = number of output partitions.
     ///
     /// - **Partitioned**: Each partition independently builds its own hash table by calling
     ///   `collect_build_side` once. Expected calls = number of build partitions.
@@ -345,6 +417,11 @@ impl SharedBuildAccumulator {
         Self {
             inner: Mutex::new(mode_data),
             barrier: Barrier::new(expected_calls),
+            inner: Mutex::new(SharedBoundsState {
+                bounds: Vec::with_capacity(expected_calls),
+                completed_partitions: 0,
+            }),
+            total_partitions: expected_calls,
             dynamic_filter,
             on_right,
             repartition_random_state,
@@ -588,6 +665,97 @@ impl SharedBuildAccumulator {
                 }
             }
             self.dynamic_filter.mark_complete();
+    /// This creates a filter where each partition's bounds form a conjunction (AND)
+    /// of column range predicates, and all partitions are combined with OR.
+    ///
+    /// For example, with 2 partitions and 2 columns:
+    /// ((col0 >= p0_min0 AND col0 <= p0_max0 AND col1 >= p0_min1 AND col1 <= p0_max1)
+    ///  OR
+    ///  (col0 >= p1_min0 AND col0 <= p1_max0 AND col1 >= p1_min1 AND col1 <= p1_max1))
+    pub(crate) fn create_filter_from_partition_bounds(
+        &self,
+        bounds: &[PartitionBounds],
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        if bounds.is_empty() {
+            return Ok(lit(true));
+        }
+
+        // Create a predicate for each partition
+        let mut partition_predicates = Vec::with_capacity(bounds.len());
+
+        for partition_bounds in bounds.iter().sorted_by_key(|b| b.partition) {
+            // Create range predicates for each join key in this partition
+            let mut column_predicates = Vec::with_capacity(partition_bounds.len());
+
+            for (col_idx, right_expr) in self.on_right.iter().enumerate() {
+                if let Some(column_bounds) = partition_bounds.get_column_bounds(col_idx) {
+                    let bounds_expr =
+                        column_bounds.physical_expr(Arc::clone(right_expr))?;
+                    column_predicates.push(bounds_expr);
+                }
+            }
+
+            // Combine all column predicates for this partition with AND
+            if !column_predicates.is_empty() {
+                let partition_predicate = column_predicates
+                    .into_iter()
+                    .reduce(|acc, pred| {
+                        Arc::new(BinaryExpr::new(acc, Operator::And, pred))
+                            as Arc<dyn PhysicalExpr>
+                    })
+                    .unwrap();
+                partition_predicates.push(partition_predicate);
+            }
+        }
+
+        // Combine all partition predicates with OR
+        let combined_predicate = partition_predicates
+            .into_iter()
+            .reduce(|acc, pred| {
+                Arc::new(BinaryExpr::new(acc, Operator::Or, pred))
+                    as Arc<dyn PhysicalExpr>
+            })
+            .unwrap_or_else(|| lit(true));
+
+        Ok(combined_predicate)
+    }
+
+    /// Report bounds from a completed partition and update dynamic filter if all partitions are done
+    ///
+    /// This method coordinates the dynamic filter updates across all partitions. It stores the
+    /// bounds from the current partition, increments the completion counter, and when all
+    /// partitions have reported, creates an OR'd filter from individual partition bounds.
+    ///
+    /// # Arguments
+    /// * `partition_bounds` - The bounds computed by this partition (if any)
+    ///
+    /// # Returns
+    /// * `Result<()>` - Ok if successful, Err if filter update failed
+    pub(crate) fn report_partition_bounds(
+        &self,
+        partition: usize,
+        partition_bounds: Option<Vec<Arc<dyn ColumnBounds>>>,
+    ) -> Result<()> {
+        let mut inner = self.inner.lock();
+
+        // Store bounds in the accumulator - this runs once per partition
+        if let Some(bounds) = partition_bounds {
+            // Only push actual bounds if they exist
+            inner.bounds.push(PartitionBounds::new(partition, bounds));
+        }
+
+        // Increment the completion counter
+        // Even empty partitions must report to ensure proper termination
+        inner.completed_partitions += 1;
+        let completed = inner.completed_partitions;
+        let total_partitions = self.total_partitions;
+
+        // Critical synchronization point: Only update the filter when ALL partitions are complete
+        // Troubleshooting: If you see "completed > total_partitions", check partition
+        // count calculation in new_from_partition_mode() - it may not match actual execution calls
+        if completed == total_partitions && !inner.bounds.is_empty() {
+            let filter_expr = self.create_filter_from_partition_bounds(&inner.bounds)?;
+            self.dynamic_filter.update(filter_expr)?;
         }
 
         Ok(())
@@ -595,6 +763,7 @@ impl SharedBuildAccumulator {
 }
 
 impl fmt::Debug for SharedBuildAccumulator {
+impl Debug for SharedBoundsAccumulator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedBuildAccumulator")
     }

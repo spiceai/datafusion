@@ -19,6 +19,8 @@
 
 pub use exec::HashJoinExec;
 pub use partitioned_hash_eval::{HashExpr, HashTableLookupExpr, SeededRandomState};
+pub use exec::{CollectLeftAccumulator, MinMaxLeftAccumulator};
+pub use shared_bounds::ColumnBounds;
 
 mod exec;
 mod inlist_builder;
