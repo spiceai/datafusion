@@ -29,7 +29,7 @@ use futures::FutureExt;
 use futures::future::BoxFuture;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
-use parquet::arrow::async_reader::{AsyncFileReader, ParquetObjectReader};
+use parquet::arrow::async_reader::{AsyncFileReader, ObjectVersionType, ParquetObjectReader};
 use parquet::file::metadata::ParquetMetaData;
 use std::any::Any;
 use std::collections::HashMap;
@@ -77,12 +77,26 @@ pub trait ParquetFileReaderFactory: Debug + Send + Sync + 'static {
 #[derive(Debug)]
 pub struct DefaultParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl DefaultParquetFileReaderFactory {
     /// Create a new `DefaultParquetFileReaderFactory`.
     pub fn new(store: Arc<dyn ObjectStore>) -> Self {
-        Self { store }
+        Self {
+            store,
+            object_versioning_type: None,
+        }
+    }
+
+    /// Set the object versioning type for reading files.
+    /// This is used to handle different versions of objects in object stores.
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
     }
 }
 
@@ -156,11 +170,8 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
             metrics,
         );
         let store = Arc::clone(&self.store);
-        let mut inner = ParquetObjectReader::new(
-            store,
-            partitioned_file.object_meta.location.clone(),
-        )
-        .with_file_size(partitioned_file.object_meta.size);
+        let mut inner = ParquetObjectReader::new_with_meta(store, partitioned_file.object_meta.clone())
+            .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
             inner = inner.with_footer_size_hint(hint)
@@ -183,6 +194,7 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
 pub struct CachedParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
     metadata_cache: Arc<dyn FileMetadataCache>,
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl CachedParquetFileReaderFactory {
@@ -193,7 +205,18 @@ impl CachedParquetFileReaderFactory {
         Self {
             store,
             metadata_cache,
+            object_versioning_type: None,
         }
+    }
+
+    /// Set the object versioning type for reading files.
+    /// This is used to handle different versions of objects in object stores.
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
     }
 }
 
@@ -212,11 +235,9 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         );
         let store = Arc::clone(&self.store);
 
-        let mut inner = ParquetObjectReader::new(
-            store,
-            partitioned_file.object_meta.location.clone(),
-        )
-        .with_file_size(partitioned_file.object_meta.size);
+        let mut inner =
+            ParquetObjectReader::new_with_meta(store, partitioned_file.object_meta.clone())
+                .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
             inner = inner.with_footer_size_hint(hint)
