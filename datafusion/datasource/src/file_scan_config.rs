@@ -19,6 +19,7 @@
 //! file sources.
 
 use crate::file_groups::FileGroup;
+use crate::metadata::MetadataColumn;
 #[allow(unused_imports)]
 use crate::schema_adapter::SchemaAdapterFactory;
 use crate::{
@@ -203,6 +204,9 @@ pub struct FileScanConfig {
     /// Expression adapter used to adapt filters and projections that are pushed down into the scan
     /// from the logical schema to the physical schema of the file.
     pub expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    /// Metadata columns to include in the output schema.
+    /// These columns provide file metadata like location, size, and last_modified.
+    pub metadata_cols: Vec<MetadataColumn>,
     /// Object versioning type for reading files.
     /// This is used to handle different versions of objects in object stores.
     #[cfg(feature = "parquet")]
@@ -282,6 +286,7 @@ pub struct FileScanConfigBuilder {
     new_lines_in_values: Option<bool>,
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
+    metadata_cols: Vec<MetadataColumn>,
     #[cfg(feature = "parquet")]
     object_versioning_type: Option<ObjectVersionType>,
 }
@@ -312,6 +317,7 @@ impl FileScanConfigBuilder {
             constraints: None,
             batch_size: None,
             expr_adapter_factory: None,
+            metadata_cols: vec![],
             #[cfg(feature = "parquet")]
             object_versioning_type: None,
         }
@@ -454,6 +460,13 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Set the metadata columns to include in the output schema.
+    /// These columns provide file metadata like location, size, and last_modified.
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
+        self.metadata_cols = metadata_cols;
+        self
+    }
+
     /// Set the object versioning type for reading files.
     /// This is used to handle different versions of objects in object stores.
     #[cfg(feature = "parquet")]
@@ -484,6 +497,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            metadata_cols,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         } = self;
@@ -518,6 +532,7 @@ impl FileScanConfigBuilder {
             new_lines_in_values,
             batch_size,
             expr_adapter_factory: expr_adapter,
+            metadata_cols,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         }
@@ -542,6 +557,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             constraints: Some(config.constraints),
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
+            metadata_cols: config.metadata_cols,
             #[cfg(feature = "parquet")]
             object_versioning_type: config.object_versioning_type,
         }
