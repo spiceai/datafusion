@@ -1955,6 +1955,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "object_store",
+ "parquet",
  "tokio",
 ]
 
