@@ -19,6 +19,11 @@
 //! file sources.
 
 use crate::file_groups::FileGroup;
+=======
+use crate::metadata::MetadataColumn;
+#[allow(unused_imports)]
+use crate::schema_adapter::SchemaAdapterFactory;
+>>>>>>> 6679acf63 (feat: Port with_metadata_cols and with_object_versioning_type from spiceai-50)
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
     file_compression_type::FileCompressionType, file_stream::FileStream,
@@ -181,6 +186,9 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
+    /// Metadata columns to include in the output schema.
+    /// These columns provide file metadata like location, size, and last_modified.
+    pub metadata_cols: Vec<MetadataColumn>,
     /// Object versioning type for reading files.
     /// This is used to handle different versions of objects in object stores.
     #[cfg(feature = "parquet")]
@@ -254,6 +262,7 @@ pub struct FileScanConfigBuilder {
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     partitioned_by_file_group: bool,
+    metadata_cols: Vec<MetadataColumn>,
     #[cfg(feature = "parquet")]
     object_versioning_type: Option<ObjectVersionType>,
 }
@@ -281,6 +290,7 @@ impl FileScanConfigBuilder {
             batch_size: None,
             expr_adapter_factory: None,
             partitioned_by_file_group: false,
+            metadata_cols: vec![],
             #[cfg(feature = "parquet")]
             object_versioning_type: None,
         }
@@ -445,6 +455,13 @@ impl FileScanConfigBuilder {
         partitioned_by_file_group: bool,
     ) -> Self {
         self.partitioned_by_file_group = partitioned_by_file_group;
+    /// Set the metadata columns to include in the output schema.
+    /// These columns provide file metadata like location, size, and last_modified.
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
+        self.metadata_cols = metadata_cols;
+        self
+    }
+
     /// Set the object versioning type for reading files.
     /// This is used to handle different versions of objects in object stores.
     #[cfg(feature = "parquet")]
@@ -476,6 +493,7 @@ impl FileScanConfigBuilder {
             batch_size,
             expr_adapter_factory: expr_adapter,
             partitioned_by_file_group,
+            metadata_cols,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         } = self;
@@ -499,6 +517,7 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
+            metadata_cols,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         }
@@ -519,6 +538,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
             partitioned_by_file_group: config.partitioned_by_file_group,
+            metadata_cols: config.metadata_cols,
             #[cfg(feature = "parquet")]
             object_versioning_type: config.object_versioning_type,
         }
