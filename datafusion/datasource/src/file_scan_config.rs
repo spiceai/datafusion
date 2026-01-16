@@ -65,6 +65,7 @@ use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
+use object_store::ObjectMeta;
 
 use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_plan::coop::cooperative;
@@ -1275,6 +1276,196 @@ impl PartitionColumnProjector {
     }
 }
 
+
+/// A helper that projects extended (i.e. partition/metadata) columns into the file record batches.
+///
+/// One interesting trick is the usage of a cache for the key buffers of the partition column
+/// dictionaries. Indeed, the partition columns are constant, so the dictionaries that represent them
+/// have all their keys equal to 0. This enables us to re-use the same "all-zero" buffer across batches,
+/// which makes the space consumption of the partition columns O(batch_size) instead of O(record_count).
+pub struct ExtendedColumnProjector {
+    /// An Arrow buffer initialized to zeros that represents the key array of all partition
+    /// columns (partition columns are materialized by dictionary arrays with only one
+    /// value in the dictionary, thus all the keys are equal to zero).
+    key_buffer_cache: ZeroBufferGenerators,
+    /// Mapping between the indexes in the list of partition columns and the target
+    /// schema. Sorted by index in the target schema so that we can iterate on it to
+    /// insert the partition columns in the target record batch.
+    projected_partition_indexes: Vec<(usize, usize)>,
+    /// Similar to `projected_partition_indexes` but only stores the indexes in the target schema
+    projected_metadata_indexes: Vec<usize>,
+    /// The schema of the table once the projection was applied.
+    projected_schema: SchemaRef,
+    /// Mapping between the column name and the metadata column.
+    metadata_map: HashMap<String, MetadataColumn>,
+}
+
+impl ExtendedColumnProjector {
+    /// Create a projector to insert the partitioning/metadata columns into batches read from files
+    /// - `projected_schema`: the target schema with file, partitioning and metadata columns
+    /// - `table_partition_cols`: all the partitioning column names
+    /// - `metadata_cols`: all the metadata columns
+    pub fn new(
+        projected_schema: SchemaRef,
+        table_partition_cols: &[String],
+        metadata_cols: &[MetadataColumn],
+    ) -> Self {
+        let mut idx_map = HashMap::new();
+        for (partition_idx, partition_name) in table_partition_cols.iter().enumerate() {
+            if let Ok(schema_idx) = projected_schema.index_of(partition_name) {
+                idx_map.insert(partition_idx, schema_idx);
+            }
+        }
+
+        let mut projected_partition_indexes: Vec<_> = idx_map.into_iter().collect();
+        projected_partition_indexes.sort_by(|(_, a), (_, b)| a.cmp(b));
+
+        let mut projected_metadata_indexes = vec![];
+        for metadata_col in metadata_cols.iter() {
+            if let Ok(schema_idx) = projected_schema.index_of(metadata_col.name()) {
+                projected_metadata_indexes.push(schema_idx);
+            }
+        }
+        // Sort to ensure that the final metadata column vector is expanded properly
+        if !projected_metadata_indexes.is_empty() {
+            projected_metadata_indexes.sort();
+        }
+
+        let mut metadata_map = HashMap::new();
+        for metadata_col in metadata_cols.iter() {
+            metadata_map.insert(metadata_col.name().to_string(), metadata_col.clone());
+        }
+
+        Self {
+            key_buffer_cache: Default::default(),
+            projected_partition_indexes,
+            projected_metadata_indexes,
+            projected_schema,
+            metadata_map,
+        }
+    }
+
+    /// Transform the batch read from the file by inserting both partitioning and metadata columns
+    /// to the right positions as deduced from `projected_schema`
+    /// - `file_batch`: batch read from the file, with internal projection applied
+    /// - `partition_values`: the list of partition values, one for each partition column
+    /// - `metadata`: the metadata of the file containing information like location, size, etc.
+    pub fn project(
+        &mut self,
+        file_batch: RecordBatch,
+        partition_values: &[ScalarValue],
+        metadata: &ObjectMeta,
+    ) -> Result<RecordBatch> {
+        // Calculate expected number of columns from the file (excluding partition and metadata columns)
+        let expected_cols = self.projected_schema.fields().len()
+            - self.projected_partition_indexes.len()
+            - self.projected_metadata_indexes.len();
+
+        // Verify the file batch has the expected number of columns
+        if file_batch.columns().len() != expected_cols {
+            return exec_err!(
+                "Unexpected batch schema from file, expected {} cols but got {}",
+                expected_cols,
+                file_batch.columns().len()
+            );
+        }
+
+        // Start with the columns from the file batch
+        let mut cols = file_batch.columns().to_vec();
+
+        // Collect all columns to insert (both partition and metadata) with their schema indices
+        // We need to insert them in ascending order by schema index to avoid index shifting issues
+        enum InsertColumn<'a> {
+            Partition { pidx: usize, sidx: usize },
+            Metadata { sidx: usize, field_name: &'a str },
+        }
+
+        let mut inserts: Vec<InsertColumn> = Vec::with_capacity(
+            self.projected_partition_indexes.len()
+                + self.projected_metadata_indexes.len(),
+        );
+
+        for &(pidx, sidx) in &self.projected_partition_indexes {
+            inserts.push(InsertColumn::Partition { pidx, sidx });
+        }
+
+        for &sidx in &self.projected_metadata_indexes {
+            let field_name = self.projected_schema.field(sidx).name();
+            inserts.push(InsertColumn::Metadata { sidx, field_name });
+        }
+
+        // Sort by schema index to ensure correct insertion order
+        inserts.sort_by_key(|insert| match insert {
+            InsertColumn::Partition { sidx, .. } => *sidx,
+            InsertColumn::Metadata { sidx, .. } => *sidx,
+        });
+
+        // Insert columns in sorted order
+        for insert in inserts {
+            match insert {
+                InsertColumn::Partition { pidx, sidx } => {
+                    // Get the partition value from the provided values
+                    let p_value = partition_values.get(pidx).ok_or_else(|| {
+                        exec_datafusion_err!("Invalid partitioning found on disk")
+                    })?;
+
+                    let mut partition_value = Cow::Borrowed(p_value);
+
+                    // Check if user forgot to dict-encode the partition value and apply auto-fix if needed
+                    let field = self.projected_schema.field(sidx);
+                    let expected_data_type = field.data_type();
+                    let actual_data_type = partition_value.data_type();
+                    if let DataType::Dictionary(key_type, _) = expected_data_type {
+                        if !matches!(actual_data_type, DataType::Dictionary(_, _)) {
+                            warn!("Partition value for column {} was not dictionary-encoded, applied auto-fix.", field.name());
+                            partition_value = Cow::Owned(ScalarValue::Dictionary(
+                                key_type.clone(),
+                                Box::new(partition_value.as_ref().clone()),
+                            ));
+                        }
+                    }
+
+                    // Create array and insert at the correct schema position
+                    cols.insert(
+                        sidx,
+                        create_output_array(
+                            &mut self.key_buffer_cache,
+                            partition_value.as_ref(),
+                            file_batch.num_rows(),
+                        )?,
+                    );
+                }
+                InsertColumn::Metadata { sidx, field_name } => {
+                    // Get the metadata column type from the field name
+                    let metadata_col =
+                        self.metadata_map.get(field_name).ok_or_else(|| {
+                            exec_datafusion_err!(
+                                "Invalid metadata column: {}",
+                                field_name
+                            )
+                        })?;
+
+                    // Convert metadata to scalar value based on the column type
+                    let scalar_value = metadata_col.to_scalar_value(metadata);
+
+                    // Create array and insert at the correct schema position
+                    cols.insert(
+                        sidx,
+                        scalar_value.to_array_of_size(file_batch.num_rows())?,
+                    );
+                }
+            }
+        }
+
+        // Create a new record batch with all columns in the correct order
+        RecordBatch::try_new_with_options(
+            Arc::clone(&self.projected_schema),
+            cols,
+            &RecordBatchOptions::new().with_row_count(Some(file_batch.num_rows())),
+        )
+        .map_err(Into::into)
+    }
+}
 #[derive(Debug, Default)]
 struct ZeroBufferGenerators {
     gen_i8: ZeroBufferGenerator<i8>,
