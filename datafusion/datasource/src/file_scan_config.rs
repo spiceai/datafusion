@@ -189,6 +189,8 @@ pub struct FileScanConfig {
     /// Metadata columns to include in the output schema.
     /// These columns provide file metadata like location, size, and last_modified.
     pub metadata_cols: Vec<MetadataColumn>,
+    /// Tracks (output_position, metadata_col_idx) for metadata columns in projection
+    pub projected_metadata_positions: Vec<(usize, usize)>,
     /// Object versioning type for reading files.
     /// This is used to handle different versions of objects in object stores.
     #[cfg(feature = "parquet")]
@@ -263,6 +265,7 @@ pub struct FileScanConfigBuilder {
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     partitioned_by_file_group: bool,
     metadata_cols: Vec<MetadataColumn>,
+    projected_metadata_positions: Vec<(usize, usize)>,
     #[cfg(feature = "parquet")]
     object_versioning_type: Option<ObjectVersionType>,
 }
@@ -291,6 +294,7 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: None,
             partitioned_by_file_group: false,
             metadata_cols: vec![],
+            projected_metadata_positions: vec![],
             #[cfg(feature = "parquet")]
             object_versioning_type: None,
         }
@@ -494,6 +498,7 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             partitioned_by_file_group,
             metadata_cols,
+            projected_metadata_positions: existing_metadata_positions,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         } = self;
@@ -504,6 +509,48 @@ impl FileScanConfigBuilder {
         });
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
+        let new_lines_in_values = new_lines_in_values.unwrap_or(false);
+
+        // Convert projection indices to ProjectionExprs using the final table schema.
+        // Note: projection_indices may include metadata column indices (indices >= table schema len).
+        // We need to:
+        // 1. Track which output positions get metadata columns (or preserve existing)
+        // 2. Filter out metadata indices before calling ProjectionExprs::from_indices()
+        let table_col_count = table_schema.table_schema().fields().len();
+        let metadata_col_start = table_col_count;
+
+        // Preserve existing metadata positions if already computed (e.g., when rebuilt from From impl)
+        // Otherwise, compute from projection_indices which may include metadata column indices
+        let (projection_exprs, projected_metadata_positions) = if !existing_metadata_positions.is_empty() {
+            let proj = match projection_indices {
+                Some(indices) => {
+                    let file_partition_indices: Vec<_> = indices
+                        .into_iter()
+                        .filter(|idx| *idx < metadata_col_start)
+                        .collect();
+                    Some(ProjectionExprs::from_indices(&file_partition_indices, table_schema.table_schema()))
+                }
+                None => None,
+            };
+            (proj, existing_metadata_positions)
+        } else {
+            match projection_indices {
+                Some(indices) => {
+                    let mut metadata_positions = vec![];
+                    let mut file_partition_indices = vec![];
+                    for (output_pos, idx) in indices.iter().enumerate() {
+                        if *idx >= metadata_col_start {
+                            metadata_positions.push((output_pos, idx - metadata_col_start));
+                        } else {
+                            file_partition_indices.push(*idx);
+                        }
+                    }
+                    let proj = ProjectionExprs::from_indices(&file_partition_indices, table_schema.table_schema());
+                    (Some(proj), metadata_positions)
+                }
+                None => (None, vec![]),
+            }
+        };
 
         FileScanConfig {
             object_store_url,
@@ -518,6 +565,7 @@ impl FileScanConfigBuilder {
             statistics,
             partitioned_by_file_group,
             metadata_cols,
+            projected_metadata_positions,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         }
@@ -539,6 +587,7 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             expr_adapter_factory: config.expr_adapter_factory,
             partitioned_by_file_group: config.partitioned_by_file_group,
             metadata_cols: config.metadata_cols,
+            projected_metadata_positions: config.projected_metadata_positions,
             #[cfg(feature = "parquet")]
             object_versioning_type: config.object_versioning_type,
         }
@@ -926,6 +975,73 @@ impl FileScanConfig {
             Some(proj) => Ok(Arc::new(proj.project_schema(schema)?)),
             None => Ok(Arc::clone(schema)),
         }
+    }
+
+    pub fn projected_stats(&self) -> Statistics {
+        let statistics = match self.file_source.statistics() {
+            Ok(s) => s,
+            Err(_) => return Statistics::new_unknown(&self.projected_schema()),
+        };
+
+        let mut table_cols_stats: Vec<_> = self
+            .projection_indices()
+            .into_iter()
+            .map(|idx| {
+                if idx < self.file_schema().fields().len() {
+                    if idx < statistics.column_statistics.len() { statistics.column_statistics[idx].clone() } else { ColumnStatistics::new_unknown() }
+                } else {
+                    // TODO provide accurate stat for partition column (#1186)
+                    ColumnStatistics::new_unknown()
+                }
+            })
+            .collect();
+
+        // Insert statistics for metadata columns at their designated output positions
+        for (output_pos, _metadata_idx) in &self.projected_metadata_positions {
+            if *output_pos <= table_cols_stats.len() {
+                table_cols_stats.insert(*output_pos, ColumnStatistics::new_unknown());
+            }
+        }
+
+        Statistics {
+            num_rows: statistics.num_rows,
+            // TODO correct byte size: https://github.com/apache/datafusion/issues/14936
+            total_byte_size: statistics.total_byte_size,
+            column_statistics: table_cols_stats,
+        }
+    }
+
+    pub fn projected_schema(&self) -> Arc<Schema> {
+        // Build fields from file and partition columns
+        let mut table_fields: Vec<_> = self
+            .projection_indices()
+            .into_iter()
+            .map(|idx| {
+                if idx < self.file_schema().fields().len() {
+                    self.file_schema().field(idx).clone()
+                } else {
+                    let partition_idx = idx - self.file_schema().fields().len();
+                    Arc::unwrap_or_clone(Arc::clone(
+                        &self.table_partition_cols()[partition_idx],
+                    ))
+                }
+            })
+            .collect();
+
+        // Insert metadata columns at their designated output positions
+        for (output_pos, metadata_idx) in &self.projected_metadata_positions {
+            if *metadata_idx < self.metadata_cols.len() {
+                let field = self.metadata_cols[*metadata_idx].field();
+                if *output_pos <= table_fields.len() {
+                    table_fields.insert(*output_pos, field);
+                }
+            }
+        }
+
+        Arc::new(Schema::new_with_metadata(
+            table_fields,
+            self.file_schema().metadata().clone(),
+        ))
     }
 
     fn add_filter_equivalence_info(
