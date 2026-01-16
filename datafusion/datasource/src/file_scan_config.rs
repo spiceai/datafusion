@@ -64,6 +64,7 @@ use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
+use object_store::ObjectMeta;
 
 use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_plan::coop::cooperative;
@@ -1498,6 +1499,7 @@ impl PartitionColumnProjector {
         .map_err(Into::into)
     }
 }
+
 
 /// A helper that projects extended (i.e. partition/metadata) columns into the file record batches.
 ///
