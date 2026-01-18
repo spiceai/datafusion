@@ -105,7 +105,7 @@ fn reorder_named_arguments(
     let positional_count = arg_names.iter().filter(|n| n.is_none()).count();
 
     // Capture args length before consuming the vector
-    let args_len = args.len();
+    let _args_len = args.len();
 
     let expected_arg_count = param_names.len();
 
@@ -141,16 +141,18 @@ fn reorder_named_arguments(
         }
     }
 
-    // Only require parameters up to the number of arguments provided (supports optional parameters)
-    let required_count = args_len;
-    for i in 0..required_count {
+    // Only require the positional parameters to be filled sequentially.
+    // Named arguments can skip to any position without requiring intermediate positions.
+    for i in 0..positional_count {
         if result[i].is_none() {
             return plan_err!("Missing required parameter '{}'", param_names[i]);
         }
     }
 
-    // Return only the assigned parameters (handles optional trailing parameters)
-    Ok(result.into_iter().take(required_count).flatten().collect())
+    // Return all non-None parameters in their proper positions.
+    // This preserves the full result array so callers can identify which
+    // parameters were provided (including those at higher positions via named args).
+    Ok(result.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
