@@ -755,4 +755,3 @@ mod tests {
         assert!(matches!(result, Ok(RangeCalculation::TerminateEarly)));
     }
 }
-pub mod metadata;
