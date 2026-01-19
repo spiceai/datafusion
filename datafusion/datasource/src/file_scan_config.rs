@@ -564,7 +564,15 @@ impl FileScanConfigBuilder {
                         );
                         (Some(proj), metadata_positions)
                     }
-                    None => (None, vec![]),
+                    None => {
+                        // When projection_indices is None, include all columns including metadata.
+                        // Metadata columns are positioned after file + partition columns.
+                        let metadata_positions: Vec<(usize, usize)> = (0..metadata_cols
+                            .len())
+                            .map(|metadata_idx| (table_col_count + metadata_idx, metadata_idx))
+                            .collect();
+                        (None, metadata_positions)
+                    }
                 }
             };
 
@@ -1822,13 +1830,26 @@ mod tests {
         verify_sort_integrity,
     };
 
-    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
+    use chrono::{TimeZone, Utc};
     use datafusion_common::stats::Precision;
     use datafusion_common::{assert_batches_eq, internal_err};
     use datafusion_expr::{Operator, SortExpr};
     use datafusion_physical_expr::create_physical_sort_expr;
     use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal};
     use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
+    use object_store::path::Path;
+
+    /// Helper function to create a test ObjectMeta with a default timestamp
+    fn create_test_object_meta(path: &str, size: usize) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from(path),
+            last_modified: Utc.timestamp_opt(1234567890, 0).unwrap(),
+            size: size.try_into().unwrap(),
+            e_tag: None,
+            version: None,
+        }
+    }
 
     /// Returns the column names on the schema
     pub fn columns(schema: &Schema) -> Vec<String> {
@@ -2444,7 +2465,7 @@ mod tests {
                             "data/date={}/{}.parquet",
                             file.date, file.name
                         )),
-                        last_modified: chrono::Utc.timestamp_nanos(0),
+                        last_modified: Utc.timestamp_nanos(0),
                         size: 0,
                         e_tag: None,
                         version: None,
@@ -2746,6 +2767,100 @@ mod tests {
         );
         assert_eq!(new_config.constraints, Constraints::default());
         assert!(new_config.new_lines_in_values);
+    }
+
+    /// Regression test for the bug where metadata columns were excluded from the
+    /// projected schema when projection_indices was None.
+    ///
+    /// When projection_indices is None, all columns should be included, including
+    /// configured metadata columns. Before the fix, projected_metadata_positions was
+    /// set to an empty vector when projection_indices was None, causing metadata
+    /// columns to be excluded from projected_schema().
+    #[test]
+    fn test_metadata_cols_included_when_projection_indices_none() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("col1", DataType::Int32, false),
+            Field::new("col2", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
+
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
+
+        // Create a config with metadata columns but WITHOUT projection indices (None)
+        // This should include all columns: file columns + metadata columns
+        let config = FileScanConfigBuilder::new(
+            object_store_url,
+            Arc::clone(&file_schema),
+            file_source,
+        )
+        .with_metadata_cols(metadata_cols.clone())
+        .build();
+
+        // Verify that the projected schema includes both file and metadata columns
+        let projected = config.projected_schema();
+
+        // Should have 4 columns: col1, col2, location, size
+        assert_eq!(
+            projected.fields().len(),
+            4,
+            "Expected 4 columns (2 file + 2 metadata), got {}",
+            projected.fields().len()
+        );
+
+        // Verify file columns
+        assert_eq!(projected.field(0).name(), "col1");
+        assert_eq!(projected.field(1).name(), "col2");
+
+        // Verify metadata columns are present at the end
+        assert_eq!(projected.field(2).name(), metadata_cols[0].name());
+        assert_eq!(projected.field(3).name(), metadata_cols[1].name());
+    }
+
+    /// Test that metadata columns work correctly with partition columns when
+    /// projection_indices is None.
+    #[test]
+    fn test_metadata_and_partition_cols_when_projection_indices_none() {
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "data",
+            DataType::Int32,
+            false,
+        )]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
+
+        let partition_cols = vec![Field::new(
+            "year",
+            wrap_partition_type_in_dict(DataType::Int32),
+            false,
+        )];
+        let metadata_cols = vec![MetadataColumn::Location(None)];
+
+        // Create a config with partition and metadata columns but NO projection indices
+        let config = FileScanConfigBuilder::new(
+            object_store_url,
+            Arc::clone(&file_schema),
+            file_source,
+        )
+        .with_table_partition_cols(partition_cols)
+        .with_metadata_cols(metadata_cols.clone())
+        .build();
+
+        // Verify that the projected schema includes all columns
+        let projected = config.projected_schema();
+
+        // Should have 3 columns: data (file), year (partition), location (metadata)
+        assert_eq!(
+            projected.fields().len(),
+            3,
+            "Expected 3 columns (1 file + 1 partition + 1 metadata), got {}",
+            projected.fields().len()
+        );
+
+        // Verify column order: file columns, then partition columns, then metadata columns
+        assert_eq!(projected.field(0).name(), "data");
+        assert_eq!(projected.field(1).name(), "year");
+        assert_eq!(projected.field(2).name(), metadata_cols[0].name());
     }
 
     /// Regression test for the bug where metadata and partition columns were
