@@ -30,6 +30,57 @@ use dashmap::DashMap;
 use object_store::path::Path;
 use object_store::ObjectMeta;
 
+/// Helper function to normalize an optional string (treats empty strings as None)
+fn normalize_optional_string(opt: &Option<String>) -> Option<&str> {
+    match opt {
+        Some(s) if !s.is_empty() => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Helper function to check if two ObjectMeta represent the same file version.
+/// Returns true if the files are considered the same version, false otherwise.
+///
+/// Logic:
+/// - If BOTH version and e_tag are absent (None or empty) → same file (no versioning available)
+/// - If version is present in BOTH and matches → same file  
+/// - If e_tag is present in BOTH and matches → same file
+/// - If version is present in one but not the other → different file
+/// - If e_tag is present in one but not the other → different file
+/// - Otherwise → different file
+fn is_same_file_version(cached: &ObjectMeta, current: &ObjectMeta) -> bool {
+    let cached_version = normalize_optional_string(&cached.version);
+    let current_version = normalize_optional_string(&current.version);
+    let cached_etag = normalize_optional_string(&cached.e_tag);
+    let current_etag = normalize_optional_string(&current.e_tag);
+    
+    // Both version and etag are absent in both - no versioning info available, consider same
+    if cached_version.is_none() && current_version.is_none() 
+        && cached_etag.is_none() && current_etag.is_none() {
+        return true;
+    }
+    
+    // Check if version or etag presence differs (one has it, other doesn't) - different files
+    if (cached_version.is_some() != current_version.is_some()) || (cached_etag.is_some() != current_etag.is_some()) {
+        return false;
+    }
+    
+    // If version is present in BOTH and matches, it's the authoritative check
+    if let (Some(cv), Some(curv)) = (cached_version, current_version) {
+        return cv == curv
+    }
+    
+    // If etag is present in BOTH and matches, files are the same
+    if let (Some(ce), Some(cure)) = (cached_etag, current_etag) {
+        if ce == cure {
+            return true;
+        }
+    }
+    
+    // Otherwise, files are different
+    false
+}
+
 /// Default implementation of [`FileStatisticsCache`]
 ///
 /// Stores collected statistics for files
@@ -61,6 +112,7 @@ impl CacheAccessor<Path, Arc<Statistics>> for DefaultFileStatisticsCache {
                 let (saved_meta, statistics) = s.value();
                 if saved_meta.size != e.size
                     || saved_meta.last_modified != e.last_modified
+                    || !is_same_file_version(saved_meta, e)
                 {
                     // file has changed
                     None
@@ -190,8 +242,8 @@ impl DefaultFilesMetadataCacheState {
         }
     }
 
-    /// Returns the respective entry from the cache, if it exists and the `size` and `last_modified`
-    /// properties from [`ObjectMeta`] match.
+    /// Returns the respective entry from the cache, if it exists and the `size`, `last_modified`,
+    /// `version`, and `e_tag` properties from [`ObjectMeta`] match.
     /// If the entry exists, it becomes the most recently used.
     fn get(&mut self, k: &ObjectMeta) -> Option<Arc<dyn FileMetadata>> {
         self.lru_queue
@@ -199,6 +251,7 @@ impl DefaultFilesMetadataCacheState {
             .map(|(object_meta, metadata)| {
                 if object_meta.size != k.size
                     || object_meta.last_modified != k.last_modified
+                    || !is_same_file_version(object_meta, k)
                 {
                     None
                 } else {
@@ -209,14 +262,16 @@ impl DefaultFilesMetadataCacheState {
             .unwrap_or(None)
     }
 
-    /// Checks if the metadata is currently cached (entry exists and the `size` and `last_modified`
-    /// properties of [`ObjectMeta`] match).
+    /// Checks if the metadata is currently cached (entry exists and the `size`, `last_modified`,
+    /// `version`, and `e_tag` properties of [`ObjectMeta`] match).
     /// The LRU queue is not updated.
     fn contains_key(&self, k: &ObjectMeta) -> bool {
         self.lru_queue
             .peek(&k.location)
             .map(|(object_meta, _)| {
-                object_meta.size == k.size && object_meta.last_modified == k.last_modified
+                object_meta.size == k.size
+                    && object_meta.last_modified == k.last_modified
+                    && is_same_file_version(object_meta, k)
             })
             .unwrap_or(false)
     }
@@ -487,6 +542,173 @@ mod tests {
     }
 
     #[test]
+    fn test_statistics_cache_version_etag() {
+        let meta = ObjectMeta {
+            location: Path::from("test"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("etag1".to_string()),
+            version: Some("v1".to_string()),
+        };
+        let cache = DefaultFileStatisticsCache::default();
+        assert!(cache.get_with_extra(&meta.location, &meta).is_none());
+
+        cache.put_with_extra(
+            &meta.location,
+            Statistics::new_unknown(&Schema::new(vec![Field::new(
+                "test_column",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            )]))
+            .into(),
+            &meta,
+        );
+        assert!(cache.get_with_extra(&meta.location, &meta).is_some());
+
+        // e_tag changed but version still matches - cache should HIT
+        let mut meta2 = meta.clone();
+        meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_some());
+
+        // version changed - cache should MISS (different file, even if etag matches)
+        let mut meta2 = meta.clone();
+        meta2.version = Some("v2".to_string());
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+
+        // both version and e_tag changed - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.version = Some("v2".to_string());
+        meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+
+        // e_tag changed from Some("etag1") to None - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.e_tag = None;
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+
+        // version changed from Some("v1") to None - cache should miss
+        let mut meta2 = meta.clone();
+        meta2.version = None;
+        assert!(cache.get_with_extra(&meta2.location, &meta2).is_none());
+    }
+
+    #[test]
+    fn test_statistics_cache_version_matching_logic() {
+        // Test the version/etag matching logic:
+        // - Both None/empty → same file
+        // - At least one matches → same file  
+        // - Neither matches → different file
+        let cache = DefaultFileStatisticsCache::default();
+        
+        let stats = Statistics::new_unknown(&Schema::new(vec![Field::new(
+            "test_column",
+            DataType::Timestamp(TimeUnit::Second, None),
+            false,
+        )]))
+        .into();
+        
+        // Case 1: Cache with None, query with None → HIT (both absent)
+        let meta_none = ObjectMeta {
+            location: Path::from("test1"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: None,
+        };
+        cache.put_with_extra(&meta_none.location, Arc::clone(&stats), &meta_none);
+        assert!(cache.get_with_extra(&meta_none.location, &meta_none).is_some());
+        
+        // Case 2: Cache with None, query with empty string → HIT (both absent)
+        let meta_empty = ObjectMeta {
+            location: Path::from("test1"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("".to_string()),
+            version: Some("".to_string()),
+        };
+        assert!(cache.get_with_extra(&meta_empty.location, &meta_empty).is_some());
+        
+        // Case 3: Cache with version="v1", query with version="v1" → HIT (version matches)
+        let meta_v1 = ObjectMeta {
+            location: Path::from("test2"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: Some("v1".to_string()),
+        };
+        cache.put_with_extra(&meta_v1.location, Arc::clone(&stats), &meta_v1);
+        assert!(cache.get_with_extra(&meta_v1.location, &meta_v1).is_some());
+        
+        // Case 4: Cache with etag="etag1", query with etag="etag1" → HIT (etag matches)
+        let meta_etag1 = ObjectMeta {
+            location: Path::from("test3"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("etag1".to_string()),
+            version: None,
+        };
+        cache.put_with_extra(&meta_etag1.location, Arc::clone(&stats), &meta_etag1);
+        assert!(cache.get_with_extra(&meta_etag1.location, &meta_etag1).is_some());
+        
+        // Case 5: Cache with version="v1", query with version="v2" and no etag → MISS
+        let meta_v2 = ObjectMeta {
+            location: Path::from("test2"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: Some("v2".to_string()),
+        };
+        assert!(cache.get_with_extra(&meta_v2.location, &meta_v2).is_none());
+        
+        // Case 6: Cache with version="v1", query with None → MISS (versioning info mismatch)
+        let meta_v1_to_none = ObjectMeta {
+            location: Path::from("test2"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: None,
+        };
+        assert!(cache.get_with_extra(&meta_v1_to_none.location, &meta_v1_to_none).is_none());
+        
+        // Case 7: Cache with version="v1" + etag="e1", query with version="v1" + etag="e2" → HIT (version matches)
+        let meta_both = ObjectMeta {
+            location: Path::from("test4"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("e1".to_string()),
+            version: Some("v1".to_string()),
+        };
+        cache.put_with_extra(&meta_both.location, Arc::clone(&stats), &meta_both);
+        
+        let meta_both_diff_etag = ObjectMeta {
+            location: Path::from("test4"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("e2".to_string()),
+            version: Some("v1".to_string()),
+        };
+        assert!(cache.get_with_extra(&meta_both_diff_etag.location, &meta_both_diff_etag).is_some());
+    }
+
+    #[test]
     fn test_list_file_cache() {
         let meta = ObjectMeta {
             location: Path::from("test"),
@@ -588,6 +810,180 @@ mod tests {
         assert_eq!(cache.len(), 2);
         cache.clear();
         assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn test_default_file_metadata_cache_version_etag() {
+        let object_meta = ObjectMeta {
+            location: Path::from("test"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("etag1".to_string()),
+            version: Some("v1".to_string()),
+        };
+
+        let metadata: Arc<dyn FileMetadata> = Arc::new(TestFileMetadata {
+            metadata: "retrieved_metadata".to_owned(),
+        });
+
+        let cache = DefaultFilesMetadataCache::new(1024 * 1024);
+
+        // put
+        cache.put(&object_meta, Arc::clone(&metadata));
+
+        // get and contains of a valid entry
+        assert!(cache.contains_key(&object_meta));
+        assert!(cache.get(&object_meta).is_some());
+
+        // e_tag changed but version still matches - cache should HIT
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get(&object_meta2).is_some());
+        assert!(cache.contains_key(&object_meta2));
+
+        // version changed - cache should MISS (different file, even if etag matches)
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.version = Some("v2".to_string());
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+
+        // both version and e_tag changed - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.version = Some("v2".to_string());
+        object_meta2.e_tag = Some("etag2".to_string());
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+
+        // e_tag changed from Some("etag1") to None - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.e_tag = None;
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+
+        // version changed from Some("v1") to None - cache should miss
+        let mut object_meta2 = object_meta.clone();
+        object_meta2.version = None;
+        assert!(cache.get(&object_meta2).is_none());
+        assert!(!cache.contains_key(&object_meta2));
+    }
+
+    #[test]
+    fn test_default_file_metadata_cache_version_matching_logic() {
+        // Test the version/etag matching logic:
+        // - Both None/empty → same file
+        // - At least one matches → same file  
+        // - Neither matches → different file
+        let cache = DefaultFilesMetadataCache::new(1024 * 1024);
+        
+        let metadata: Arc<dyn FileMetadata> = Arc::new(TestFileMetadata {
+            metadata: "test_data".to_owned(),
+        });
+        
+        // Case 1: Cache with None, query with None → HIT (both absent)
+        let meta_none = ObjectMeta {
+            location: Path::from("test1"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: None,
+        };
+        cache.put(&meta_none, Arc::clone(&metadata));
+        assert!(cache.get(&meta_none).is_some());
+        assert!(cache.contains_key(&meta_none));
+        
+        // Case 2: Cache with None, query with empty string → HIT (both absent)
+        let meta_empty = ObjectMeta {
+            location: Path::from("test1"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("".to_string()),
+            version: Some("".to_string()),
+        };
+        assert!(cache.get(&meta_empty).is_some());
+        assert!(cache.contains_key(&meta_empty));
+        
+        // Case 3: Cache with version="v1", query with version="v1" → HIT (version matches)
+        let meta_v1 = ObjectMeta {
+            location: Path::from("test2"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: Some("v1".to_string()),
+        };
+        cache.put(&meta_v1, Arc::clone(&metadata));
+        assert!(cache.get(&meta_v1).is_some());
+        assert!(cache.contains_key(&meta_v1));
+        
+        // Case 4: Cache with version="v1", query with version="v2" → MISS
+        let meta_v2 = ObjectMeta {
+            location: Path::from("test2"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: Some("v2".to_string()),
+        };
+        assert!(cache.get(&meta_v2).is_none());
+        assert!(!cache.contains_key(&meta_v2));
+        
+        // Case 5: Cache with version="v1", query with None → MISS (versioning info present vs absent)
+        let meta_v1_to_none = ObjectMeta {
+            location: Path::from("test2"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: None,
+            version: None,
+        };
+        assert!(cache.get(&meta_v1_to_none).is_none());
+        assert!(!cache.contains_key(&meta_v1_to_none));
+        
+        // Case 6: Cache with version="v1" + etag="e1", query with version="v1" + etag="e2" → HIT (version matches)
+        let meta_both = ObjectMeta {
+            location: Path::from("test3"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("e1".to_string()),
+            version: Some("v1".to_string()),
+        };
+        cache.put(&meta_both, Arc::clone(&metadata));
+        
+        let meta_both_diff_etag = ObjectMeta {
+            location: Path::from("test3"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("e2".to_string()),
+            version: Some("v1".to_string()),
+        };
+        assert!(cache.get(&meta_both_diff_etag).is_some());
+        assert!(cache.contains_key(&meta_both_diff_etag));
+        
+        // Case 7: Cache with version="v1" + etag="e1", query with version="v2" + etag="e1" → MISS (version differs)
+        let meta_both_diff_version = ObjectMeta {
+            location: Path::from("test3"),
+            last_modified: DateTime::parse_from_rfc3339("2025-07-29T12:12:12+00:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: Some("e1".to_string()),
+            version: Some("v2".to_string()),
+        };
+        assert!(cache.get(&meta_both_diff_version).is_none());
+        assert!(!cache.contains_key(&meta_both_diff_version));
     }
 
     fn generate_test_metadata_with_size(
