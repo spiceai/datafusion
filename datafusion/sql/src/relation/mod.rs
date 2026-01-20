@@ -30,7 +30,7 @@ use datafusion_expr::planner::{
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
 use datafusion_expr::expr::FieldMetadata;
-use datafusion_expr::{expr::Unnest, Expr, LogicalPlan, LogicalPlanBuilder};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{
     Expr as SQLExpr, FunctionArg, FunctionArgExpr, Spanned, TableFactor,
@@ -156,7 +156,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     let args = func_args
                         .args
                         .into_iter()
-                        .flat_map(|arg| match arg {
+                        .map(|arg| match arg {
                             FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => self
                                 .sql_expr_to_logical_expr(
                                     expr,
@@ -167,29 +167,40 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 name: SQLExpr::Identifier(ident),
                                 arg: FunctionArgExpr::Expr(arg),
                                 operator: _,
-                            } => match self.sql_expr_to_logical_expr(
-                                arg,
-                                &DFSchema::empty(),
-                                planner_context,
-                            ) {
-                                Ok(Expr::Literal(scalar, meta)) => {
-                                    let spice_metadata =
-                                        FieldMetadata::new(BTreeMap::from([(
-                                            "spice.parameter_name".to_string(),
-                                            ident.value,
-                                        )]));
-                                    let mut meta =
-                                        meta.unwrap_or_else(FieldMetadata::default);
-                                    meta.extend(spice_metadata);
-                                    Ok(Expr::Literal(scalar, Some(meta)))
+                            } => {
+                                let param_name = ident.value;
+                                let spice_metadata =
+                                    FieldMetadata::new(BTreeMap::from([(
+                                        "spice.parameter_name".to_string(),
+                                        param_name.clone(),
+                                    )]));
+                                match self.sql_expr_to_logical_expr(
+                                    arg,
+                                    &DFSchema::empty(),
+                                    planner_context,
+                                ) {
+                                    Ok(Expr::Literal(scalar, meta)) => {
+                                        let mut meta =
+                                            meta.unwrap_or_else(FieldMetadata::default);
+                                        meta.extend(spice_metadata);
+                                        Ok(Expr::Literal(scalar, Some(meta)))
+                                    }
+                                    Ok(other) => {
+                                        // For non-literal named arguments (like function calls),
+                                        // we wrap in an alias to preserve the parameter name.
+                                        Ok(other.alias_with_metadata(
+                                            param_name,
+                                            Some(spice_metadata),
+                                        ))
+                                    }
+                                    Err(e) => Err(e),
                                 }
-                                other => other,
-                            },
+                            }
                             _ => {
                                 plan_err!("Unsupported function argument type: {}", arg)
                             }
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>>>()?;
                     let table_name_arg_str = args
                         .iter()
                         .map(|e| e.to_string())
