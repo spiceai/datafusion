@@ -104,9 +104,6 @@ fn reorder_named_arguments(
 
     let positional_count = arg_names.iter().filter(|n| n.is_none()).count();
 
-    // Capture args length before consuming the vector
-    let args_len = args.len();
-
     let expected_arg_count = param_names.len();
 
     if positional_count > expected_arg_count {
@@ -141,16 +138,22 @@ fn reorder_named_arguments(
         }
     }
 
-    // Only require parameters up to the number of arguments provided (supports optional parameters)
-    let required_count = args_len;
-    for i in 0..required_count {
+    // Validate positional arguments fill consecutive slots from the start.
+    // Named arguments can target ANY parameter position (including later ones)
+    // without requiring intermediate positions to be filled.
+    //
+    // This follows PostgreSQL semantics where named arguments can skip optional
+    // parameters that have defaults. For example, in PostgreSQL:
+    //   CREATE FUNCTION test(a int, b int DEFAULT 10, c int DEFAULT 20, d int)
+    //   SELECT test(1, d => 4)  -- Valid: skips b and c, they use defaults
+    for i in 0..positional_count {
         if result[i].is_none() {
             return plan_err!("Missing required parameter '{}'", param_names[i]);
         }
     }
 
-    // Return only the assigned parameters (handles optional trailing parameters)
-    Ok(result.into_iter().take(required_count).flatten().collect())
+    // Return all assigned parameters in order, filtering out unassigned optional positions.
+    Ok(result.into_iter().flatten().collect())
 }
 
 #[cfg(test)]
@@ -268,18 +271,67 @@ mod tests {
     }
 
     #[test]
-    fn test_missing_required_parameter() {
+    fn test_named_arg_can_skip_middle_parameter() {
         let param_names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
 
-        // Call with: func(a => 1, c => 3.0) - missing 'b'
+        // Call with: func(1, c => 3.0)
+        // - 1 positional arg fills position 0 (a)
+        // - Named arg 'c' fills position 2
+        // - Position 1 (b) is skipped (optional, uses default)
+        // positional_count = 1, so only position 0 must be filled ✓
+        let args = vec![lit(1), lit(3.0)];
+        let arg_names = vec![None, Some("c".to_string())];
+
+        let result = resolve_function_arguments(&param_names, args, arg_names).unwrap();
+
+        // Returns [a, c] = [1, 3.0], position 1 (b) skipped
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], lit(1));
+        assert_eq!(result[1], lit(3.0));
+    }
+
+    #[test]
+    fn test_named_argument_skips_optional_positions() {
+        // Simulates: vector_search(foo, 'yellow', rank_weight => 100)
+        // where params are [tbl, query, column, limit, include_score, rank_weight]
+        // and column, limit, include_score are optional
+        let param_names = vec![
+            "tbl".to_string(),
+            "query".to_string(),
+            "column".to_string(),
+            "limit".to_string(),
+            "include_score".to_string(),
+            "rank_weight".to_string(),
+        ];
+
+        // 2 positional args + 1 named arg that targets position 5
+        let args = vec![lit("foo"), lit("yellow"), lit(100)];
+        let arg_names = vec![None, None, Some("rank_weight".to_string())];
+
+        let result = resolve_function_arguments(&param_names, args, arg_names).unwrap();
+
+        // Should return all 3 provided arguments: [tbl, query, rank_weight]
+        // Positions 2, 3, 4 (column, limit, include_score) are skipped
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0], lit("foo"));
+        assert_eq!(result[1], lit("yellow"));
+        assert_eq!(result[2], lit(100));
+    }
+
+    #[test]
+    fn test_named_arguments_can_skip_optional_parameters() {
+        let param_names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+
+        // Call with: func(a => 1, c => 3.0) - skipping 'b' (optional)
+        // This is valid - named arguments can target non-consecutive parameters
         let args = vec![lit(1), lit(3.0)];
         let arg_names = vec![Some("a".to_string()), Some("c".to_string())];
 
-        let result = resolve_function_arguments(&param_names, args, arg_names);
-        assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Missing required parameter"));
+        let result = resolve_function_arguments(&param_names, args, arg_names).unwrap();
+
+        // Should return [a, c] = [1, 3.0], skipping b
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], lit(1));
+        assert_eq!(result[1], lit(3.0));
     }
 }
