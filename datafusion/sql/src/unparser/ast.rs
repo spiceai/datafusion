@@ -275,7 +275,7 @@ impl SelectBuilder {
         self.sort_by = value;
         self
     }
-    pub fn get_sort_by(&self) -> Vec<ast::Expr> {
+    pub fn get_sort_by(&self) -> Vec<ast::OrderByExpr> {
         self.sort_by.clone()
     }
     pub fn having(&mut self, value: Option<ast::Expr>) -> &mut Self {
