@@ -2816,6 +2816,18 @@ config_namespace! {
     }
 }
 
+config_namespace! {
+    /// Options controlling Vortex format
+    pub struct VortexOptions {
+        /// The size of the in-memory footer cache in megabytes.
+        pub footer_cache_size_mb: usize, default = 64
+        /// The size of the in-memory segment cache in megabytes.
+        pub segment_cache_size_mb: usize, default = 0
+
+        pub footer_initial_read_size_bytes: usize, default = 65536
+    }
+}
+
 pub trait OutputFormatExt: Display {}
 
 #[derive(Debug, Clone, PartialEq)]

@@ -34,7 +34,7 @@ use arrow::ipc::writer::{
 use datafusion_common::{
     config::{
         CsvOptions, JsonOptions, ParquetColumnOptions, ParquetOptions,
-        TableParquetOptions,
+        TableParquetOptions, VortexOptions,
     },
     file_options::{csv_writer::CsvWriterOptions, json_writer::JsonWriterOptions},
     parsers::CompressionTypeVariant,
@@ -986,6 +986,18 @@ impl TryFrom<&JsonOptions> for protobuf::JsonOptions {
         Ok(protobuf::JsonOptions {
             compression: compression.into(),
             schema_infer_max_rec: opts.schema_infer_max_rec.map(|h| h as u64),
+        })
+    }
+}
+
+impl TryFrom<&VortexOptions> for protobuf::VortexOptions {
+    type Error = DataFusionError;
+
+    fn try_from(opts: &VortexOptions) -> datafusion_common::Result<Self, Self::Error> {
+        Ok(protobuf::VortexOptions {
+            footer_cache_size_mb: opts.footer_cache_size_mb as u64,
+            segment_cache_size_mb: opts.segment_cache_size_mb as u64,
+            footer_initial_read_size_bytes: opts.footer_initial_read_size_bytes as u64,
         })
     }
 }

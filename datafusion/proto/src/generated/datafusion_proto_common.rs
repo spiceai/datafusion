@@ -47,6 +47,24 @@ pub struct NdJsonFormat {
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ArrowFormat {}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VortexFormat {
+    #[prost(message, optional, tag = "1")]
+    pub options: ::core::option::Option<VortexOptions>,
+}
+/// Options controlling Vortex format
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct VortexOptions {
+    /// default = 64
+    #[prost(uint64, tag = "1")]
+    pub footer_cache_size_mb: u64,
+    /// default = 0
+    #[prost(uint64, tag = "2")]
+    pub segment_cache_size_mb: u64,
+    /// default = 65535
+    #[prost(uint64, tag = "3")]
+    pub footer_initial_read_size_bytes: u64,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct PrimaryKeyConstraint {
     #[prost(uint64, repeated, tag = "1")]
