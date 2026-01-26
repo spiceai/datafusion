@@ -125,7 +125,7 @@ pub struct ListingTableScanNode {
     pub file_sort_order: ::prost::alloc::vec::Vec<SortExprNodeCollection>,
     #[prost(
         oneof = "listing_table_scan_node::FileFormatType",
-        tags = "10, 11, 12, 15, 16"
+        tags = "10, 11, 12, 15, 16, 17"
     )]
     pub file_format_type: ::core::option::Option<
         listing_table_scan_node::FileFormatType,
@@ -145,6 +145,8 @@ pub mod listing_table_scan_node {
         Json(super::super::datafusion_common::NdJsonFormat),
         #[prost(message, tag = "16")]
         Arrow(super::super::datafusion_common::ArrowFormat),
+        #[prost(message, tag = "17")]
+        Vortex(super::super::datafusion_common::VortexFormat),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
