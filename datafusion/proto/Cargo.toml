@@ -42,6 +42,7 @@ default = ["parquet"]
 json = ["pbjson", "serde", "serde_json", "datafusion-proto-common/json"]
 parquet = ["datafusion-datasource-parquet", "datafusion-common/parquet", "datafusion/parquet"]
 avro = ["datafusion-datasource-avro", "datafusion-common/avro"]
+vortex = ["vortex-datafusion"]
 
 # Note to developers: do *not* add `datafusion` as a dependency in
 # this crate. See https://github.com/apache/datafusion/issues/17713
@@ -68,7 +69,7 @@ datafusion-physical-expr-common = { workspace = true }
 datafusion-physical-plan = { workspace = true }
 datafusion-proto-common = { workspace = true }
 object_store = { workspace = true }
-vortex-datafusion = { workspace = true }
+vortex-datafusion = { workspace = true, optional = true }
 pbjson = { workspace = true, optional = true }
 prost = { workspace = true }
 serde = { version = "1.0", optional = true }

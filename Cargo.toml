@@ -282,3 +282,21 @@ arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223a
 arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
 arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
 parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+
+# Patch datafusion crates so vortex-datafusion uses our local workspace versions
+datafusion = { path = "datafusion/core" }
+datafusion-catalog = { path = "datafusion/catalog" }
+datafusion-catalog-listing = { path = "datafusion/catalog-listing" }
+datafusion-common = { path = "datafusion/common" }
+datafusion-common-runtime = { path = "datafusion/common-runtime" }
+datafusion-datasource = { path = "datafusion/datasource" }
+datafusion-datasource-parquet = { path = "datafusion/datasource-parquet" }
+datafusion-execution = { path = "datafusion/execution" }
+datafusion-expr = { path = "datafusion/expr" }
+datafusion-expr-common = { path = "datafusion/expr-common" }
+datafusion-functions = { path = "datafusion/functions" }
+datafusion-physical-expr = { path = "datafusion/physical-expr" }
+datafusion-physical-expr-common = { path = "datafusion/physical-expr-common" }
+datafusion-physical-expr-adapter = { path = "datafusion/physical-expr-adapter" }
+datafusion-physical-plan = { path = "datafusion/physical-plan" }
+datafusion-pruning = { path = "datafusion/pruning" }
