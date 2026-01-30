@@ -413,11 +413,13 @@ impl AsLogicalPlan for LogicalPlanNode {
                             }
                             Arc::new(csv)
                         },
+                        #[cfg_attr(not(feature = "vortex"), allow(unused_variables))]
                         FileFormatType::Vortex(protobuf::VortexFormat {
                             options
                         }) => {
+                            #[cfg(feature = "vortex")]
                             {
-                                use datafusion_datasource::file_format::FileFormatFactory as _;
+                                use datafusion_datasource::file_format::FileFormatFactory;
                                 let opts = if let Some(options) = options {
                                     vortex_datafusion::VortexOptions {
                                         footer_cache_size_mb: options.footer_cache_size_mb as usize,
@@ -427,8 +429,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                                 } else {
                                     vortex_datafusion::VortexOptions::default()
                                 };
-                                vortex_datafusion::VortexFormatFactory::new().with_options(opts).default()
+                                let factory = vortex_datafusion::VortexFormatFactory::new().with_options(opts);
+                                FileFormatFactory::default(&factory)
                             }
+                            #[cfg(not(feature = "vortex"))]
+                            panic!("Unable to process vortex file since `vortex` feature is not enabled");
                         },
                         FileFormatType::Json(protobuf::NdJsonFormat {
                             options
@@ -1059,6 +1064,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                     let file_format_type = {
                         let mut maybe_some_type = None;
 
+                        #[cfg(feature = "vortex")]
                         if let Some(vortex) =
                             any.downcast_ref::<vortex_datafusion::VortexFormat>()
                         {
