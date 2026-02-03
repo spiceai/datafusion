@@ -1452,8 +1452,10 @@ fn build_predicate_expression(
                 })
                 .collect();
             // Build a balanced tree to avoid deep recursion during evaluation
-            let change_expr = build_balanced_binary_tree(re_op, eq_exprs)
-                .expect("list is not empty, so this should always return Some");
+            let Some(change_expr) = build_balanced_binary_tree(re_op, eq_exprs) else {
+                unreachable!("list is not empty, so this should always return Some");
+            };
+
             return build_predicate_expression(
                 &change_expr,
                 schema,
