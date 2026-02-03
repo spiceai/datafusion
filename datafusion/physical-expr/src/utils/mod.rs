@@ -59,15 +59,60 @@ pub fn conjunction(
 /// If the input is empty or the return None.
 /// If the input contains a single predicate, return Some(predicate).
 /// Otherwise, return a Some(..) of a conjunction of the predicates (e.g. `Some(a AND b AND c)`).
+///
+/// The resulting expression tree is balanced to avoid deep recursion during evaluation.
+/// For example, `conjunction([a, b, c, d])` produces `((a AND b) AND (c AND d))` rather than
+/// `(((a AND b) AND c) AND d)`.
 pub fn conjunction_opt(
     predicates: impl IntoIterator<Item = Arc<dyn PhysicalExpr>>,
 ) -> Option<Arc<dyn PhysicalExpr>> {
-    predicates
-        .into_iter()
-        .fold(None, |acc, predicate| match acc {
-            None => Some(predicate),
-            Some(acc) => Some(Arc::new(BinaryExpr::new(acc, Operator::And, predicate))),
-        })
+    let predicates: Vec<_> = predicates.into_iter().collect();
+    build_balanced_binary_tree(Operator::And, predicates)
+}
+
+/// Build a balanced tree of binary expressions from an operator and a list of expressions.
+///
+/// For example, `build_balanced_binary_tree(AND, [a, b, c, d, e])` produces:
+/// `((a AND b) AND ((c AND d) AND e))` with tree depth O(log n) rather than O(n).
+///
+/// Returns `None` if the input is empty.
+/// Returns the single expression if the input contains only one element.
+pub fn build_balanced_binary_tree(
+    op: Operator,
+    exprs: Vec<Arc<dyn PhysicalExpr>>,
+) -> Option<Arc<dyn PhysicalExpr>> {
+    let n = exprs.len();
+    if n == 0 {
+        return None;
+    }
+    // Use an iterator approach to avoid ownership issues
+    let mut iter = exprs.into_iter();
+    Some(build_balanced_tree_inner(op, &mut iter, n))
+}
+
+/// Helper function for [`build_balanced_binary_tree`] implementation.
+///
+/// `take_len` represents the number of elements to take from `exprs`.
+/// Using `take_len` avoids building complex iterator types from recursive `take()` calls.
+fn build_balanced_tree_inner(
+    op: Operator,
+    exprs: &mut impl Iterator<Item = Arc<dyn PhysicalExpr>>,
+    take_len: usize,
+) -> Arc<dyn PhysicalExpr> {
+    debug_assert!(take_len > 0, "take_len must be greater than 0");
+
+    if take_len == 1 {
+        return exprs.next().expect("Expected one more element in iterator");
+    }
+
+    // Split the list in two balanced halves
+    let left_len = take_len / 2;
+    let right_len = take_len - left_len;
+
+    let left = build_balanced_tree_inner(op, exprs, left_len);
+    let right = build_balanced_tree_inner(op, exprs, right_len);
+
+    Arc::new(BinaryExpr::new(left, op, right))
 }
 
 /// Assume the predicate is in the form of DNF, split the predicate to a Vec of PhysicalExprs.
@@ -560,6 +605,201 @@ pub(crate) mod tests {
         expected.insert(Column::new("col1", 2));
         expected.insert(Column::new("col2", 5));
         assert_eq!(collect_columns(&expr3), expected);
+        Ok(())
+    }
+
+    /// Helper to calculate the depth of a binary expression tree
+    fn tree_depth(expr: &Arc<dyn PhysicalExpr>) -> usize {
+        if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+            1 + std::cmp::max(tree_depth(binary.left()), tree_depth(binary.right()))
+        } else {
+            1
+        }
+    }
+
+    /// Helper to evaluate an expression with a boolean result
+    fn eval_bool(
+        expr: &Arc<dyn PhysicalExpr>,
+        batch: &arrow::record_batch::RecordBatch,
+    ) -> Result<Vec<bool>> {
+        use datafusion_expr::ColumnarValue;
+        let result = expr.evaluate(batch)?;
+        match result {
+            ColumnarValue::Array(arr) => {
+                let bool_arr = arr
+                    .as_any()
+                    .downcast_ref::<arrow::array::BooleanArray>()
+                    .unwrap();
+                Ok(bool_arr.iter().map(|v| v.unwrap_or(false)).collect())
+            }
+            ColumnarValue::Scalar(s) => {
+                if let ScalarValue::Boolean(Some(b)) = s {
+                    Ok(vec![b])
+                } else {
+                    Ok(vec![false])
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_build_balanced_binary_tree_empty() {
+        let result = build_balanced_binary_tree(Operator::And, vec![]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_build_balanced_binary_tree_single() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let result = build_balanced_binary_tree(Operator::And, vec![col_a.clone()]);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        // Single element should return the element itself
+        assert!(result.as_any().is::<Column>());
+    }
+
+    #[test]
+    fn test_build_balanced_binary_tree_depth() {
+        // Test that the tree depth is O(log n) not O(n)
+        // With 8 elements, balanced tree has depth 4, linear tree has depth 8
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = (0..8)
+            .map(|i| Arc::new(Column::new(&format!("c{i}"), i)) as Arc<dyn PhysicalExpr>)
+            .collect();
+
+        let result = build_balanced_binary_tree(Operator::And, exprs).unwrap();
+        let depth = tree_depth(&result);
+
+        // Balanced tree of 8 elements should have depth 4 (log2(8) + 1)
+        // A linear tree would have depth 8
+        assert!(depth <= 4, "Expected depth <= 4, got {depth}");
+    }
+
+    #[test]
+    fn test_build_balanced_binary_tree_large() {
+        // Test with a larger number of elements to verify no stack overflow
+        // and proper depth
+        let n = 100;
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = (0..n)
+            .map(|i| Arc::new(Column::new(&format!("c{i}"), i)) as Arc<dyn PhysicalExpr>)
+            .collect();
+
+        let result = build_balanced_binary_tree(Operator::Or, exprs).unwrap();
+        let depth = tree_depth(&result);
+
+        // log2(100) ≈ 6.6, so depth should be around 7-8
+        let expected_max_depth = (n as f64).log2().ceil() as usize + 1;
+        assert!(
+            depth <= expected_max_depth,
+            "Expected depth <= {expected_max_depth}, got {depth}"
+        );
+    }
+
+    #[test]
+    fn test_conjunction_opt_empty() {
+        let result = conjunction_opt(vec![]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_conjunction_opt_single() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let result = conjunction_opt(vec![col_a.clone()]);
+        assert!(result.is_some());
+        assert!(result.unwrap().as_any().is::<Column>());
+    }
+
+    #[test]
+    fn test_conjunction_opt_balanced_depth() {
+        // Verify conjunction_opt produces a balanced tree
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = (0..8)
+            .map(|i| Arc::new(Column::new(&format!("c{i}"), i)) as Arc<dyn PhysicalExpr>)
+            .collect();
+
+        let result = conjunction_opt(exprs).unwrap();
+        let depth = tree_depth(&result);
+
+        // Should be balanced, not linear
+        assert!(depth <= 4, "Expected depth <= 4, got {depth}");
+    }
+
+    #[test]
+    fn test_conjunction_logical_equivalence() -> Result<()> {
+        // Test that conjunction produces logically equivalent results
+        // Create boolean columns and verify AND behavior
+        use arrow::array::BooleanArray;
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("c", DataType::Boolean, false),
+        ]));
+
+        let a = Arc::new(BooleanArray::from(vec![true, true, false, false]));
+        let b = Arc::new(BooleanArray::from(vec![true, false, true, false]));
+        let c = Arc::new(BooleanArray::from(vec![true, true, true, true]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![a, b, c])?;
+
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let col_c: Arc<dyn PhysicalExpr> = Arc::new(Column::new("c", 2));
+
+        // Test a AND b AND c using conjunction
+        let conj =
+            conjunction_opt(vec![col_a.clone(), col_b.clone(), col_c.clone()]).unwrap();
+        let result = eval_bool(&conj, &batch)?;
+
+        // Expected: true AND true AND true = true
+        //           true AND false AND true = false
+        //           false AND true AND true = false
+        //           false AND false AND true = false
+        assert_eq!(result, vec![true, false, false, false]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_conjunction_roundtrip() -> Result<()> {
+        // Test that split_conjunction and conjunction are inverses
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        let col_c: Arc<dyn PhysicalExpr> = Arc::new(Column::new("c", 2));
+
+        // Build a conjunction
+        let conj = conjunction(vec![col_a.clone(), col_b.clone(), col_c.clone()]);
+
+        // Split it back
+        let split = split_conjunction(&conj);
+
+        // Should have 3 elements
+        assert_eq!(split.len(), 3);
+
+        // Rebuild and verify logical equivalence via evaluation
+        use arrow::array::BooleanArray;
+        use arrow::record_batch::RecordBatch;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("c", DataType::Boolean, false),
+        ]));
+
+        let a = Arc::new(BooleanArray::from(vec![true, false, true, false]));
+        let b = Arc::new(BooleanArray::from(vec![true, true, false, false]));
+        let c = Arc::new(BooleanArray::from(vec![true, true, true, false]));
+
+        let batch = RecordBatch::try_new(schema.clone(), vec![a, b, c])?;
+
+        // Evaluate original conjunction
+        let original_result = eval_bool(&conj, &batch)?;
+
+        // Rebuild conjunction from split parts
+        let rebuilt = conjunction(split.into_iter().cloned());
+        let rebuilt_result = eval_bool(&rebuilt, &batch)?;
+
+        assert_eq!(original_result, rebuilt_result);
+
         Ok(())
     }
 }
