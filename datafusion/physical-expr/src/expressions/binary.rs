@@ -187,6 +187,16 @@ impl PhysicalExpr for BinaryExpr {
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         use arrow::compute::kernels::numeric::*;
 
+        // For AND/OR operators with deeply nested chains, use iterative evaluation
+        // to avoid stack overflow. We only check depth for AND/OR since other
+        // operators don't typically form deep chains.
+        if matches!(self.op, Operator::And | Operator::Or) {
+            let depth = self.estimate_and_or_chain_depth();
+            if depth > ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD {
+                return self.evaluate_and_or_chain(batch);
+            }
+        }
+
         // Evaluate left-hand side expression.
         let lhs = self.left.evaluate(batch)?;
 
@@ -652,7 +662,137 @@ impl BinaryExpr {
             }
         }
     }
+
+    /// Estimates the depth of a homogeneous AND/OR chain.
+    ///
+    /// Uses iterative stack-based traversal to avoid recursion.
+    /// Only counts depth for chains where all BinaryExpr have the same operator.
+    fn estimate_and_or_chain_depth(&self) -> usize {
+        if !matches!(self.op, Operator::And | Operator::Or) {
+            return 1;
+        }
+
+        let target_op = self.op;
+        let mut max_depth = 0;
+        // Stack holds (expression, current_depth)
+        let mut stack: Vec<(&Arc<dyn PhysicalExpr>, usize)> =
+            vec![(&self.left, 1), (&self.right, 1)];
+
+        while let Some((expr, depth)) = stack.pop() {
+            max_depth = max_depth.max(depth);
+
+            if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+                if binary.op == target_op {
+                    stack.push((&binary.left, depth + 1));
+                    stack.push((&binary.right, depth + 1));
+                }
+            }
+        }
+
+        max_depth
+    }
+
+    /// Collects all operands from a homogeneous AND/OR chain iteratively.
+    ///
+    /// For example, `(a AND b) AND (c AND d)` returns `[a, b, c, d]`.
+    /// Stops descending when encountering a non-BinaryExpr or a BinaryExpr with a different operator.
+    fn collect_boolean_chain_operands(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        debug_assert!(matches!(self.op, Operator::And | Operator::Or));
+
+        let target_op = self.op;
+        let mut operands = Vec::new();
+        let mut stack: Vec<Arc<dyn PhysicalExpr>> =
+            vec![Arc::clone(&self.right), Arc::clone(&self.left)];
+
+        while let Some(expr) = stack.pop() {
+            if let Some(binary) = expr.as_any().downcast_ref::<BinaryExpr>() {
+                if binary.op == target_op {
+                    // Push right first so left is processed first (preserves order)
+                    stack.push(Arc::clone(&binary.right));
+                    stack.push(Arc::clone(&binary.left));
+                    continue;
+                }
+            }
+            // Not a matching BinaryExpr, so it's a leaf operand
+            operands.push(expr);
+        }
+
+        operands
+    }
+
+    /// Evaluates an AND/OR chain iteratively with short-circuit semantics.
+    ///
+    /// This avoids deep recursion for chains like `a AND b AND c AND ... AND z`.
+    fn evaluate_and_or_chain(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
+        debug_assert!(matches!(self.op, Operator::And | Operator::Or));
+
+        let is_and = self.op == Operator::And;
+        let operands = self.collect_boolean_chain_operands();
+        let num_rows = batch.num_rows();
+
+        // Start with identity value for the operation
+        // AND: start with all true, OR: start with all false
+        let mut result: Option<ColumnarValue> = None;
+
+        for operand in operands {
+            // Evaluate this operand
+            let value = operand.evaluate(batch)?;
+
+            // Check for short-circuit opportunity
+            match check_short_circuit(&value, &self.op) {
+                ShortCircuitStrategy::ReturnLeft => {
+                    // For AND: all false means result is false
+                    // For OR: all true means result is true
+                    return Ok(value);
+                }
+                ShortCircuitStrategy::ReturnRight => {
+                    // For AND: all true means continue (identity)
+                    // For OR: all false means continue (identity)
+                    // Skip this operand as it doesn't affect result
+                    continue;
+                }
+                ShortCircuitStrategy::PreSelection(_) | ShortCircuitStrategy::None => {
+                    // Can't short-circuit, need to combine with accumulated result
+                }
+            }
+
+            // Combine with accumulated result
+            result = Some(match result {
+                None => value,
+                Some(acc) => {
+                    // Combine acc and value using the appropriate boolean kernel
+                    let acc_array = acc.into_array(num_rows)?;
+                    let value_array = value.into_array(num_rows)?;
+                    let combined = if is_and {
+                        boolean_op(&acc_array, &value_array, and_kleene)?
+                    } else {
+                        boolean_op(&acc_array, &value_array, or_kleene)?
+                    };
+                    ColumnarValue::Array(combined)
+                }
+            });
+
+            // After combining, check if we can short-circuit based on result
+            if let Some(ref res) = result {
+                match check_short_circuit(res, &self.op) {
+                    ShortCircuitStrategy::ReturnLeft => {
+                        return Ok(result.unwrap());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Return result or identity value if all operands were skipped
+        Ok(result
+            .unwrap_or_else(|| ColumnarValue::Scalar(ScalarValue::Boolean(Some(is_and)))))
+    }
 }
+
+/// Threshold for switching to iterative evaluation for AND/OR chains.
+/// When the chain depth exceeds this value, we use iterative evaluation
+/// to avoid stack overflow.
+const ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD: usize = 10;
 
 enum ShortCircuitStrategy<'a> {
     None,
@@ -5312,5 +5452,260 @@ mod tests {
         let expected =
             BooleanArray::from_iter(vec![Some(true), Some(true), Some(true), Some(true)]);
         assert_eq!(eq_result.into_array(4).unwrap().as_boolean(), &expected);
+    }
+
+    #[test]
+    fn test_estimate_and_or_chain_depth() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("c", DataType::Boolean, false),
+        ]);
+
+        let col_a = col("a", &schema).unwrap();
+        let col_b = col("b", &schema).unwrap();
+        let col_c = col("c", &schema).unwrap();
+
+        // Single binary expression: depth = 1
+        let expr = BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone());
+        assert_eq!(expr.estimate_and_or_chain_depth(), 1);
+
+        // (a AND b) AND c: depth = 2
+        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
+        let expr = BinaryExpr::new(left, Operator::And, col_c.clone());
+        assert_eq!(expr.estimate_and_or_chain_depth(), 2);
+
+        // a AND (b AND c): depth = 2
+        let right =
+            Arc::new(BinaryExpr::new(col_b.clone(), Operator::And, col_c.clone()));
+        let expr = BinaryExpr::new(col_a.clone(), Operator::And, right);
+        assert_eq!(expr.estimate_and_or_chain_depth(), 2);
+
+        // Mixed operators don't increase depth: (a AND b) OR c has depth 1 for OR
+        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
+        let expr = BinaryExpr::new(left, Operator::Or, col_c.clone());
+        assert_eq!(expr.estimate_and_or_chain_depth(), 1);
+
+        // Non-AND/OR operator: depth = 1
+        let expr = BinaryExpr::new(col_a.clone(), Operator::Eq, col_b.clone());
+        assert_eq!(expr.estimate_and_or_chain_depth(), 1);
+    }
+
+    #[test]
+    fn test_collect_boolean_chain_operands() {
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("c", DataType::Boolean, false),
+            Field::new("d", DataType::Boolean, false),
+        ]);
+
+        let col_a = col("a", &schema).unwrap();
+        let col_b = col("b", &schema).unwrap();
+        let col_c = col("c", &schema).unwrap();
+        let col_d = col("d", &schema).unwrap();
+
+        // Simple: a AND b -> [a, b]
+        let expr = BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone());
+        let operands = expr.collect_boolean_chain_operands();
+        assert_eq!(operands.len(), 2);
+
+        // Nested: (a AND b) AND (c AND d) -> [a, b, c, d]
+        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
+        let right =
+            Arc::new(BinaryExpr::new(col_c.clone(), Operator::And, col_d.clone()));
+        let expr = BinaryExpr::new(left, Operator::And, right);
+        let operands = expr.collect_boolean_chain_operands();
+        assert_eq!(operands.len(), 4);
+
+        // Mixed: (a AND b) OR c -> [(a AND b), c] (stops at different operator)
+        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
+        let expr = BinaryExpr::new(left, Operator::Or, col_c.clone());
+        let operands = expr.collect_boolean_chain_operands();
+        assert_eq!(operands.len(), 2);
+    }
+
+    #[test]
+    fn test_deep_and_chain_iterative() -> Result<()> {
+        // Create a chain deeper than the threshold to trigger iterative evaluation
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
+
+        // Create test data
+        let a = BooleanArray::from(vec![true, true, false, true]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a)])?;
+
+        let col_a = col("a", &schema)?;
+
+        // Build a deep chain: a AND a AND a AND ... (depth > threshold)
+        let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
+        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        for _ in 0..depth {
+            expr = Arc::new(BinaryExpr::new(expr, Operator::And, col_a.clone()));
+        }
+
+        // This should use the iterative path and not stack overflow
+        let result = expr.evaluate(&batch)?;
+        let result_array = result.into_array(batch.num_rows())?;
+        let bool_array = result_array.as_boolean();
+
+        // a AND a AND ... AND a = a
+        assert_eq!(bool_array.value(0), true);
+        assert_eq!(bool_array.value(1), true);
+        assert_eq!(bool_array.value(2), false);
+        assert_eq!(bool_array.value(3), true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_deep_or_chain_iterative() -> Result<()> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
+
+        let a = BooleanArray::from(vec![true, false, false, true]);
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a)])?;
+
+        let col_a = col("a", &schema)?;
+
+        // Build a deep OR chain
+        let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
+        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        for _ in 0..depth {
+            expr = Arc::new(BinaryExpr::new(expr, Operator::Or, col_a.clone()));
+        }
+
+        let result = expr.evaluate(&batch)?;
+        let result_array = result.into_array(batch.num_rows())?;
+        let bool_array = result_array.as_boolean();
+
+        // a OR a OR ... OR a = a
+        assert_eq!(bool_array.value(0), true);
+        assert_eq!(bool_array.value(1), false);
+        assert_eq!(bool_array.value(2), false);
+        assert_eq!(bool_array.value(3), true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_iterative_and_short_circuit_all_false() -> Result<()> {
+        // Test that short-circuit works: if any operand is all false, AND returns false
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+        ]));
+
+        let a = BooleanArray::from(vec![true, true, true, true]);
+        let b = BooleanArray::from(vec![false, false, false, false]); // all false
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a), Arc::new(b)])?;
+
+        let col_a = col("a", &schema)?;
+        let col_b = col("b", &schema)?;
+
+        // Build deep chain: a AND a AND ... AND b AND a AND ...
+        // The b (all false) should short-circuit
+        let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
+        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        for i in 0..depth {
+            if i == depth / 2 {
+                expr = Arc::new(BinaryExpr::new(expr, Operator::And, col_b.clone()));
+            } else {
+                expr = Arc::new(BinaryExpr::new(expr, Operator::And, col_a.clone()));
+            }
+        }
+
+        let result = expr.evaluate(&batch)?;
+        let result_array = result.into_array(batch.num_rows())?;
+        let bool_array = result_array.as_boolean();
+
+        // Result should be all false due to short-circuit
+        assert_eq!(bool_array.value(0), false);
+        assert_eq!(bool_array.value(1), false);
+        assert_eq!(bool_array.value(2), false);
+        assert_eq!(bool_array.value(3), false);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_iterative_or_short_circuit_all_true() -> Result<()> {
+        // Test that short-circuit works: if any operand is all true, OR returns true
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+        ]));
+
+        let a = BooleanArray::from(vec![false, false, false, false]);
+        let b = BooleanArray::from(vec![true, true, true, true]); // all true
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a), Arc::new(b)])?;
+
+        let col_a = col("a", &schema)?;
+        let col_b = col("b", &schema)?;
+
+        // Build deep chain: a OR a OR ... OR b OR a OR ...
+        let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
+        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        for i in 0..depth {
+            if i == depth / 2 {
+                expr = Arc::new(BinaryExpr::new(expr, Operator::Or, col_b.clone()));
+            } else {
+                expr = Arc::new(BinaryExpr::new(expr, Operator::Or, col_a.clone()));
+            }
+        }
+
+        let result = expr.evaluate(&batch)?;
+        let result_array = result.into_array(batch.num_rows())?;
+        let bool_array = result_array.as_boolean();
+
+        // Result should be all true due to short-circuit
+        assert_eq!(bool_array.value(0), true);
+        assert_eq!(bool_array.value(1), true);
+        assert_eq!(bool_array.value(2), true);
+        assert_eq!(bool_array.value(3), true);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_iterative_mixed_values() -> Result<()> {
+        // Test with mixed boolean values
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Boolean, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("c", DataType::Boolean, false),
+        ]));
+
+        let a = BooleanArray::from(vec![true, true, false, false]);
+        let b = BooleanArray::from(vec![true, false, true, false]);
+        let c = BooleanArray::from(vec![true, true, true, true]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(a), Arc::new(b), Arc::new(c)],
+        )?;
+
+        let col_a = col("a", &schema)?;
+        let col_b = col("b", &schema)?;
+        let col_c = col("c", &schema)?;
+
+        // Build: a AND b AND c AND a AND b AND ... (deep chain)
+        let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 3;
+        let cols = vec![col_a.clone(), col_b.clone(), col_c.clone()];
+        let mut expr: Arc<dyn PhysicalExpr> = cols[0].clone();
+        for i in 1..depth {
+            expr = Arc::new(BinaryExpr::new(expr, Operator::And, cols[i % 3].clone()));
+        }
+
+        let result = expr.evaluate(&batch)?;
+        let result_array = result.into_array(batch.num_rows())?;
+        let bool_array = result_array.as_boolean();
+
+        // a AND b AND c = [true, false, false, false]
+        assert_eq!(bool_array.value(0), true);
+        assert_eq!(bool_array.value(1), false);
+        assert_eq!(bool_array.value(2), false);
+        assert_eq!(bool_array.value(3), false);
+
+        Ok(())
     }
 }
