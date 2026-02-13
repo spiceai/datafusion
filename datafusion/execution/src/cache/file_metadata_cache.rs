@@ -25,6 +25,7 @@ use object_store::{ObjectMeta, path::Path};
 use crate::cache::{
     CacheAccessor,
     cache_manager::{FileMetadata, FileMetadataCache, FileMetadataCacheEntry},
+    cache_unit::is_same_file_version,
     lru_queue::LruQueue,
 };
 
@@ -46,8 +47,8 @@ impl DefaultFilesMetadataCacheState {
         }
     }
 
-    /// Returns the respective entry from the cache, if it exists and the `size` and `last_modified`
-    /// properties from [`ObjectMeta`] match.
+    /// Returns the respective entry from the cache, if it exists and the `size`, `last_modified`,
+    /// `version`, and `e_tag` properties from [`ObjectMeta`] match.
     /// If the entry exists, it becomes the most recently used.
     fn get(&mut self, k: &ObjectMeta) -> Option<Arc<dyn FileMetadata>> {
         self.lru_queue
@@ -55,6 +56,7 @@ impl DefaultFilesMetadataCacheState {
             .map(|(object_meta, metadata)| {
                 if object_meta.size != k.size
                     || object_meta.last_modified != k.last_modified
+                    || !is_same_file_version(object_meta, k)
                 {
                     None
                 } else {
@@ -65,14 +67,16 @@ impl DefaultFilesMetadataCacheState {
             .unwrap_or(None)
     }
 
-    /// Checks if the metadata is currently cached (entry exists and the `size` and `last_modified`
-    /// properties of [`ObjectMeta`] match).
+    /// Checks if the metadata is currently cached (entry exists and the `size`, `last_modified`,
+    /// `version`, and `e_tag` properties of [`ObjectMeta`] match).
     /// The LRU queue is not updated.
     fn contains_key(&self, k: &ObjectMeta) -> bool {
         self.lru_queue
             .peek(&k.location)
             .map(|(object_meta, _)| {
-                object_meta.size == k.size && object_meta.last_modified == k.last_modified
+                object_meta.size == k.size
+                    && object_meta.last_modified == k.last_modified
+                    && is_same_file_version(object_meta, k)
             })
             .unwrap_or(false)
     }
