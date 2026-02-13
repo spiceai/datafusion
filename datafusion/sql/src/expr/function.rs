@@ -27,10 +27,8 @@ use datafusion_expr::{
     Expr, ExprSchemable, SortExpr, WindowFrame, WindowFunctionDefinition,
     arguments::ArgumentName,
     expr,
-    expr::{NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction},
+    expr::{FieldMetadata, NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction},
     planner::{PlannerResult, RawAggregateExpr, RawWindowExpr},
-use datafusion_expr::expr::{
-    FieldMetadata, NullTreatment, ScalarFunction, Unnest, WildcardOptions, WindowFunction,
 };
 use sqlparser::ast::{
     DuplicateTreatment, Expr as SQLExpr, Function as SQLFunction, FunctionArg,
