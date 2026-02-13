@@ -559,6 +559,21 @@ mod tests {
 
         // test the list_entries method
         let entries = cache.list_entries();
+        assert_eq!(
+            entries,
+            HashMap::from([(
+                Path::from("test"),
+                FileStatisticsCacheEntry {
+                    object_meta: meta.clone(),
+                    num_rows: Precision::Absent,
+                    num_columns: 1,
+                    table_size_bytes: Precision::Absent,
+                    statistics_size_bytes: 0,
+                }
+            )])
+        );
+    }
+
     #[test]
     fn test_statistics_cache_version_etag() {
         let meta = ObjectMeta {
