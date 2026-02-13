@@ -177,7 +177,7 @@ impl SelectBuilder {
         self
     }
     pub fn get_projection(&self) -> Vec<ast::SelectItem> {
-        self.projection.clone()
+        self.projection.clone().unwrap_or_default()
     }
     pub fn projection(&mut self, value: Vec<ast::SelectItem>) -> &mut Self {
         self.projection = Some(value);
