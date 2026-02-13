@@ -30,9 +30,8 @@ use crate::filter_pushdown::{
 };
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
-    ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
-use crate::joins::hash_join::shared_bounds::{
-    ColumnBounds, MinMaxColumnBounds, SharedBoundsAccumulator,
+    ColumnBounds, MinMaxColumnBounds, PartitionBounds, PushdownStrategy,
+    SharedBuildAccumulator,
 };
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
@@ -124,32 +123,6 @@ pub(super) struct JoinLeftData {
 }
 
 impl JoinLeftData {
-    /// Bounds computed from the build side for dynamic filter pushdown
-    pub(super) bounds: Option<Vec<Arc<dyn ColumnBounds>>>,
-}
-
-impl JoinLeftData {
-    /// Create a new `JoinLeftData` from its parts
-    pub(super) fn new(
-        hash_map: Box<dyn JoinHashMapType>,
-        batch: RecordBatch,
-        values: Vec<ArrayRef>,
-        visited_indices_bitmap: SharedBitmapBuilder,
-        probe_threads_counter: AtomicUsize,
-        reservation: MemoryReservation,
-        bounds: Option<Vec<Arc<dyn ColumnBounds>>>,
-    ) -> Self {
-        Self {
-            hash_map,
-            batch,
-            values,
-            visited_indices_bitmap,
-            probe_threads_counter,
-            _reservation: reservation,
-            bounds,
-        }
-    }
-
     /// return a reference to the hash map
     pub(super) fn hash_map(&self) -> &dyn JoinHashMapType {
         &*self.hash_map
@@ -1085,8 +1058,6 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
 
-                Ok(collect_left_input(
-                    self.random_state.random_state().clone(),
                 Ok(collect_left_input::<A>(
                     self.random_state.clone(),
                     left_stream,
@@ -1115,8 +1086,6 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
                         .register(context.memory_pool());
 
-                OnceFut::new(collect_left_input(
-                    self.random_state.random_state().clone(),
                 OnceFut::new(collect_left_input::<A>(
                     self.random_state.clone(),
                     left_stream,
@@ -1567,8 +1536,6 @@ impl<A: CollectLeftAccumulator> BuildSideState<A> {
 /// # Returns
 /// `JoinLeftData` containing the hash map, consolidated batch, join key values,
 /// visited indices bitmap, and computed bounds (if requested).
-#[expect(clippy::too_many_arguments)]
-async fn collect_left_input(
 #[allow(clippy::too_many_arguments)]
 async fn collect_left_input<A: CollectLeftAccumulator>(
     random_state: RandomState,
@@ -1691,16 +1658,13 @@ async fn collect_left_input<A: CollectLeftAccumulator>(
 
     // Compute bounds for dynamic filter if enabled
     let bounds = match bounds_accumulators {
-        Some(accumulators) if num_rows > 0 => Some(
-            accumulators
+        Some(accumulators) if num_rows > 0 => {
+            let bounds = accumulators
                 .into_iter()
-                .map(CollectLeftAccumulator::evaluate)
+                .map(|a| a.evaluate())
                 .collect::<Result<Vec<_>>>()?;
             Some(PartitionBounds::new(bounds))
         }
-                .map(|a| a.evaluate())
-                .collect::<Result<Vec<_>>>()?,
-        ),
         _ => None,
     };
 
