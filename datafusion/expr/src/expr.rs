@@ -2852,16 +2852,6 @@ fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
 
 // Modifies expr to match the DataType, metadata, and nullability of other if it is
 // a placeholder with previously unspecified type information (i.e., most placeholders)
-fn rewrite_placeholder(expr: &mut Expr, other: &Expr, schema: &DFSchema) -> Result<()> {
-    if let Expr::Placeholder(Placeholder { id: _, field }) = expr
-        && field.is_none()
-    {
-        let other_field = other.to_field(schema);
-        match other_field {
-            Err(e) => {
-                Err(e.context(format!(
-                    "Can not find type of {other} needed to infer type of {expr}"
-                )))?;
 fn rewrite_placeholder_with_field(
     expr: &mut Expr,
     other: &Expr,
@@ -2883,13 +2873,8 @@ fn rewrite_placeholder_with_field(
                         Some(other_field.as_ref().clone().with_nullable(true).into());
                 }
             }
-            Ok((_, other_field)) => {
-                // We can't infer the nullability of the future parameter that might
-                // be bound, so ensure this is set to true
-                *field = Some(other_field.as_ref().clone().with_nullable(true).into());
-            }
-        }
-    };
+        };
+    }
     Ok(())
 }
 
