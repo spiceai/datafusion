@@ -22,12 +22,10 @@ use super::{
         SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
     },
     rewrite::{
-        TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
+        TableAliasRewriter, inject_column_aliases_into_subquery,
+        normalize_union_schema, remove_dangling_identifiers,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
-        inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
-        subquery_alias_inner_query_and_columns, TableAliasRewriter,
     },
     utils::{
         find_agg_node_within_select, find_unnest_node_within_select,
