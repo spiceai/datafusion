@@ -30,7 +30,6 @@ use datafusion_expr::planner::{
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
 use datafusion_expr::expr::FieldMetadata;
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{
     Expr as SQLExpr, FunctionArg, FunctionArgExpr, Spanned, TableFactor,
