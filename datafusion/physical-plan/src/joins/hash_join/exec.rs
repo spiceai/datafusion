@@ -503,7 +503,7 @@ impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
         let cache = Self::compute_properties(
             &left,
             &right,
-            Arc::clone(&join_schema),
+            &join_schema,
             *join_type,
             &on,
             partition_mode,
@@ -1498,9 +1498,7 @@ impl<A: CollectLeftAccumulator> BuildSideState<A> {
                 .then(|| {
                     on_left
                         .into_iter()
-                        .map(|expr| CollectLeftAccumulator::try_new(expr, schema))
-                        .iter()
-                        .map(|expr| A::try_new(Arc::clone(expr), schema))
+                        .map(|expr| A::try_new(expr, schema))
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -1538,7 +1536,7 @@ impl<A: CollectLeftAccumulator> BuildSideState<A> {
 /// visited indices bitmap, and computed bounds (if requested).
 #[allow(clippy::too_many_arguments)]
 async fn collect_left_input<A: CollectLeftAccumulator>(
-    random_state: RandomState,
+    random_state: SeededRandomState,
     left_stream: SendableRecordBatchStream,
     on_left: Vec<PhysicalExprRef>,
     metrics: BuildProbeJoinMetrics,
@@ -1631,7 +1629,7 @@ async fn collect_left_input<A: CollectLeftAccumulator>(
             batch,
             &mut *hashmap,
             offset,
-            &random_state,
+            random_state.random_state(),
             &mut hashes_buffer,
             0,
             true,
