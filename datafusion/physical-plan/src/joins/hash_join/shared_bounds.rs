@@ -626,7 +626,7 @@ impl SharedBuildAccumulator {
     }
 }
 
-impl fmt::Debug for SharedBuildAccumulator {
+impl Debug for SharedBuildAccumulator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedBuildAccumulator")
     }
