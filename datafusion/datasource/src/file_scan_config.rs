@@ -19,11 +19,9 @@
 //! file sources.
 
 use crate::file_groups::FileGroup;
-=======
 use crate::metadata::MetadataColumn;
 #[allow(unused_imports)]
 use crate::schema_adapter::SchemaAdapterFactory;
->>>>>>> 6679acf63 (feat: Port with_metadata_cols and with_object_versioning_type from spiceai-50)
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
     file_compression_type::FileCompressionType, file_stream::FileStream,
