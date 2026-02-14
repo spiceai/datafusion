@@ -27,17 +27,19 @@ use crate::{
     file_compression_type::FileCompressionType, file_stream::FileStream,
     source::DataSource, statistics::MinMaxStatistics,
 };
-use arrow::datatypes::FieldRef;
-use arrow::datatypes::{DataType, Schema, SchemaRef};
+use arrow::array::{ArrayData, ArrayRef, BufferBuilder, DictionaryArray};
+use arrow::buffer::Buffer;
+use arrow::datatypes::{ArrowNativeType, DataType, FieldRef, Schema, SchemaRef, UInt16Type};
+use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
-    Constraints, Result, ScalarValue, Statistics, internal_datafusion_err, internal_err,
+    Constraints, Result, ScalarValue, Statistics,
+    exec_datafusion_err, exec_err, internal_datafusion_err, internal_err,
 };
 use datafusion_execution::{
     SendableRecordBatchStream, TaskContext, object_store::ObjectStoreUrl,
 };
 use datafusion_expr::Operator;
-
 use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 use datafusion_physical_expr::projection::ProjectionExprs;
@@ -47,24 +49,6 @@ use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::SortOrderPushdownResult;
-use datafusion_physical_expr_common::sort_expr::LexOrdering;
-use datafusion_physical_plan::projection::{
-    all_alias_free_columns, new_projections_for_columns, ProjectionExpr,
-};
-use datafusion_physical_plan::{
-    display::{display_orderings, ProjectSchemaDisplay},
-    filter_pushdown::FilterPushdownPropagation,
-    metrics::ExecutionPlanMetricsSet,
-    DisplayAs, DisplayFormatType,
-};
-use object_store::ObjectMeta;
-use std::{
-    any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
-    fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
-};
-use object_store::ObjectMeta;
-
-use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_plan::coop::cooperative;
 use datafusion_physical_plan::execution_plan::SchedulingType;
 use datafusion_physical_plan::{
@@ -74,7 +58,11 @@ use datafusion_physical_plan::{
     metrics::ExecutionPlanMetricsSet,
 };
 use log::{debug, warn};
-use std::{any::Any, fmt::Debug, fmt::Formatter, fmt::Result as FmtResult, sync::Arc};
+use object_store::ObjectMeta;
+use std::{
+    any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
+    fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
+};
 #[cfg(feature = "parquet")]
 use parquet::arrow::async_reader::ObjectVersionType;
 
@@ -952,77 +940,6 @@ impl FileScanConfig {
             Some(proj) => Ok(Arc::new(proj.project_schema(schema)?)),
             None => Ok(Arc::clone(schema)),
         }
-    }
-
-    pub fn projected_stats(&self) -> Statistics {
-        let statistics = match self.file_source.statistics() {
-            Ok(s) => s,
-            Err(_) => return Statistics::new_unknown(&self.projected_schema()),
-        };
-
-        let mut table_cols_stats: Vec<_> = self
-            .projection_indices()
-            .into_iter()
-            .map(|idx| {
-                if idx < self.file_schema().fields().len() {
-                    if idx < statistics.column_statistics.len() {
-                        statistics.column_statistics[idx].clone()
-                    } else {
-                        ColumnStatistics::new_unknown()
-                    }
-                } else {
-                    // TODO provide accurate stat for partition column (#1186)
-                    ColumnStatistics::new_unknown()
-                }
-            })
-            .collect();
-
-        // Insert statistics for metadata columns at their designated output positions
-        for (output_pos, _metadata_idx) in &self.projected_metadata_positions {
-            if *output_pos <= table_cols_stats.len() {
-                table_cols_stats.insert(*output_pos, ColumnStatistics::new_unknown());
-            }
-        }
-
-        Statistics {
-            num_rows: statistics.num_rows,
-            // TODO correct byte size: https://github.com/apache/datafusion/issues/14936
-            total_byte_size: statistics.total_byte_size,
-            column_statistics: table_cols_stats,
-        }
-    }
-
-    pub fn projected_schema(&self) -> Arc<Schema> {
-        // Build fields from file and partition columns
-        let mut table_fields: Vec<_> = self
-            .projection_indices()
-            .into_iter()
-            .map(|idx| {
-                if idx < self.file_schema().fields().len() {
-                    self.file_schema().field(idx).clone()
-                } else {
-                    let partition_idx = idx - self.file_schema().fields().len();
-                    Arc::unwrap_or_clone(Arc::clone(
-                        &self.table_partition_cols()[partition_idx],
-                    ))
-                }
-            })
-            .collect();
-
-        // Insert metadata columns at their designated output positions
-        for (output_pos, metadata_idx) in &self.projected_metadata_positions {
-            if *metadata_idx < self.metadata_cols.len() {
-                let field = self.metadata_cols[*metadata_idx].field();
-                if *output_pos <= table_fields.len() {
-                    table_fields.insert(*output_pos, field);
-                }
-            }
-        }
-
-        Arc::new(Schema::new_with_metadata(
-            table_fields,
-            self.file_schema().metadata().clone(),
-        ))
     }
 
     fn add_filter_equivalence_info(
