@@ -477,6 +477,9 @@ impl FileScanConfigBuilder {
         partitioned_by_file_group: bool,
     ) -> Self {
         self.partitioned_by_file_group = partitioned_by_file_group;
+        self
+    }
+
     /// Set the metadata columns to include in the output schema.
     /// These columns provide file metadata like location, size, and last_modified.
     pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
@@ -513,10 +516,10 @@ impl FileScanConfigBuilder {
             output_ordering,
             file_compression_type,
             batch_size,
-            expr_adapter_factory: expr_adapter,
+            expr_adapter_factory,
             partitioned_by_file_group,
             metadata_cols,
-            projected_metadata_positions: existing_metadata_positions,
+            projected_metadata_positions,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         } = self;
@@ -527,64 +530,6 @@ impl FileScanConfigBuilder {
         });
         let file_compression_type =
             file_compression_type.unwrap_or(FileCompressionType::UNCOMPRESSED);
-        let new_lines_in_values = new_lines_in_values.unwrap_or(false);
-
-        // Convert projection indices to ProjectionExprs using the final table schema.
-        // Note: projection_indices may include metadata column indices (indices >= table schema len).
-        // We need to:
-        // 1. Track which output positions get metadata columns (or preserve existing)
-        // 2. Filter out metadata indices before calling ProjectionExprs::from_indices()
-        let table_col_count = table_schema.table_schema().fields().len();
-        let metadata_col_start = table_col_count;
-
-        // Preserve existing metadata positions if already computed (e.g., when rebuilt from From impl)
-        // Otherwise, compute from projection_indices which may include metadata column indices
-        let (projection_exprs, projected_metadata_positions) =
-            if !existing_metadata_positions.is_empty() {
-                let proj = match projection_indices {
-                    Some(indices) => {
-                        let file_partition_indices: Vec<_> = indices
-                            .into_iter()
-                            .filter(|idx| *idx < metadata_col_start)
-                            .collect();
-                        Some(ProjectionExprs::from_indices(
-                            &file_partition_indices,
-                            table_schema.table_schema(),
-                        ))
-                    }
-                    None => None,
-                };
-                (proj, existing_metadata_positions)
-            } else {
-                match projection_indices {
-                    Some(indices) => {
-                        let mut metadata_positions = vec![];
-                        let mut file_partition_indices = vec![];
-                        for (output_pos, idx) in indices.iter().enumerate() {
-                            if *idx >= metadata_col_start {
-                                metadata_positions
-                                    .push((output_pos, idx - metadata_col_start));
-                            } else {
-                                file_partition_indices.push(*idx);
-                            }
-                        }
-                        let proj = ProjectionExprs::from_indices(
-                            &file_partition_indices,
-                            table_schema.table_schema(),
-                        );
-                        (Some(proj), metadata_positions)
-                    }
-                    None => {
-                        // When projection_indices is None, include all columns including metadata.
-                        // Metadata columns are positioned after file + partition columns.
-                        let metadata_positions: Vec<(usize, usize)> = (0..metadata_cols
-                            .len())
-                            .map(|metadata_idx| (table_col_count + metadata_idx, metadata_idx))
-                            .collect();
-                        (None, metadata_positions)
-                    }
-                }
-            };
 
         FileScanConfig {
             object_store_url,
@@ -595,7 +540,7 @@ impl FileScanConfigBuilder {
             output_ordering,
             file_compression_type,
             batch_size,
-            expr_adapter_factory: expr_adapter,
+            expr_adapter_factory,
             statistics,
             partitioned_by_file_group,
             metadata_cols,
@@ -1398,6 +1343,8 @@ fn ordered_column_indices_from_projection(
             Some(index)
         })
         .collect::<Option<Vec<usize>>>()
+}
+
 /// A helper that projects partition columns into the file record batches.
 ///
 /// One interesting trick is the usage of a cache for the key buffers of the partition column
