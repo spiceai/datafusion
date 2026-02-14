@@ -43,7 +43,6 @@ use datafusion_common::{
 };
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::expressions::CastColumnExpr;
-use datafusion_physical_expr::expressions::CastColumnExpr;
 use datafusion_physical_expr::utils::{
     Guarantee, LiteralGuarantee, build_balanced_binary_tree, collect_columns,
 };
