@@ -503,22 +503,6 @@ impl TableProvider for ListingTable {
                     .with_expr_adapter(self.expr_adapter_factory.clone())
                     .with_partitioned_by_file_group(partitioned_by_file_group)
                     .build(),
-                FileScanConfigBuilder::new(
-                    object_store_url,
-                    Arc::clone(&self.file_schema),
-                    file_source,
-                )
-                .with_file_groups(partitioned_file_lists)
-                .with_constraints(self.constraints.clone())
-                .with_statistics(statistics)
-                .with_projection_indices(projection)
-                .with_limit(limit)
-                .with_output_ordering(output_ordering)
-                .with_table_partition_cols(table_partition_cols)
-                .with_expr_adapter(self.expr_adapter_factory.clone())
-                .with_metadata_cols(self.options.metadata_cols.clone())
-                .with_object_versioning_type(self.options.object_versioning_type.clone())
-                .build(),
             )
             .await?;
 
