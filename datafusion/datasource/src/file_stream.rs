@@ -78,13 +78,11 @@ impl FileStream {
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
         let projected_schema = config.projected_schema()?;
+        // In DF52 partition columns are injected by the opener (ProjectionOpener /
+        // ParquetOpener), so the projector only needs to handle metadata columns.
         let col_projector = ExtendedColumnProjector::new(
             Arc::clone(&projected_schema),
-            &config
-                .table_partition_cols()
-                .iter()
-                .map(|x| x.name().clone())
-                .collect::<Vec<_>>(),
+            &[],
             &config.metadata_cols,
         );
 
@@ -207,7 +205,7 @@ impl FileStream {
                 },
                 FileStreamState::Scan {
                     reader,
-                    partition_values,
+                    partition_values: _,
                     object_meta,
                     next,
                 } => {
@@ -225,7 +223,7 @@ impl FileStream {
                             self.file_stream_metrics.time_scanning_total.stop();
                             let result = self
                                 .col_projector
-                                .project(batch, partition_values, object_meta)
+                                .project(batch, &[], object_meta)
                                 .map(|batch| match &mut self.remain {
                                     Some(remain) => {
                                         if *remain > batch.num_rows() {

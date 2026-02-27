@@ -29,12 +29,14 @@ use crate::{
 };
 use arrow::array::{ArrayData, ArrayRef, BufferBuilder, DictionaryArray};
 use arrow::buffer::Buffer;
-use arrow::datatypes::{ArrowNativeType, DataType, FieldRef, Schema, SchemaRef, UInt16Type};
+use arrow::datatypes::{
+    ArrowNativeType, DataType, FieldRef, Schema, SchemaRef, UInt16Type,
+};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
-    Constraints, Result, ScalarValue, Statistics,
-    exec_datafusion_err, exec_err, internal_datafusion_err, internal_err,
+    Constraints, Result, ScalarValue, Statistics, exec_datafusion_err, exec_err,
+    internal_datafusion_err, internal_err,
 };
 use datafusion_execution::{
     SendableRecordBatchStream, TaskContext, object_store::ObjectStoreUrl,
@@ -59,12 +61,12 @@ use datafusion_physical_plan::{
 };
 use log::{debug, warn};
 use object_store::ObjectMeta;
+#[cfg(feature = "parquet")]
+use parquet::arrow::async_reader::ObjectVersionType;
 use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
-#[cfg(feature = "parquet")]
-use parquet::arrow::async_reader::ObjectVersionType;
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -936,10 +938,21 @@ impl FileScanConfig {
 
     pub fn projected_schema(&self) -> Result<Arc<Schema>> {
         let schema = self.file_source.table_schema().table_schema();
-        match self.file_source.projection() {
-            Some(proj) => Ok(Arc::new(proj.project_schema(schema)?)),
-            None => Ok(Arc::clone(schema)),
+        let base_schema = match self.file_source.projection() {
+            Some(proj) => Arc::new(proj.project_schema(schema)?),
+            None => Arc::clone(schema),
+        };
+
+        if self.metadata_cols.is_empty() {
+            return Ok(base_schema);
         }
+
+        let mut fields: Vec<FieldRef> = base_schema.fields().iter().cloned().collect();
+        fields.extend(self.metadata_cols.iter().map(|c| Arc::new(c.field())));
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            base_schema.metadata().clone(),
+        )))
     }
 
     fn add_filter_equivalence_info(
@@ -1335,7 +1348,10 @@ impl PartitionColumnProjector {
             let actual_data_type = partition_value.data_type();
             if let DataType::Dictionary(key_type, _) = expected_data_type {
                 if !matches!(actual_data_type, DataType::Dictionary(_, _)) {
-                    warn!("Partition value for column {} was not dictionary-encoded, applied auto-fix.", field.name());
+                    warn!(
+                        "Partition value for column {} was not dictionary-encoded, applied auto-fix.",
+                        field.name()
+                    );
                     partition_value = Cow::Owned(ScalarValue::Dictionary(
                         key_type.clone(),
                         Box::new(partition_value.as_ref().clone()),
@@ -1361,7 +1377,6 @@ impl PartitionColumnProjector {
         .map_err(Into::into)
     }
 }
-
 
 /// A helper that projects extended (i.e. partition/metadata) columns into the file record batches.
 ///
@@ -1503,7 +1518,10 @@ impl ExtendedColumnProjector {
                     let actual_data_type = partition_value.data_type();
                     if let DataType::Dictionary(key_type, _) = expected_data_type {
                         if !matches!(actual_data_type, DataType::Dictionary(_, _)) {
-                            warn!("Partition value for column {} was not dictionary-encoded, applied auto-fix.", field.name());
+                            warn!(
+                                "Partition value for column {} was not dictionary-encoded, applied auto-fix.",
+                                field.name()
+                            );
                             partition_value = Cow::Owned(ScalarValue::Dictionary(
                                 key_type.clone(),
                                 Box::new(partition_value.as_ref().clone()),
@@ -1842,8 +1860,8 @@ mod tests {
         verify_sort_integrity,
     };
 
-    use arrow::datatypes::Field;
     use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
+    use arrow::datatypes::Field;
     use chrono::{TimeZone, Utc};
     use datafusion_common::stats::Precision;
     use datafusion_common::{ColumnStatistics, internal_err};
@@ -2482,22 +2500,19 @@ mod tests {
             Field::new("col2", DataType::Utf8, false),
         ]));
         let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::new(table_schema));
 
         let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
 
         // Create a config with metadata columns but WITHOUT projection indices (None)
         // This should include all columns: file columns + metadata columns
-        let config = FileScanConfigBuilder::new(
-            object_store_url,
-            Arc::clone(&file_schema),
-            file_source,
-        )
-        .with_metadata_cols(metadata_cols.clone())
-        .build();
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .build();
 
         // Verify that the projected schema includes both file and metadata columns
-        let projected = config.projected_schema();
+        let projected = config.projected_schema().expect("projected schema");
 
         // Should have 4 columns: col1, col2, location, size
         assert_eq!(
@@ -2526,27 +2541,24 @@ mod tests {
             false,
         )]));
         let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
 
-        let partition_cols = vec![Field::new(
+        let partition_cols = vec![Arc::new(Field::new(
             "year",
             wrap_partition_type_in_dict(DataType::Int32),
             false,
-        )];
+        ))];
         let metadata_cols = vec![MetadataColumn::Location(None)];
 
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), partition_cols);
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::new(table_schema));
+
         // Create a config with partition and metadata columns but NO projection indices
-        let config = FileScanConfigBuilder::new(
-            object_store_url,
-            Arc::clone(&file_schema),
-            file_source,
-        )
-        .with_table_partition_cols(partition_cols)
-        .with_metadata_cols(metadata_cols.clone())
-        .build();
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .build();
 
         // Verify that the projected schema includes all columns
-        let projected = config.projected_schema();
+        let projected = config.projected_schema().expect("projected schema");
 
         // Should have 3 columns: data (file), year (partition), location (metadata)
         assert_eq!(
