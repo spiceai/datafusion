@@ -347,19 +347,44 @@ impl FileScanConfigBuilder {
     /// Set the columns on which to project the data using column indices.
     ///
     /// Indexes that are higher than the number of columns of `file_schema` refer to `table_partition_cols`.
+    /// Indexes beyond file + partition columns refer to metadata columns and are tracked
+    /// separately in `projected_metadata_positions`.
     pub fn with_projection_indices(
         mut self,
         indices: Option<Vec<usize>>,
     ) -> Result<Self> {
-        let projection_exprs = indices.map(|indices| {
-            ProjectionExprs::from_indices(
-                &indices,
-                self.file_source.table_schema().table_schema(),
-            )
-        });
-        let Some(projection_exprs) = projection_exprs else {
+        let Some(indices) = indices else {
             return Ok(self);
         };
+
+        let table_schema = self.file_source.table_schema().table_schema();
+        let table_col_count = table_schema.fields().len();
+
+        // Separate metadata column indices from file+partition indices.
+        // Metadata column indices are >= table_col_count (file + partition).
+        let mut file_partition_indices = Vec::new();
+        let mut metadata_positions = Vec::new();
+        for (output_pos, idx) in indices.iter().enumerate() {
+            if *idx >= table_col_count {
+                metadata_positions.push((output_pos, idx - table_col_count));
+            } else {
+                file_partition_indices.push(*idx);
+            }
+        }
+
+        self.projected_metadata_positions = metadata_positions;
+
+        // Only skip projection pushdown when all projected columns are metadata.
+        // When both are empty (e.g. INSERT INTO passes Some(vec![])), we must
+        // still push down the empty projection so the schema reflects zero fields.
+        if file_partition_indices.is_empty()
+            && !self.projected_metadata_positions.is_empty()
+        {
+            return Ok(self);
+        }
+
+        let projection_exprs =
+            ProjectionExprs::from_indices(&file_partition_indices, table_schema);
         let new_source = self
             .file_source
             .try_pushdown_projection(&projection_exprs)
@@ -507,10 +532,22 @@ impl FileScanConfigBuilder {
             expr_adapter_factory,
             partitioned_by_file_group,
             metadata_cols,
-            projected_metadata_positions,
+            mut projected_metadata_positions,
             #[cfg(feature = "parquet")]
             object_versioning_type,
         } = self;
+
+        // If no explicit metadata positions were set (e.g. projection_indices was None
+        // or didn't include metadata columns), default to appending all metadata
+        // columns after the table (file + partition) columns. This mirrors DF51's
+        // build() behavior for the None-projection case.
+        if projected_metadata_positions.is_empty() && !metadata_cols.is_empty() {
+            let table_col_count =
+                file_source.table_schema().table_schema().fields().len();
+            projected_metadata_positions = (0..metadata_cols.len())
+                .map(|i| (table_col_count + i, i))
+                .collect();
+        }
 
         let constraints = constraints.unwrap_or_default();
         let statistics = statistics.unwrap_or_else(|| {
@@ -597,7 +634,7 @@ impl DataSource for FileScanConfig {
                     if let Some(projection) = self.file_source.projection() {
                         // This matches what ProjectionExec does.
                         // TODO: can we put this into ProjectionExprs so that it's shared code?
-                        let expr: Vec<String> = projection
+                        let mut expr: Vec<String> = projection
                             .as_ref()
                             .iter()
                             .map(|proj_expr| {
@@ -617,6 +654,23 @@ impl DataSource for FileScanConfig {
                                 }
                             })
                             .collect();
+
+                        // Insert metadata column names at their designated output positions
+                        // so the EXPLAIN display reflects the full projected schema.
+                        for (output_pos, metadata_idx) in
+                            &self.projected_metadata_positions
+                        {
+                            if *metadata_idx < self.metadata_cols.len() {
+                                let name = self.metadata_cols[*metadata_idx]
+                                    .field()
+                                    .name()
+                                    .clone();
+                                if *output_pos <= expr.len() {
+                                    expr.insert(*output_pos, name);
+                                }
+                            }
+                        }
+
                         write!(f, ", projection=[{}]", expr.join(", "))?;
                     } else {
                         write!(f, ", projection={}", ProjectSchemaDisplay(&schema))?;
@@ -983,7 +1037,18 @@ impl FileScanConfig {
         }
 
         let mut fields: Vec<FieldRef> = base_schema.fields().iter().cloned().collect();
-        fields.extend(self.metadata_cols.iter().map(|c| Arc::new(c.field())));
+
+        // Insert metadata columns at their designated output positions
+        // (set by with_projection_indices), preserving the user's requested column order.
+        for (output_pos, metadata_idx) in &self.projected_metadata_positions {
+            if *metadata_idx < self.metadata_cols.len() {
+                let field = Arc::new(self.metadata_cols[*metadata_idx].field());
+                if *output_pos <= fields.len() {
+                    fields.insert(*output_pos, field);
+                }
+            }
+        }
+
         Ok(Arc::new(Schema::new_with_metadata(
             fields,
             base_schema.metadata().clone(),
@@ -3723,5 +3788,270 @@ mod tests {
         {
             assert_eq!(eq_field.name(), proj_field.name());
         }
+    }
+
+    /// Test that projection with both metadata and partition columns works correctly.
+    ///
+    /// Scenario: A hive-partitioned parquet table with file columns, partition columns,
+    /// and metadata columns. When `SELECT *` is issued, DataFusion creates a projection
+    /// that includes ALL column indices (file + partition + metadata).
+    #[test]
+    fn test_projection_indices_with_partition_and_metadata_columns() {
+        // Simulate hive-partitioned parquet data with metadata columns
+        // File schema: [id]
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
+
+        // Partition columns: [year, month, day] (hive partitioning)
+        let partition_cols = vec![
+            Arc::new(Field::new(
+                "year",
+                wrap_partition_type_in_dict(DataType::Int32),
+                false,
+            )),
+            Arc::new(Field::new(
+                "month",
+                wrap_partition_type_in_dict(DataType::Int32),
+                false,
+            )),
+            Arc::new(Field::new(
+                "day",
+                wrap_partition_type_in_dict(DataType::Int32),
+                false,
+            )),
+        ];
+
+        // Metadata columns: [location, size, last_modified]
+        let metadata_cols = vec![
+            MetadataColumn::Location(None),
+            MetadataColumn::Size,
+            MetadataColumn::LastModified,
+        ];
+
+        let table_schema =
+            TableSchema::new(Arc::clone(&file_schema), partition_cols.clone());
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        // table_schema() returns [id, year, month, day] = 4 columns
+        assert_eq!(
+            table_schema.table_schema().fields().len(),
+            4,
+            "table_schema should have 4 fields (1 file + 3 partition)"
+        );
+
+        // SELECT * projection: all file + partition + metadata column indices
+        // [0=id, 1=year, 2=month, 3=day, 4=location, 5=size, 6=last_modified]
+        let all_indices = Some(vec![0, 1, 2, 3, 4, 5, 6]);
+
+        // This should NOT panic - metadata column indices (4,5,6) exceed
+        // table_schema().fields().len() (4) but should be handled gracefully
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .with_projection_indices(all_indices)
+            .expect("with_projection_indices should handle metadata column indices")
+            .build();
+
+        // Verify projected schema includes all 7 columns in the correct order
+        let projected = config.projected_schema().expect("projected schema");
+        assert_eq!(
+            projected.fields().len(),
+            7,
+            "Expected 7 columns (1 file + 3 partition + 3 metadata), got {}",
+            projected.fields().len()
+        );
+
+        assert_eq!(projected.field(0).name(), "id");
+        assert_eq!(projected.field(1).name(), "year");
+        assert_eq!(projected.field(2).name(), "month");
+        assert_eq!(projected.field(3).name(), "day");
+        assert_eq!(projected.field(4).name(), "location");
+        assert_eq!(projected.field(5).name(), "size");
+        assert_eq!(projected.field(6).name(), "last_modified");
+    }
+
+    /// Test that projection with only some metadata columns works correctly.
+    ///
+    /// E.g. SELECT id, location FROM table_with_partitions_and_metadata
+    /// projection = [0, 4] where 0=id (file), 4=location (metadata)
+    #[test]
+    fn test_projection_indices_partial_metadata_with_partitions() {
+        let file_schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
+
+        let partition_cols = vec![
+            Arc::new(Field::new(
+                "year",
+                wrap_partition_type_in_dict(DataType::Int32),
+                false,
+            )),
+            Arc::new(Field::new(
+                "month",
+                wrap_partition_type_in_dict(DataType::Int32),
+                false,
+            )),
+        ];
+
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
+
+        let table_schema =
+            TableSchema::new(Arc::clone(&file_schema), partition_cols.clone());
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        // table_schema = [id(0), year(1), month(2)] = 3 columns
+        // metadata = [location(3), size(4)]
+        // SELECT id, location -> projection = [0, 3]
+        let partial_indices = Some(vec![0, 3]);
+
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .with_projection_indices(partial_indices)
+            .expect("with_projection_indices should handle partial metadata indices")
+            .build();
+
+        let projected = config.projected_schema().expect("projected schema");
+        assert_eq!(
+            projected.fields().len(),
+            2,
+            "Expected 2 columns (id + location), got {}",
+            projected.fields().len()
+        );
+
+        assert_eq!(projected.field(0).name(), "id");
+        assert_eq!(projected.field(1).name(), "location");
+    }
+
+    /// Test that projection with metadata columns in non-sequential order works.
+    ///
+    /// E.g. SELECT location, id, size FROM table
+    /// projection = [3, 0, 4] where reordered
+    #[test]
+    fn test_projection_indices_metadata_reordered() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
+
+        let partition_cols = vec![Arc::new(Field::new(
+            "day",
+            wrap_partition_type_in_dict(DataType::Int32),
+            false,
+        ))];
+
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
+
+        let table_schema =
+            TableSchema::new(Arc::clone(&file_schema), partition_cols.clone());
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        // table_schema = [id(0), value(1), day(2)] = 3 columns
+        // metadata = [location(3), size(4)]
+        // SELECT location, id, size -> projection = [3, 0, 4]
+        let reordered_indices = Some(vec![3, 0, 4]);
+
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .with_projection_indices(reordered_indices)
+            .expect("with_projection_indices should handle reordered metadata")
+            .build();
+
+        let projected = config.projected_schema().expect("projected schema");
+        assert_eq!(
+            projected.fields().len(),
+            3,
+            "Expected 3 columns (location + id + size), got {}",
+            projected.fields().len()
+        );
+
+        assert_eq!(projected.field(0).name(), "location");
+        assert_eq!(projected.field(1).name(), "id");
+        assert_eq!(projected.field(2).name(), "size");
+    }
+
+    /// Test partial projection selecting file, partition, AND metadata columns.
+    ///
+    /// E.g. SELECT id, year, location FROM hive_partitioned_table
+    /// projection = [0, 1, 4] where 0=id (file), 1=year (partition), 4=location (metadata)
+    #[test]
+    fn test_projection_indices_file_partition_and_metadata() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
+
+        let partition_cols = vec![
+            Arc::new(Field::new(
+                "year",
+                wrap_partition_type_in_dict(DataType::Int32),
+                false,
+            )),
+            Arc::new(Field::new(
+                "month",
+                wrap_partition_type_in_dict(DataType::Int32),
+                false,
+            )),
+        ];
+
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
+
+        let table_schema =
+            TableSchema::new(Arc::clone(&file_schema), partition_cols.clone());
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        // table_schema = [id(0), value(1), year(2), month(3)] = 4 columns
+        // metadata = [location(4), size(5)]
+        // SELECT id, year, location -> projection = [0, 2, 4]
+        let indices = Some(vec![0, 2, 4]);
+
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .with_projection_indices(indices)
+            .expect("with_projection_indices should handle mixed file+partition+metadata")
+            .build();
+
+        let projected = config.projected_schema().expect("projected schema");
+        assert_eq!(
+            projected.fields().len(),
+            3,
+            "Expected 3 columns (id + year + location), got {}",
+            projected.fields().len()
+        );
+
+        assert_eq!(projected.field(0).name(), "id");
+        assert_eq!(projected.field(1).name(), "year");
+        assert_eq!(projected.field(2).name(), "location");
+
+        // Now test reordered: SELECT location, year, id -> projection = [4, 2, 0]
+        let file_source2: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+        let object_store_url2 = ObjectStoreUrl::parse("test:///").unwrap();
+        let reordered_indices = Some(vec![4, 2, 0]);
+
+        let config2 = FileScanConfigBuilder::new(object_store_url2, file_source2)
+            .with_metadata_cols(metadata_cols)
+            .with_projection_indices(reordered_indices)
+            .expect(
+                "with_projection_indices should handle reordered file+partition+metadata",
+            )
+            .build();
+
+        let projected2 = config2.projected_schema().expect("projected schema");
+        assert_eq!(
+            projected2.fields().len(),
+            3,
+            "Expected 3 columns (location + year + id), got {}",
+            projected2.fields().len()
+        );
+
+        assert_eq!(projected2.field(0).name(), "location");
+        assert_eq!(projected2.field(1).name(), "year");
+        assert_eq!(projected2.field(2).name(), "id");
     }
 }
