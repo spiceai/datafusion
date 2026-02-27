@@ -29,12 +29,14 @@ use crate::{
 };
 use arrow::array::{ArrayData, ArrayRef, BufferBuilder, DictionaryArray};
 use arrow::buffer::Buffer;
-use arrow::datatypes::{ArrowNativeType, DataType, FieldRef, Schema, SchemaRef, UInt16Type};
+use arrow::datatypes::{
+    ArrowNativeType, DataType, FieldRef, Schema, SchemaRef, UInt16Type,
+};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
-    Constraints, Result, ScalarValue, Statistics,
-    exec_datafusion_err, exec_err, internal_datafusion_err, internal_err,
+    Constraints, Result, ScalarValue, Statistics, exec_datafusion_err, exec_err,
+    internal_datafusion_err, internal_err,
 };
 use datafusion_execution::{
     SendableRecordBatchStream, TaskContext, object_store::ObjectStoreUrl,
@@ -43,7 +45,7 @@ use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::project_orderings;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column};
 use datafusion_physical_expr::projection::ProjectionExprs;
-use datafusion_physical_expr::utils::reassign_expr_columns;
+use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
@@ -54,17 +56,17 @@ use datafusion_physical_plan::execution_plan::SchedulingType;
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType,
     display::{ProjectSchemaDisplay, display_orderings},
-    filter_pushdown::FilterPushdownPropagation,
+    filter_pushdown::{FilterPushdownPropagation, PushedDown},
     metrics::ExecutionPlanMetricsSet,
 };
 use log::{debug, warn};
 use object_store::ObjectMeta;
+#[cfg(feature = "parquet")]
+use parquet::arrow::async_reader::ObjectVersionType;
 use std::{
     any::Any, borrow::Cow, collections::HashMap, fmt::Debug, fmt::Formatter,
     fmt::Result as FmtResult, marker::PhantomData, sync::Arc,
 };
-#[cfg(feature = "parquet")]
-use parquet::arrow::async_reader::ObjectVersionType;
 
 /// The base configurations for a [`DataSourceExec`], the a physical plan for
 /// any given file format.
@@ -757,6 +759,17 @@ impl DataSource for FileScanConfig {
             }
         }
 
+        // Append metadata column fields to the schema. These columns are
+        // injected by ExtendedColumnProjector in FileStream but are not part
+        // of the table schema. The schema advertised by eq_properties must
+        // include them so that DataSourceExec::schema() matches the actual
+        // batches produced.
+        if !self.metadata_cols.is_empty() {
+            eq_properties = eq_properties.with_extra_fields(
+                self.metadata_cols.iter().map(|c| Arc::new(c.field())),
+            );
+        }
+
         eq_properties
     }
 
@@ -838,22 +851,39 @@ impl DataSource for FileScanConfig {
         let table_schema = self.file_source.table_schema().table_schema();
         // If there's a projection with aliases, first map the filters back through
         // the projection expressions before remapping to the table schema.
-        let filters_to_remap = if let Some(projection) = self.file_source.projection() {
-            use datafusion_physical_plan::projection::update_expr;
-            filters
-                .into_iter()
-                .map(|filter| {
-                    update_expr(&filter, projection.as_ref(), true)?.ok_or_else(|| {
-                        internal_datafusion_err!(
-                            "Failed to map filter expression through projection: {}",
-                            filter
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            filters
-        };
+        //
+        // Metadata columns (e.g. `location`) are appended after the projection by
+        // ExtendedColumnProjector and are NOT part of the projection expressions.
+        // Filters that reference metadata columns cannot be remapped through the
+        // projection and cannot be pushed down to the file source. We separate them
+        // out and return PushedDown::No for those.
+        let (filters_to_remap, metadata_filter_indices) =
+            if let Some(projection) = self.file_source.projection() {
+                use datafusion_physical_plan::projection::update_expr;
+                let proj_len = projection.as_ref().len();
+                let mut pushable = Vec::new();
+                let mut metadata_indices = Vec::new();
+
+                for (i, filter) in filters.into_iter().enumerate() {
+                    let cols = collect_columns(&filter);
+                    if cols.iter().any(|c| c.index() >= proj_len) {
+                        // Filter references a metadata column — can't push down
+                        metadata_indices.push(i);
+                    } else {
+                        let remapped = update_expr(&filter, projection.as_ref(), true)?
+                            .ok_or_else(|| {
+                            internal_datafusion_err!(
+                                "Failed to map filter expression through projection: {}",
+                                filter
+                            )
+                        })?;
+                        pushable.push(remapped);
+                    }
+                }
+                (pushable, metadata_indices)
+            } else {
+                (filters, vec![])
+            };
         // Now remap column indices to match the table schema.
         let remapped_filters: Result<Vec<_>> = filters_to_remap
             .into_iter()
@@ -864,19 +894,26 @@ impl DataSource for FileScanConfig {
         let result = self
             .file_source
             .try_pushdown_filters(remapped_filters, config)?;
+
+        // Merge results: insert PushedDown::No at the positions of metadata filters.
+        let mut all_filters = result.filters;
+        for &idx in &metadata_filter_indices {
+            all_filters.insert(idx, PushedDown::No);
+        }
+
         match result.updated_node {
             Some(new_file_source) => {
                 let mut new_file_scan_config = self.clone();
                 new_file_scan_config.file_source = new_file_source;
                 Ok(FilterPushdownPropagation {
-                    filters: result.filters,
+                    filters: all_filters,
                     updated_node: Some(Arc::new(new_file_scan_config) as _),
                 })
             }
             None => {
                 // If the file source does not support filter pushdown, return the original config
                 Ok(FilterPushdownPropagation {
-                    filters: result.filters,
+                    filters: all_filters,
                     updated_node: None,
                 })
             }
@@ -936,10 +973,21 @@ impl FileScanConfig {
 
     pub fn projected_schema(&self) -> Result<Arc<Schema>> {
         let schema = self.file_source.table_schema().table_schema();
-        match self.file_source.projection() {
-            Some(proj) => Ok(Arc::new(proj.project_schema(schema)?)),
-            None => Ok(Arc::clone(schema)),
+        let base_schema = match self.file_source.projection() {
+            Some(proj) => Arc::new(proj.project_schema(schema)?),
+            None => Arc::clone(schema),
+        };
+
+        if self.metadata_cols.is_empty() {
+            return Ok(base_schema);
         }
+
+        let mut fields: Vec<FieldRef> = base_schema.fields().iter().cloned().collect();
+        fields.extend(self.metadata_cols.iter().map(|c| Arc::new(c.field())));
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            base_schema.metadata().clone(),
+        )))
     }
 
     fn add_filter_equivalence_info(
@@ -1335,7 +1383,10 @@ impl PartitionColumnProjector {
             let actual_data_type = partition_value.data_type();
             if let DataType::Dictionary(key_type, _) = expected_data_type {
                 if !matches!(actual_data_type, DataType::Dictionary(_, _)) {
-                    warn!("Partition value for column {} was not dictionary-encoded, applied auto-fix.", field.name());
+                    warn!(
+                        "Partition value for column {} was not dictionary-encoded, applied auto-fix.",
+                        field.name()
+                    );
                     partition_value = Cow::Owned(ScalarValue::Dictionary(
                         key_type.clone(),
                         Box::new(partition_value.as_ref().clone()),
@@ -1361,7 +1412,6 @@ impl PartitionColumnProjector {
         .map_err(Into::into)
     }
 }
-
 
 /// A helper that projects extended (i.e. partition/metadata) columns into the file record batches.
 ///
@@ -1503,7 +1553,10 @@ impl ExtendedColumnProjector {
                     let actual_data_type = partition_value.data_type();
                     if let DataType::Dictionary(key_type, _) = expected_data_type {
                         if !matches!(actual_data_type, DataType::Dictionary(_, _)) {
-                            warn!("Partition value for column {} was not dictionary-encoded, applied auto-fix.", field.name());
+                            warn!(
+                                "Partition value for column {} was not dictionary-encoded, applied auto-fix.",
+                                field.name()
+                            );
                             partition_value = Cow::Owned(ScalarValue::Dictionary(
                                 key_type.clone(),
                                 Box::new(partition_value.as_ref().clone()),
@@ -1842,8 +1895,8 @@ mod tests {
         verify_sort_integrity,
     };
 
-    use arrow::datatypes::Field;
     use arrow::array::{Int32Array, RecordBatch, StringArray, UInt64Array};
+    use arrow::datatypes::Field;
     use chrono::{TimeZone, Utc};
     use datafusion_common::stats::Precision;
     use datafusion_common::{ColumnStatistics, internal_err};
@@ -2482,22 +2535,19 @@ mod tests {
             Field::new("col2", DataType::Utf8, false),
         ]));
         let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::new(table_schema));
 
         let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
 
         // Create a config with metadata columns but WITHOUT projection indices (None)
         // This should include all columns: file columns + metadata columns
-        let config = FileScanConfigBuilder::new(
-            object_store_url,
-            Arc::clone(&file_schema),
-            file_source,
-        )
-        .with_metadata_cols(metadata_cols.clone())
-        .build();
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .build();
 
         // Verify that the projected schema includes both file and metadata columns
-        let projected = config.projected_schema();
+        let projected = config.projected_schema().expect("projected schema");
 
         // Should have 4 columns: col1, col2, location, size
         assert_eq!(
@@ -2526,27 +2576,24 @@ mod tests {
             false,
         )]));
         let object_store_url = ObjectStoreUrl::parse("test:///").unwrap();
-        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::default());
 
-        let partition_cols = vec![Field::new(
+        let partition_cols = vec![Arc::new(Field::new(
             "year",
             wrap_partition_type_in_dict(DataType::Int32),
             false,
-        )];
+        ))];
         let metadata_cols = vec![MetadataColumn::Location(None)];
 
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), partition_cols);
+        let file_source: Arc<dyn FileSource> = Arc::new(MockSource::new(table_schema));
+
         // Create a config with partition and metadata columns but NO projection indices
-        let config = FileScanConfigBuilder::new(
-            object_store_url,
-            Arc::clone(&file_schema),
-            file_source,
-        )
-        .with_table_partition_cols(partition_cols)
-        .with_metadata_cols(metadata_cols.clone())
-        .build();
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols.clone())
+            .build();
 
         // Verify that the projected schema includes all columns
-        let projected = config.projected_schema();
+        let projected = config.projected_schema().expect("projected schema");
 
         // Should have 3 columns: data (file), year (partition), location (metadata)
         assert_eq!(
@@ -3442,6 +3489,239 @@ mod tests {
                 assert_eq!(col_names, vec!["year", "month"]);
             }
             _ => panic!("Expected Hash partitioning"),
+        }
+    }
+
+    /// Test that `try_pushdown_filters` works when a filter references
+    /// a metadata column (e.g. `location`) that is appended after the projection.
+    /// Metadata column indices are beyond the projection length, so they must be
+    /// separated out rather than remapped through `update_expr`.
+    #[test]
+    fn test_try_pushdown_filters_with_metadata_column_filter() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").expect("valid url");
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        let metadata_cols = vec![MetadataColumn::Location(None)];
+
+        // Build config with metadata columns and a projection.
+        let config =
+            FileScanConfigBuilder::new(object_store_url, Arc::clone(&file_source))
+                .with_metadata_cols(metadata_cols)
+                .with_projection_indices(Some(vec![0, 1]))
+                .expect("valid projection")
+                .build();
+
+        // Push a projection so that `file_source.projection()` is Some.
+        let proj_exprs = ProjectionExprs::new(vec![
+            ProjectionExpr::new(col("id", &file_schema).expect("col"), "id"),
+            ProjectionExpr::new(col("value", &file_schema).expect("col"), "value"),
+        ]);
+        let data_source = config
+            .try_swapping_with_projection(&proj_exprs)
+            .expect("swap ok")
+            .expect("should produce new source");
+
+        // projected schema: [id, value, location]
+        let projected = data_source
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .expect("is FileScanConfig")
+            .projected_schema()
+            .expect("projected schema");
+        assert_eq!(projected.fields().len(), 3);
+        assert_eq!(projected.field(2).name(), "location");
+
+        // Create a filter on the metadata column: location@2 = 's3://bucket'
+        // (index 2 because projected output is [id@0, value@1, location@2])
+        let location_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("location", 2)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some(
+                "s3://bucket".to_string(),
+            )))),
+        ));
+
+        // This should work without crashing, even though the filter references a metadata column
+        let config_options = ConfigOptions::default();
+        let result =
+            data_source.try_pushdown_filters(vec![location_filter], &config_options);
+        let propagation = result.expect("to pushdown filters");
+
+        // The metadata filter cannot be pushed down to the file source.
+        assert_eq!(propagation.filters.len(), 1);
+        assert!(
+            matches!(propagation.filters[0], PushedDown::No),
+            "metadata column filter should not be pushed down"
+        );
+    }
+
+    /// Test that `try_pushdown_filters` correctly handles a mix of regular
+    /// filters and metadata column filters — regular filters are remapped
+    /// through the projection while metadata filters are returned as not pushed.
+    #[test]
+    fn test_try_pushdown_filters_mixed_regular_and_metadata_filters() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").expect("valid url");
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        let metadata_cols = vec![MetadataColumn::Location(None)];
+
+        let config =
+            FileScanConfigBuilder::new(object_store_url, Arc::clone(&file_source))
+                .with_metadata_cols(metadata_cols)
+                .with_projection_indices(Some(vec![0, 1]))
+                .expect("valid projection")
+                .build();
+
+        let proj_exprs = ProjectionExprs::new(vec![
+            ProjectionExpr::new(col("id", &file_schema).expect("col"), "id"),
+            ProjectionExpr::new(col("value", &file_schema).expect("col"), "value"),
+        ]);
+        let data_source = config
+            .try_swapping_with_projection(&proj_exprs)
+            .expect("swap ok")
+            .expect("should produce new source");
+
+        // Filter 0: regular filter on id@0 (within projection)
+        let id_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("id", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+        ));
+        // Filter 1: metadata column filter on location@2 (beyond projection)
+        let location_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("location", 2)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some(
+                "s3://bucket".to_string(),
+            )))),
+        ));
+
+        let config_options = ConfigOptions::default();
+        let result = data_source
+            .try_pushdown_filters(vec![id_filter, location_filter], &config_options);
+        let propagation = result.expect("to pushdown filters");
+
+        // Both filters should be present in results, in the original order.
+        assert_eq!(propagation.filters.len(), 2);
+        // Regular filter: MockSource returns PushedDown::No (default impl).
+        assert!(
+            matches!(propagation.filters[0], PushedDown::No),
+            "regular filter: MockSource default returns No"
+        );
+        // Metadata filter: separated out, returned as PushedDown::No.
+        assert!(
+            matches!(propagation.filters[1], PushedDown::No),
+            "metadata column filter should not be pushed down"
+        );
+    }
+
+    /// Test that `eq_properties` includes metadata columns in its schema.
+    /// `DataSourceExec::schema()` is derived from `eq_properties().schema()`,
+    /// so metadata columns must be appended to match the actual batches
+    /// produced by `FileStream` via `ExtendedColumnProjector`.
+    #[test]
+    fn test_eq_properties_schema_includes_metadata_columns() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").expect("valid url");
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        let metadata_cols = vec![MetadataColumn::Location(None), MetadataColumn::Size];
+
+        let config = FileScanConfigBuilder::new(object_store_url, file_source)
+            .with_metadata_cols(metadata_cols)
+            .build();
+
+        let eq_props = config.eq_properties();
+        let schema = eq_props.schema();
+
+        // Schema should include file columns + metadata columns
+        assert_eq!(
+            schema.fields().len(),
+            4,
+            "Expected 4 fields (2 file + 2 metadata), got {}",
+            schema.fields().len()
+        );
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "value");
+        assert_eq!(schema.field(2).name(), "location");
+        assert_eq!(schema.field(3).name(), "size");
+    }
+
+    /// Same as above but with a projection applied — metadata columns must
+    /// still appear in the schema after projection.
+    #[test]
+    fn test_eq_properties_schema_includes_metadata_columns_with_projection() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").expect("valid url");
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        let metadata_cols = vec![MetadataColumn::Location(None)];
+
+        let config =
+            FileScanConfigBuilder::new(object_store_url, Arc::clone(&file_source))
+                .with_metadata_cols(metadata_cols)
+                .with_projection_indices(Some(vec![0, 1]))
+                .expect("valid projection")
+                .build();
+
+        // Push a projection so that file_source.projection() is Some
+        let proj_exprs = ProjectionExprs::new(vec![
+            ProjectionExpr::new(col("id", &file_schema).expect("col"), "id"),
+            ProjectionExpr::new(col("value", &file_schema).expect("col"), "value"),
+        ]);
+        let data_source = config
+            .try_swapping_with_projection(&proj_exprs)
+            .expect("swap ok")
+            .expect("should produce new source");
+
+        let eq_props = data_source.eq_properties();
+        let schema = eq_props.schema();
+
+        // Projected schema: [id, value] + metadata: [location]
+        assert_eq!(
+            schema.fields().len(),
+            3,
+            "Expected 3 fields (2 projected + 1 metadata), got {}",
+            schema.fields().len()
+        );
+        assert_eq!(schema.field(0).name(), "id");
+        assert_eq!(schema.field(1).name(), "value");
+        assert_eq!(schema.field(2).name(), "location");
+
+        // Verify it matches projected_schema()
+        let projected = data_source
+            .as_any()
+            .downcast_ref::<FileScanConfig>()
+            .expect("is FileScanConfig")
+            .projected_schema()
+            .expect("projected schema");
+        assert_eq!(schema.fields().len(), projected.fields().len());
+        for (eq_field, proj_field) in
+            schema.fields().iter().zip(projected.fields().iter())
+        {
+            assert_eq!(eq_field.name(), proj_field.name());
         }
     }
 }
