@@ -35,8 +35,8 @@ use arrow::datatypes::{
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
-    Constraints, Result, ScalarValue, Statistics, exec_datafusion_err, exec_err,
-    internal_datafusion_err, internal_err,
+    ColumnStatistics, Constraints, Result, ScalarValue, Statistics,
+    exec_datafusion_err, exec_err, internal_datafusion_err, internal_err,
 };
 use datafusion_execution::{
     SendableRecordBatchStream, TaskContext, object_store::ObjectStoreUrl,
@@ -832,33 +832,53 @@ impl DataSource for FileScanConfig {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        if let Some(partition) = partition {
+        let output_schema = self.projected_schema()?;
+
+        let mut stats = if let Some(partition) = partition {
             // Get statistics for a specific partition
             // Note: FileGroup statistics include partition columns (computed from partition_values)
             if let Some(file_group) = self.file_groups.get(partition)
                 && let Some(stat) = file_group.file_statistics(None)
             {
                 // Project the statistics based on the projection
-                let output_schema = self.projected_schema()?;
-                return if let Some(projection) = self.file_source.projection() {
-                    projection.project_statistics(stat.clone(), &output_schema)
+                if let Some(projection) = self.file_source.projection() {
+                    projection.project_statistics(stat.clone(), &output_schema)?
                 } else {
-                    Ok(stat.clone())
-                };
+                    stat.clone()
+                }
+            } else {
+                // If no statistics available for this partition, return unknown
+                Statistics::new_unknown(output_schema.as_ref())
             }
-            // If no statistics available for this partition, return unknown
-            Ok(Statistics::new_unknown(self.projected_schema()?.as_ref()))
         } else {
             // Return aggregate statistics across all partitions
             let statistics = self.statistics();
-            let projection = self.file_source.projection();
-            let output_schema = self.projected_schema()?;
-            if let Some(projection) = &projection {
-                projection.project_statistics(statistics.clone(), &output_schema)
+            if let Some(projection) = self.file_source.projection() {
+                projection.project_statistics(statistics.clone(), &output_schema)?
             } else {
-                Ok(statistics)
+                statistics
+            }
+        };
+
+        // Insert unknown column statistics for metadata columns at their
+        // designated output positions. File/partition statistics don't include
+        // metadata columns, but the projected schema does, so we must pad to
+        // avoid index-out-of-bounds errors when downstream operators (e.g.,
+        // ProjectionExec) access column statistics by index.
+        let expected_cols = output_schema.fields().len();
+        if stats.column_statistics.len() < expected_cols {
+            for (output_pos, metadata_idx) in &self.projected_metadata_positions {
+                if *metadata_idx < self.metadata_cols.len()
+                    && *output_pos <= stats.column_statistics.len()
+                {
+                    stats
+                        .column_statistics
+                        .insert(*output_pos, ColumnStatistics::new_unknown());
+                }
             }
         }
+
+        Ok(stats)
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -880,6 +900,36 @@ impl DataSource for FileScanConfig {
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn DataSource>>> {
+        // Metadata columns (e.g. `location`, `size`, `last_modified`) are
+        // appended after file+partition columns by ExtendedColumnProjector and
+        // are NOT part of the file source's projection. If the incoming
+        // projection references any metadata column we cannot push it down
+        // into the file source — bail out and keep the ProjectionExec above.
+        if !self.projected_metadata_positions.is_empty() {
+            let file_partition_len = self
+                .file_source
+                .projection()
+                .map(|p| p.as_ref().len())
+                .unwrap_or_else(|| {
+                    self.file_source
+                        .table_schema()
+                        .table_schema()
+                        .fields()
+                        .len()
+                });
+            let has_metadata_refs = projection.iter().any(|proj_expr| {
+                proj_expr
+                    .expr
+                    .as_any()
+                    .downcast_ref::<Column>()
+                    .map(|c| c.index() >= file_partition_len)
+                    .unwrap_or(false)
+            });
+            if has_metadata_refs {
+                return Ok(None);
+            }
+        }
+
         match self.file_source.try_pushdown_projection(projection)? {
             Some(new_source) => {
                 let mut new_file_scan_config = self.clone();
@@ -3452,6 +3502,96 @@ mod tests {
         // Verify row count and byte size
         assert_eq!(partition_stats.num_rows, Precision::Exact(100));
         assert_eq!(partition_stats.total_byte_size, Precision::Exact(800));
+    }
+
+    /// Test that `partition_statistics` includes unknown entries for metadata
+    /// columns so that downstream operators (e.g. `ProjectionExec`) don't
+    /// encounter an index-out-of-bounds panic when they access column
+    /// statistics by index from the projected schema.
+    #[test]
+    fn test_partition_statistics_with_metadata_columns() {
+        use crate::source::DataSourceExec;
+        use datafusion_physical_plan::ExecutionPlan;
+
+        // File schema: [compression]
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "compression",
+            DataType::Utf8,
+            true,
+        )]));
+
+        // Partition column: [day]
+        let partition_cols =
+            vec![Arc::new(Field::new("day", DataType::Utf8, true))];
+
+        let table_schema =
+            TableSchema::new(Arc::clone(&file_schema), partition_cols);
+
+        // Metadata column: location
+        let metadata_cols = vec![MetadataColumn::Location(None)];
+
+        let file_group_stats = Statistics {
+            num_rows: Precision::Exact(1),
+            total_byte_size: Precision::Exact(100),
+            column_statistics: vec![
+                // compression
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    ..ColumnStatistics::new_unknown()
+                },
+                // day (partition)
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    ..ColumnStatistics::new_unknown()
+                },
+            ],
+        };
+
+        let file_group =
+            FileGroup::new(vec![PartitionedFile::new("data.parquet", 100)])
+                .with_statistics(Arc::new(file_group_stats));
+
+        // table_schema columns: [compression(0), day(1)]
+        // metadata columns:     [location(2)]
+        // SELECT location, day, compression -> projection = [2, 1, 0]
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::parse("test:///").unwrap(),
+            Arc::new(MockSource::new(table_schema)),
+        )
+        .with_metadata_cols(metadata_cols)
+        .with_projection_indices(Some(vec![2, 1, 0]))
+        .expect("projection indices should be valid")
+        .with_file_groups(vec![file_group])
+        .build();
+
+        let exec = DataSourceExec::from_data_source(config);
+
+        // The projected schema has 3 columns: [location, day, compression]
+        assert_eq!(exec.schema().fields().len(), 3);
+
+        // partition_statistics must return 3 column_statistics entries —
+        // one for each column in the projected schema — so that
+        // ProjectionExec doesn't panic on index access.
+        let stats = exec
+            .partition_statistics(Some(0))
+            .expect("partition_statistics should succeed");
+        assert_eq!(
+            stats.column_statistics.len(),
+            3,
+            "Expected 3 column statistics (2 file/partition + 1 metadata), got {}",
+            stats.column_statistics.len()
+        );
+
+        // Also verify aggregate statistics (partition = None)
+        let agg_stats = exec
+            .partition_statistics(None)
+            .expect("aggregate partition_statistics should succeed");
+        assert_eq!(
+            agg_stats.column_statistics.len(),
+            3,
+            "Expected 3 aggregate column statistics, got {}",
+            agg_stats.column_statistics.len()
+        );
     }
 
     #[test]
