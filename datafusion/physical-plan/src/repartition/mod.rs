@@ -1534,6 +1534,12 @@ struct PerPartitionStream {
 
     /// None for sort preserving variant (merge sort already does coalescing)
     batch_coalescer: Option<LimitedBatchCoalescer>,
+
+    /// Target batch size for lazy coalescer initialization.
+    /// The coalescer is created on the first batch using the actual batch
+    /// schema rather than the declared schema to avoid type mismatches
+    /// (e.g., a child declares LargeUtf8 but produces Utf8).
+    target_batch_size: Option<usize>,
 }
 
 impl PerPartitionStream {
@@ -1548,8 +1554,6 @@ impl PerPartitionStream {
         baseline_metrics: BaselineMetrics,
         batch_size: Option<usize>,
     ) -> Self {
-        let batch_coalescer =
-            batch_size.map(|s| LimitedBatchCoalescer::new(Arc::clone(&schema), s, None));
         Self {
             schema,
             receiver,
@@ -1559,7 +1563,8 @@ impl PerPartitionStream {
             state: StreamState::ReadingMemory,
             remaining_partitions: num_input_partitions,
             baseline_metrics,
-            batch_coalescer,
+            batch_coalescer: None,
+            target_batch_size: batch_size,
         }
     }
 
@@ -1689,13 +1694,48 @@ impl Stream for PerPartitionStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let poll;
-        if let Some(mut coalescer) = self.batch_coalescer.take() {
-            poll = self.poll_next_and_coalesce(cx, &mut coalescer);
+        let poll = if let Some(mut coalescer) = self.batch_coalescer.take() {
+            // Coalescer already initialized — use it
+            let result = self.poll_next_and_coalesce(cx, &mut coalescer);
             self.batch_coalescer = Some(coalescer);
+            result
+        } else if let Some(target_batch_size) = self.target_batch_size.take() {
+            // Coalescer not yet initialized — lazily create it from the
+            // first batch's actual schema to avoid type mismatches
+            // (e.g. child declares LargeUtf8 but produces Utf8).
+            match self.poll_next_inner(cx) {
+                Poll::Pending => {
+                    // Restore target_batch_size so we retry on next poll
+                    self.target_batch_size = Some(target_batch_size);
+                    return self.baseline_metrics.record_poll(Poll::Pending);
+                }
+                Poll::Ready(Some(Ok(batch))) => {
+                    let mut coalescer = LimitedBatchCoalescer::new(
+                        batch.schema(),
+                        target_batch_size,
+                        None,
+                    );
+                    if let Err(err) = coalescer.push_batch(batch) {
+                        return self
+                            .baseline_metrics
+                            .record_poll(Poll::Ready(Some(Err(err))));
+                    }
+                    let result = self.poll_next_and_coalesce(cx, &mut coalescer);
+                    self.batch_coalescer = Some(coalescer);
+                    result
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return self.baseline_metrics.record_poll(Poll::Ready(Some(Err(e))));
+                }
+                Poll::Ready(None) => {
+                    // Stream ended with no batches — nothing to coalesce
+                    return self.baseline_metrics.record_poll(Poll::Ready(None));
+                }
+            }
         } else {
-            poll = self.poll_next_inner(cx);
-        }
+            // No coalescing requested (sort-preserving variant)
+            self.poll_next_inner(cx)
+        };
         self.baseline_metrics.record_poll(poll)
     }
 }
