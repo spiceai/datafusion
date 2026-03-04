@@ -134,9 +134,19 @@ impl ExecutionPlan for CustomPlan {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
+        let schema_captured = self.schema().clone();
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            futures::stream::iter(self.batches.clone().into_iter().map(Ok)),
+            futures::stream::iter(self.batches.clone().into_iter().map(move |batch| {
+                let projection: Vec<usize> = schema_captured
+                    .fields()
+                    .iter()
+                    .filter_map(|field| batch.schema().index_of(field.name()).ok())
+                    .collect();
+                batch
+                    .project(&projection)
+                    .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+            })),
         )))
     }
 
