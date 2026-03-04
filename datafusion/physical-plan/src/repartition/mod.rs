@@ -30,7 +30,6 @@ use super::metrics::{self, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet};
 use super::{
     DisplayAs, ExecutionPlanProperties, RecordBatchStream, SendableRecordBatchStream,
 };
-use crate::coalesce::LimitedBatchCoalescer;
 use crate::execution_plan::{CardinalityEffect, EvaluationType, SchedulingType};
 use crate::hash_utils::create_hashes;
 use crate::metrics::{BaselineMetrics, SpillMetrics};
@@ -999,7 +998,6 @@ impl ExecutionPlan for RepartitionExec {
                             spill_stream,
                             1, // Each receiver handles one input partition
                             BaselineMetrics::new(&metrics, partition),
-                            None, // subsequent merge sort already does batching https://github.com/apache/datafusion/blob/e4dcf0c85611ad0bd291f03a8e03fe56d773eb16/datafusion/physical-plan/src/sorts/merge.rs#L286
                         )) as SendableRecordBatchStream
                     })
                     .collect::<Vec<_>>();
@@ -1038,7 +1036,6 @@ impl ExecutionPlan for RepartitionExec {
                     spill_stream,
                     num_input_partitions,
                     BaselineMetrics::new(&metrics, partition),
-                    Some(context.session_config().batch_size()),
                 )) as SendableRecordBatchStream)
             }
         })
@@ -1531,13 +1528,9 @@ struct PerPartitionStream {
 
     /// Execution metrics
     baseline_metrics: BaselineMetrics,
-
-    /// None for sort preserving variant (merge sort already does coalescing)
-    batch_coalescer: Option<LimitedBatchCoalescer>,
 }
 
 impl PerPartitionStream {
-    #[expect(clippy::too_many_arguments)]
     fn new(
         schema: SchemaRef,
         receiver: DistributionReceiver<MaybeBatch>,
@@ -1546,10 +1539,7 @@ impl PerPartitionStream {
         spill_stream: SendableRecordBatchStream,
         num_input_partitions: usize,
         baseline_metrics: BaselineMetrics,
-        batch_size: Option<usize>,
     ) -> Self {
-        let batch_coalescer =
-            batch_size.map(|s| LimitedBatchCoalescer::new(Arc::clone(&schema), s, None));
         Self {
             schema,
             receiver,
@@ -1559,7 +1549,6 @@ impl PerPartitionStream {
             state: StreamState::ReadingMemory,
             remaining_partitions: num_input_partitions,
             baseline_metrics,
-            batch_coalescer,
         }
     }
 
@@ -1643,43 +1632,6 @@ impl PerPartitionStream {
             }
         }
     }
-
-    fn poll_next_and_coalesce(
-        self: &mut Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        coalescer: &mut LimitedBatchCoalescer,
-    ) -> Poll<Option<Result<RecordBatch>>> {
-        let cloned_time = self.baseline_metrics.elapsed_compute().clone();
-        let mut completed = false;
-
-        loop {
-            if let Some(batch) = coalescer.next_completed_batch() {
-                return Poll::Ready(Some(Ok(batch)));
-            }
-            if completed {
-                return Poll::Ready(None);
-            }
-
-            match ready!(self.poll_next_inner(cx)) {
-                Some(Ok(batch)) => {
-                    let _timer = cloned_time.timer();
-                    if let Err(err) = coalescer.push_batch(batch) {
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                }
-                Some(err) => {
-                    return Poll::Ready(Some(err));
-                }
-                None => {
-                    completed = true;
-                    let _timer = cloned_time.timer();
-                    if let Err(err) = coalescer.finish() {
-                        return Poll::Ready(Some(Err(err)));
-                    }
-                }
-            }
-        }
-    }
 }
 
 impl Stream for PerPartitionStream {
@@ -1689,13 +1641,7 @@ impl Stream for PerPartitionStream {
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Self::Item>> {
-        let poll;
-        if let Some(mut coalescer) = self.batch_coalescer.take() {
-            poll = self.poll_next_and_coalesce(cx, &mut coalescer);
-            self.batch_coalescer = Some(coalescer);
-        } else {
-            poll = self.poll_next_inner(cx);
-        }
+        let poll = self.poll_next_inner(cx);
         self.baseline_metrics.record_poll(poll)
     }
 }
@@ -1730,9 +1676,9 @@ mod tests {
     use datafusion_common::exec_err;
     use datafusion_common::test_util::batches_to_sort_string;
     use datafusion_common_runtime::JoinSet;
-    use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use insta::assert_snapshot;
+    use itertools::Itertools;
 
     #[tokio::test]
     async fn one_to_many_round_robin() -> Result<()> {
@@ -1746,13 +1692,10 @@ mod tests {
             repartition(&schema, partitions, Partitioning::RoundRobinBatch(4)).await?;
 
         assert_eq!(4, output_partitions.len());
-        for partition in &output_partitions {
-            assert_eq!(1, partition.len());
-        }
-        assert_eq!(13 * 8, output_partitions[0][0].num_rows());
-        assert_eq!(13 * 8, output_partitions[1][0].num_rows());
-        assert_eq!(12 * 8, output_partitions[2][0].num_rows());
-        assert_eq!(12 * 8, output_partitions[3][0].num_rows());
+        assert_eq!(13, output_partitions[0].len());
+        assert_eq!(13, output_partitions[1].len());
+        assert_eq!(12, output_partitions[2].len());
+        assert_eq!(12, output_partitions[3].len());
 
         Ok(())
     }
@@ -1769,7 +1712,7 @@ mod tests {
             repartition(&schema, partitions, Partitioning::RoundRobinBatch(1)).await?;
 
         assert_eq!(1, output_partitions.len());
-        assert_eq!(150 * 8, output_partitions[0][0].num_rows());
+        assert_eq!(150, output_partitions[0].len());
 
         Ok(())
     }
@@ -1785,12 +1728,12 @@ mod tests {
         let output_partitions =
             repartition(&schema, partitions, Partitioning::RoundRobinBatch(5)).await?;
 
-        let total_rows_per_partition = 8 * 50 * 3 / 5;
         assert_eq!(5, output_partitions.len());
-        for partition in output_partitions {
-            assert_eq!(1, partition.len());
-            assert_eq!(total_rows_per_partition, partition[0].num_rows());
-        }
+        assert_eq!(30, output_partitions[0].len());
+        assert_eq!(30, output_partitions[1].len());
+        assert_eq!(30, output_partitions[2].len());
+        assert_eq!(30, output_partitions[3].len());
+        assert_eq!(30, output_partitions[4].len());
 
         Ok(())
     }
@@ -1817,32 +1760,6 @@ mod tests {
         assert_eq!(8, output_partitions.len());
         assert_eq!(total_rows, 8 * 50 * 3);
 
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_repartition_with_coalescing() -> Result<()> {
-        let schema = test_schema();
-        // create 50 batches, each having 8 rows
-        let partition = create_vec_batches(50);
-        let partitions = vec![partition.clone(), partition.clone()];
-        let partitioning = Partitioning::RoundRobinBatch(1);
-
-        let session_config = SessionConfig::new().with_batch_size(200);
-        let task_ctx = TaskContext::default().with_session_config(session_config);
-        let task_ctx = Arc::new(task_ctx);
-
-        // create physical plan
-        let exec = TestMemoryExec::try_new_exec(&partitions, Arc::clone(&schema), None)?;
-        let exec = RepartitionExec::try_new(exec, partitioning)?;
-
-        for i in 0..exec.partitioning().partition_count() {
-            let mut stream = exec.execute(i, Arc::clone(&task_ctx))?;
-            while let Some(result) = stream.next().await {
-                let batch = result?;
-                assert_eq!(200, batch.num_rows());
-            }
-        }
         Ok(())
     }
 
@@ -1891,12 +1808,12 @@ mod tests {
 
         let output_partitions = handle.join().await.unwrap().unwrap();
 
-        let total_rows_per_partition = 8 * 50 * 3 / 5;
         assert_eq!(5, output_partitions.len());
-        for partition in output_partitions {
-            assert_eq!(1, partition.len());
-            assert_eq!(total_rows_per_partition, partition[0].num_rows());
-        }
+        assert_eq!(30, output_partitions[0].len());
+        assert_eq!(30, output_partitions[1].len());
+        assert_eq!(30, output_partitions[2].len());
+        assert_eq!(30, output_partitions[3].len());
+        assert_eq!(30, output_partitions[4].len());
 
         Ok(())
     }
@@ -2134,13 +2051,14 @@ mod tests {
         });
         let batches_with_drop = crate::common::collect(output_stream1).await.unwrap();
 
-        let items_vec_with_drop = str_batches_to_vec(&batches_with_drop);
-        let items_set_with_drop: HashSet<&str> =
-            items_vec_with_drop.iter().copied().collect();
-        assert_eq!(
-            items_set_with_drop.symmetric_difference(&items_set).count(),
-            0
-        );
+        fn sort(batch: Vec<RecordBatch>) -> Vec<RecordBatch> {
+            batch
+                .into_iter()
+                .sorted_by_key(|b| format!("{b:?}"))
+                .collect()
+        }
+
+        assert_eq!(sort(batches_without_drop), sort(batches_with_drop));
     }
 
     fn str_batches_to_vec(batches: &[RecordBatch]) -> Vec<&str> {
