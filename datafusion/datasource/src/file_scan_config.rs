@@ -785,6 +785,29 @@ impl DataSource for FileScanConfig {
     ) -> Result<Option<Arc<dyn DataSource>>> {
         // This process can be moved into CsvExec, but it would be an overlap of their responsibility.
 
+        // Metadata columns (e.g. `location`, `size`, `last_modified`) are
+        // inserted at designated output positions by ExtendedColumnProjector
+        // and are NOT part of the file source's projection. If the incoming
+        // projection references any metadata column we cannot push it down
+        // into the file source — bail out and keep the ProjectionExec above.
+        if !self.projected_metadata_positions.is_empty() {
+            let has_metadata_refs = projection.iter().any(|proj_expr| {
+                proj_expr
+                    .expr
+                    .as_any()
+                    .downcast_ref::<Column>()
+                    .map(|c| {
+                        self.projected_metadata_positions
+                            .iter()
+                            .any(|(output_pos, _)| c.index() == *output_pos)
+                    })
+                    .unwrap_or(false)
+            });
+            if has_metadata_refs {
+                return Ok(None);
+            }
+        }
+
         // Must be all column references, with no table partition columns (which can not be projected)
         let partitioned_columns_in_proj = projection.iter().any(|proj_expr| {
             proj_expr
