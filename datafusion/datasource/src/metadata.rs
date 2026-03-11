@@ -50,12 +50,12 @@ impl fmt::Display for MetadataColumn {
 }
 
 impl MetadataColumn {
-    /// The name of the metadata column (one of `location`, `last_modified`, or `size`)
+    /// The name of the metadata column (one of `_location`, `_last_modified`, or `_size`)
     pub fn name(&self) -> &str {
         match self {
-            MetadataColumn::Location(_) => "location",
-            MetadataColumn::LastModified => "last_modified",
-            MetadataColumn::Size => "size",
+            MetadataColumn::Location(_) => "_location",
+            MetadataColumn::LastModified => "_last_modified",
+            MetadataColumn::Size => "_size",
         }
     }
 
@@ -114,11 +114,11 @@ impl FromStr for MetadataColumn {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "location" => Ok(MetadataColumn::Location(None)),
-            "last_modified" => Ok(MetadataColumn::LastModified),
-            "size" => Ok(MetadataColumn::Size),
+            "_location" => Ok(MetadataColumn::Location(None)),
+            "_last_modified" => Ok(MetadataColumn::LastModified),
+            "_size" => Ok(MetadataColumn::Size),
             _ => plan_err!(
-                "Invalid metadata column: {}, expected: location, last_modified, or size",
+                "Invalid metadata column: {}, expected: _location, _last_modified, or _size",
                 s
             ),
         }
@@ -180,9 +180,9 @@ mod tests {
 
     #[test]
     fn test_metadata_column_name() {
-        assert_eq!(MetadataColumn::Location(None).name(), "location");
-        assert_eq!(MetadataColumn::LastModified.name(), "last_modified");
-        assert_eq!(MetadataColumn::Size.name(), "size");
+        assert_eq!(MetadataColumn::Location(None).name(), "_location");
+        assert_eq!(MetadataColumn::LastModified.name(), "_last_modified");
+        assert_eq!(MetadataColumn::Size.name(), "_size");
     }
 
     #[test]
@@ -198,12 +198,12 @@ mod tests {
     #[test]
     fn test_metadata_column_field() {
         let field = MetadataColumn::Location(None).field();
-        assert_eq!(field.name(), "location");
+        assert_eq!(field.name(), "_location");
         assert_eq!(field.data_type(), &DataType::Utf8);
         assert!(field.is_nullable());
 
         let field = MetadataColumn::LastModified.field();
-        assert_eq!(field.name(), "last_modified");
+        assert_eq!(field.name(), "_last_modified");
         assert_eq!(
             field.data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
@@ -211,7 +211,7 @@ mod tests {
         assert!(field.is_nullable());
 
         let field = MetadataColumn::Size.field();
-        assert_eq!(field.name(), "size");
+        assert_eq!(field.name(), "_size");
         assert_eq!(field.data_type(), &DataType::UInt64);
         assert!(field.is_nullable());
     }
@@ -247,15 +247,15 @@ mod tests {
     fn test_metadata_column_from_str() {
         // Test valid values
         assert_eq!(
-            MetadataColumn::from_str("location").unwrap(),
+            MetadataColumn::from_str("_location").unwrap(),
             MetadataColumn::Location(None)
         );
         assert_eq!(
-            MetadataColumn::from_str("last_modified").unwrap(),
+            MetadataColumn::from_str("_last_modified").unwrap(),
             MetadataColumn::LastModified
         );
         assert_eq!(
-            MetadataColumn::from_str("size").unwrap(),
+            MetadataColumn::from_str("_size").unwrap(),
             MetadataColumn::Size
         );
 
@@ -266,9 +266,9 @@ mod tests {
 
     #[test]
     fn test_metadata_column_display() {
-        assert_eq!(format!("{}", MetadataColumn::Location(None)), "location");
-        assert_eq!(format!("{}", MetadataColumn::LastModified), "last_modified");
-        assert_eq!(format!("{}", MetadataColumn::Size), "size");
+        assert_eq!(format!("{}", MetadataColumn::Location(None)), "_location");
+        assert_eq!(format!("{}", MetadataColumn::LastModified), "_last_modified");
+        assert_eq!(format!("{}", MetadataColumn::Size), "_size");
     }
 
     #[test]
