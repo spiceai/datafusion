@@ -2834,9 +2834,9 @@ mod tests {
         // Verify the schema matches expected order
         assert_eq!(result.num_columns(), 5);
         assert_eq!(result.schema().field(0).name(), "data");
-        assert_eq!(result.schema().field(1).name(), "location");
+        assert_eq!(result.schema().field(1).name(), "_location");
         assert_eq!(result.schema().field(2).name(), "year");
-        assert_eq!(result.schema().field(3).name(), "size");
+        assert_eq!(result.schema().field(3).name(), "_size");
         assert_eq!(result.schema().field(4).name(), "month");
 
         // Verify the values are correct in each column
@@ -2916,7 +2916,7 @@ mod tests {
 
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.schema().field(0).name(), "value");
-        assert_eq!(result.schema().field(1).name(), "size");
+        assert_eq!(result.schema().field(1).name(), "_size");
         assert_eq!(result.schema().field(2).name(), "part");
 
         // Verify values
@@ -2981,7 +2981,7 @@ mod tests {
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.schema().field(0).name(), "value");
         assert_eq!(result.schema().field(1).name(), "part");
-        assert_eq!(result.schema().field(2).name(), "location");
+        assert_eq!(result.schema().field(2).name(), "_location");
 
         let location_col = result
             .column(2)
@@ -3065,10 +3065,10 @@ mod tests {
         // Verify schema order
         assert_eq!(result.num_columns(), 7);
         assert_eq!(result.schema().field(0).name(), "col_a");
-        assert_eq!(result.schema().field(1).name(), "size");
+        assert_eq!(result.schema().field(1).name(), "_size");
         assert_eq!(result.schema().field(2).name(), "col_b");
         assert_eq!(result.schema().field(3).name(), "p1");
-        assert_eq!(result.schema().field(4).name(), "last_modified");
+        assert_eq!(result.schema().field(4).name(), "_last_modified");
         assert_eq!(result.schema().field(5).name(), "col_c");
         assert_eq!(result.schema().field(6).name(), "p2");
 
@@ -3212,8 +3212,8 @@ mod tests {
 
         assert_eq!(result.num_columns(), 3);
         assert_eq!(result.schema().field(0).name(), "data");
-        assert_eq!(result.schema().field(1).name(), "location");
-        assert_eq!(result.schema().field(2).name(), "size");
+        assert_eq!(result.schema().field(1).name(), "_location");
+        assert_eq!(result.schema().field(2).name(), "_size");
 
         let location_col = result
             .column(1)
@@ -3280,7 +3280,7 @@ mod tests {
         assert_eq!(result.num_columns(), 2);
         assert_eq!(result.num_rows(), 5);
         assert_eq!(result.schema().field(0).name(), "part");
-        assert_eq!(result.schema().field(1).name(), "size");
+        assert_eq!(result.schema().field(1).name(), "_size");
     }
 
     #[test]
@@ -3759,12 +3759,12 @@ mod tests {
             .projected_schema()
             .expect("projected schema");
         assert_eq!(projected.fields().len(), 3);
-        assert_eq!(projected.field(2).name(), "location");
+        assert_eq!(projected.field(2).name(), "_location");
 
         // Create a filter on the metadata column: location@2 = 's3://bucket'
         // (index 2 because projected output is [id@0, value@1, location@2])
         let location_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            Arc::new(Column::new("location", 2)),
+            Arc::new(Column::new("_location", 2)),
             Operator::Eq,
             Arc::new(Literal::new(ScalarValue::Utf8(Some(
                 "s3://bucket".to_string(),
@@ -3825,7 +3825,7 @@ mod tests {
         ));
         // Filter 1: metadata column filter on location@2 (beyond projection)
         let location_filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
-            Arc::new(Column::new("location", 2)),
+            Arc::new(Column::new("_location", 2)),
             Operator::Eq,
             Arc::new(Literal::new(ScalarValue::Utf8(Some(
                 "s3://bucket".to_string(),
@@ -3884,8 +3884,8 @@ mod tests {
         );
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "value");
-        assert_eq!(schema.field(2).name(), "location");
-        assert_eq!(schema.field(3).name(), "size");
+        assert_eq!(schema.field(2).name(), "_location");
+        assert_eq!(schema.field(3).name(), "_size");
     }
 
     /// Same as above but with a projection applied — metadata columns must
@@ -3932,7 +3932,7 @@ mod tests {
         );
         assert_eq!(schema.field(0).name(), "id");
         assert_eq!(schema.field(1).name(), "value");
-        assert_eq!(schema.field(2).name(), "location");
+        assert_eq!(schema.field(2).name(), "_location");
 
         // Verify it matches projected_schema()
         let projected = data_source
@@ -4043,7 +4043,7 @@ mod tests {
         // metadata = [location(2), size(3)]
         // SELECT location, id -> projection = [2, 0]
         // -> file_partition_indices = [0], metadata_positions = [(0, 0)]
-        // Metadata "location" should be at output position 0, "id" after it.
+        // Metadata "_location" should be at output position 0, "id" after it.
         let config = FileScanConfigBuilder::new(object_store_url, file_source)
             .with_metadata_cols(metadata_cols)
             .with_projection_indices(Some(vec![2, 0]))
@@ -4151,9 +4151,9 @@ mod tests {
         assert_eq!(projected.field(1).name(), "year");
         assert_eq!(projected.field(2).name(), "month");
         assert_eq!(projected.field(3).name(), "day");
-        assert_eq!(projected.field(4).name(), "location");
-        assert_eq!(projected.field(5).name(), "size");
-        assert_eq!(projected.field(6).name(), "last_modified");
+        assert_eq!(projected.field(4).name(), "_location");
+        assert_eq!(projected.field(5).name(), "_size");
+        assert_eq!(projected.field(6).name(), "_last_modified");
     }
 
     /// Test that projection with only some metadata columns works correctly.
@@ -4206,7 +4206,7 @@ mod tests {
         );
 
         assert_eq!(projected.field(0).name(), "id");
-        assert_eq!(projected.field(1).name(), "location");
+        assert_eq!(projected.field(1).name(), "_location");
     }
 
     /// Test that projection with metadata columns in non-sequential order works.
@@ -4253,9 +4253,9 @@ mod tests {
             projected.fields().len()
         );
 
-        assert_eq!(projected.field(0).name(), "location");
+        assert_eq!(projected.field(0).name(), "_location");
         assert_eq!(projected.field(1).name(), "id");
-        assert_eq!(projected.field(2).name(), "size");
+        assert_eq!(projected.field(2).name(), "_size");
     }
 
     /// Test partial projection selecting file, partition, AND metadata columns.
@@ -4311,7 +4311,7 @@ mod tests {
 
         assert_eq!(projected.field(0).name(), "id");
         assert_eq!(projected.field(1).name(), "year");
-        assert_eq!(projected.field(2).name(), "location");
+        assert_eq!(projected.field(2).name(), "_location");
 
         // Now test reordered: SELECT location, year, id -> projection = [4, 2, 0]
         let file_source2: Arc<dyn FileSource> =
@@ -4335,7 +4335,7 @@ mod tests {
             projected2.fields().len()
         );
 
-        assert_eq!(projected2.field(0).name(), "location");
+        assert_eq!(projected2.field(0).name(), "_location");
         assert_eq!(projected2.field(1).name(), "year");
         assert_eq!(projected2.field(2).name(), "id");
     }
@@ -4380,7 +4380,7 @@ mod tests {
             "Expected 1 column (location only), got {}",
             projected.fields().len()
         );
-        assert_eq!(projected.field(0).name(), "location");
+        assert_eq!(projected.field(0).name(), "_location");
 
         // The file source should have an empty projection (no file/partition columns)
         let source_proj = config
@@ -4398,7 +4398,7 @@ mod tests {
         let binding = config.eq_properties();
         let eq_schema = binding.schema();
         assert_eq!(eq_schema.fields().len(), 1);
-        assert_eq!(eq_schema.field(0).name(), "location");
+        assert_eq!(eq_schema.field(0).name(), "_location");
     }
 
     /// Test that with_projection_indices correctly handles a mix of file,
@@ -4433,7 +4433,7 @@ mod tests {
         let projected = config.projected_schema().expect("projected schema");
         assert_eq!(projected.fields().len(), 3);
         assert_eq!(projected.field(0).name(), "value");
-        assert_eq!(projected.field(1).name(), "location");
+        assert_eq!(projected.field(1).name(), "_location");
         assert_eq!(projected.field(2).name(), "year");
 
         // File source should have projection for indices [1, 2] (value, year)

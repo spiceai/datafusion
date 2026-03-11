@@ -1055,8 +1055,8 @@ mod tests {
         let schema_with_metadata = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("value", DataType::Utf8, true),
-            Field::new("location", DataType::Utf8, true),
-            Field::new("size", DataType::UInt64, true),
+            Field::new("_location", DataType::Utf8, true),
+            Field::new("_size", DataType::UInt64, true),
         ]));
 
         // Create the projector with metadata columns
@@ -1093,8 +1093,8 @@ mod tests {
             Field::new("id", DataType::Int32, false),
             Field::new("value", DataType::Utf8, true),
             Field::new("year", DataType::Utf8, true),
-            Field::new("location", DataType::Utf8, true),
-            Field::new("size", DataType::UInt64, true),
+            Field::new("_location", DataType::Utf8, true),
+            Field::new("_size", DataType::UInt64, true),
         ]));
 
         // Create the projector
@@ -1130,11 +1130,11 @@ mod tests {
 
         // Create a schema with columns in a different order
         let schema_mixed = Arc::new(Schema::new(vec![
-            Field::new("location", DataType::Utf8, true), // metadata column first
+            Field::new("_location", DataType::Utf8, true), // metadata column first
             Field::new("id", DataType::Int32, false),     // file column
             Field::new("year", DataType::Utf8, true),     // partition column
             Field::new("value", DataType::Utf8, true),    // file column
-            Field::new("size", DataType::UInt64, true),   // metadata column last
+            Field::new("_size", DataType::UInt64, true),   // metadata column last
         ]));
 
         // Create the projector
@@ -1174,7 +1174,7 @@ mod tests {
             .collect();
 
         // Check location column
-        let location_idx = *field_indices.get("location").unwrap();
+        let location_idx = *field_indices.get("_location").unwrap();
         let location_col = projected_batch.column(location_idx);
         let location_array = location_col.as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(location_array.value(0), "test/file.parquet");
@@ -1201,7 +1201,7 @@ mod tests {
         assert_eq!(value_array.value(0), "a");
 
         // Check size column
-        let size_idx = *field_indices.get("size").unwrap();
+        let size_idx = *field_indices.get("_size").unwrap();
         let size_col = projected_batch.column(size_idx);
         let size_array = size_col.as_any().downcast_ref::<UInt64Array>().unwrap();
         assert_eq!(size_array.value(0), 1024);
