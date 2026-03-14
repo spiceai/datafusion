@@ -990,6 +990,7 @@ impl LogicalPlan {
                 column_defaults,
                 temporary,
                 table_partition_cols,
+                constraints,
                 ..
             })) => {
                 self.assert_no_expressions(expr)?;
@@ -997,7 +998,7 @@ impl LogicalPlan {
                 Ok(LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
                     CreateMemoryTable {
                         input: Arc::new(input),
-                        constraints: Constraints::default(),
+                        constraints: constraints.clone(),
                         name: name.clone(),
                         if_not_exists: *if_not_exists,
                         or_replace: *or_replace,

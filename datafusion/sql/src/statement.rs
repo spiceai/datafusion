@@ -540,7 +540,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 or_replace,
                                 column_defaults,
                                 temporary,
-                                table_partition_cols: table_partition_cols.clone(),
+                                table_partition_cols,
                             },
                         )))
                     }
