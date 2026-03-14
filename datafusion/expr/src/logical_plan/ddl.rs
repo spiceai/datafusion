@@ -508,6 +508,7 @@ impl CreateMemoryTable {
     }
 
     /// Create a new [`CreateMemoryTable`] with explicitly specified partition columns.
+    #[expect(clippy::too_many_arguments)]
     pub fn new_with_partition_cols(
         name: TableReference,
         constraints: Constraints,

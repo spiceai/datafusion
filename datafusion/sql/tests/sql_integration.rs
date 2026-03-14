@@ -612,6 +612,28 @@ fn plan_create_table_partition_by_invalid_expr() {
 }
 
 #[test]
+fn plan_create_table_partition_by_unknown_column() {
+    let sql = "create table person (id int, name string) partition by (unknown_col)";
+    let result = logical_plan(sql);
+    assert!(result.is_err());
+    assert_contains!(
+        result.unwrap_err().strip_backtrace(),
+        "PARTITION BY column 'unknown_col' not found in table schema"
+    );
+}
+
+#[test]
+fn plan_create_table_as_select_partition_by_unknown_column() {
+    let sql = "create table person_copy partition by (unknown_col) as select * from person";
+    let result = logical_plan(sql);
+    assert!(result.is_err());
+    assert_contains!(
+        result.unwrap_err().strip_backtrace(),
+        "PARTITION BY column 'unknown_col' not found in table schema"
+    );
+}
+
+#[test]
 fn plan_start_transaction() {
     let sql = "start transaction";
     let plan = logical_plan(sql).unwrap();

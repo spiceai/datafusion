@@ -517,6 +517,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             plan
                         };
 
+                        // Validate partition columns exist in the schema
+                        for col_name in &table_partition_cols {
+                            if !plan.schema().has_column_with_unqualified_name(col_name) {
+                                return plan_err!(
+                                    "PARTITION BY column '{col_name}' not found in table schema"
+                                );
+                            }
+                        }
+
                         let constraints = self.new_constraint_from_table_constraints(
                             &all_constraints,
                             plan.schema(),
@@ -537,6 +546,15 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     }
 
                     None => {
+                        // Validate partition columns exist in the schema
+                        for col_name in &table_partition_cols {
+                            if !schema.has_column_with_unqualified_name(col_name) {
+                                return plan_err!(
+                                    "PARTITION BY column '{col_name}' not found in table schema"
+                                );
+                            }
+                        }
+
                         let plan = EmptyRelation {
                             produce_one_row: false,
                             schema,
