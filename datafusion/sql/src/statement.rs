@@ -517,14 +517,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             plan
                         };
 
-                        // Validate partition columns exist in the schema
-                        for col_name in &table_partition_cols {
-                            if !plan.schema().has_column_with_unqualified_name(col_name) {
-                                return plan_err!(
-                                    "PARTITION BY column '{col_name}' not found in table schema"
-                                );
-                            }
-                        }
+                        Self::validate_partition_columns(plan.schema(), &table_partition_cols)?;
 
                         let constraints = self.new_constraint_from_table_constraints(
                             &all_constraints,
@@ -546,14 +539,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     }
 
                     None => {
-                        // Validate partition columns exist in the schema
-                        for col_name in &table_partition_cols {
-                            if !schema.has_column_with_unqualified_name(col_name) {
-                                return plan_err!(
-                                    "PARTITION BY column '{col_name}' not found in table schema"
-                                );
-                            }
-                        }
+                        Self::validate_partition_columns(&schema, &table_partition_cols)?;
 
                         let plan = EmptyRelation {
                             produce_one_row: false,
@@ -1698,6 +1684,21 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
 
     /// Convert a `PARTITION BY` expression into a list of column name strings.
     ///
+    /// Validate that all partition column names exist in the given schema.
+    fn validate_partition_columns(
+        schema: &DFSchema,
+        partition_cols: &[String],
+    ) -> Result<()> {
+        for col_name in partition_cols {
+            if !schema.has_column_with_unqualified_name(col_name) {
+                return plan_err!(
+                    "PARTITION BY column '{col_name}' not found in table schema"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Supports the following forms:
     /// - `PARTITION BY col` — a single identifier
     /// - `PARTITION BY (col1, col2, ...)` — a tuple of identifiers

@@ -529,6 +529,23 @@ fn plan_create_table_check_constraint() {
 }
 
 #[test]
+fn plan_create_table_partition_by_single_column_no_parens() {
+    let sql = "create table person (id int, name string) partition by name";
+    let plan = logical_plan(sql).unwrap();
+    match &plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+            datafusion_expr::CreateMemoryTable {
+                table_partition_cols,
+                ..
+            },
+        )) => {
+            assert_eq!(table_partition_cols, &vec!["name".to_string()]);
+        }
+        _ => panic!("Expected CreateMemoryTable, got {plan:?}"),
+    }
+}
+
+#[test]
 fn plan_create_table_partition_by_single_column() {
     let sql = "create table person (id int, name string) partition by (name)";
     let plan = logical_plan(sql).unwrap();
