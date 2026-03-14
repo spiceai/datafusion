@@ -989,6 +989,7 @@ impl LogicalPlan {
                 or_replace,
                 column_defaults,
                 temporary,
+                table_partition_cols,
                 ..
             })) => {
                 self.assert_no_expressions(expr)?;
@@ -1002,6 +1003,7 @@ impl LogicalPlan {
                         or_replace: *or_replace,
                         column_defaults: column_defaults.clone(),
                         temporary: *temporary,
+                        table_partition_cols: table_partition_cols.clone(),
                     },
                 )))
             }

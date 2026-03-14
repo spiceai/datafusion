@@ -476,6 +476,8 @@ pub struct CreateMemoryTable {
     pub column_defaults: Vec<(String, Expr)>,
     /// Whether the table is `TableType::Temporary`
     pub temporary: bool,
+    /// Partition Columns
+    pub table_partition_cols: Vec<String>,
 }
 
 /// Creates a view.
