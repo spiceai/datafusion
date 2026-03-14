@@ -529,6 +529,128 @@ fn plan_create_table_check_constraint() {
 }
 
 #[test]
+fn plan_create_table_partition_by_single_column_no_parens() {
+    let sql = "create table person (id int, name string) partition by name";
+    let plan = logical_plan(sql).unwrap();
+    match &plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+            datafusion_expr::CreateMemoryTable {
+                table_partition_cols,
+                ..
+            },
+        )) => {
+            assert_eq!(table_partition_cols, &vec!["name".to_string()]);
+        }
+        _ => panic!("Expected CreateMemoryTable, got {plan:?}"),
+    }
+}
+
+#[test]
+fn plan_create_table_partition_by_single_column() {
+    let sql = "create table person (id int, name string) partition by (name)";
+    let plan = logical_plan(sql).unwrap();
+    match &plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+            datafusion_expr::CreateMemoryTable {
+                table_partition_cols,
+                ..
+            },
+        )) => {
+            assert_eq!(table_partition_cols, &vec!["name".to_string()]);
+        }
+        _ => panic!("Expected CreateMemoryTable, got {plan:?}"),
+    }
+}
+
+#[test]
+fn plan_create_table_partition_by_multiple_columns() {
+    let sql = "create table person (id int, name string) partition by (id, name)";
+    let plan = logical_plan(sql).unwrap();
+    match &plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+            datafusion_expr::CreateMemoryTable {
+                table_partition_cols,
+                ..
+            },
+        )) => {
+            assert_eq!(
+                table_partition_cols,
+                &vec!["id".to_string(), "name".to_string()]
+            );
+        }
+        _ => panic!("Expected CreateMemoryTable, got {plan:?}"),
+    }
+}
+
+#[test]
+fn plan_create_table_partition_by_no_partition() {
+    let sql = "create table person (id int, name string)";
+    let plan = logical_plan(sql).unwrap();
+    match &plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+            datafusion_expr::CreateMemoryTable {
+                table_partition_cols,
+                ..
+            },
+        )) => {
+            assert!(table_partition_cols.is_empty());
+        }
+        _ => panic!("Expected CreateMemoryTable, got {plan:?}"),
+    }
+}
+
+#[test]
+fn plan_create_table_as_select_partition_by() {
+    let sql =
+        "create table person_copy partition by (id) as select * from person";
+    let plan = logical_plan(sql).unwrap();
+    match &plan {
+        LogicalPlan::Ddl(DdlStatement::CreateMemoryTable(
+            datafusion_expr::CreateMemoryTable {
+                table_partition_cols,
+                ..
+            },
+        )) => {
+            assert_eq!(table_partition_cols, &vec!["id".to_string()]);
+        }
+        _ => panic!("Expected CreateMemoryTable, got {plan:?}"),
+    }
+}
+
+#[test]
+fn plan_create_table_partition_by_invalid_expr() {
+    let sql = "create table person (id int, name string) partition by (1 + 2)";
+    let result = logical_plan(sql);
+    assert!(result.is_err());
+    assert_contains!(
+        result.unwrap_err().strip_backtrace(),
+        "Expected column name(s) in PARTITION BY"
+    );
+}
+
+#[test]
+fn plan_create_table_partition_by_unknown_column() {
+    let sql = "create table person (id int, name string) partition by (unknown_col)";
+    let result = logical_plan(sql);
+    assert!(result.is_err());
+    assert_contains!(
+        result.unwrap_err().strip_backtrace(),
+        "PARTITION BY column 'unknown_col' not found in table schema"
+    );
+}
+
+#[test]
+fn plan_create_table_as_select_partition_by_unknown_column() {
+    let sql = "create table person_copy partition by (unknown_col) as select * from person";
+    let result = logical_plan(sql);
+    assert!(result.is_err());
+    assert_contains!(
+        result.unwrap_err().strip_backtrace(),
+        "PARTITION BY column 'unknown_col' not found in table schema"
+    );
+}
+
+#[test]
 fn plan_start_transaction() {
     let sql = "start transaction";
     let plan = logical_plan(sql).unwrap();

@@ -372,6 +372,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     or_replace: false,
                     temporary: false,
                     column_defaults: vec![],
+                    table_partition_cols: vec![],
                 },
             ))),
             _ => Ok(plan),

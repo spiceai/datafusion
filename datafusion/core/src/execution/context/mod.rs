@@ -869,6 +869,7 @@ impl SessionContext {
             constraints,
             column_defaults,
             temporary,
+            ..
         } = cmd;
 
         let input = Arc::unwrap_or_clone(input);
