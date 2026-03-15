@@ -384,11 +384,9 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 if order_by.is_some() {
                     return not_impl_err!("Order by not supported")?;
                 }
-                let table_partition_cols = if let Some(partition_by) = partition_by {
-                    Self::partition_by_to_col_names(*partition_by)?
-                } else {
-                    vec![]
-                };
+                if partition_by.is_some() {
+                    return not_impl_err!("Partition by not supported")?;
+                }
                 if cluster_by.is_some() {
                     return not_impl_err!("Cluster by not supported")?;
                 }
@@ -517,8 +515,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             plan
                         };
 
-                        Self::validate_partition_columns(plan.schema(), &table_partition_cols)?;
-
                         let constraints = self.new_constraint_from_table_constraints(
                             &all_constraints,
                             plan.schema(),
@@ -533,14 +529,11 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 or_replace,
                                 column_defaults,
                                 temporary,
-                                table_partition_cols,
                             },
                         )))
                     }
 
                     None => {
-                        Self::validate_partition_columns(&schema, &table_partition_cols)?;
-
                         let plan = EmptyRelation {
                             produce_one_row: false,
                             schema,
@@ -559,7 +552,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                                 or_replace,
                                 column_defaults,
                                 temporary,
-                                table_partition_cols,
                             },
                         )))
                     }
@@ -1680,46 +1672,6 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 .with_column_defaults(column_defaults)
                 .build(),
         )))
-    }
-
-    /// Convert a `PARTITION BY` expression into a list of column name strings.
-    ///
-    /// Validate that all partition column names exist in the given schema.
-    fn validate_partition_columns(
-        schema: &DFSchema,
-        partition_cols: &[String],
-    ) -> Result<()> {
-        for col_name in partition_cols {
-            if !schema.has_column_with_unqualified_name(col_name) {
-                return plan_err!(
-                    "PARTITION BY column '{col_name}' not found in table schema"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Supports the following forms:
-    /// - `PARTITION BY col` — a single identifier
-    /// - `PARTITION BY (col1, col2, ...)` — a tuple of identifiers
-    fn partition_by_to_col_names(expr: SQLExpr) -> Result<Vec<String>> {
-        match expr {
-            SQLExpr::Identifier(ident) => Ok(vec![normalize_ident(ident)]),
-            // PARTITION BY (col) is parsed as Nested(Identifier)
-            SQLExpr::Nested(inner) => Self::partition_by_to_col_names(*inner),
-            SQLExpr::Tuple(exprs) => exprs
-                .into_iter()
-                .map(|e| match e {
-                    SQLExpr::Identifier(ident) => Ok(normalize_ident(ident)),
-                    other => plan_err!(
-                        "Expected column name identifier in PARTITION BY, found: {other}"
-                    ),
-                })
-                .collect(),
-            other => plan_err!(
-                "Expected column name(s) in PARTITION BY, found: {other}"
-            ),
-        }
     }
 
     /// Get the indices of the constraint columns in the schema.
