@@ -476,60 +476,6 @@ pub struct CreateMemoryTable {
     pub column_defaults: Vec<(String, Expr)>,
     /// Whether the table is `TableType::Temporary`
     pub temporary: bool,
-    /// Partition Columns
-    pub table_partition_cols: Vec<String>,
-}
-
-impl CreateMemoryTable {
-    /// Create a new [`CreateMemoryTable`] without specifying partition columns.
-    ///
-    /// This constructor is intended as a stable, forward-compatible API for
-    /// constructing [`CreateMemoryTable`]. Future fields can be added with
-    /// sensible defaults without requiring downstream code to change.
-    pub fn new(
-        name: TableReference,
-        constraints: Constraints,
-        input: Arc<LogicalPlan>,
-        if_not_exists: bool,
-        or_replace: bool,
-        column_defaults: Vec<(String, Expr)>,
-        temporary: bool,
-    ) -> Self {
-        Self {
-            name,
-            constraints,
-            input,
-            if_not_exists,
-            or_replace,
-            column_defaults,
-            temporary,
-            table_partition_cols: Vec::new(),
-        }
-    }
-
-    /// Create a new [`CreateMemoryTable`] with explicitly specified partition columns.
-    #[expect(clippy::too_many_arguments)]
-    pub fn new_with_partition_cols(
-        name: TableReference,
-        constraints: Constraints,
-        input: Arc<LogicalPlan>,
-        if_not_exists: bool,
-        or_replace: bool,
-        column_defaults: Vec<(String, Expr)>,
-        temporary: bool,
-        table_partition_cols: Vec<String>,
-    ) -> Self {
-        Self {
-            name,
-            constraints,
-            input,
-            if_not_exists,
-            or_replace,
-            column_defaults,
-            temporary,
-            table_partition_cols,
-        }
-    }
 }
 
 /// Creates a view.
