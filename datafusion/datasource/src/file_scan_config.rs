@@ -35,8 +35,8 @@ use arrow::datatypes::{
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::{
-    ColumnStatistics, Constraints, Result, ScalarValue, Statistics,
-    exec_datafusion_err, exec_err, internal_datafusion_err, internal_err,
+    ColumnStatistics, Constraints, Result, ScalarValue, Statistics, exec_datafusion_err,
+    exec_err, internal_datafusion_err, internal_err,
 };
 use datafusion_execution::{
     SendableRecordBatchStream, TaskContext, object_store::ObjectStoreUrl,
@@ -928,25 +928,17 @@ impl DataSource for FileScanConfig {
         // projection references any metadata column we cannot push it down
         // into the file source — bail out and keep the ProjectionExec above.
         if !self.projected_metadata_positions.is_empty() {
-            let file_partition_len = self
-                .file_source
-                .projection()
-                .map(|p| p.as_ref().len())
-                .unwrap_or_else(|| {
-                    self.file_source
-                        .table_schema()
-                        .table_schema()
-                        .fields()
-                        .len()
+            // Use `collect_columns` to find ALL Column references within each
+            // projection expression, including those nested inside function
+            // calls (e.g. `upper(_location)`), not just top-level Column exprs.
+            let has_metadata_refs = projection
+                .iter()
+                .flat_map(|proj_expr| collect_columns(&proj_expr.expr))
+                .any(|c| {
+                    self.projected_metadata_positions
+                        .iter()
+                        .any(|(output_pos, _)| c.index() == *output_pos)
                 });
-            let has_metadata_refs = projection.iter().any(|proj_expr| {
-                proj_expr
-                    .expr
-                    .as_any()
-                    .downcast_ref::<Column>()
-                    .map(|c| c.index() >= file_partition_len)
-                    .unwrap_or(false)
-            });
             if has_metadata_refs {
                 return Ok(None);
             }
@@ -4449,5 +4441,64 @@ mod tests {
 
         // Metadata positions should track location at output position 1
         assert_eq!(config.projected_metadata_positions, vec![(1, 0)]);
+    }
+
+    /// Test that `try_swapping_with_projection` returns `None` when the
+    /// projection contains an **expression** wrapping a metadata column
+    /// (e.g. `upper(_location)`), not just a bare `Column` reference.
+    #[test]
+    fn test_try_swap_projection_rejects_nested_metadata_ref() {
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("value", DataType::Utf8, false),
+        ]));
+        let object_store_url = ObjectStoreUrl::parse("test:///").expect("valid url");
+        let table_schema = TableSchema::new(Arc::clone(&file_schema), vec![]);
+        let file_source: Arc<dyn FileSource> =
+            Arc::new(MockSource::new(table_schema.clone()));
+
+        let metadata_cols = vec![MetadataColumn::Location(None)];
+
+        let config =
+            FileScanConfigBuilder::new(object_store_url, Arc::clone(&file_source))
+                .with_metadata_cols(metadata_cols)
+                .with_projection_indices(Some(vec![0, 1]))
+                .expect("valid projection")
+                .build();
+
+        // First push a simple projection so that `file_source.projection()` is set.
+        let simple_proj = ProjectionExprs::new(vec![
+            ProjectionExpr::new(col("id", &file_schema).expect("col"), "id"),
+            ProjectionExpr::new(col("value", &file_schema).expect("col"), "value"),
+        ]);
+        let data_source = config
+            .try_swapping_with_projection(&simple_proj)
+            .expect("swap ok")
+            .expect("should produce new source");
+
+        // Now build a projection that contains a *nested* metadata column
+        // reference: `_location = 'x'` — the Column(_location@2) is inside a
+        // BinaryExpr, so a simple downcast_ref::<Column>() on the top-level
+        // expression would miss it.
+        let nested_metadata_expr: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("_location", 2)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Utf8(Some(
+                "s3://bucket".to_string(),
+            )))),
+        ));
+        let nested_proj = ProjectionExprs::new(vec![ProjectionExpr::new(
+            nested_metadata_expr,
+            "loc_eq",
+        )]);
+
+        let result = data_source
+            .try_swapping_with_projection(&nested_proj)
+            .expect("should not error");
+        assert!(
+            result.is_none(),
+            "try_swapping_with_projection must return None when the projection \
+             contains an expression that references a metadata column"
+        );
     }
 }
