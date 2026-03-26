@@ -620,6 +620,10 @@ impl Dialect for BigQueryDialect {
         }
     }
 
+    fn float64_ast_dtype(&self) -> ast::DataType {
+        ast::DataType::Float64
+    }
+
     fn date_field_extract_style(&self) -> DateFieldExtractStyle {
         DateFieldExtractStyle::Extract
     }
