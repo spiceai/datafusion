@@ -649,6 +649,10 @@ impl Dialect for BigQueryDialect {
         true
     }
 
+    fn supports_column_alias_in_table_alias(&self) -> bool {
+        false
+    }
+
     fn timestamp_with_tz_to_string(&self, dt: DateTime<Tz>, unit: TimeUnit) -> String {
         // https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/data-types#timestamp_type
         let format = match unit {
