@@ -2855,3 +2855,192 @@ fn test_struct_expr3() {
         @r#"SELECT test.c1."metadata".product."name" FROM (SELECT {"metadata": {product: {"name": 'Product Name'}}} AS c1) AS test"#
     );
 }
+
+/// Verifies that `SubqueryAlias` wrapping a `Filter` over a `TableScan` with
+/// pushdown filters correctly rewrites column references to the alias name.
+///
+/// Three scenarios are covered:
+///
+/// 1. **Inexact pushdown** — the same predicate appears in both the `TableScan`
+///    filters and the `Filter` node (the optimizer keeps the `Filter` for
+///    re-checking):
+///      SubqueryAlias: n1
+///        Filter: nation.n_name = 'FRANCE'
+///          TableScan: nation filters=[nation.n_name = 'FRANCE']
+///
+/// 2. **Mixed pushdown** — the `Filter` node contains additional predicates
+///    beyond what was pushed into the `TableScan` (e.g. some filters returned
+///    `Unsupported` from `supports_filters_pushdown`):
+///      SubqueryAlias: n1
+///        Filter: nation.n_name = 'FRANCE' AND nation.n_nationkey > 10
+///          TableScan: nation filters=[nation.n_name = 'FRANCE']
+///
+/// 3. **Disjoint predicates** — the `Filter` and `TableScan` have completely
+///    different predicates (no duplicates):
+///      SubqueryAlias: n1
+///        Filter: nation.n_nationkey > 10
+///          TableScan: nation filters=[nation.n_name = 'FRANCE']
+#[test]
+fn test_subquery_alias_with_filter_over_table_scan_pushdown() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("n_nationkey", DataType::Int32, false),
+        Field::new("n_name", DataType::Utf8, false),
+    ]);
+
+    // Scenario 1: Inexact pushdown — same predicate in both TableScan and Filter
+    let scan = table_scan_with_filters(
+        Some("nation"),
+        &schema,
+        Some(vec![0, 1]),
+        vec![col("n_name").eq(lit("FRANCE"))],
+    )?
+    .build()?;
+
+    let filtered = LogicalPlanBuilder::from(scan)
+        .filter(col("nation.n_name").eq(lit("FRANCE")))?
+        .build()?;
+
+    let aliased = LogicalPlanBuilder::from(filtered).alias("n1")?.build()?;
+
+    let sql = plan_to_sql(&aliased)?;
+    // Duplicate filter is expected: both the Filter node and TableScan carry
+    // the same predicate for Inexact pushdown. Deduplicating filters that may
+    // be duplicated by Inexact/partial pushdown does not affect query
+    // correctness and can be optimized separately.
+    assert_snapshot!(
+        sql,
+        @"SELECT n1.n_nationkey, n1.n_name FROM nation AS n1 WHERE (n1.n_name = 'FRANCE') AND (n1.n_name = 'FRANCE')"
+    );
+
+    // Scenario 2: Mixed pushdown — Filter has an additional predicate not in TableScan
+    let scan = table_scan_with_filters(
+        Some("nation"),
+        &schema,
+        Some(vec![0, 1]),
+        vec![col("n_name").eq(lit("FRANCE"))],
+    )?
+    .build()?;
+
+    let filtered = LogicalPlanBuilder::from(scan)
+        .filter(
+            col("nation.n_name")
+                .eq(lit("FRANCE"))
+                .and(col("nation.n_nationkey").gt(lit(10))),
+        )?
+        .build()?;
+
+    let aliased = LogicalPlanBuilder::from(filtered).alias("n1")?.build()?;
+
+    let sql = plan_to_sql(&aliased)?;
+    // The `n_name = 'FRANCE'` predicate appears twice: once from the Filter
+    // node (which also carries the extra `n_nationkey > 10`) and once from
+    // the TableScan pushdown filters. This is correct but redundant — dedup
+    // for Inexact/partial pushdown duplicates can be optimized separately.
+    assert_snapshot!(
+        sql,
+        @"SELECT n1.n_nationkey, n1.n_name FROM nation AS n1 WHERE ((n1.n_name = 'FRANCE') AND (n1.n_nationkey > 10)) AND (n1.n_name = 'FRANCE')"
+    );
+
+    // Scenario 3: Disjoint predicates — Filter and TableScan have different predicates
+    let scan = table_scan_with_filters(
+        Some("nation"),
+        &schema,
+        Some(vec![0, 1]),
+        vec![col("n_name").eq(lit("FRANCE"))],
+    )?
+    .build()?;
+
+    let filtered = LogicalPlanBuilder::from(scan)
+        .filter(col("nation.n_nationkey").gt(lit(10)))?
+        .build()?;
+
+    let aliased = LogicalPlanBuilder::from(filtered).alias("n1")?.build()?;
+
+    let sql = plan_to_sql(&aliased)?;
+    // No duplicate: Filter predicate differs from TableScan pushdown filter.
+    assert_snapshot!(
+        sql,
+        @"SELECT n1.n_nationkey, n1.n_name FROM nation AS n1 WHERE (n1.n_nationkey > 10) AND (n1.n_name = 'FRANCE')"
+    );
+
+    Ok(())
+}
+
+/// Verifies that a `Filter` node above a `TableScan` with pushdown filters
+/// (without a `SubqueryAlias`) is handled correctly by the SQL conversion path.
+#[test]
+fn test_filter_over_table_scan_pushdown_no_alias() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("n_nationkey", DataType::Int32, false),
+        Field::new("n_name", DataType::Utf8, false),
+    ]);
+
+    // Same predicate in both TableScan and Filter (Inexact pushdown, no alias)
+    let scan = table_scan_with_filters(
+        Some("nation"),
+        &schema,
+        Some(vec![0, 1]),
+        vec![col("n_name").eq(lit("FRANCE"))],
+    )?
+    .build()?;
+
+    let filtered = LogicalPlanBuilder::from(scan)
+        .filter(col("nation.n_name").eq(lit("FRANCE")))?
+        .build()?;
+
+    let sql = plan_to_sql(&filtered)?;
+    // Duplicate filter: same predicate in Filter node and TableScan pushdown.
+    // Dedup for Inexact/partial pushdown duplicates does not affect correctness
+    // and can be optimized separately.
+    assert_snapshot!(
+        sql,
+        @"SELECT nation.n_nationkey, nation.n_name FROM nation WHERE (nation.n_name = 'FRANCE') AND (nation.n_name = 'FRANCE')"
+    );
+
+    // Filter has additional predicate beyond what was pushed down
+    let scan = table_scan_with_filters(
+        Some("nation"),
+        &schema,
+        Some(vec![0, 1]),
+        vec![col("n_name").eq(lit("FRANCE"))],
+    )?
+    .build()?;
+
+    let filtered = LogicalPlanBuilder::from(scan)
+        .filter(
+            col("nation.n_name")
+                .eq(lit("FRANCE"))
+                .and(col("nation.n_nationkey").gt(lit(10))),
+        )?
+        .build()?;
+
+    let sql = plan_to_sql(&filtered)?;
+    // `n_name = 'FRANCE'` appears in both Filter and TableScan — redundant
+    // but correct. Dedup can be optimized separately.
+    assert_snapshot!(
+        sql,
+        @"SELECT nation.n_nationkey, nation.n_name FROM nation WHERE ((nation.n_name = 'FRANCE') AND (nation.n_nationkey > 10)) AND (nation.n_name = 'FRANCE')"
+    );
+
+    // Disjoint predicates — Filter and TableScan have different predicates
+    let scan = table_scan_with_filters(
+        Some("nation"),
+        &schema,
+        Some(vec![0, 1]),
+        vec![col("n_name").eq(lit("FRANCE"))],
+    )?
+    .build()?;
+
+    let filtered = LogicalPlanBuilder::from(scan)
+        .filter(col("nation.n_nationkey").gt(lit(10)))?
+        .build()?;
+
+    let sql = plan_to_sql(&filtered)?;
+    // No duplicate: Filter predicate differs from TableScan pushdown filter.
+    assert_snapshot!(
+        sql,
+        @"SELECT nation.n_nationkey, nation.n_name FROM nation WHERE (nation.n_nationkey > 10) AND (nation.n_name = 'FRANCE')"
+    );
+
+    Ok(())
+}

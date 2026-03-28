@@ -22,9 +22,8 @@ use super::{
         SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
     },
     rewrite::{
-        TableAliasRewriter, inject_column_aliases_into_subquery,
-        normalize_union_schema, remove_dangling_identifiers,
-        rewrite_plan_for_sort_on_non_projected_fields,
+        TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
+        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
     utils::{
@@ -1236,6 +1235,30 @@ impl Unparser<'_> {
                     return Ok(Some(plan));
                 }
                 Ok(ret)
+            }
+            // Handle Filter between SubqueryAlias and TableScan (e.g. Inexact/Unsupported
+            // filter pushdown). Rewrite predicate column references to use the alias.
+            LogicalPlan::Filter(filter) => {
+                if let Some(plan) = self.unparse_table_scan_pushdown(
+                    &filter.input,
+                    alias.clone(),
+                    already_projected,
+                )? {
+                    let predicate = if let Some(ref alias_name) = alias {
+                        let mut rewriter = TableAliasRewriter {
+                            table_schema: plan.schema().as_arrow(),
+                            alias_name: alias_name.clone(),
+                        };
+                        filter.predicate.clone().rewrite(&mut rewriter).data()?
+                    } else {
+                        filter.predicate.clone()
+                    };
+                    Ok(Some(
+                        LogicalPlanBuilder::from(plan).filter(predicate)?.build()?,
+                    ))
+                } else {
+                    Ok(None)
+                }
             }
             // SubqueryAlias could be rewritten to a plan with a projection as the top node by [rewrite::subquery_alias_inner_query_and_columns].
             // The inner table scan could be a scan with pushdown operations.
