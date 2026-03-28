@@ -3044,3 +3044,65 @@ fn test_filter_over_table_scan_pushdown_no_alias() -> Result<()> {
 
     Ok(())
 }
+
+/// Verifies that when `SubqueryAlias(Filter(TableScan))` is used inside a JOIN,
+/// `try_transform_to_simple_table_scan_with_filters` rewrites the Filter
+/// predicate with the alias so `nation.n_name` becomes `n1.n_name` and the
+/// duplicate filter is properly deduplicated.
+#[test]
+fn test_join_with_filter_over_aliased_table_scan_pushdown() -> Result<()> {
+    let nation_schema = Schema::new(vec![
+        Field::new("n_nationkey", DataType::Int32, false),
+        Field::new("n_name", DataType::Utf8, false),
+    ]);
+
+    let supplier_schema = Schema::new(vec![
+        Field::new("s_suppkey", DataType::Int32, false),
+        Field::new("s_nationkey", DataType::Int32, false),
+    ]);
+
+    let supplier_scan = table_scan(Some("supplier"), &supplier_schema, Some(vec![0, 1]))?
+        .build()?;
+
+    // Build: SubqueryAlias(n1, Filter(nation.n_name IN ('FRANCE','GERMANY'),
+    //          TableScan(nation, partial_filters=[same])))
+    let nation_scan = table_scan_with_filters(
+        Some("nation"),
+        &nation_schema,
+        Some(vec![0, 1]),
+        vec![col("n_name").eq(lit("FRANCE")).or(col("n_name").eq(lit("GERMANY")))],
+    )?
+    .build()?;
+
+    let nation_filtered = LogicalPlanBuilder::from(nation_scan)
+        .filter(
+            col("nation.n_name")
+                .eq(lit("FRANCE"))
+                .or(col("nation.n_name").eq(lit("GERMANY"))),
+        )?
+        .build()?;
+
+    let nation_aliased = LogicalPlanBuilder::from(nation_filtered)
+        .alias("n1")?
+        .build()?;
+
+    let join_plan = LogicalPlanBuilder::from(supplier_scan)
+        .join(
+            nation_aliased,
+            datafusion_expr::JoinType::Inner,
+            (vec!["supplier.s_nationkey"], vec!["n1.n_nationkey"]),
+            None,
+        )?
+        .build()?;
+
+    let sql = plan_to_sql(&join_plan)?;
+    // The filter predicate should use alias n1 (not original table name "nation").
+    // With Inexact pushdown, the Filter and TableScan carry the same predicate;
+    // after alias rewriting both become identical and are deduplicated.
+    assert_snapshot!(
+        sql,
+        @r#"SELECT supplier.s_suppkey, supplier.s_nationkey, n1.n_nationkey, n1.n_name FROM supplier INNER JOIN nation AS n1 ON supplier.s_nationkey = n1.n_nationkey AND ((n1.n_name = 'FRANCE') OR (n1.n_name = 'GERMANY'))"#
+    );
+
+    Ok(())
+}
