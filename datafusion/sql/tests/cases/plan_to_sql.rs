@@ -28,7 +28,7 @@ use datafusion_expr::test::function_stub::{
 use datafusion_expr::{
     EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Union,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, WindowFrame,
-    WindowFunctionDefinition, cast, col, lit, table_scan, wildcard,
+    WindowFunctionDefinition, cast, col, lit, not_exists, table_scan, wildcard,
 };
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
@@ -1758,9 +1758,11 @@ fn test_sort_with_scalar_fn_and_push_down_fetch() -> Result<()> {
         .filter(col("search_phrase").not_eq(lit("")))?
         .project(vec![col("search_phrase"), col("event_time")])?
         .sort_with_limit(
-            vec![substr_udf
-                .call(vec![col("event_time"), lit(1), lit(5)])
-                .sort(true, true)],
+            vec![
+                substr_udf
+                    .call(vec![col("event_time"), lit(1), lit(5)])
+                    .sort(true, true),
+            ],
             Some(10),
         )?
         .project(vec![col("search_phrase")])?
@@ -3061,8 +3063,8 @@ fn test_join_with_filter_over_aliased_table_scan_pushdown() -> Result<()> {
         Field::new("s_nationkey", DataType::Int32, false),
     ]);
 
-    let supplier_scan = table_scan(Some("supplier"), &supplier_schema, Some(vec![0, 1]))?
-        .build()?;
+    let supplier_scan =
+        table_scan(Some("supplier"), &supplier_schema, Some(vec![0, 1]))?.build()?;
 
     // Build: SubqueryAlias(n1, Filter(nation.n_name IN ('FRANCE','GERMANY'),
     //          TableScan(nation, partial_filters=[same])))
@@ -3070,7 +3072,11 @@ fn test_join_with_filter_over_aliased_table_scan_pushdown() -> Result<()> {
         Some("nation"),
         &nation_schema,
         Some(vec![0, 1]),
-        vec![col("n_name").eq(lit("FRANCE")).or(col("n_name").eq(lit("GERMANY")))],
+        vec![
+            col("n_name")
+                .eq(lit("FRANCE"))
+                .or(col("n_name").eq(lit("GERMANY"))),
+        ],
     )?
     .build()?;
 
@@ -3102,6 +3108,75 @@ fn test_join_with_filter_over_aliased_table_scan_pushdown() -> Result<()> {
     assert_snapshot!(
         sql,
         @r#"SELECT supplier.s_suppkey, supplier.s_nationkey, n1.n_nationkey, n1.n_name FROM supplier INNER JOIN nation AS n1 ON supplier.s_nationkey = n1.n_nationkey AND ((n1.n_name = 'FRANCE') OR (n1.n_name = 'GERMANY'))"#
+    );
+
+    Ok(())
+}
+
+/// Verifies that when a `Filter` predicate contains subquery expressions
+/// (e.g. `NOT EXISTS`), `unparse_table_scan_pushdown` returns `None` so the
+/// caller's `SubqueryAlias` handler falls back to wrapping the inner plan as a
+/// derived table: `(SELECT ... FROM table WHERE ...) AS alias`.
+///
+/// This preserves the original table name inside the derived table, which is
+/// required for `OuterReferenceColumn` expressions (e.g. `outer_ref(customer.c_custkey)`)
+/// that refer to the original table name rather than the alias.
+#[test]
+fn test_filter_with_subquery_over_aliased_table_scan_pushdown() -> Result<()> {
+    let customer_schema = Schema::new(vec![
+        Field::new("c_custkey", DataType::Int32, false),
+        Field::new("c_phone", DataType::Utf8, false),
+        Field::new("c_acctbal", DataType::Float64, false),
+    ]);
+
+    let orders_schema = Schema::new(vec![
+        Field::new("o_orderkey", DataType::Int32, false),
+        Field::new("o_custkey", DataType::Int32, false),
+    ]);
+
+    // Build a NOT EXISTS subquery:
+    //   NOT EXISTS (SELECT o_orderkey, o_custkey FROM orders
+    //               WHERE orders.o_custkey = outer_ref(customer.c_custkey))
+    let orders_scan =
+        table_scan(Some("orders"), &orders_schema, Some(vec![0, 1]))?.build()?;
+
+    let subquery_filter = LogicalPlanBuilder::from(orders_scan)
+        .filter(col("orders.o_custkey").eq(Expr::OuterReferenceColumn(
+            Arc::new(Field::new("c_custkey", DataType::Int32, false)),
+            Column::new(Some("customer"), "c_custkey"),
+        )))?
+        .build()?;
+
+    let not_exists_expr = not_exists(Arc::new(subquery_filter));
+
+    // Build the plan mirroring Q22 structure:
+    //   SubqueryAlias(custsale,
+    //     Projection(c_custkey, c_acctbal),
+    //       Filter(c_acctbal > 0 AND NOT EXISTS(...),
+    //         TableScan(customer, partial_filters=[c_acctbal > 0])))
+    let customer_scan = table_scan_with_filters(
+        Some("customer"),
+        &customer_schema,
+        Some(vec![0, 1, 2]),
+        vec![col("c_acctbal").gt(lit(0.0))],
+    )?
+    .build()?;
+
+    let filtered = LogicalPlanBuilder::from(customer_scan)
+        .filter(col("customer.c_acctbal").gt(lit(0.0)).and(not_exists_expr))?
+        .project(vec![col("customer.c_custkey"), col("customer.c_acctbal")])?
+        .build()?;
+
+    let aliased = LogicalPlanBuilder::from(filtered)
+        .alias("custsale")?
+        .build()?;
+
+    let sql = plan_to_sql(&aliased)?;
+    // The subquery produces a derived table that preserves the original "customer" table name,
+    // so outer_ref(customer.c_custkey) remains valid inside the NOT EXISTS subquery.
+    assert_snapshot!(
+        sql,
+        @"SELECT * FROM (SELECT customer.c_custkey, customer.c_acctbal FROM customer WHERE ((customer.c_acctbal > 0.0) AND NOT EXISTS (SELECT orders.o_orderkey, orders.o_custkey FROM orders WHERE (orders.o_custkey = customer.c_custkey))) AND (customer.c_acctbal > 0.0)) AS custsale"
     );
 
     Ok(())

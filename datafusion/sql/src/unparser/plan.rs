@@ -1238,7 +1238,20 @@ impl Unparser<'_> {
             }
             // Handle Filter between SubqueryAlias and TableScan (e.g. Inexact/Unsupported
             // filter pushdown). Rewrite predicate column references to use the alias.
+            // Skip predicates with subquery expressions — TableAliasRewriter
+            // cannot rewrite OuterReferenceColumn inside subquery LogicalPlans.
+            // Returning None lets the caller wrap the plan as a derived table,
+            // preserving the original table name for outer references and generate correct SQL.
             LogicalPlan::Filter(filter) => {
+                if filter.predicate.exists(|e| {
+                    Ok(matches!(
+                        e,
+                        Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                    ))
+                })? {
+                    return Ok(None);
+                }
+
                 if let Some(plan) = self.unparse_table_scan_pushdown(
                     &filter.input,
                     alias.clone(),
