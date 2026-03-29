@@ -22,9 +22,8 @@ use super::{
         SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
     },
     rewrite::{
-        TableAliasRewriter, inject_column_aliases_into_subquery,
-        normalize_union_schema, remove_dangling_identifiers,
-        rewrite_plan_for_sort_on_non_projected_fields,
+        TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
+        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
     utils::{
@@ -1236,6 +1235,43 @@ impl Unparser<'_> {
                     return Ok(Some(plan));
                 }
                 Ok(ret)
+            }
+            // Handle Filter between SubqueryAlias and TableScan (e.g. Inexact/Unsupported
+            // filter pushdown). Rewrite predicate column references to use the alias.
+            // Skip predicates with subquery expressions — TableAliasRewriter
+            // cannot rewrite OuterReferenceColumn inside subquery LogicalPlans.
+            // Returning None lets the caller wrap the plan as a derived table,
+            // preserving the original table name for outer references and generate correct SQL.
+            LogicalPlan::Filter(filter) => {
+                if filter.predicate.exists(|e| {
+                    Ok(matches!(
+                        e,
+                        Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                    ))
+                })? {
+                    return Ok(None);
+                }
+
+                if let Some(plan) = self.unparse_table_scan_pushdown(
+                    &filter.input,
+                    alias.clone(),
+                    already_projected,
+                )? {
+                    let predicate = if let Some(ref alias_name) = alias {
+                        let mut rewriter = TableAliasRewriter {
+                            table_schema: plan.schema().as_arrow(),
+                            alias_name: alias_name.clone(),
+                        };
+                        filter.predicate.clone().rewrite(&mut rewriter).data()?
+                    } else {
+                        filter.predicate.clone()
+                    };
+                    Ok(Some(
+                        LogicalPlanBuilder::from(plan).filter(predicate)?.build()?,
+                    ))
+                } else {
+                    Ok(None)
+                }
             }
             // SubqueryAlias could be rewritten to a plan with a projection as the top node by [rewrite::subquery_alias_inner_query_and_columns].
             // The inner table scan could be a scan with pushdown operations.
