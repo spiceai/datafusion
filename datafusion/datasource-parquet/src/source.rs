@@ -522,6 +522,12 @@ impl FileSource for ParquetSource {
 
         let parquet_file_reader_factory =
             self.parquet_file_reader_factory.clone().unwrap_or_else(|| {
+                {
+                    use std::io::Write;
+                    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/datafusion_debug.log") {
+                        let _ = writeln!(f, "[ParquetSource] creating DefaultParquetFileReaderFactory");
+                    }
+                }
                 Arc::new(DefaultParquetFileReaderFactory::new(object_store)) as _
             });
 
