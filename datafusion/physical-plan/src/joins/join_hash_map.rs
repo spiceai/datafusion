@@ -20,6 +20,7 @@
 //! ["on" values] to a list of indices with this key's value.
 
 use std::fmt::{self, Debug};
+use std::mem::size_of;
 use std::ops::Sub;
 
 use arrow::datatypes::ArrowNativeType;
@@ -129,6 +130,9 @@ pub trait JoinHashMapType: Send + Sync {
 
     /// Returns the number of entries in the join hash map.
     fn len(&self) -> usize;
+
+    /// Returns the memory footprint of this hash map in bytes.
+    fn memory_size(&self) -> usize;
 }
 
 pub struct JoinHashMapU32 {
@@ -203,6 +207,13 @@ impl JoinHashMapType for JoinHashMapU32 {
     fn len(&self) -> usize {
         self.map.len()
     }
+
+    fn memory_size(&self) -> usize {
+        // Includes struct headers plus heap allocations for hash table and chained `next` storage.
+        size_of::<JoinHashMapU32>()
+            .saturating_add(self.map.allocation_size())
+            .saturating_add(self.next.capacity().saturating_mul(size_of::<u32>()))
+    }
 }
 
 pub struct JoinHashMapU64 {
@@ -276,6 +287,13 @@ impl JoinHashMapType for JoinHashMapU64 {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn memory_size(&self) -> usize {
+        // Includes struct headers plus heap allocations for hash table and chained `next` storage.
+        size_of::<JoinHashMapU64>()
+            .saturating_add(self.map.allocation_size())
+            .saturating_add(self.next.capacity().saturating_mul(size_of::<u64>()))
     }
 }
 
@@ -495,4 +513,35 @@ where
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn join_hash_map_u32_memory_size_matches_components() {
+        let mut map = JoinHashMapU32::with_capacity(16);
+        let hashes = [10_u64, 20, 10, 30];
+
+        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
+
+        let expected = size_of::<JoinHashMapU32>()
+            + map.map.allocation_size()
+            + map.next.capacity() * size_of::<u32>();
+        assert_eq!(map.memory_size(), expected);
+    }
+
+    #[test]
+    fn join_hash_map_u64_memory_size_matches_components() {
+        let mut map = JoinHashMapU64::with_capacity(16);
+        let hashes = [10_u64, 20, 10, 30];
+
+        map.update_from_iter(Box::new(hashes.iter().enumerate()), 0);
+
+        let expected = size_of::<JoinHashMapU64>()
+            + map.map.allocation_size()
+            + map.next.capacity() * size_of::<u64>();
+        assert_eq!(map.memory_size(), expected);
+    }
 }

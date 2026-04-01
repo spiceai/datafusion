@@ -1382,6 +1382,8 @@ pub(crate) struct BuildProbeJoinMetrics {
     pub(crate) build_input_rows: metrics::Count,
     /// Memory used by build-side in bytes
     pub(crate) build_mem_used: metrics::Gauge,
+    /// Overestimation in bytes between estimated and actual hash table allocation
+    pub(crate) build_hash_table_mem_overestimation: metrics::Gauge,
     /// Total time for joining probe-side batches to the build-side batches
     pub(crate) join_time: metrics::Time,
     /// Number of batches consumed by probe-side of this operator
@@ -1430,6 +1432,9 @@ impl BuildProbeJoinMetrics {
         let build_mem_used =
             MetricBuilder::new(metrics).gauge("build_mem_used", partition);
 
+        let build_hash_table_mem_overestimation = MetricBuilder::new(metrics)
+            .gauge("build_hash_table_mem_overestimation", partition);
+
         let input_batches =
             MetricBuilder::new(metrics).counter("input_batches", partition);
 
@@ -1448,6 +1453,7 @@ impl BuildProbeJoinMetrics {
             build_input_batches,
             build_input_rows,
             build_mem_used,
+            build_hash_table_mem_overestimation,
             join_time,
             input_batches,
             input_rows,

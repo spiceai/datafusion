@@ -36,7 +36,6 @@ use arrow::array::{
 use arrow::compute::concat_batches;
 use arrow::datatypes::{ArrowNativeType, Schema, SchemaRef};
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_common::utils::memory::estimate_memory_size;
 use datafusion_common::{HashSet, JoinSide, Result, ScalarValue, arrow_datafusion_err};
 use datafusion_expr::interval_arithmetic::Interval;
 use datafusion_physical_expr::expressions::Column;
@@ -100,6 +99,10 @@ impl JoinHashMapType for PruningJoinHashMap {
 
     fn len(&self) -> usize {
         self.map.len()
+    }
+
+    fn memory_size(&self) -> usize {
+        self.size()
     }
 }
 
@@ -189,11 +192,9 @@ impl PruningJoinHashMap {
     /// # Returns
     /// The size of the hash map in bytes.
     pub(crate) fn size(&self) -> usize {
-        let fixed_size = size_of::<PruningJoinHashMap>();
-
-        // TODO: switch to using [HashTable::allocation_size] when available after upgrading hashbrown to 0.15
-        estimate_memory_size::<(u64, u64)>(self.map.capacity(), fixed_size).unwrap()
-            + self.next.capacity() * size_of::<u64>()
+        size_of::<PruningJoinHashMap>()
+            .saturating_add(self.map.allocation_size())
+            .saturating_add(self.next.capacity().saturating_mul(size_of::<u64>()))
     }
 
     /// Removes hash values from the map and the list based on the given pruning
