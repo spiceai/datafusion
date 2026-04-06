@@ -28,7 +28,8 @@ use datafusion_expr::test::function_stub::{
 use datafusion_expr::{
     EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder, Union,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, WindowFrame,
-    WindowFunctionDefinition, cast, col, lit, not_exists, table_scan, wildcard,
+    WindowFunctionDefinition, cast, col, lit, not_exists, scalar_subquery, table_scan,
+    wildcard,
 };
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
@@ -3177,6 +3178,86 @@ fn test_filter_with_subquery_over_aliased_table_scan_pushdown() -> Result<()> {
     assert_snapshot!(
         sql,
         @"SELECT * FROM (SELECT customer.c_custkey, customer.c_acctbal FROM customer WHERE ((customer.c_acctbal > 0.0) AND NOT EXISTS (SELECT orders.o_orderkey, orders.o_custkey FROM orders WHERE (orders.o_custkey = customer.c_custkey))) AND (customer.c_acctbal > 0.0)) AS custsale"
+    );
+
+    Ok(())
+}
+
+/// Verifies that when `supports_subquery_in_join_predicate` returns false,
+/// subquery-containing filters extracted from `Filter -> TableScan` are moved
+/// to the WHERE clause instead of the JOIN ON clause for inner joins.
+#[test]
+fn test_inner_join_scalar_subquery_filter_moved_to_where() -> Result<()> {
+    let part_schema = Schema::new(vec![
+        Field::new("p_partkey", DataType::Int32, false),
+    ]);
+
+    let partsupp_schema = Schema::new(vec![
+        Field::new("ps_partkey", DataType::Int32, false),
+        Field::new("ps_supplycost", DataType::Float64, false),
+    ]);
+
+    // Build the scalar subquery:
+    //   SELECT min(ps_supplycost) FROM partsupp
+    //   WHERE p_partkey = ps_partkey
+    let subquery_scan =
+        table_scan(Some("partsupp"), &partsupp_schema, Some(vec![0, 1]))?.build()?;
+
+    let subquery_plan = LogicalPlanBuilder::from(subquery_scan)
+        .filter(
+            col("partsupp.ps_partkey").eq(Expr::OuterReferenceColumn(
+                Arc::new(Field::new("p_partkey", DataType::Int32, false)),
+                Column::new(Some("part"), "p_partkey"),
+            )),
+        )?
+        .aggregate(
+            Vec::<Expr>::new(),
+            vec![min_udaf()
+                .call(vec![col("partsupp.ps_supplycost")])
+                .alias("min_cost")],
+        )?
+        .project(vec![col("min_cost")])?
+        .build()?;
+
+    let subquery_expr = scalar_subquery(Arc::new(subquery_plan));
+
+    // Build: Filter(ps_supplycost = <subquery>, TableScan(partsupp))
+    let partsupp_scan =
+        table_scan(Some("partsupp"), &partsupp_schema, Some(vec![0, 1]))?.build()?;
+
+    let partsupp_filtered = LogicalPlanBuilder::from(partsupp_scan)
+        .filter(col("partsupp.ps_supplycost").eq(subquery_expr))?
+        .build()?;
+
+    // Build: part INNER JOIN (Filter -> partsupp) ON p_partkey = ps_partkey
+    let part_scan =
+        table_scan(Some("part"), &part_schema, Some(vec![0]))?.build()?;
+
+    let join_plan = LogicalPlanBuilder::from(part_scan)
+        .join(
+            partsupp_filtered,
+            datafusion_expr::JoinType::Inner,
+            (vec!["part.p_partkey"], vec!["partsupp.ps_partkey"]),
+            None,
+        )?
+        .build()?;
+
+    // Default dialect (supports_subquery_in_join_predicate = true):
+    // subquery stays in ON
+    let default_sql = plan_to_sql(&join_plan)?;
+    assert_snapshot!(
+        default_sql,
+        @r#"SELECT "part".p_partkey, partsupp.ps_partkey, partsupp.ps_supplycost FROM "part" INNER JOIN partsupp ON "part".p_partkey = partsupp.ps_partkey AND (partsupp.ps_supplycost = (SELECT min(partsupp.ps_supplycost) AS min_cost FROM partsupp WHERE (partsupp.ps_partkey = "part".p_partkey)))"#
+    );
+
+    // BigQuery dialect (supports_subquery_in_join_predicate = false):
+    // subquery moves to WHERE
+    let bigquery_dialect = BigQueryDialect::new();
+    let unparser = Unparser::new(&bigquery_dialect);
+    let bigquery_sql = unparser.plan_to_sql(&join_plan)?;
+    assert_snapshot!(
+        bigquery_sql,
+        @r#"SELECT `part`.`p_partkey`, `partsupp`.`ps_partkey`, `partsupp`.`ps_supplycost` FROM `part` INNER JOIN `partsupp` ON `part`.`p_partkey` = `partsupp`.`ps_partkey` WHERE (`partsupp`.`ps_supplycost` = (SELECT min(`partsupp`.`ps_supplycost`) AS `min_cost` FROM `partsupp` WHERE (`partsupp`.`ps_partkey` = `part`.`p_partkey`)))"#
     );
 
     Ok(())
