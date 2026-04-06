@@ -419,6 +419,27 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
     Ok(None)
 }
 
+/// Returns `true` if the expression contains a subquery (scalar, IN, or EXISTS).
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists(_)
+        ))
+    })
+    .unwrap_or(false)
+}
+
+/// Partitions filters into `(non_subquery, subquery)` based on whether
+/// each filter contains a subquery expression.
+pub(crate) fn partition_subquery_filters(
+    filters: Vec<Expr>,
+) -> (Vec<Expr>, Vec<Expr>) {
+    filters
+        .into_iter()
+        .partition(|f| !expr_contains_subquery(f))
+}
+
 /// Converts a date_part function to SQL, tailoring it to the supported date field extraction style.
 pub(crate) fn date_part_to_sql(
     unparser: &Unparser,

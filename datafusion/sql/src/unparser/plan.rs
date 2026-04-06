@@ -28,7 +28,8 @@ use super::{
     },
     utils::{
         find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters,
+        find_window_nodes_within_select, partition_subquery_filters,
+        try_transform_to_simple_table_scan_with_filters,
         unproject_sort_expr, unproject_unnest_expr, unproject_window_exprs,
     },
 };
@@ -741,12 +742,42 @@ impl Unparser<'_> {
                     &mut right_relation,
                 )?;
 
-                let join_filters = if table_scan_filters.is_empty() {
+                // When the dialect does not support subqueries inside JOIN ON
+                // predicates, separate subquery-containing filters from simple
+                // ones. For inner joins, subquery filters move to WHERE
+                // (semantically equivalent). For non-inner joins, return an
+                // error since moving to WHERE would change join semantics.
+                let (on_filters, where_filters): (Vec<_>, Vec<_>) =
+                    if self.dialect.supports_subquery_in_join_predicate() {
+                        (table_scan_filters, vec![])
+                    } else {
+                        let (simple, subquery) =
+                            partition_subquery_filters(table_scan_filters);
+
+                        if !subquery.is_empty()
+                            && join.join_type != JoinType::Inner
+                        {
+                            return not_impl_err!(
+                                "Subqueries in JOIN ON predicates are not supported for {} joins by this dialect",
+                                join.join_type
+                            );
+                        }
+
+                        (simple, subquery)
+                    };
+
+                // Move subquery-containing filters to WHERE for inner joins
+                for filter in where_filters {
+                    let filter_expr = self.expr_to_sql(&filter)?;
+                    select.selection(Some(filter_expr));
+                }
+
+                let join_filters = if on_filters.is_empty() {
                     join.filter.clone()
                 } else {
-                    // Combine `table_scan_filters` into a single filter using `AND`
+                    // Combine `on_filters` into a single filter using `AND`
                     let Some(combined_filters) =
-                        table_scan_filters.into_iter().reduce(|acc, filter| {
+                        on_filters.into_iter().reduce(|acc, filter| {
                             Expr::BinaryExpr(BinaryExpr {
                                 left: Box::new(acc),
                                 op: Operator::And,
