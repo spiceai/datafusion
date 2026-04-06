@@ -241,7 +241,7 @@ impl ExecutionPlan for SortPreservingMergeExec {
             metrics: self.metrics.clone(),
             fetch: limit,
             cache: self.cache.clone(),
-            enable_round_robin_repartition: true,
+            enable_round_robin_repartition: self.enable_round_robin_repartition,
         }))
     }
 
