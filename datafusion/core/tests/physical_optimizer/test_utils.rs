@@ -979,3 +979,144 @@ pub fn test_scan_with_ordering(
 ) -> Arc<dyn ExecutionPlan> {
     Arc::new(TestScan::with_ordering(schema, ordering))
 }
+
+/// A test scan that returns `Exact` from `try_pushdown_sort`.
+#[derive(Debug, Clone)]
+pub struct ExactTestScan {
+    schema: SchemaRef,
+    plan_properties: PlanProperties,
+    requested_ordering: Option<LexOrdering>,
+    fetch: Option<usize>,
+}
+
+impl ExactTestScan {
+    pub fn new(schema: SchemaRef) -> Self {
+        let eq_properties = EquivalenceProperties::new(Arc::clone(&schema));
+        let plan_properties = PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            schema,
+            plan_properties,
+            requested_ordering: None,
+            fetch: None,
+        }
+    }
+}
+
+impl DisplayAs for ExactTestScan {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "ExactTestScan")?;
+                if let Some(ref req) = self.requested_ordering {
+                    write!(f, ": ordered=[")?;
+                    for (i, sort_expr) in req.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, ", ")?;
+                        }
+                        write!(f, "{sort_expr}")?;
+                    }
+                    write!(f, "]")?;
+                }
+                if let Some(fetch) = self.fetch {
+                    write!(f, ", fetch={fetch}")?;
+                }
+                Ok(())
+            }
+            DisplayFormatType::TreeRender => {
+                write!(f, "ExactTestScan")
+            }
+        }
+    }
+}
+
+impl ExecutionPlan for ExactTestScan {
+    fn name(&self) -> &str {
+        "ExactTestScan"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.plan_properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            internal_err!("ExactTestScan should have no children")
+        }
+    }
+
+    fn execute(
+        &self,
+        _partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        internal_err!("ExactTestScan is for testing optimizer only, not for execution")
+    }
+
+    fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        Ok(Statistics::new_unknown(&self.schema))
+    }
+
+    fn with_fetch(&self, fetch: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let mut new_scan = self.clone();
+        new_scan.fetch = fetch;
+        Some(Arc::new(new_scan))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.fetch
+    }
+
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+    ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
+        let requested_ordering = LexOrdering::new(order.to_vec());
+
+        let orderings: Vec<Vec<PhysicalSortExpr>> = vec![order.to_vec()];
+        let eq_properties = EquivalenceProperties::new_with_orderings(
+            Arc::clone(&self.schema),
+            orderings,
+        );
+        let plan_properties = PlanProperties::new(
+            eq_properties,
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+
+        let new_scan = ExactTestScan {
+            schema: Arc::clone(&self.schema),
+            plan_properties,
+            requested_ordering,
+            fetch: self.fetch,
+        };
+
+        // Return Exact: this source guarantees the requested ordering
+        Ok(SortOrderPushdownResult::Exact {
+            inner: Arc::new(new_scan),
+        })
+    }
+}
+
+/// Helper function to create an ExactTestScan
+pub fn exact_test_scan(schema: SchemaRef) -> Arc<dyn ExecutionPlan> {
+    Arc::new(ExactTestScan::new(schema))
+}
