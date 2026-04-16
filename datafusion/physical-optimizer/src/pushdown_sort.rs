@@ -55,6 +55,7 @@ use datafusion_common::config::ConfigOptions;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::SortOrderPushdownResult;
+use datafusion_physical_plan::limit::GlobalLimitExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use std::sync::Arc;
 
@@ -95,8 +96,27 @@ impl PhysicalOptimizerRule for PushdownSort {
             // Each node type defines its own pushdown behavior via try_pushdown_sort()
             match sort_input.try_pushdown_sort(required_ordering)? {
                 SortOrderPushdownResult::Exact { inner } => {
-                    // Data source guarantees perfect ordering - remove the Sort operator
-                    Ok(Transformed::yes(inner))
+                    // Data source guarantees perfect ordering - remove the Sort operator.
+                    //
+                    // If the SortExec carried a fetch (LIMIT), we must preserve it.
+                    // First try pushing the limit into the source via `with_fetch()`
+                    // If the source doesn't support `with_fetch`, fall back to
+                    // wrapping with GlobalLimitExec.
+                    //
+                    // Note: LimitPushdown runs *before* PushdownSort in the optimizer
+                    // pipeline, so we need to handle the limit manually here.
+                    if let Some(fetch) = sort_exec.fetch() {
+                        let limited = inner
+                            .with_fetch(Some(fetch))
+                            .unwrap_or_else(|| {
+                                Arc::new(GlobalLimitExec::new(
+                                    inner, 0, Some(fetch),
+                                ))
+                            });
+                        Ok(Transformed::yes(limited))
+                    } else {
+                        Ok(Transformed::yes(inner))
+                    }
                 }
                 SortOrderPushdownResult::Inexact { inner } => {
                     // Data source is optimized for the ordering but not perfectly sorted

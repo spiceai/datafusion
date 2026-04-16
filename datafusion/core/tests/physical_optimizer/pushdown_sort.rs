@@ -32,8 +32,8 @@ use datafusion_physical_optimizer::pushdown_sort::PushdownSort;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
-    OptimizationTest, coalesce_batches_exec, coalesce_partitions_exec, parquet_exec,
-    parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
+    OptimizationTest, coalesce_batches_exec, coalesce_partitions_exec, exact_test_scan,
+    parquet_exec, parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
     repartition_exec, schema, simple_projection_exec, sort_exec, sort_exec_with_fetch,
     sort_expr, sort_expr_named, test_scan_with_ordering,
 };
@@ -1035,6 +1035,61 @@ fn test_sort_pushdown_with_test_scan_arbitrary_ordering() {
         Ok:
           - SortExec: expr=[a@0 ASC, b@1 DESC NULLS LAST], preserve_partitioning=[false]
           -   TestScan: output_ordering=[a@0 ASC, b@1 ASC], requested_ordering=[a@0 ASC, b@1 DESC NULLS LAST]
+    "
+    );
+}
+
+// ============================================================================
+// EXACT PUSHDOWN TESTS (source guarantees ordering, SortExec removed)
+// ============================================================================
+
+#[test]
+fn test_sort_pushdown_exact_no_fetch_no_limit() {
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let b = sort_expr("b", &schema);
+    let source = exact_test_scan(schema.clone());
+
+    let ordering = LexOrdering::new(vec![a, b.reverse()]).unwrap();
+    let plan = sort_exec(ordering, source);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: expr=[a@0 ASC, b@1 DESC NULLS LAST], preserve_partitioning=[false]
+        -   ExactTestScan
+      output:
+        Ok:
+          - ExactTestScan: ordered=[a@0 ASC, b@1 DESC NULLS LAST]
+    "
+    );
+}
+
+#[test]
+fn test_sort_pushdown_exact_preserves_fetch() {
+    // When a source returns Exact and the SortExec has fetch (LIMIT),
+    // the optimizer tries to push the limit into the source via with_fetch().
+    // ExactTestScan supports with_fetch(), so the limit should appear
+    // directly on the source (no GlobalLimitExec wrapper needed).
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source = exact_test_scan(schema.clone());
+
+    let ordering = LexOrdering::new(vec![a]).unwrap();
+    let plan = sort_exec_with_fetch(ordering, Some(10), source);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[false]
+        -   ExactTestScan
+      output:
+        Ok:
+          - ExactTestScan: ordered=[a@0 ASC], fetch=10
     "
     );
 }
