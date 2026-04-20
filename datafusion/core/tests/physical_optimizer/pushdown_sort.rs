@@ -1093,3 +1093,34 @@ fn test_sort_pushdown_exact_preserves_fetch() {
     "
     );
 }
+
+#[test]
+fn test_sort_pushdown_exact_preserves_fetch_through_projection() {
+    // Regression test: in the Exact pushdown path, SortExec is removed and
+    // fetch must be propagated through ProjectionExec to the source via with_fetch().
+    let schema = schema();
+    let source = exact_test_scan(schema.clone());
+
+    // Projection reorders columns: SELECT b, a
+    let projection = simple_projection_exec(source, vec![1, 0]);
+
+    // Sort on projected column b with LIMIT.
+    let b_expr_at_0 = sort_expr_named("b", 0);
+    let ordering = LexOrdering::new(vec![b_expr_at_0]).unwrap();
+    let plan = sort_exec_with_fetch(ordering, Some(10), projection);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: TopK(fetch=10), expr=[b@0 ASC], preserve_partitioning=[false]
+        -   ProjectionExec: expr=[b@1 as b, a@0 as a]
+        -     ExactTestScan
+      output:
+        Ok:
+          - ProjectionExec: expr=[b@1 as b, a@0 as a]
+          -   ExactTestScan: ordered=[b@1 ASC], fetch=10
+    "
+    );
+}
