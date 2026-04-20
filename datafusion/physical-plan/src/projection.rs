@@ -324,6 +324,17 @@ impl ExecutionPlan for ProjectionExec {
         true
     }
 
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let child_with_fetch = self.input().with_fetch(limit)?;
+        ProjectionExec::try_new(self.expr().to_vec(), child_with_fetch)
+            .ok()
+            .map(|projection| Arc::new(projection) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.input().fetch()
+    }
+
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
     }
