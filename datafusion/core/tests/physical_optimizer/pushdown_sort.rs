@@ -747,6 +747,43 @@ fn test_sort_pushdown_through_projection_with_alias() {
 }
 
 #[test]
+fn test_no_sort_pushdown_for_projection_name_index_mismatch() {
+    // Regression: if a sort column's index points into a projection output but
+    // its name does not match the projected alias, do not rewrite by index only.
+    let schema = schema();
+
+    // Source has [a ASC] ordering
+    let a = sort_expr("a", &schema);
+    let source_ordering = LexOrdering::new(vec![a.clone()]).unwrap();
+    let source = parquet_exec_with_sort(schema.clone(), vec![source_ordering]);
+
+    // Projection: SELECT a, b
+    let projection = simple_projection_exec(source, vec![0, 1]);
+
+    // Mismatched column metadata: name "_score" at index 0.
+    // Even though index 0 maps to projected column `a`, this must not push down.
+    let mismatched = sort_expr_named("_score", 0);
+    let ordering = LexOrdering::new(vec![mismatched.reverse()]).unwrap();
+    let plan = sort_exec(ordering, projection);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: expr=[_score@0 DESC NULLS LAST], preserve_partitioning=[false]
+        -   ProjectionExec: expr=[a@0 as a, b@1 as b]
+        -     DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
+      output:
+        Ok:
+          - SortExec: expr=[_score@0 DESC NULLS LAST], preserve_partitioning=[false]
+          -   ProjectionExec: expr=[a@0 as a, b@1 as b]
+          -     DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet
+    "
+    );
+}
+
+#[test]
 fn test_no_sort_pushdown_through_computed_projection() {
     use datafusion_expr::Operator;
 
