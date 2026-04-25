@@ -1371,14 +1371,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     exec_err!("Function name not provided")
                 }
             }
-            Statement::Truncate(ast::Truncate {
+            Statement::Truncate {
                 table_names,
                 partitions,
                 identity,
                 cascade,
                 on_cluster,
                 table,
-            }) => {
+            } => {
                 let _ = table; // Support TRUNCATE TABLE and TRUNCATE syntax
                 if table_names.len() != 1 {
                     return not_impl_err!(
