@@ -1041,9 +1041,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                     });
                 // TODO: support multiple tables in UPDATE SET FROM
                 if from_clauses.as_ref().is_some_and(|f| f.len() > 1) {
-                    plan_err!("Multiple tables in UPDATE SET FROM not yet supported")?;
+                    not_impl_err!(
+                        "Multiple tables in UPDATE SET FROM not yet supported"
+                    )?;
                 }
                 let update_from = from_clauses.and_then(|mut f| f.pop());
+
+                // UPDATE ... FROM is currently not working
+                // TODO fix https://github.com/apache/datafusion/issues/19950
+                if update_from.is_some() {
+                    return not_impl_err!("UPDATE ... FROM is not supported");
+                }
+
                 if returning.is_some() {
                     plan_err!("Update-returning clause not yet supported")?;
                 }
@@ -1361,6 +1370,56 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 } else {
                     exec_err!("Function name not provided")
                 }
+            }
+            Statement::Truncate {
+                table_names,
+                partitions,
+                identity,
+                cascade,
+                on_cluster,
+                table,
+            } => {
+                let _ = table; // Support TRUNCATE TABLE and TRUNCATE syntax
+                if table_names.len() != 1 {
+                    return not_impl_err!(
+                        "TRUNCATE with multiple tables is not supported"
+                    );
+                }
+
+                let target = &table_names[0];
+                if target.only {
+                    return not_impl_err!("TRUNCATE with ONLY is not supported");
+                }
+                if partitions.is_some() {
+                    return not_impl_err!("TRUNCATE with PARTITION is not supported");
+                }
+                if identity.is_some() {
+                    return not_impl_err!(
+                        "TRUNCATE with RESTART/CONTINUE IDENTITY is not supported"
+                    );
+                }
+                if cascade.is_some() {
+                    return not_impl_err!(
+                        "TRUNCATE with CASCADE/RESTRICT is not supported"
+                    );
+                }
+                if on_cluster.is_some() {
+                    return not_impl_err!("TRUNCATE with ON CLUSTER is not supported");
+                }
+                let table = self.object_name_to_table_reference(target.name.clone())?;
+                let source = self.context_provider.get_table_source(table.clone())?;
+
+                // TRUNCATE does not operate on input rows. The EmptyRelation is a logical placeholder
+                // since the real operation is executed directly by the TableProvider's truncate() hook.
+                Ok(LogicalPlan::Dml(DmlStatement::new(
+                    table.clone(),
+                    source,
+                    WriteOp::Truncate,
+                    Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                        produce_one_row: false,
+                        schema: DFSchemaRef::new(DFSchema::empty()),
+                    })),
+                )))
             }
             Statement::CreateIndex(CreateIndex {
                 name,
