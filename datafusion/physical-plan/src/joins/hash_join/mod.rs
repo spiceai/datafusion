@@ -17,7 +17,7 @@
 
 //! [`HashJoinExec`] Partitioned Hash Join Operator
 
-pub use exec::HashJoinExec;
+pub use exec::{HashJoinExec, HashJoinExecBuilder};
 pub use partitioned_hash_eval::{HashExpr, HashTableLookupExpr, SeededRandomState};
 pub use exec::{CollectLeftAccumulator, MinMaxLeftAccumulator};
 pub use shared_bounds::ColumnBounds;

@@ -18,18 +18,18 @@
 //! Utilities for shared build-side information. Used in dynamic filter pushdown in Hash Joins.
 // TODO: include the link to the Dynamic Filter blog post.
 
-use std::fmt::{self, Debug};
+use std::fmt;
 use std::sync::Arc;
 
 use crate::ExecutionPlan;
 use crate::ExecutionPlanProperties;
+use crate::joins::Map;
 use crate::joins::PartitionMode;
 use crate::joins::hash_join::exec::HASH_JOIN_SEED;
 use crate::joins::hash_join::inlist_builder::build_struct_fields;
 use crate::joins::hash_join::partitioned_hash_eval::{
     HashExpr, HashTableLookupExpr, SeededRandomState,
 };
-use crate::joins::utils::JoinHashMapType;
 use arrow::array::ArrayRef;
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion_common::config::ConfigOptions;
@@ -44,61 +44,19 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, ScalarFunctionExpr
 use parking_lot::Mutex;
 use tokio::sync::Barrier;
 
-/// Trait representing some set of bounds for a column used in join dynamic filtering.
-///
-/// Bounds could be min/max values, or some other type of custom bounds that can be represented by a physical expression.
-///
-/// Refer to the [`MinMaxColumnBounds`] implementation for an example of min/max bounds.
-pub trait ColumnBounds: Send + Sync + Debug {
-    /// Creates a physical expression representing the bounds for this column (left expression).
-    ///
-    /// # Arguments
-    ///
-    /// * `left_expr` - The left side physical expression for which to create bounds.
-    ///
-    /// # Returns
-    /// `Ok(Arc<dyn PhysicalExpr>)` if creating the bounds expression succeeds, or an error otherwise.
-    fn physical_expr(
-        &self,
-        left_expr: Arc<dyn PhysicalExpr>,
-    ) -> Result<Arc<dyn PhysicalExpr>>;
-}
-
 /// Represents the minimum and maximum values for a specific column.
 /// Used in dynamic filter pushdown to establish value boundaries.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct MinMaxColumnBounds {
+pub(crate) struct ColumnBounds {
     /// The minimum value observed for this column
-    min: ScalarValue,
-    /// The maximum value observed for this column
-    max: ScalarValue,
+    pub(crate) min: ScalarValue,
+    /// The maximum value observed for this column  
+    pub(crate) max: ScalarValue,
 }
 
-impl MinMaxColumnBounds {
+impl ColumnBounds {
     pub(crate) fn new(min: ScalarValue, max: ScalarValue) -> Self {
         Self { min, max }
-    }
-}
-
-impl ColumnBounds for MinMaxColumnBounds {
-    fn physical_expr(
-        &self,
-        left_expr: Arc<dyn PhysicalExpr>,
-    ) -> Result<Arc<dyn PhysicalExpr>> {
-        // Create predicate: col >= min AND col <= max
-        let min_expr = Arc::new(BinaryExpr::new(
-            Arc::clone(&left_expr),
-            Operator::GtEq,
-            lit(self.min.clone()),
-        )) as Arc<dyn PhysicalExpr>;
-        let max_expr = Arc::new(BinaryExpr::new(
-            Arc::clone(&left_expr),
-            Operator::LtEq,
-            lit(self.max.clone()),
-        )) as Arc<dyn PhysicalExpr>;
-        let range_expr = Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
-            as Arc<dyn PhysicalExpr>;
-        Ok(range_expr)
     }
 }
 
@@ -108,18 +66,15 @@ impl ColumnBounds for MinMaxColumnBounds {
 pub(crate) struct PartitionBounds {
     /// Min/max bounds for each join key column in this partition.
     /// Index corresponds to the join key expression index.
-    column_bounds: Vec<Arc<dyn ColumnBounds>>,
+    column_bounds: Vec<ColumnBounds>,
 }
 
 impl PartitionBounds {
-    pub(crate) fn new(column_bounds: Vec<Arc<dyn ColumnBounds>>) -> Self {
+    pub(crate) fn new(column_bounds: Vec<ColumnBounds>) -> Self {
         Self { column_bounds }
     }
 
-    pub(crate) fn get_column_bounds(
-        &self,
-        index: usize,
-    ) -> Option<&Arc<dyn ColumnBounds>> {
+    pub(crate) fn get_column_bounds(&self, index: usize) -> Option<&ColumnBounds> {
         self.column_bounds.get(index)
     }
 }
@@ -173,46 +128,50 @@ fn create_membership_predicate(
             )?)))
         }
         // Use hash table lookup for large build sides
-        PushdownStrategy::HashTable(hash_map) => {
-            let lookup_hash_expr = Arc::new(HashExpr::new(
-                on_right.to_vec(),
-                random_state.clone(),
-                "hash_join".to_string(),
-            )) as Arc<dyn PhysicalExpr>;
-
-            Ok(Some(Arc::new(HashTableLookupExpr::new(
-                lookup_hash_expr,
-                hash_map,
-                "hash_lookup".to_string(),
-            )) as Arc<dyn PhysicalExpr>))
-        }
+        PushdownStrategy::Map(hash_map) => Ok(Some(Arc::new(HashTableLookupExpr::new(
+            on_right.to_vec(),
+            random_state.clone(),
+            hash_map,
+            "hash_lookup".to_string(),
+        )) as Arc<dyn PhysicalExpr>)),
         // Empty partition - should not create a filter for this
         PushdownStrategy::Empty => Ok(None),
     }
 }
 
-/// Creates a bounds predicate from partition bounds using the [`ColumnBounds`] trait.
+/// Creates a bounds predicate from partition bounds.
 ///
-/// Returns `Ok(None)` if no column bounds are available.
-/// Returns a combined predicate for all columns with bounds via each column's
-/// [`ColumnBounds::physical_expr`] implementation.
+/// Returns `None` if no column bounds are available.
+/// Returns a combined predicate (col >= min AND col <= max) for all columns with bounds.
 fn create_bounds_predicate(
     on_right: &[PhysicalExprRef],
     bounds: &PartitionBounds,
-) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+) -> Option<Arc<dyn PhysicalExpr>> {
     let mut column_predicates = Vec::new();
 
     for (col_idx, right_expr) in on_right.iter().enumerate() {
         if let Some(column_bounds) = bounds.get_column_bounds(col_idx) {
-            let bounds_expr = column_bounds.physical_expr(Arc::clone(right_expr))?;
-            column_predicates.push(bounds_expr);
+            // Create predicate: col >= min AND col <= max
+            let min_expr = Arc::new(BinaryExpr::new(
+                Arc::clone(right_expr),
+                Operator::GtEq,
+                lit(column_bounds.min.clone()),
+            )) as Arc<dyn PhysicalExpr>;
+            let max_expr = Arc::new(BinaryExpr::new(
+                Arc::clone(right_expr),
+                Operator::LtEq,
+                lit(column_bounds.max.clone()),
+            )) as Arc<dyn PhysicalExpr>;
+            let range_expr = Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
+                as Arc<dyn PhysicalExpr>;
+            column_predicates.push(range_expr);
         }
     }
 
     if column_predicates.is_empty() {
-        Ok(None)
+        None
     } else {
-        Ok(Some(
+        Some(
             column_predicates
                 .into_iter()
                 .reduce(|acc, pred| {
@@ -220,7 +179,7 @@ fn create_bounds_predicate(
                         as Arc<dyn PhysicalExpr>
                 })
                 .unwrap(),
-        ))
+        )
     }
 }
 
@@ -274,8 +233,8 @@ pub(crate) struct SharedBuildAccumulator {
 pub(crate) enum PushdownStrategy {
     /// Use InList for small build sides (< 128MB)
     InList(ArrayRef),
-    /// Use hash table lookup for large build sides
-    HashTable(Arc<dyn JoinHashMapType>),
+    /// Use map lookup for large build sides
+    Map(Arc<Map>),
     /// There was no data in this partition, do not build a dynamic filter for it
     Empty,
 }
@@ -320,8 +279,10 @@ impl SharedBuildAccumulator {
     /// ## Partition Mode Execution Patterns
     ///
     /// - **CollectLeft**: Build side is collected ONCE from partition 0 and shared via `OnceFut`
-    ///   across all output partitions. Each output partition calls `collect_build_side` to access
-    ///   the shared build data. Expected calls = number of output partitions.
+    ///   across all output partitions. Each output partition calls `collect_build_side` to access the shared build data.
+    ///   Although this results in multiple invocations, the  `report_partition_bounds` function contains deduplication logic to handle them safely.
+    ///   Expected calls = number of output partitions.
+    ///
     ///
     /// - **Partitioned**: Each partition independently builds its own hash table by calling
     ///   `collect_build_side` once. Expected calls = number of build partitions.
@@ -453,7 +414,7 @@ impl SharedBuildAccumulator {
                         let bounds_expr = create_bounds_predicate(
                             &self.on_right,
                             &partition_data.bounds,
-                        )?;
+                        );
 
                         // Combine membership and bounds expressions for multi-layer optimization:
                         // - Bounds (min/max): Enable statistics-based pruning (Parquet row group/file skipping)
@@ -563,7 +524,7 @@ impl SharedBuildAccumulator {
                                 let bounds_expr = create_bounds_predicate(
                                     &self.on_right,
                                     &partition.bounds,
-                                )?;
+                                );
 
                                 // 3. Combine membership and bounds expressions
                                 let then_expr = match (membership_expr, bounds_expr) {
@@ -626,7 +587,7 @@ impl SharedBuildAccumulator {
     }
 }
 
-impl Debug for SharedBuildAccumulator {
+impl fmt::Debug for SharedBuildAccumulator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedBuildAccumulator")
     }

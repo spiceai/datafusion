@@ -39,7 +39,7 @@ use std::cmp::{Ordering, min};
 use std::collections::HashSet;
 use std::num::NonZero;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread::available_parallelism;
 
 /// Applies an optional projection to a [`SchemaRef`], returning the
@@ -70,10 +70,10 @@ use std::thread::available_parallelism;
 /// ```
 pub fn project_schema(
     schema: &SchemaRef,
-    projection: Option<&Vec<usize>>,
+    projection: Option<&impl AsRef<[usize]>>,
 ) -> Result<SchemaRef> {
     let schema = match projection {
-        Some(columns) => Arc::new(schema.project(columns)?),
+        Some(columns) => Arc::new(schema.project(columns.as_ref())?),
         None => Arc::clone(schema),
     };
     Ok(schema)
@@ -516,6 +516,7 @@ impl SingleRowListArrayBuilder {
 /// );
 ///
 /// assert_eq!(list_arr, expected);
+/// ```
 pub fn arrays_into_list_array(
     arr: impl IntoIterator<Item = ArrayRef>,
 ) -> Result<ListArray> {
@@ -587,6 +588,7 @@ pub enum ListCoercion {
 /// let base_type = DataType::Float64;
 /// let coerced_type = coerced_type_with_base_type_only(&data_type, &base_type, None);
 /// assert_eq!(coerced_type, DataType::List(Arc::new(Field::new_list_field(DataType::Float64, true))));
+/// ```
 pub fn coerced_type_with_base_type_only(
     data_type: &DataType,
     base_type: &DataType,
@@ -920,10 +922,15 @@ pub fn combine_limit(
 ///
 /// This is a wrapper around `std::thread::available_parallelism`, providing a default value
 /// of `1` if the system's parallelism cannot be determined.
+///
+/// The result is cached after the first call.
 pub fn get_available_parallelism() -> usize {
-    available_parallelism()
-        .unwrap_or(NonZero::new(1).expect("literal value `1` shouldn't be zero"))
-        .get()
+    static PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
+        available_parallelism()
+            .unwrap_or(NonZero::new(1).expect("literal value `1` shouldn't be zero"))
+            .get()
+    });
+    *PARALLELISM
 }
 
 /// Converts a collection of function arguments into a fixed-size array of length N

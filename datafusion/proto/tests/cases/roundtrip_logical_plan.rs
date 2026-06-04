@@ -28,7 +28,7 @@ use datafusion::datasource::file_format::json::{JsonFormat, JsonFormatFactory};
 use datafusion::datasource::listing::{
     ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
-use datafusion::execution::options::ArrowReadOptions;
+use datafusion::execution::options::{ArrowReadOptions, JsonReadOptions};
 use datafusion::optimizer::Optimizer;
 use datafusion::optimizer::optimize_unions::OptimizeUnions;
 use datafusion_common::parquet_config::DFParquetWriterVersion;
@@ -755,7 +755,7 @@ async fn create_json_scan(ctx: &SessionContext) -> Result<LogicalPlan, DataFusio
     ctx.register_json(
         "t1",
         "../core/tests/data/1.json",
-        NdJsonReadOptions::default(),
+        JsonReadOptions::default(),
     )
     .await?;
 
@@ -1534,6 +1534,16 @@ fn round_trip_scalar_values_and_data_types() {
             Box::new(DataType::Int32),
             Box::new(ScalarValue::Utf8(None)),
         ),
+        ScalarValue::RunEndEncoded(
+            Field::new("run_ends", DataType::Int32, false).into(),
+            Field::new("values", DataType::Utf8, true).into(),
+            Box::new(ScalarValue::from("foo")),
+        ),
+        ScalarValue::RunEndEncoded(
+            Field::new("run_ends", DataType::Int32, false).into(),
+            Field::new("values", DataType::Utf8, true).into(),
+            Box::new(ScalarValue::Utf8(None)),
+        ),
         ScalarValue::Binary(Some(b"bar".to_vec())),
         ScalarValue::Binary(None),
         ScalarValue::LargeBinary(Some(b"bar".to_vec())),
@@ -1781,19 +1791,20 @@ fn round_trip_datatype() {
             ),
         ])),
         DataType::Union(
-            UnionFields::new(
+            UnionFields::try_new(
                 vec![7, 5, 3],
                 vec![
                     Field::new("nullable", DataType::Boolean, false),
                     Field::new("name", DataType::Utf8, false),
                     Field::new("datatype", DataType::Binary, false),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Sparse,
         ),
         DataType::Union(
-            UnionFields::new(
-                vec![5, 8, 1],
+            UnionFields::try_new(
+                vec![5, 8, 1, 100],
                 vec![
                     Field::new("nullable", DataType::Boolean, false),
                     Field::new("name", DataType::Utf8, false),
@@ -1808,7 +1819,8 @@ fn round_trip_datatype() {
                         true,
                     ),
                 ],
-            ),
+            )
+            .unwrap(),
             UnionMode::Dense,
         ),
         DataType::Dictionary(
