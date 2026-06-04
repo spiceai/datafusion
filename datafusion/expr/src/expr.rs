@@ -2260,6 +2260,7 @@ impl Expr {
                 | Expr::Wildcard { .. }
                 | Expr::GroupingSet(_)
                 | Expr::OuterReferenceColumn(_, _)
+                | Expr::SetComparison(_)
                 | Expr::Unnest(_) => {}
             }
             Ok(Transformed::yes(expr))

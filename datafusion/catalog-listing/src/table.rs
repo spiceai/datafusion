@@ -213,18 +213,10 @@ impl ListingTable {
             .options
             .ok_or_else(|| internal_datafusion_err!("No ListingOptions provided"))?;
 
-        // Validate metadata columns don't conflict with existing schema
-        options.validate_metadata_cols(&file_schema)?;
-
         // Add the partition columns to the file schema
         let mut builder = SchemaBuilder::from(file_schema.as_ref().to_owned());
         for (part_col_name, part_col_type) in &options.table_partition_cols {
             builder.push(Field::new(part_col_name, part_col_type.clone(), false));
-        }
-
-        // Add metadata columns to the table schema
-        for col in &options.metadata_cols {
-            builder.push(col.field());
         }
 
         let table_schema = Arc::new(
@@ -587,7 +579,6 @@ impl TableProvider for ListingTable {
                     .with_file_groups(partitioned_file_lists)
                     .with_constraints(self.constraints.clone())
                     .with_statistics(statistics)
-                    .with_metadata_cols(self.options.metadata_cols.clone())
                     .with_projection_indices(projection)?
                     .with_limit(limit)
                     .with_output_ordering(output_ordering)

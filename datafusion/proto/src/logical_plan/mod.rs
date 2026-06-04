@@ -421,13 +421,15 @@ impl AsLogicalPlan for LogicalPlanNode {
                             {
                                 use datafusion_datasource::file_format::FileFormatFactory;
                                 let opts = if let Some(options) = options {
-                                    vortex_datafusion::VortexOptions {
-                                        footer_cache_size_mb: options.footer_cache_size_mb as usize,
-                                        segment_cache_size_mb: options.segment_cache_size_mb as usize,
+                                    // vortex 0.74 renamed VortexOptions -> VortexTableOptions and
+                                    // dropped the per-format footer/segment cache sizes; map the
+                                    // remaining field and default the rest.
+                                    vortex_datafusion::VortexTableOptions {
                                         footer_initial_read_size_bytes: options.footer_initial_read_size_bytes as usize,
+                                        ..Default::default()
                                     }
                                 } else {
-                                    vortex_datafusion::VortexOptions::default()
+                                    vortex_datafusion::VortexTableOptions::default()
                                 };
                                 let factory = vortex_datafusion::VortexFormatFactory::new().with_options(opts);
                                 FileFormatFactory::default(&factory)
@@ -1072,11 +1074,11 @@ impl AsLogicalPlan for LogicalPlanNode {
                             maybe_some_type =
                                 Some(FileFormatType::Vortex(protobuf::VortexFormat {
                                     options: Some(protobuf::VortexOptions {
-                                        footer_cache_size_mb: options.footer_cache_size_mb
-                                            as u64,
-                                        segment_cache_size_mb: options
-                                            .segment_cache_size_mb
-                                            as u64,
+                                        // footer_cache_size_mb / segment_cache_size_mb were removed
+                                        // in vortex 0.74 (cache is no longer configured per-format);
+                                        // keep proto wire-compat by zeroing them.
+                                        footer_cache_size_mb: 0,
+                                        segment_cache_size_mb: 0,
                                         footer_initial_read_size_bytes: options
                                             .footer_initial_read_size_bytes
                                             as u64,
