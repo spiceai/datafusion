@@ -1845,9 +1845,16 @@ impl ContextProvider for SessionContextProvider<'_> {
         let args = args
             .into_iter()
             .map(|arg| {
-                simplifier
-                    .coerce(arg, &schema)
-                    .and_then(|e| simplifier.simplify(e))
+                // Type-coerce arguments where possible. Spice table functions
+                // (`vector_search`/`rrf`) take a table name as a bare-identifier
+                // argument, which resolves to an unqualified `Column` whose type
+                // cannot be looked up against the empty schema — DF53 errors here
+                // (DF52 did not). Fall back to simplify-only on coercion failure
+                // so the table function can interpret the column-as-table-name.
+                match simplifier.coerce(arg.clone(), &schema) {
+                    Ok(coerced) => simplifier.simplify(coerced),
+                    Err(_) => simplifier.simplify(arg),
+                }
             })
             .collect::<datafusion_common::Result<Vec<_>>>()?;
         let provider = tbl_func.create_table_provider(&args)?;
