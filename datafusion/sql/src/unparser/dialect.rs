@@ -337,7 +337,12 @@ pub enum CharacterLengthStyle {
 pub enum TimezoneCastStyle {
     /// SQL-standard `expr AT TIME ZONE 'tz'` (PostgreSQL, DuckDB).
     AtTimeZone,
-    /// `CONVERT_TIMEZONE('tz', expr)` (Snowflake, Amazon Redshift).
+    /// `CAST(CONVERT_TIMEZONE('tz', expr) AS TIMESTAMP_NTZ)` (Snowflake).
+    ///
+    /// Not Amazon Redshift: Redshift's 2-arg `CONVERT_TIMEZONE(source_tz, ts)`
+    /// reads the first argument as the *source* zone and converts to the session
+    /// zone, whereas this emits the target zone as the first argument (Snowflake
+    /// semantics), so the rendered SQL would mean something different on Redshift.
     ConvertTimezone,
     /// Legacy `CAST(expr AS <timestamp_tz_cast_dtype>)`, which drops the zone
     /// name. Preserves the pre-fix behavior for callers that opt out.
