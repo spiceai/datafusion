@@ -1148,6 +1148,18 @@ impl Unparser<'_> {
     // For example: CAST(Utf8("binary_value") AS Binary) and  CAST(Utf8("dictionary_value") AS Dictionary)
     fn cast_to_sql(&self, expr: &Expr, data_type: &DataType) -> Result<ast::Expr> {
         let inner_expr = self.expr_to_sql_inner(expr)?;
+        // `expr AT TIME ZONE 'tz'` is planned as CAST(expr AS Timestamp(_, Some(tz))).
+        // Render it faithfully (e.g. `AT TIME ZONE` or `CONVERT_TIMEZONE`) so the zone
+        // name survives, instead of a bare `CAST(... AS TIMESTAMP WITH TIME ZONE)` that
+        // silently drops it and changes the meaning on the remote engine.
+        if let DataType::Timestamp(_, Some(tz)) = data_type {
+            if let Some(at_tz) = self
+                .dialect
+                .timestamp_at_time_zone_to_sql(inner_expr.clone(), tz.as_ref())
+            {
+                return Ok(at_tz);
+            }
+        }
         match inner_expr {
             ast::Expr::Value(_) => match data_type {
                 DataType::Dictionary(_, _) | DataType::Binary | DataType::BinaryView => {
@@ -1823,6 +1835,7 @@ mod tests {
     use crate::unparser::dialect::{
         CharacterLengthStyle, CustomDialect, CustomDialectBuilder, DateFieldExtractStyle,
         DefaultDialect, Dialect, DuckDBDialect, PostgreSqlDialect, ScalarFnToSqlHandler,
+        TimezoneCastStyle,
     };
 
     use super::*;
@@ -1917,7 +1930,7 @@ mod tests {
                         Some("+08:00".into()),
                     ),
                 }),
-                r#"CAST(a AS TIMESTAMP WITH TIME ZONE)"#,
+                r#"a AT TIME ZONE '+08:00'"#,
             ),
             (
                 Expr::Cast(Cast {
@@ -2341,6 +2354,135 @@ mod tests {
             assert_eq!(actual, expected);
         }
 
+        Ok(())
+    }
+
+    #[test]
+    fn cast_to_timestamp_with_timezone_unparses_at_time_zone() -> Result<()> {
+        // `expr AT TIME ZONE 'tz'` is planned as CAST(expr AS Timestamp(_, Some(tz))).
+        // The unparser must round-trip it as `AT TIME ZONE`, preserving the zone name,
+        // rather than collapsing it to a zone-dropping `CAST(... AS TIMESTAMP WITH TIME ZONE)`.
+        let expr = Expr::Cast(Cast {
+            expr: Box::new(col("a")),
+            data_type: DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("America/Los_Angeles".into()),
+            ),
+        });
+        let ast = expr_to_sql(&expr)?;
+        assert_eq!(format!("{ast}"), "a AT TIME ZONE 'America/Los_Angeles'");
+        Ok(())
+    }
+
+    #[test]
+    fn nested_at_time_zone_casts_preserve_each_zone() -> Result<()> {
+        // The exact shape produced by
+        // `MQL_AT AT TIME ZONE 'UTC' AT TIME ZONE 'America/Los_Angeles'`.
+        // Both zone names must survive unparsing; previously both were dropped.
+        let inner = Expr::Cast(Cast {
+            expr: Box::new(col("mql_at")),
+            data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        });
+        let outer = Expr::Cast(Cast {
+            expr: Box::new(inner),
+            data_type: DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("America/Los_Angeles".into()),
+            ),
+        });
+        let ast = expr_to_sql(&outer)?;
+        assert_eq!(
+            format!("{ast}"),
+            "mql_at AT TIME ZONE 'UTC' AT TIME ZONE 'America/Los_Angeles'"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_dialect_at_time_zone_style_renders_at_time_zone() -> Result<()> {
+        let dialect = CustomDialectBuilder::new()
+            .with_timezone_cast_style(TimezoneCastStyle::AtTimeZone)
+            .build();
+        let unparser = Unparser::new(&dialect);
+        let expr = Expr::Cast(Cast {
+            expr: Box::new(col("a")),
+            data_type: DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("America/Los_Angeles".into()),
+            ),
+        });
+        let ast = unparser.expr_to_sql(&expr)?;
+        assert_eq!(format!("{ast}"), "a AT TIME ZONE 'America/Los_Angeles'");
+        Ok(())
+    }
+
+    #[test]
+    fn custom_dialect_convert_timezone_style_renders_function() -> Result<()> {
+        // Snowflake expresses the conversion as a function call rather than the
+        // `AT TIME ZONE` operator (which it does not support). The result is cast
+        // to naive TIMESTAMP_NTZ so comparisons against naive literals stay
+        // wall-clock based (session-TIMEZONE independent).
+        let dialect = CustomDialectBuilder::new()
+            .with_timezone_cast_style(TimezoneCastStyle::ConvertTimezone)
+            .build();
+        let unparser = Unparser::new(&dialect);
+        let expr = Expr::Cast(Cast {
+            expr: Box::new(col("a")),
+            data_type: DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("America/Los_Angeles".into()),
+            ),
+        });
+        let ast = unparser.expr_to_sql(&expr)?;
+        assert_eq!(
+            format!("{ast}"),
+            "CAST(CONVERT_TIMEZONE('America/Los_Angeles', a) AS TIMESTAMP_NTZ)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_dialect_convert_timezone_style_nested_chain() -> Result<()> {
+        // The reported bug shape: `MQL_AT AT TIME ZONE 'UTC' AT TIME ZONE 'LA'`.
+        // Composes to nested CONVERT_TIMEZONE calls; correct on Snowflake when the
+        // session TIMEZONE is pinned to UTC (see convert_timezone_to_ast docs).
+        let dialect = CustomDialectBuilder::new()
+            .with_timezone_cast_style(TimezoneCastStyle::ConvertTimezone)
+            .build();
+        let unparser = Unparser::new(&dialect);
+        let inner = Expr::Cast(Cast {
+            expr: Box::new(col("mql_at")),
+            data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        });
+        let outer = Expr::Cast(Cast {
+            expr: Box::new(inner),
+            data_type: DataType::Timestamp(
+                TimeUnit::Nanosecond,
+                Some("America/Los_Angeles".into()),
+            ),
+        });
+        let ast = unparser.expr_to_sql(&outer)?;
+        assert_eq!(
+            format!("{ast}"),
+            "CAST(CONVERT_TIMEZONE('America/Los_Angeles', \
+             CAST(CONVERT_TIMEZONE('UTC', mql_at) AS TIMESTAMP_NTZ)) AS TIMESTAMP_NTZ)"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_dialect_default_timezone_cast_is_legacy() -> Result<()> {
+        // The default style is `Cast`: it preserves the pre-fix (zone-dropping)
+        // behavior so existing CustomDialect-based connectors are unaffected
+        // until they explicitly opt in.
+        let dialect = CustomDialectBuilder::new().build();
+        let unparser = Unparser::new(&dialect);
+        let expr = Expr::Cast(Cast {
+            expr: Box::new(col("a")),
+            data_type: DataType::Timestamp(TimeUnit::Nanosecond, Some("+08:00".into())),
+        });
+        let ast = unparser.expr_to_sql(&expr)?;
+        assert_eq!(format!("{ast}"), "CAST(a AS TIMESTAMP WITH TIME ZONE)");
         Ok(())
     }
 
