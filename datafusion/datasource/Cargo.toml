@@ -33,7 +33,7 @@ all-features = true
 [features]
 compression = ["async-compression", "liblzma", "bzip2", "flate2", "zstd", "tokio-util"]
 default = ["compression"]
-parquet = ["dep:parquet", "tempfile"]
+parquet = ["dep:parquet", "tempfile", "parquet/object_store"]
 
 [dependencies]
 arrow = { workspace = true }

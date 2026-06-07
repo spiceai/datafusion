@@ -17,6 +17,7 @@
 
 //! Helper struct to manage table schemas with partition columns
 
+use crate::metadata::MetadataColumn;
 use arrow::datatypes::{FieldRef, SchemaBuilder, SchemaRef};
 use std::sync::Arc;
 
@@ -72,10 +73,21 @@ pub struct TableSchema {
     /// row during query execution based on the file's location.
     table_partition_cols: Arc<Vec<FieldRef>>,
 
-    /// The complete table schema: file_schema columns followed by partition columns.
+    /// Metadata columns to include in the output schema (Spice extension).
     ///
-    /// This is pre-computed during construction by concatenating `file_schema`
-    /// and `table_partition_cols`, so it can be returned as a cheap reference.
+    /// These columns expose per-file [`object_store::ObjectMeta`] information
+    /// (such as `_location`, `_size`, and `_last_modified`). Like partition
+    /// columns, they are NOT present in the data files but are appended to each
+    /// row during query execution. They are always appended *after* the
+    /// partition columns in [`Self::table_schema`].
+    metadata_cols: Arc<Vec<MetadataColumn>>,
+
+    /// The complete table schema: file_schema columns followed by partition
+    /// columns and then metadata columns.
+    ///
+    /// This is pre-computed during construction by concatenating `file_schema`,
+    /// `table_partition_cols`, and `metadata_cols`, so it can be returned as a
+    /// cheap reference.
     table_schema: SchemaRef,
 }
 
@@ -117,13 +129,32 @@ impl TableSchema {
     /// assert_eq!(table_schema.table_schema().fields().len(), 4);
     /// ```
     pub fn new(file_schema: SchemaRef, table_partition_cols: Vec<FieldRef>) -> Self {
-        let mut builder = SchemaBuilder::from(file_schema.as_ref());
-        builder.extend(table_partition_cols.iter().cloned());
+        let table_partition_cols = Arc::new(table_partition_cols);
+        let metadata_cols = Arc::new(Vec::new());
+        let table_schema = Self::compute_table_schema(
+            &file_schema,
+            &table_partition_cols,
+            &metadata_cols,
+        );
         Self {
             file_schema,
-            table_partition_cols: Arc::new(table_partition_cols),
-            table_schema: Arc::new(builder.finish()),
+            table_partition_cols,
+            metadata_cols,
+            table_schema,
         }
+    }
+
+    /// Compute the complete table schema by concatenating the file schema,
+    /// partition columns, and metadata columns (in that order).
+    fn compute_table_schema(
+        file_schema: &SchemaRef,
+        table_partition_cols: &[FieldRef],
+        metadata_cols: &[MetadataColumn],
+    ) -> SchemaRef {
+        let mut builder = SchemaBuilder::from(file_schema.as_ref());
+        builder.extend(table_partition_cols.iter().cloned());
+        builder.extend(metadata_cols.iter().map(|c| Arc::new(c.field())));
+        Arc::new(builder.finish())
     }
 
     /// Create a new TableSchema with no partition columns.
@@ -149,9 +180,26 @@ impl TableSchema {
             );
             table_partition_cols.extend(partition_cols);
         }
-        let mut builder = SchemaBuilder::from(self.file_schema.as_ref());
-        builder.extend(self.table_partition_cols.iter().cloned());
-        self.table_schema = Arc::new(builder.finish());
+        self.table_schema = Self::compute_table_schema(
+            &self.file_schema,
+            &self.table_partition_cols,
+            &self.metadata_cols,
+        );
+        self
+    }
+
+    /// Set the metadata columns (Spice extension), returning a new instance.
+    ///
+    /// Metadata columns are appended to the table schema *after* the partition
+    /// columns. They expose per-file [`object_store::ObjectMeta`] information
+    /// such as `_location`, `_size`, and `_last_modified`.
+    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
+        self.metadata_cols = Arc::new(metadata_cols);
+        self.table_schema = Self::compute_table_schema(
+            &self.file_schema,
+            &self.table_partition_cols,
+            &self.metadata_cols,
+        );
         self
     }
 
@@ -168,6 +216,15 @@ impl TableSchema {
     /// will be appended to each row during query execution.
     pub fn table_partition_cols(&self) -> &Vec<FieldRef> {
         &self.table_partition_cols
+    }
+
+    /// Get the metadata columns (Spice extension).
+    ///
+    /// These are appended to the table schema after the partition columns and
+    /// are populated from each file's [`object_store::ObjectMeta`] during
+    /// query execution.
+    pub fn metadata_cols(&self) -> &Vec<MetadataColumn> {
+        &self.metadata_cols
     }
 
     /// Get the full table schema (file schema + partition columns).

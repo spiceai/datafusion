@@ -247,6 +247,21 @@ impl FileOpener for ParquetOpener {
             partitioned_file.statistics.as_deref(),
             &logical_file_schema,
         ));
+        // Add metadata columns (Spice extension), derived from the file's
+        // ObjectMeta (e.g. `_location`, `_size`, `_last_modified`). These are
+        // appended to the table schema after the partition columns and are
+        // substituted into the projection as literals here.
+        literal_columns.extend(
+            self.table_schema
+                .metadata_cols()
+                .iter()
+                .map(|c| {
+                    (
+                        c.name().to_string(),
+                        c.to_scalar_value(&partitioned_file.object_meta),
+                    )
+                }),
+        );
 
         // Apply literal replacements to projection and predicate
         let mut projection = self.projection.clone();
