@@ -332,7 +332,9 @@ impl ListingTable {
                 .iter()
                 .map(|(col, field)| Arc::new(Field::new(col, field.clone(), false)))
                 .collect(),
-        );
+        )
+        // Append metadata columns (Spice extension) after the partition columns.
+        .with_metadata_cols(self.options.metadata_cols.clone());
 
         self.options.format.file_source(table_schema)
     }
@@ -579,6 +581,9 @@ impl TableProvider for ListingTable {
                     .with_file_groups(partitioned_file_lists)
                     .with_constraints(self.constraints.clone())
                     .with_statistics(statistics)
+                    .with_object_versioning_type(
+                        self.options.object_versioning_type.clone(),
+                    )
                     .with_projection_indices(projection)?
                     .with_limit(limit)
                     .with_output_ordering(output_ordering)

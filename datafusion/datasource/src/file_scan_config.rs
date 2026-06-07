@@ -19,6 +19,7 @@
 //! file sources.
 
 use crate::file_groups::FileGroup;
+use crate::metadata::MetadataColumn;
 use crate::{
     PartitionedFile, display::FileGroupsDisplay, file::FileSource,
     file_compression_type::FileCompressionType, file_stream::FileStream,
@@ -204,6 +205,13 @@ pub struct FileScanConfig {
     /// If the number of file partitions > target_partitions, the file partitions will be grouped
     /// in a round-robin fashion such that number of file partitions = target_partitions.
     pub partitioned_by_file_group: bool,
+    /// Object versioning type for reading files (Spice extension).
+    ///
+    /// This is used to handle different versions of objects in object stores,
+    /// ensuring that objects listed during planning are consistent with objects
+    /// read during execution.
+    #[cfg(feature = "parquet")]
+    pub object_versioning_type: Option<parquet::arrow::async_reader::ObjectVersionType>,
 }
 
 /// A builder for [`FileScanConfig`]'s.
@@ -274,6 +282,8 @@ pub struct FileScanConfigBuilder {
     batch_size: Option<usize>,
     expr_adapter_factory: Option<Arc<dyn PhysicalExprAdapterFactory>>,
     partitioned_by_file_group: bool,
+    #[cfg(feature = "parquet")]
+    object_versioning_type: Option<parquet::arrow::async_reader::ObjectVersionType>,
 }
 
 impl FileScanConfigBuilder {
@@ -300,6 +310,8 @@ impl FileScanConfigBuilder {
             batch_size: None,
             expr_adapter_factory: None,
             partitioned_by_file_group: false,
+            #[cfg(feature = "parquet")]
+            object_versioning_type: None,
         }
     }
 
@@ -392,6 +404,38 @@ impl FileScanConfigBuilder {
             )?;
         }
         Ok(self)
+    }
+
+    /// Set the metadata columns to include in the output schema (Spice extension).
+    ///
+    /// Metadata columns (e.g. `_location`, `_size`, `_last_modified`) are
+    /// appended to the table schema after the partition columns and are
+    /// populated from each file's [`object_store::ObjectMeta`] during execution.
+    ///
+    /// This folds the metadata columns into the underlying [`FileSource`]'s
+    /// table schema, so it should be called *before* [`Self::with_projection_indices`]
+    /// if the projection references metadata column indices.
+    ///
+    /// # Errors
+    /// Returns an error if the underlying [`FileSource`] does not support metadata
+    /// columns.
+    pub fn with_metadata_cols(
+        mut self,
+        metadata_cols: Vec<MetadataColumn>,
+    ) -> Result<Self> {
+        if metadata_cols.is_empty() {
+            return Ok(self);
+        }
+        match self.file_source.with_metadata_cols(metadata_cols) {
+            Some(new_source) => {
+                self.file_source = new_source;
+                Ok(self)
+            }
+            None => internal_err!(
+                "FileSource {} does not support metadata columns",
+                self.file_source.file_type()
+            ),
+        }
     }
 
     /// Set the table constraints
@@ -500,6 +544,20 @@ impl FileScanConfigBuilder {
         self
     }
 
+    /// Set the object versioning type for reading files (Spice extension).
+    ///
+    /// This is used to handle different versions of objects in object stores,
+    /// ensuring that objects listed during planning are consistent with objects
+    /// read during execution.
+    #[cfg(feature = "parquet")]
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<parquet::arrow::async_reader::ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
+    }
+
     /// Build the final [`FileScanConfig`] with all the configured settings.
     ///
     /// This method takes ownership of the builder and returns the constructed `FileScanConfig`.
@@ -521,6 +579,8 @@ impl FileScanConfigBuilder {
             batch_size,
             expr_adapter_factory: expr_adapter,
             partitioned_by_file_group,
+            #[cfg(feature = "parquet")]
+            object_versioning_type,
         } = self;
 
         let constraints = constraints.unwrap_or_default();
@@ -546,6 +606,8 @@ impl FileScanConfigBuilder {
             expr_adapter_factory: expr_adapter,
             statistics,
             partitioned_by_file_group,
+            #[cfg(feature = "parquet")]
+            object_versioning_type,
         }
     }
 }
@@ -565,6 +627,8 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
             batch_size: config.batch_size,
             expr_adapter_factory: config.expr_adapter_factory,
             partitioned_by_file_group: config.partitioned_by_file_group,
+            #[cfg(feature = "parquet")]
+            object_versioning_type: config.object_versioning_type,
         }
     }
 }

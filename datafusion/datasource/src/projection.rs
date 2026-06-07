@@ -32,6 +32,7 @@ use itertools::Itertools;
 use crate::{
     PartitionedFile, TableSchema,
     file_stream::{FileOpenFuture, FileOpener},
+    metadata::MetadataColumn,
 };
 
 /// A file opener that handles applying a projection on top of an inner opener.
@@ -49,6 +50,7 @@ pub struct ProjectionOpener {
     projection: ProjectionExprs,
     input_schema: SchemaRef,
     partition_columns: Vec<PartitionColumnIndex>,
+    metadata_columns: Vec<MetadataColumnIndex>,
 }
 
 impl ProjectionOpener {
@@ -62,6 +64,7 @@ impl ProjectionOpener {
             projection: projection.remapped_projection,
             input_schema: Arc::new(file_schema.project(&projection.file_indices)?),
             partition_columns: projection.partition_columns,
+            metadata_columns: projection.metadata_columns,
         }))
     }
 }
@@ -78,6 +81,17 @@ impl FileOpener for ProjectionOpener {
                 &self.projection,
                 &self.partition_columns,
                 partition_values,
+            )
+        };
+        // Substitute any metadata column references with literal values derived
+        // from the file's ObjectMeta (Spice extension).
+        let projection = if self.metadata_columns.is_empty() {
+            projection
+        } else {
+            inject_metadata_columns_into_projection(
+                &projection,
+                &self.metadata_columns,
+                &partitioned_file.object_meta,
             )
         };
         let projector = projection.make_projector(&self.input_schema)?;
@@ -103,6 +117,59 @@ pub struct PartitionColumnIndex {
     pub in_remainder_projection: usize,
     /// The index of this partition column in the partition_values array
     pub in_partition_values: usize,
+}
+
+/// Maps a metadata column (Spice extension) to its position in the remapped
+/// (remainder) projection, along with the [`MetadataColumn`] used to derive its
+/// per-file literal value from the file's [`object_store::ObjectMeta`].
+#[derive(Debug, Clone)]
+pub struct MetadataColumnIndex {
+    /// The index of this metadata column in the remainder projection
+    /// (>= num_file_columns + num_partition_columns)
+    pub in_remainder_projection: usize,
+    /// The metadata column definition used to compute the literal value.
+    pub metadata_col: MetadataColumn,
+}
+
+fn inject_metadata_columns_into_projection(
+    projection: &ProjectionExprs,
+    metadata_columns: &[MetadataColumnIndex],
+    object_meta: &object_store::ObjectMeta,
+) -> ProjectionExprs {
+    // Pre-create all literals for metadata columns to avoid recomputing them.
+    let metadata_literals: Vec<(usize, Arc<dyn datafusion_physical_plan::PhysicalExpr>)> =
+        metadata_columns
+            .iter()
+            .map(|mci| {
+                let literal: Arc<dyn datafusion_physical_plan::PhysicalExpr> = Arc::new(
+                    Literal::new(mci.metadata_col.to_scalar_value(object_meta)),
+                );
+                (mci.in_remainder_projection, literal)
+            })
+            .collect();
+
+    let projections = projection
+        .iter()
+        .map(|projection| {
+            let expr = Arc::clone(&projection.expr)
+                .transform(|expr| {
+                    let original_expr = Arc::clone(&expr);
+                    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+                        if let Some((_, literal)) = metadata_literals
+                            .iter()
+                            .find(|(idx, _)| *idx == column.index())
+                        {
+                            return Ok(Transformed::yes(Arc::clone(literal)));
+                        }
+                    }
+                    Ok(Transformed::no(original_expr))
+                })
+                .data()
+                .expect("infallible transform");
+            ProjectionExpr::new(expr, projection.alias.clone())
+        })
+        .collect_vec();
+    ProjectionExprs::new(projections)
 }
 
 fn inject_partition_columns_into_projection(
@@ -163,6 +230,9 @@ pub struct SplitProjection {
     pub file_indices: Vec<usize>,
     /// Pre-computed partition column mappings (internal, used by ProjectionOpener)
     pub(crate) partition_columns: Vec<PartitionColumnIndex>,
+    /// Pre-computed metadata column mappings (internal, used by ProjectionOpener).
+    /// Spice extension: maps projected metadata columns to per-file literals.
+    pub(crate) metadata_columns: Vec<MetadataColumnIndex>,
     /// The remapped projection (internal, used by ProjectionOpener)
     pub(crate) remapped_projection: ProjectionExprs,
 }
@@ -173,7 +243,27 @@ impl SplitProjection {
             &(0..table_schema.table_schema().fields().len()).collect_vec(),
             table_schema.table_schema(),
         );
-        Self::new(table_schema.file_schema(), &projection)
+        Self::new_with_table_schema(table_schema, &projection)
+    }
+
+    /// Creates a new [`SplitProjection`] from a [`TableSchema`], which is aware
+    /// of metadata columns (Spice extension) in addition to file and partition
+    /// columns.
+    ///
+    /// Metadata columns are expected to appear in the table schema *after* the
+    /// partition columns. They are classified separately so that the
+    /// [`ProjectionOpener`] can substitute them with per-file literals derived
+    /// from the file's [`object_store::ObjectMeta`].
+    pub fn new_with_table_schema(
+        table_schema: &TableSchema,
+        projection: &ProjectionExprs,
+    ) -> Self {
+        Self::new_inner(
+            table_schema.file_schema(),
+            projection,
+            table_schema.table_partition_cols().len(),
+            table_schema.metadata_cols(),
+        )
     }
 
     /// Creates a new [`SplitProjection`] by splitting a projection into
@@ -186,12 +276,33 @@ impl SplitProjection {
     /// table schema minus any partition columns.
     /// Partition columns are always expected to be at the end of the table schema.
     /// Note that `file_schema` is *not* the physical schema of the file.
+    ///
+    /// This entry point does not handle metadata columns; use
+    /// [`Self::new_with_table_schema`] if the table schema includes Spice
+    /// metadata columns.
     pub fn new(logical_file_schema: &Schema, projection: &ProjectionExprs) -> Self {
-        let num_file_schema_columns = logical_file_schema.fields().len();
+        // No metadata columns: every non-file column is a partition column.
+        Self::new_inner(logical_file_schema, projection, usize::MAX, &[])
+    }
 
-        // Collect all unique columns and classify as file or partition
+    fn new_inner(
+        logical_file_schema: &Schema,
+        projection: &ProjectionExprs,
+        num_partition_columns: usize,
+        metadata_cols: &[MetadataColumn],
+    ) -> Self {
+        let num_file_schema_columns = logical_file_schema.fields().len();
+        // The boundary (in table-schema index space) between partition columns
+        // and metadata columns. Saturating add guards the `usize::MAX` sentinel
+        // used by [`Self::new`] (treat everything after the file columns as a
+        // partition column).
+        let metadata_start =
+            num_file_schema_columns.saturating_add(num_partition_columns);
+
+        // Collect all unique columns and classify as file, partition, or metadata
         let mut file_columns = Vec::new();
         let mut partition_columns = Vec::new();
+        let mut metadata_columns: Vec<usize> = Vec::new();
         let mut all_columns = std::collections::HashMap::new();
 
         // Extract all unique column references (index -> name)
@@ -216,11 +327,13 @@ impl SplitProjection {
             .collect();
         sorted_columns.sort_by_key(|(_, idx)| *idx);
 
-        // Separate file and partition columns, assigning final indices
-        // Pre-create all remapped columns to avoid duplicate Arc'd expressions
+        // Separate file, partition, and metadata columns, assigning final indices.
+        // Partition and metadata columns share the remapped index space that
+        // immediately follows the file columns, in sorted (ascending) order.
+        // Pre-create all remapped columns to avoid duplicate Arc'd expressions.
         let mut column_mapping = std::collections::HashMap::new();
         let mut file_idx = 0;
-        let mut partition_idx = 0;
+        let mut non_file_idx = 0;
 
         for (name, original_index) in sorted_columns {
             let new_index = if original_index < num_file_schema_columns {
@@ -230,10 +343,14 @@ impl SplitProjection {
                 file_idx += 1;
                 idx
             } else {
-                // Partition column: gets index [num_file_columns..)
-                partition_columns.push(original_index);
-                let idx = file_idx + partition_idx;
-                partition_idx += 1;
+                // Partition or metadata column: gets index [num_file_columns..)
+                if original_index < metadata_start {
+                    partition_columns.push(original_index);
+                } else {
+                    metadata_columns.push(original_index);
+                }
+                let idx = file_idx + non_file_idx;
+                non_file_idx += 1;
                 idx
             };
 
@@ -263,14 +380,42 @@ impl SplitProjection {
             })
             .collect_vec();
 
-        // Pre-compute partition column mappings for ProjectionOpener
+        // Pre-compute partition and metadata column mappings for ProjectionOpener.
+        // Partition and metadata columns occupy a single contiguous remapped
+        // index range [num_file_columns..) in ascending table-index order, so we
+        // merge them to compute each column's `in_remainder_projection`.
         let num_file_columns = file_columns.len();
+        let mut non_file_columns: Vec<usize> = partition_columns
+            .iter()
+            .chain(metadata_columns.iter())
+            .copied()
+            .collect();
+        non_file_columns.sort_unstable();
+
+        let remainder_index_of = |table_index: usize| -> usize {
+            num_file_columns
+                + non_file_columns
+                    .iter()
+                    .position(|&i| i == table_index)
+                    .expect("non-file column must be present")
+        };
+
         let partition_column_mappings = partition_columns
             .iter()
-            .enumerate()
-            .map(|(partition_idx, &table_index)| PartitionColumnIndex {
-                in_remainder_projection: num_file_columns + partition_idx,
+            .map(|&table_index| PartitionColumnIndex {
+                in_remainder_projection: remainder_index_of(table_index),
                 in_partition_values: table_index - num_file_schema_columns,
+            })
+            .collect_vec();
+
+        let metadata_column_mappings = metadata_columns
+            .iter()
+            .map(|&table_index| {
+                let metadata_idx = table_index - metadata_start;
+                MetadataColumnIndex {
+                    in_remainder_projection: remainder_index_of(table_index),
+                    metadata_col: metadata_cols[metadata_idx].clone(),
+                }
             })
             .collect_vec();
 
@@ -278,6 +423,7 @@ impl SplitProjection {
             source: projection.clone(),
             file_indices: file_columns,
             partition_columns: partition_column_mappings,
+            metadata_columns: metadata_column_mappings,
             remapped_projection: ProjectionExprs::from(remapped_projection),
         }
     }

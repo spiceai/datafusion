@@ -381,13 +381,23 @@ impl FileSource for ArrowSource {
         &self.table_schema
     }
 
+    fn with_metadata_cols(
+        &self,
+        metadata_cols: Vec<datafusion_datasource::metadata::MetadataColumn>,
+    ) -> Option<Arc<dyn FileSource>> {
+        let mut source = self.clone();
+        source.table_schema = source.table_schema.with_metadata_cols(metadata_cols);
+        source.projection = SplitProjection::unprojected(&source.table_schema);
+        Some(Arc::new(source))
+    }
+
     fn try_pushdown_projection(
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn FileSource>>> {
         let mut source = self.clone();
-        source.projection = SplitProjection::new(
-            self.table_schema().file_schema(),
+        source.projection = SplitProjection::new_with_table_schema(
+            self.table_schema(),
             &source.projection.source.try_merge(projection)?,
         );
         Ok(Some(Arc::new(source)))

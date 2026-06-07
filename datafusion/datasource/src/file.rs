@@ -84,6 +84,24 @@ pub trait FileSource: Send + Sync {
     /// after applying the projection.
     fn table_schema(&self) -> &crate::table_schema::TableSchema;
 
+    /// Return a new [`FileSource`] whose [`Self::table_schema`] has the given
+    /// metadata columns appended (Spice extension).
+    ///
+    /// Metadata columns (e.g. `_location`, `_size`, `_last_modified`) are
+    /// appended after the partition columns in the table schema and are
+    /// populated from each file's [`object_store::ObjectMeta`] during
+    /// execution.
+    ///
+    /// Returns `None` if this source does not support metadata columns. The
+    /// default implementation returns `None`; file sources that support
+    /// metadata columns (Parquet, CSV, JSON, Avro, Arrow) override this.
+    fn with_metadata_cols(
+        &self,
+        _metadata_cols: Vec<crate::metadata::MetadataColumn>,
+    ) -> Option<Arc<dyn FileSource>> {
+        None
+    }
+
     /// Initialize new type with batch size configuration
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource>;
 
