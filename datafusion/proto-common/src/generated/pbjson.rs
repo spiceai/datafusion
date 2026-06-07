@@ -9628,3 +9628,234 @@ impl<'de> serde::Deserialize<'de> for UniqueConstraint {
         deserializer.deserialize_struct("datafusion_common.UniqueConstraint", FIELDS, GeneratedVisitor)
     }
 }
+impl serde::Serialize for VortexFormat {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.options.is_some() {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion_common.VortexFormat", len)?;
+        if let Some(v) = self.options.as_ref() {
+            struct_ser.serialize_field("options", v)?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for VortexFormat {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "options",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            Options,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "options" => Ok(GeneratedField::Options),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = VortexFormat;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion_common.VortexFormat")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<VortexFormat, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut options__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::Options => {
+                            if options__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("options"));
+                            }
+                            options__ = map_.next_value()?;
+                        }
+                    }
+                }
+                Ok(VortexFormat {
+                    options: options__,
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion_common.VortexFormat", FIELDS, GeneratedVisitor)
+    }
+}
+impl serde::Serialize for VortexOptions {
+    #[allow(deprecated)]
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut len = 0;
+        if self.footer_cache_size_mb != 0 {
+            len += 1;
+        }
+        if self.segment_cache_size_mb != 0 {
+            len += 1;
+        }
+        if self.footer_initial_read_size_bytes != 0 {
+            len += 1;
+        }
+        let mut struct_ser = serializer.serialize_struct("datafusion_common.VortexOptions", len)?;
+        if self.footer_cache_size_mb != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("footerCacheSizeMb", ToString::to_string(&self.footer_cache_size_mb).as_str())?;
+        }
+        if self.segment_cache_size_mb != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("segmentCacheSizeMb", ToString::to_string(&self.segment_cache_size_mb).as_str())?;
+        }
+        if self.footer_initial_read_size_bytes != 0 {
+            #[allow(clippy::needless_borrow)]
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            struct_ser.serialize_field("footerInitialReadSizeBytes", ToString::to_string(&self.footer_initial_read_size_bytes).as_str())?;
+        }
+        struct_ser.end()
+    }
+}
+impl<'de> serde::Deserialize<'de> for VortexOptions {
+    #[allow(deprecated)]
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        const FIELDS: &[&str] = &[
+            "footer_cache_size_mb",
+            "footerCacheSizeMb",
+            "segment_cache_size_mb",
+            "segmentCacheSizeMb",
+            "footer_initial_read_size_bytes",
+            "footerInitialReadSizeBytes",
+        ];
+
+        #[allow(clippy::enum_variant_names)]
+        enum GeneratedField {
+            FooterCacheSizeMb,
+            SegmentCacheSizeMb,
+            FooterInitialReadSizeBytes,
+        }
+        impl<'de> serde::Deserialize<'de> for GeneratedField {
+            fn deserialize<D>(deserializer: D) -> std::result::Result<GeneratedField, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                struct GeneratedVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+                    type Value = GeneratedField;
+
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        write!(formatter, "expected one of: {:?}", &FIELDS)
+                    }
+
+                    #[allow(unused_variables)]
+                    fn visit_str<E>(self, value: &str) -> std::result::Result<GeneratedField, E>
+                    where
+                        E: serde::de::Error,
+                    {
+                        match value {
+                            "footerCacheSizeMb" | "footer_cache_size_mb" => Ok(GeneratedField::FooterCacheSizeMb),
+                            "segmentCacheSizeMb" | "segment_cache_size_mb" => Ok(GeneratedField::SegmentCacheSizeMb),
+                            "footerInitialReadSizeBytes" | "footer_initial_read_size_bytes" => Ok(GeneratedField::FooterInitialReadSizeBytes),
+                            _ => Err(serde::de::Error::unknown_field(value, FIELDS)),
+                        }
+                    }
+                }
+                deserializer.deserialize_identifier(GeneratedVisitor)
+            }
+        }
+        struct GeneratedVisitor;
+        impl<'de> serde::de::Visitor<'de> for GeneratedVisitor {
+            type Value = VortexOptions;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("struct datafusion_common.VortexOptions")
+            }
+
+            fn visit_map<V>(self, mut map_: V) -> std::result::Result<VortexOptions, V::Error>
+                where
+                    V: serde::de::MapAccess<'de>,
+            {
+                let mut footer_cache_size_mb__ = None;
+                let mut segment_cache_size_mb__ = None;
+                let mut footer_initial_read_size_bytes__ = None;
+                while let Some(k) = map_.next_key()? {
+                    match k {
+                        GeneratedField::FooterCacheSizeMb => {
+                            if footer_cache_size_mb__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("footerCacheSizeMb"));
+                            }
+                            footer_cache_size_mb__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::SegmentCacheSizeMb => {
+                            if segment_cache_size_mb__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("segmentCacheSizeMb"));
+                            }
+                            segment_cache_size_mb__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                        GeneratedField::FooterInitialReadSizeBytes => {
+                            if footer_initial_read_size_bytes__.is_some() {
+                                return Err(serde::de::Error::duplicate_field("footerInitialReadSizeBytes"));
+                            }
+                            footer_initial_read_size_bytes__ = 
+                                Some(map_.next_value::<::pbjson::private::NumberDeserialize<_>>()?.0)
+                            ;
+                        }
+                    }
+                }
+                Ok(VortexOptions {
+                    footer_cache_size_mb: footer_cache_size_mb__.unwrap_or_default(),
+                    segment_cache_size_mb: segment_cache_size_mb__.unwrap_or_default(),
+                    footer_initial_read_size_bytes: footer_initial_read_size_bytes__.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_struct("datafusion_common.VortexOptions", FIELDS, GeneratedVisitor)
+    }
+}

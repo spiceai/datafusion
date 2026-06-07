@@ -195,6 +195,7 @@ tokio-util = "0.7"
 url = "2.5.7"
 uuid = "1.21"
 zstd = { version = "0.13", default-features = false }
+vortex-datafusion = { git = "https://github.com/spiceai/vortex.git", rev = "a677d1118273afe4ed9af0cdf3a6dbdd045d4fca" } # spiceai 0.74
 
 [workspace.lints.clippy]
 # Detects large stack-allocated futures that may cause stack overflow crashes (see threshold in clippy.toml)
@@ -279,3 +280,39 @@ incremental = false
 inherits = "release"
 debug = true
 strip = false
+
+[patch.crates-io]
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+
+# Patch datafusion crates so vortex-datafusion uses our local workspace versions
+datafusion = { path = "datafusion/core" }
+datafusion-catalog = { path = "datafusion/catalog" }
+datafusion-catalog-listing = { path = "datafusion/catalog-listing" }
+datafusion-common = { path = "datafusion/common" }
+datafusion-common-runtime = { path = "datafusion/common-runtime" }
+datafusion-datasource = { path = "datafusion/datasource" }
+datafusion-datasource-parquet = { path = "datafusion/datasource-parquet" }
+datafusion-execution = { path = "datafusion/execution" }
+datafusion-expr = { path = "datafusion/expr" }
+datafusion-expr-common = { path = "datafusion/expr-common" }
+datafusion-functions = { path = "datafusion/functions" }
+datafusion-physical-expr = { path = "datafusion/physical-expr" }
+datafusion-physical-expr-common = { path = "datafusion/physical-expr-common" }
+datafusion-physical-expr-adapter = { path = "datafusion/physical-expr-adapter" }
+datafusion-physical-plan = { path = "datafusion/physical-plan" }
+datafusion-pruning = { path = "datafusion/pruning" }

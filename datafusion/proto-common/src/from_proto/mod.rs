@@ -41,7 +41,7 @@ use datafusion_common::{
     arrow_datafusion_err,
     config::{
         CsvOptions, JsonOptions, ParquetColumnOptions, ParquetOptions,
-        TableParquetOptions,
+        TableParquetOptions, VortexOptions,
     },
     file_options::{csv_writer::CsvWriterOptions, json_writer::JsonWriterOptions},
     parsers::CompressionTypeVariant,
@@ -1178,6 +1178,21 @@ impl TryFrom<&protobuf::JsonOptions> for JsonOptions {
             compression_level: proto_opts.compression_level,
             schema_infer_max_rec: proto_opts.schema_infer_max_rec.map(|h| h as usize),
             newline_delimited: proto_opts.newline_delimited.unwrap_or(true),
+        })
+    }
+}
+
+impl TryFrom<&protobuf::VortexOptions> for VortexOptions {
+    type Error = DataFusionError;
+
+    fn try_from(
+        proto_opts: &protobuf::VortexOptions,
+    ) -> datafusion_common::Result<Self, Self::Error> {
+        Ok(VortexOptions {
+            footer_cache_size_mb: proto_opts.footer_cache_size_mb as usize,
+            segment_cache_size_mb: proto_opts.segment_cache_size_mb as usize,
+            footer_initial_read_size_bytes: proto_opts.footer_initial_read_size_bytes
+                as usize,
         })
     }
 }

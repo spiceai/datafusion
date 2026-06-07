@@ -366,6 +366,17 @@ impl ExecutionPlan for ProjectionExec {
         true
     }
 
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        let child_with_fetch = self.input().with_fetch(limit)?;
+        ProjectionExec::try_new(self.expr().to_vec(), child_with_fetch)
+            .ok()
+            .map(|projection| Arc::new(projection) as Arc<dyn ExecutionPlan>)
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        self.input().fetch()
+    }
+
     fn cardinality_effect(&self) -> CardinalityEffect {
         CardinalityEffect::Equal
     }
@@ -444,7 +455,15 @@ impl ExecutionPlan for ProjectionExec {
 
                     let proj_expr = &self.expr()[col.index()];
 
-                    // Check if projection expression is a simple column
+                    // Guard against stale/mismatched column metadata (e.g. same index
+                    // but different field name). In that case we must not rewrite by
+                    // index only, as it can push down an order on a different column.
+                    if col.name() != proj_expr.alias {
+                        can_pushdown = false;
+                        return Ok(Transformed::no(expr));
+                    }
+
+                    // Check if projection expression is a simple column.
                     // We cannot push down order by clauses that depend on
                     // projected computations as they would have nothing to reference.
                     if let Some(child_col) =

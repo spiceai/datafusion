@@ -365,6 +365,16 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                         alias_name: alias_name.clone(),
                     });
 
+                // Rewrite already-collected Filter node predicates to use the
+                // table alias so they can be properly deduplicated against the
+                // rewritten TableScan filters below.
+                if let Some(ref mut rewriter) = filter_alias_rewriter {
+                    filters = filters
+                        .into_iter()
+                        .map(|expr| expr.rewrite(rewriter).data())
+                        .collect::<Result<IndexSet<_>, _>>()?;
+                }
+
                 // rewrite filters to use table alias if present
                 let table_scan_filters = table_scan
                     .filters
@@ -407,6 +417,27 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
     }
 
     Ok(None)
+}
+
+/// Returns `true` if the expression contains a subquery (scalar, IN, or EXISTS).
+pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::ScalarSubquery(_) | Expr::InSubquery(_) | Expr::Exists(_)
+        ))
+    })
+    .unwrap_or(false)
+}
+
+/// Partitions filters into `(non_subquery, subquery)` based on whether
+/// each filter contains a subquery expression.
+pub(crate) fn partition_subquery_filters(
+    filters: Vec<Expr>,
+) -> (Vec<Expr>, Vec<Expr>) {
+    filters
+        .into_iter()
+        .partition(|f| !expr_contains_subquery(f))
 }
 
 /// Converts a date_part function to SQL, tailoring it to the supported date field extraction style.

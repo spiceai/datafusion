@@ -43,9 +43,11 @@ use datafusion_common::{
 };
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::expressions::CastColumnExpr;
-use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee};
+use datafusion_physical_expr::utils::{
+    Guarantee, LiteralGuarantee, build_balanced_binary_tree, collect_columns,
+};
 use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
-use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
+use datafusion_physical_expr_common::physical_expr::{snapshot_physical_expr, snapshot_physical_expr_opt};
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
@@ -628,7 +630,7 @@ impl PruningPredicate {
 
 /// Builds the return `Vec` for [`PruningPredicate::prune`].
 #[derive(Debug)]
-struct BoolVecBuilder {
+pub struct BoolVecBuilder {
     /// One element per container. Each element is
     /// * `true`: if the container has row that may pass the predicate
     /// * `false`: if the container has rows that DEFINITELY DO NOT pass the predicate
@@ -637,7 +639,7 @@ struct BoolVecBuilder {
 
 impl BoolVecBuilder {
     /// Create a new `BoolVecBuilder` with `num_containers` elements
-    fn new(num_containers: usize) -> Self {
+    pub fn new(num_containers: usize) -> Self {
         Self {
             // assume by default all containers may pass the predicate
             inner: vec![true; num_containers],
@@ -668,7 +670,7 @@ impl BoolVecBuilder {
     ///
     /// # Panics
     /// If `value` is not boolean
-    fn combine_value(&mut self, value: ColumnarValue) {
+    pub fn combine_value(&mut self, value: ColumnarValue) {
         match value {
             ColumnarValue::Array(array) => {
                 self.combine_array(array.as_boolean());
@@ -685,12 +687,12 @@ impl BoolVecBuilder {
     }
 
     /// Convert this builder into a Vec of bools
-    fn build(self) -> Vec<bool> {
+    pub fn build(self) -> Vec<bool> {
         self.inner
     }
 
     /// Check all containers has rows that DEFINITELY DO NOT pass the predicate
-    fn check_all_pruned(&self) -> bool {
+    pub fn check_all_pruned(&self) -> bool {
         self.inner.iter().all(|&x| !x)
     }
 }
@@ -913,7 +915,7 @@ impl From<Vec<(phys_expr::Column, StatisticsType, Field)>> for RequiredColumns {
 /// -------+--------
 ///   5    | 1000
 /// ```
-fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
+pub fn build_statistics_record_batch<S: PruningStatistics + ?Sized>(
     statistics: &S,
     required_columns: &RequiredColumns,
 ) -> Result<RecordBatch> {
@@ -1474,7 +1476,8 @@ fn build_predicate_expression(
             } else {
                 Operator::Or
             };
-            let change_expr = in_list
+            // Build individual equality/inequality expressions
+            let eq_exprs: Vec<Arc<dyn PhysicalExpr>> = in_list
                 .list()
                 .iter()
                 .map(|e| {
@@ -1484,8 +1487,12 @@ fn build_predicate_expression(
                         Arc::clone(e),
                     )) as _
                 })
-                .reduce(|a, b| Arc::new(phys_expr::BinaryExpr::new(a, re_op, b)) as _)
-                .unwrap();
+                .collect();
+            // Build a balanced tree to avoid deep recursion during evaluation
+            let Some(change_expr) = build_balanced_binary_tree(re_op, eq_exprs) else {
+                unreachable!("list is not empty, so this should always return Some");
+            };
+
             return build_predicate_expression(
                 &change_expr,
                 schema,
@@ -1944,7 +1951,7 @@ fn wrap_null_count_check_expr(
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub(crate) enum StatisticsType {
+pub enum StatisticsType {
     Min,
     Max,
     NullCount,
@@ -5440,5 +5447,95 @@ mod tests {
         let expected =
             "c1_null_count@2 != row_count@3 AND c1_min@0 <= a AND a <= c1_max@1";
         assert_eq!(res.to_string(), expected);
+    }
+
+    /// Helper to calculate the depth of a physical expression tree
+    fn expr_tree_depth(expr: &Arc<dyn PhysicalExpr>) -> usize {
+        if let Some(binary) = expr.as_any().downcast_ref::<phys_expr::BinaryExpr>() {
+            1 + std::cmp::max(
+                expr_tree_depth(binary.left()),
+                expr_tree_depth(binary.right()),
+            )
+        } else {
+            1
+        }
+    }
+
+    #[test]
+    fn test_in_list_balanced_tree_depth() {
+        // Test that InList expressions produce balanced trees with O(log n) depth
+        // rather than O(n) depth to avoid stack overflow during evaluation
+        let schema = Schema::new(vec![Field::new("c1", DataType::Int32, false)]);
+
+        // Test with MAX_LIST_VALUE_SIZE_REWRITE (20) elements
+        let expr = Expr::InList(InList::new(
+            Box::new(col("c1")),
+            (1..=20).map(lit).collect(),
+            false,
+        ));
+        let predicate_expr =
+            test_build_predicate_expression(&expr, &schema, &mut RequiredColumns::new());
+
+        let depth = expr_tree_depth(&predicate_expr);
+        // With 20 elements, balanced tree should have depth around log2(20) + some constants
+        // for the inner expressions. A linear tree would have depth proportional to 20.
+        // The actual depth depends on the structure of inner expressions too.
+        // For a balanced OR tree of 20 items, max depth should be around 5-6 for the OR nodes
+        // plus the depth of individual expressions.
+        // Let's verify it's not linear (which would be > 20)
+        assert!(
+            depth < 20,
+            "Expected balanced tree depth < 20, got {depth}. Tree may not be balanced."
+        );
+    }
+
+    #[test]
+    fn test_in_list_logical_equivalence() -> Result<()> {
+        // Verify that the balanced tree produces the same pruning results as expected
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("c1", DataType::Int32, false)]));
+
+        // Test c1 IN (1, 2, 3, 4, 5)
+        let expr = col("c1").in_list(vec![lit(1), lit(2), lit(3), lit(4), lit(5)], false);
+
+        // Statistics where c1 is between 0 and 2 (should NOT be pruned - contains 1, 2)
+        let statistics1 = TestStatistics::new().with(
+            "c1",
+            ContainerStats::new_i32(vec![Some(0)], vec![Some(2)])
+                .with_null_counts(vec![Some(0)])
+                .with_row_counts(vec![Some(100)]),
+        );
+
+        // Statistics where c1 is between 10 and 20 (should be pruned - contains none of 1,2,3,4,5)
+        let statistics2 = TestStatistics::new().with(
+            "c1",
+            ContainerStats::new_i32(vec![Some(10)], vec![Some(20)])
+                .with_null_counts(vec![Some(0)])
+                .with_row_counts(vec![Some(100)]),
+        );
+
+        // Create the pruning predicate
+        let physical_expr = logical2physical(&expr, &schema);
+        let pruning_predicate = PruningPredicate::try_new(physical_expr, schema)?;
+
+        // Test pruning results
+        let result1 = pruning_predicate.prune(&statistics1)?;
+        let result2 = pruning_predicate.prune(&statistics2)?;
+
+        // First container should NOT be pruned (true = may contain matching rows)
+        assert_eq!(
+            result1,
+            vec![true],
+            "Container with values 0-2 should not be pruned for IN (1,2,3,4,5)"
+        );
+
+        // Second container SHOULD be pruned (false = definitely no matching rows)
+        assert_eq!(
+            result2,
+            vec![false],
+            "Container with values 10-20 should be pruned for IN (1,2,3,4,5)"
+        );
+
+        Ok(())
     }
 }

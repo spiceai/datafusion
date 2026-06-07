@@ -122,6 +122,28 @@ pub trait Dialect: Send + Sync {
         ast::DataType::Timestamp(None, tz_info)
     }
 
+    /// How to unparse a cast that attaches a specific timezone to a timestamp —
+    /// the logical-plan form `CAST(expr AS Timestamp(_, Some(tz)))` that
+    /// DataFusion produces for `expr AT TIME ZONE 'tz'`.
+    ///
+    /// `input` is the already-unparsed inner expression and `tz` is the
+    /// timezone name (e.g. `"America/Los_Angeles"`, `"UTC"`, `"+00:00"`).
+    ///
+    /// Returning `Some(_)` replaces the default cast rendering produced by
+    /// [`Self::timestamp_cast_dtype`], which collapses a named zone down to a
+    /// bare `TIMESTAMP WITH TIME ZONE` and silently drops the zone — yielding
+    /// SQL whose meaning depends on the remote engine's session timezone.
+    /// Returning `None` falls back to that legacy cast rendering.
+    ///
+    /// The default emits the SQL-standard `input AT TIME ZONE 'tz'`.
+    fn timestamp_at_time_zone_to_sql(
+        &self,
+        input: ast::Expr,
+        tz: &str,
+    ) -> Option<ast::Expr> {
+        Some(at_time_zone_to_ast(input, tz))
+    }
+
     /// The SQL type to use for Arrow Date32 unparsing
     /// Most dialects use Date, but some, like SQLite require TEXT
     fn date32_cast_dtype(&self) -> ast::DataType {
@@ -248,6 +270,23 @@ pub trait Dialect: Send + Sync {
     fn supports_empty_select_list(&self) -> bool {
         false
     }
+
+    /// Whether the dialect supports subquery expressions (scalar subqueries,
+    /// `IN` subqueries, `EXISTS`) inside `JOIN ON` predicates.
+    ///
+    /// When `false` and the join is an inner join, subquery-containing filter
+    /// predicates are moved from the `ON` clause to the `WHERE` clause, which
+    /// is semantically equivalent for inner joins.
+    ///
+    /// For non-inner joins (LEFT, RIGHT, FULL) when this returns `false`, the
+    /// unparser returns an error (not currently supported)
+    ///
+    /// # Default
+    ///
+    /// Returns `true` — most SQL backends accept subqueries in `JOIN ON`.
+    fn supports_subquery_in_join_predicate(&self) -> bool {
+        true
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -288,6 +327,85 @@ pub enum DateFieldExtractStyle {
 pub enum CharacterLengthStyle {
     Length,
     CharacterLength,
+}
+
+/// How a [`Dialect`] renders a cast that attaches a specific timezone to a
+/// timestamp. DataFusion lowers `expr AT TIME ZONE 'tz'` to
+/// `CAST(expr AS Timestamp(_, Some(tz)))`; this selects how that cast is
+/// unparsed back to SQL so the zone name is not silently dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TimezoneCastStyle {
+    /// SQL-standard `expr AT TIME ZONE 'tz'` (PostgreSQL, DuckDB).
+    AtTimeZone,
+    /// `CAST(CONVERT_TIMEZONE('tz', expr) AS TIMESTAMP_NTZ)` (Snowflake).
+    ///
+    /// Not Amazon Redshift: Redshift's 2-arg `CONVERT_TIMEZONE(source_tz, ts)`
+    /// reads the first argument as the *source* zone and converts to the session
+    /// zone, whereas this emits the target zone as the first argument (Snowflake
+    /// semantics), so the rendered SQL would mean something different on Redshift.
+    ConvertTimezone,
+    /// Legacy `CAST(expr AS <timestamp_tz_cast_dtype>)`, which drops the zone
+    /// name. Preserves the pre-fix behavior for callers that opt out.
+    Cast,
+}
+
+/// Build the AST for `input AT TIME ZONE 'tz'`.
+pub(crate) fn at_time_zone_to_ast(input: ast::Expr, tz: &str) -> ast::Expr {
+    ast::Expr::AtTimeZone {
+        timestamp: Box::new(input),
+        time_zone: Box::new(ast::Expr::value(ast::Value::SingleQuotedString(
+            tz.to_string(),
+        ))),
+    }
+}
+
+/// Build the AST for `CAST(CONVERT_TIMEZONE('tz', input) AS TIMESTAMP_NTZ)`
+/// (Snowflake).
+///
+/// The result is cast to a naive `TIMESTAMP_NTZ` (the wall-clock in `tz`) on
+/// purpose. DataFusion's `expr AT TIME ZONE 'tz'` is typically compared against
+/// a naive timestamp literal, and that comparison is wall-clock based. If this
+/// returned a `TIMESTAMP_TZ` instead, Snowflake would coerce the naive literal
+/// using the session `TIMEZONE`, reintroducing a session-dependent skew (the
+/// original bug). Keeping the result naive makes the comparison
+/// `TIMESTAMP_NTZ` vs `TIMESTAMP_NTZ`, i.e. wall-clock vs wall-clock.
+///
+/// For a nested chain (`x AT TIME ZONE 'A' AT TIME ZONE 'B'`) the inner result
+/// is already `TIMESTAMP_NTZ`; the outer `CONVERT_TIMEZONE` then interprets it
+/// as local time in the session zone, so the connection's session `TIMEZONE`
+/// must be pinned to `UTC` for the chain to compose to the intended instant.
+pub(crate) fn convert_timezone_to_ast(input: ast::Expr, tz: &str) -> ast::Expr {
+    let convert = ast::Expr::Function(Function {
+        name: ObjectName::from(vec![Ident::new("CONVERT_TIMEZONE")]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(ast::Expr::value(
+                    ast::Value::SingleQuotedString(tz.to_string()),
+                ))),
+                ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(input)),
+            ],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+    // Cast to naive TIMESTAMP_NTZ so a comparison against a naive literal stays
+    // wall-clock based and session-TIMEZONE independent for the value.
+    ast::Expr::Cast {
+        kind: ast::CastKind::Cast,
+        expr: Box::new(convert),
+        data_type: ast::DataType::Custom(
+            ObjectName::from(vec![Ident::new("TIMESTAMP_NTZ")]),
+            vec![],
+        ),
+        array: false,
+        format: None,
+    }
 }
 
 pub struct DefaultDialect {}
@@ -517,6 +635,15 @@ impl Dialect for MySqlDialect {
         ast::DataType::Datetime(None)
     }
 
+    fn timestamp_at_time_zone_to_sql(
+        &self,
+        _input: ast::Expr,
+        _tz: &str,
+    ) -> Option<ast::Expr> {
+        // MySQL has no `AT TIME ZONE` operator; keep the legacy DATETIME cast.
+        None
+    }
+
     fn requires_derived_table_alias(&self) -> bool {
         true
     }
@@ -570,6 +697,15 @@ impl Dialect for SqliteDialect {
         ast::DataType::Text
     }
 
+    fn timestamp_at_time_zone_to_sql(
+        &self,
+        _input: ast::Expr,
+        _tz: &str,
+    ) -> Option<ast::Expr> {
+        // SQLite has no `AT TIME ZONE` operator; keep the legacy TEXT cast.
+        None
+    }
+
     fn scalar_function_to_sql_overrides(
         &self,
         unparser: &Unparser,
@@ -621,8 +757,62 @@ impl Dialect for BigQueryDialect {
         }
     }
 
+    fn float64_ast_dtype(&self) -> ast::DataType {
+        ast::DataType::Float64
+    }
+
+    fn date_field_extract_style(&self) -> DateFieldExtractStyle {
+        DateFieldExtractStyle::Extract
+    }
+
+    fn interval_style(&self) -> IntervalStyle {
+        IntervalStyle::SQLStandard
+    }
+
+    fn scalar_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        if func_name == "date_part" {
+            return date_part_to_sql(unparser, self.date_field_extract_style(), args);
+        }
+
+        Ok(None)
+    }
+
     fn unnest_as_table_factor(&self) -> bool {
         true
+    }
+
+    fn supports_column_alias_in_table_alias(&self) -> bool {
+        false
+    }
+
+    fn supports_subquery_in_join_predicate(&self) -> bool {
+        false
+    }
+
+    fn timestamp_at_time_zone_to_sql(
+        &self,
+        _input: ast::Expr,
+        _tz: &str,
+    ) -> Option<ast::Expr> {
+        // BigQuery has no `AT TIME ZONE` operator; keep the legacy cast.
+        None
+    }
+
+    fn timestamp_with_tz_to_string(&self, dt: DateTime<Tz>, unit: TimeUnit) -> String {
+        // https://docs.cloud.google.com/bigquery/docs/reference/standard-sql/data-types#timestamp_type
+        let format = match unit {
+            TimeUnit::Second => "%Y-%m-%d %H:%M:%S%:z",
+            TimeUnit::Millisecond => "%Y-%m-%d %H:%M:%S%.3f%:z",
+            TimeUnit::Microsecond => "%Y-%m-%d %H:%M:%S%.6f%:z",
+            TimeUnit::Nanosecond => "%Y-%m-%d %H:%M:%S%.9f%:z",
+        };
+
+        dt.format(format).to_string()
     }
 }
 
@@ -654,6 +844,8 @@ pub struct CustomDialect {
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
     unnest_as_table_factor: bool,
+    supports_subquery_in_join_predicate: bool,
+    timezone_cast_style: TimezoneCastStyle,
 }
 
 impl Default for CustomDialect {
@@ -682,6 +874,8 @@ impl Default for CustomDialect {
             window_func_support_window_frame: true,
             full_qualified_col: false,
             unnest_as_table_factor: false,
+            supports_subquery_in_join_predicate: true,
+            timezone_cast_style: TimezoneCastStyle::Cast,
         }
     }
 }
@@ -743,6 +937,20 @@ impl Dialect for CustomDialect {
         }
     }
 
+    fn timestamp_at_time_zone_to_sql(
+        &self,
+        input: ast::Expr,
+        tz: &str,
+    ) -> Option<ast::Expr> {
+        match self.timezone_cast_style {
+            TimezoneCastStyle::AtTimeZone => Some(at_time_zone_to_ast(input, tz)),
+            TimezoneCastStyle::ConvertTimezone => {
+                Some(convert_timezone_to_ast(input, tz))
+            }
+            TimezoneCastStyle::Cast => None,
+        }
+    }
+
     fn date32_cast_dtype(&self) -> ast::DataType {
         self.date32_cast_dtype.clone()
     }
@@ -792,6 +1000,10 @@ impl Dialect for CustomDialect {
     fn unnest_as_table_factor(&self) -> bool {
         self.unnest_as_table_factor
     }
+
+    fn supports_subquery_in_join_predicate(&self) -> bool {
+        self.supports_subquery_in_join_predicate
+    }
 }
 
 /// `CustomDialectBuilder` to build `CustomDialect` using builder pattern
@@ -829,6 +1041,8 @@ pub struct CustomDialectBuilder {
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
     unnest_as_table_factor: bool,
+    supports_subquery_in_join_predicate: bool,
+    timezone_cast_style: TimezoneCastStyle,
 }
 
 impl Default for CustomDialectBuilder {
@@ -863,6 +1077,8 @@ impl CustomDialectBuilder {
             window_func_support_window_frame: true,
             full_qualified_col: false,
             unnest_as_table_factor: false,
+            supports_subquery_in_join_predicate: true,
+            timezone_cast_style: TimezoneCastStyle::Cast,
         }
     }
 
@@ -889,6 +1105,9 @@ impl CustomDialectBuilder {
             window_func_support_window_frame: self.window_func_support_window_frame,
             full_qualified_col: self.full_qualified_col,
             unnest_as_table_factor: self.unnest_as_table_factor,
+            supports_subquery_in_join_predicate: self
+                .supports_subquery_in_join_predicate,
+            timezone_cast_style: self.timezone_cast_style,
         }
     }
 
@@ -984,6 +1203,15 @@ impl CustomDialectBuilder {
         self
     }
 
+    /// Customize how a cast that attaches a timezone to a timestamp is rendered
+    /// (the lowering of `expr AT TIME ZONE 'tz'`). Defaults to
+    /// [`TimezoneCastStyle::Cast`], which preserves the legacy zone-dropping
+    /// `CAST(... AS TIMESTAMP WITH TIME ZONE)` behavior.
+    pub fn with_timezone_cast_style(mut self, style: TimezoneCastStyle) -> Self {
+        self.timezone_cast_style = style;
+        self
+    }
+
     pub fn with_date32_cast_dtype(mut self, date32_cast_dtype: ast::DataType) -> Self {
         self.date32_cast_dtype = date32_cast_dtype;
         self
@@ -1027,6 +1255,17 @@ impl CustomDialectBuilder {
 
     pub fn with_unnest_as_table_factor(mut self, unnest_as_table_factor: bool) -> Self {
         self.unnest_as_table_factor = unnest_as_table_factor;
+        self
+    }
+
+    /// Customize whether the dialect supports subquery expressions inside
+    /// `JOIN ON` predicates.
+    pub fn with_supports_subquery_in_join_predicate(
+        mut self,
+        supports_subquery_in_join_predicate: bool,
+    ) -> Self {
+        self.supports_subquery_in_join_predicate =
+            supports_subquery_in_join_predicate;
         self
     }
 }

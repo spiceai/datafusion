@@ -23,12 +23,13 @@ use super::{
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        rewrite_plan_for_sort_on_non_projected_fields,
+        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
     utils::{
         find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters,
+        find_window_nodes_within_select, partition_subquery_filters,
+        try_transform_to_simple_table_scan_with_filters,
         unproject_sort_expr, unproject_unnest_expr, unproject_window_exprs,
     },
 };
@@ -216,9 +217,69 @@ impl Unparser<'_> {
             )]);
         }
 
+        // Construct a list of all the identifiers present in query sources
+        let mut all_idents = Vec::new();
+        if let Some(source_alias) = relation_builder.get_alias() {
+            all_idents.push(source_alias);
+        } else if let Some(source_name) = relation_builder.get_name() {
+            all_idents.push(source_name);
+        }
+
         let mut twj = select_builder.pop_from().unwrap();
+        twj.get_joins()
+            .iter()
+            .for_each(|join| match &join.relation {
+                ast::TableFactor::Table { alias, name, .. } => {
+                    if let Some(alias) = alias {
+                        all_idents.push(alias.name.to_string());
+                    } else {
+                        all_idents.push(name.to_string());
+                    }
+                }
+                ast::TableFactor::Derived { alias, .. } => {
+                    if let Some(alias) = alias {
+                        all_idents.push(alias.name.to_string());
+                    }
+                }
+                _ => {}
+            });
+
         twj.relation(relation_builder);
         select_builder.push_from(twj);
+
+        // Ensure that the projection contains references to sources that actually exist
+        let mut projection = select_builder.get_projection();
+        projection
+            .iter_mut()
+            .for_each(|select_item| match select_item {
+                ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) => {
+                    remove_dangling_identifiers(idents, &all_idents);
+                }
+                _ => {}
+            });
+
+        // Check the order by as well
+        if let Some(query) = query.as_mut() {
+            if let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by() {
+                order_by.iter_mut().for_each(|sort_item| {
+                    if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
+                        remove_dangling_identifiers(idents, &all_idents);
+                    }
+                });
+
+                query.order_by(OrderByKind::Expressions(order_by));
+            }
+        }
+
+        // Order by could be a sort in the select builder
+        let mut sort = select_builder.get_sort_by();
+        sort.iter_mut().for_each(|sort_item| {
+            if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
+                remove_dangling_identifiers(idents, &all_idents);
+            }
+        });
+
+        select_builder.projection(projection);
 
         Ok(SetExpr::Select(Box::new(select_builder.build()?)))
     }
@@ -681,12 +742,42 @@ impl Unparser<'_> {
                     &mut right_relation,
                 )?;
 
-                let join_filters = if table_scan_filters.is_empty() {
+                // When the dialect does not support subqueries inside JOIN ON
+                // predicates, separate subquery-containing filters from simple
+                // ones. For inner joins, subquery filters move to WHERE
+                // (semantically equivalent). For non-inner joins, return an
+                // error since moving to WHERE would change join semantics.
+                let (on_filters, where_filters): (Vec<_>, Vec<_>) =
+                    if self.dialect.supports_subquery_in_join_predicate() {
+                        (table_scan_filters, vec![])
+                    } else {
+                        let (simple, subquery) =
+                            partition_subquery_filters(table_scan_filters);
+
+                        if !subquery.is_empty()
+                            && join.join_type != JoinType::Inner
+                        {
+                            return not_impl_err!(
+                                "Subqueries in JOIN ON predicates are not supported for {} joins by this dialect",
+                                join.join_type
+                            );
+                        }
+
+                        (simple, subquery)
+                    };
+
+                // Move subquery-containing filters to WHERE for inner joins
+                for filter in where_filters {
+                    let filter_expr = self.expr_to_sql(&filter)?;
+                    select.selection(Some(filter_expr));
+                }
+
+                let join_filters = if on_filters.is_empty() {
                     join.filter.clone()
                 } else {
-                    // Combine `table_scan_filters` into a single filter using `AND`
+                    // Combine `on_filters` into a single filter using `AND`
                     let Some(combined_filters) =
-                        table_scan_filters.into_iter().reduce(|acc, filter| {
+                        on_filters.into_iter().reduce(|acc, filter| {
                             Expr::BinaryExpr(BinaryExpr {
                                 left: Box::new(acc),
                                 op: Operator::And,
@@ -1175,6 +1266,43 @@ impl Unparser<'_> {
                     return Ok(Some(plan));
                 }
                 Ok(ret)
+            }
+            // Handle Filter between SubqueryAlias and TableScan (e.g. Inexact/Unsupported
+            // filter pushdown). Rewrite predicate column references to use the alias.
+            // Skip predicates with subquery expressions — TableAliasRewriter
+            // cannot rewrite OuterReferenceColumn inside subquery LogicalPlans.
+            // Returning None lets the caller wrap the plan as a derived table,
+            // preserving the original table name for outer references and generate correct SQL.
+            LogicalPlan::Filter(filter) => {
+                if filter.predicate.exists(|e| {
+                    Ok(matches!(
+                        e,
+                        Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+                    ))
+                })? {
+                    return Ok(None);
+                }
+
+                if let Some(plan) = self.unparse_table_scan_pushdown(
+                    &filter.input,
+                    alias.clone(),
+                    already_projected,
+                )? {
+                    let predicate = if let Some(ref alias_name) = alias {
+                        let mut rewriter = TableAliasRewriter {
+                            table_schema: plan.schema().as_arrow(),
+                            alias_name: alias_name.clone(),
+                        };
+                        filter.predicate.clone().rewrite(&mut rewriter).data()?
+                    } else {
+                        filter.predicate.clone()
+                    };
+                    Ok(Some(
+                        LogicalPlanBuilder::from(plan).filter(predicate)?.build()?,
+                    ))
+                } else {
+                    Ok(None)
+                }
             }
             // SubqueryAlias could be rewritten to a plan with a projection as the top node by [rewrite::subquery_alias_inner_query_and_columns].
             // The inner table scan could be a scan with pushdown operations.
