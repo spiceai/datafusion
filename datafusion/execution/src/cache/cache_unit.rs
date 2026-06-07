@@ -46,50 +46,48 @@ fn normalize_optional_string(opt: &Option<String>) -> Option<&str> {
 /// versioning enabled) where a new version of an object can share the same size
 /// and last-modified timestamp.
 ///
-/// Logic:
-/// - If BOTH version and e_tag are absent (None or empty) in both -> same file
-///   (no versioning information available)
-/// - If version is present in BOTH and matches -> same file
-/// - If e_tag is present in BOTH and matches -> same file
-/// - If version is present in one but not the other -> different file
-/// - If e_tag is present in one but not the other -> different file
-/// - Otherwise -> different file
+/// Logic (in priority order):
+/// - If `version` is present (non-empty) in BOTH, it is authoritative: same file
+///   iff the versions are equal. A difference in `e_tag` presence/value is
+///   ignored in this case, because the object store has already told us the
+///   definitive version identity.
+/// - Otherwise, if `version` presence differs (one side has it, the other does
+///   not) -> different file (one read saw a versioned object, the other didn't).
+/// - Otherwise (neither side has a usable `version`), fall back to `e_tag`:
+///     - both present and equal -> same file
+///     - both present and different -> different file
+///     - presence differs -> different file
+/// - If neither `version` nor `e_tag` is available on either side -> same file
+///   (no versioning information to distinguish them).
+///
+/// Empty strings are normalized to "absent" (see [`normalize_optional_string`]).
 pub(crate) fn is_same_file_version(cached: &ObjectMeta, current: &ObjectMeta) -> bool {
     let cached_version = normalize_optional_string(&cached.version);
     let current_version = normalize_optional_string(&current.version);
     let cached_etag = normalize_optional_string(&cached.e_tag);
     let current_etag = normalize_optional_string(&current.e_tag);
 
-    // Both version and etag are absent in both - no versioning info available, consider same.
-    if cached_version.is_none()
-        && current_version.is_none()
-        && cached_etag.is_none()
-        && current_etag.is_none()
-    {
-        return true;
-    }
-
-    // Check if version or etag presence differs (one has it, other doesn't) - different files.
-    if (cached_version.is_some() != current_version.is_some())
-        || (cached_etag.is_some() != current_etag.is_some())
-    {
-        return false;
-    }
-
-    // If version is present in BOTH, it is the authoritative check.
+    // `version`, when present on BOTH sides, is authoritative and decides on its
+    // own. e_tag presence/value differences must not force invalidation here.
     if let (Some(cv), Some(curv)) = (cached_version, current_version) {
         return cv == curv;
     }
 
-    // If etag is present in BOTH and matches, files are the same.
-    if let (Some(ce), Some(cure)) = (cached_etag, current_etag) {
-        if ce == cure {
-            return true;
-        }
+    // `version` could not decide. If its presence differs, the two reads
+    // disagree on whether the object is versioned -> treat as different files.
+    if cached_version.is_some() != current_version.is_some() {
+        return false;
     }
 
-    // Otherwise, files are different.
-    false
+    // Neither side has a usable `version`; fall back to `e_tag` semantics.
+    match (cached_etag, current_etag) {
+        // Both present: same file iff the e_tags match.
+        (Some(ce), Some(cure)) => ce == cure,
+        // e_tag presence differs -> different files.
+        (Some(_), None) | (None, Some(_)) => false,
+        // No versioning information available at all -> consider same file.
+        (None, None) => true,
+    }
 }
 
 /// Default implementation of [`FileStatisticsCache`]
@@ -192,6 +190,106 @@ mod tests {
             e_tag: None,
             version: None,
         }
+    }
+
+    /// Build an [`ObjectMeta`] with the given optional `version` and `e_tag`.
+    /// Empty strings are passed through verbatim to exercise the empty-string
+    /// normalization in [`is_same_file_version`].
+    fn meta_with_version_etag(version: Option<&str>, e_tag: Option<&str>) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from("test"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: e_tag.map(str::to_string),
+            version: version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_is_same_file_version_both_none() {
+        // No versioning info on either side -> same file.
+        let cached = meta_with_version_etag(None, None);
+        let current = meta_with_version_etag(None, None);
+        assert!(is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_empty_string_normalization() {
+        // Empty strings are treated as absent, so empty/None on both sides ->
+        // same file (no versioning info), and empty == None is indistinguishable.
+        let cached = meta_with_version_etag(Some(""), Some(""));
+        let current = meta_with_version_etag(None, None);
+        assert!(is_same_file_version(&cached, &current));
+
+        // An empty `version` must not be treated as an authoritative match
+        // against a real version; it normalizes to "absent" and the present
+        // version on the other side forces a difference.
+        let cached_empty = meta_with_version_etag(Some(""), None);
+        let current_v = meta_with_version_etag(Some("v2"), None);
+        assert!(!is_same_file_version(&cached_empty, &current_v));
+    }
+
+    #[test]
+    fn test_is_same_file_version_version_match_etag_one_side() {
+        // Versions present and equal on both sides: `version` is authoritative,
+        // so e_tag presence differing on one side must NOT force invalidation.
+        let cached = meta_with_version_etag(Some("v1"), None);
+        let current = meta_with_version_etag(Some("v1"), Some("etag-current"));
+        assert!(is_same_file_version(&cached, &current));
+
+        let cached = meta_with_version_etag(Some("v1"), Some("etag-cached"));
+        let current = meta_with_version_etag(Some("v1"), None);
+        assert!(is_same_file_version(&cached, &current));
+
+        // Versions present and equal but e_tags differ on both sides ->
+        // still the same file (version wins over a stale/changed e_tag).
+        let cached = meta_with_version_etag(Some("v1"), Some("etag-a"));
+        let current = meta_with_version_etag(Some("v1"), Some("etag-b"));
+        assert!(is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_version_mismatch() {
+        // Versions present on both sides but different -> different file,
+        // regardless of e_tag.
+        let cached = meta_with_version_etag(Some("v1"), Some("same-etag"));
+        let current = meta_with_version_etag(Some("v2"), Some("same-etag"));
+        assert!(!is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_version_presence_differs() {
+        // `version` present on one side only -> different file (the reads
+        // disagree on whether the object is versioned).
+        let cached = meta_with_version_etag(Some("v1"), None);
+        let current = meta_with_version_etag(None, None);
+        assert!(!is_same_file_version(&cached, &current));
+
+        // Even with a matching e_tag, a one-sided version still invalidates.
+        let cached = meta_with_version_etag(Some("v1"), Some("etag"));
+        let current = meta_with_version_etag(None, Some("etag"));
+        assert!(!is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_etag_only() {
+        // No versions on either side: fall back to e_tag.
+        // Matching e_tag -> same file.
+        let cached = meta_with_version_etag(None, Some("etag-1"));
+        let current = meta_with_version_etag(None, Some("etag-1"));
+        assert!(is_same_file_version(&cached, &current));
+
+        // Mismatched e_tag with no versions -> different file.
+        let cached = meta_with_version_etag(None, Some("etag-1"));
+        let current = meta_with_version_etag(None, Some("etag-2"));
+        assert!(!is_same_file_version(&cached, &current));
+
+        // e_tag presence differs (no versions) -> different file.
+        let cached = meta_with_version_etag(None, Some("etag-1"));
+        let current = meta_with_version_etag(None, None);
+        assert!(!is_same_file_version(&cached, &current));
     }
 
     #[test]

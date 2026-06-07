@@ -124,8 +124,15 @@ pub struct PartitionColumnIndex {
 /// per-file literal value from the file's [`object_store::ObjectMeta`].
 #[derive(Debug, Clone)]
 pub struct MetadataColumnIndex {
-    /// The index of this metadata column in the remainder projection
-    /// (>= num_file_columns + num_partition_columns)
+    /// The index of this metadata column in the remainder projection.
+    ///
+    /// Metadata and partition columns share a single contiguous remainder range
+    /// that begins at `num_file_columns` (the number of *projected* file
+    /// columns), ordered by ascending table-schema index. The index is
+    /// therefore `>= num_file_columns`; it is *not* necessarily
+    /// `>= num_file_columns + num_partition_columns`, because partition columns
+    /// that are not projected do not occupy a slot. With no projected partition
+    /// columns a metadata column can sit at `num_file_columns`.
     pub in_remainder_projection: usize,
     /// The metadata column definition used to compute the literal value.
     pub metadata_col: MetadataColumn,
