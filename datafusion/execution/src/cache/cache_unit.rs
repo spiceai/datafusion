@@ -23,9 +23,74 @@ use crate::cache::cache_manager::{
 };
 
 use dashmap::DashMap;
+use object_store::ObjectMeta;
 use object_store::path::Path;
 
 pub use crate::cache::DefaultFilesMetadataCache;
+
+/// Helper function to normalize an optional string (treats empty strings as `None`).
+fn normalize_optional_string(opt: &Option<String>) -> Option<&str> {
+    match opt {
+        Some(s) if !s.is_empty() => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Check if two [`ObjectMeta`] represent the same file version.
+///
+/// Returns `true` if the files are considered the same version, `false` otherwise.
+///
+/// Unlike a plain `size` + `last_modified` comparison, this also takes the
+/// object `version` and `e_tag` into account, which is required to correctly
+/// invalidate cache entries for versioned object stores (e.g. S3 with object
+/// versioning enabled) where a new version of an object can share the same size
+/// and last-modified timestamp.
+///
+/// Logic:
+/// - If BOTH version and e_tag are absent (None or empty) in both -> same file
+///   (no versioning information available)
+/// - If version is present in BOTH and matches -> same file
+/// - If e_tag is present in BOTH and matches -> same file
+/// - If version is present in one but not the other -> different file
+/// - If e_tag is present in one but not the other -> different file
+/// - Otherwise -> different file
+pub(crate) fn is_same_file_version(cached: &ObjectMeta, current: &ObjectMeta) -> bool {
+    let cached_version = normalize_optional_string(&cached.version);
+    let current_version = normalize_optional_string(&current.version);
+    let cached_etag = normalize_optional_string(&cached.e_tag);
+    let current_etag = normalize_optional_string(&current.e_tag);
+
+    // Both version and etag are absent in both - no versioning info available, consider same.
+    if cached_version.is_none()
+        && current_version.is_none()
+        && cached_etag.is_none()
+        && current_etag.is_none()
+    {
+        return true;
+    }
+
+    // Check if version or etag presence differs (one has it, other doesn't) - different files.
+    if (cached_version.is_some() != current_version.is_some())
+        || (cached_etag.is_some() != current_etag.is_some())
+    {
+        return false;
+    }
+
+    // If version is present in BOTH, it is the authoritative check.
+    if let (Some(cv), Some(curv)) = (cached_version, current_version) {
+        return cv == curv;
+    }
+
+    // If etag is present in BOTH and matches, files are the same.
+    if let (Some(ce), Some(cure)) = (cached_etag, current_etag) {
+        if ce == cure {
+            return true;
+        }
+    }
+
+    // Otherwise, files are different.
+    false
+}
 
 /// Default implementation of [`FileStatisticsCache`]
 ///
