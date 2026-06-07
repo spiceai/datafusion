@@ -1081,7 +1081,7 @@ pub mod table_reference {
 pub struct PhysicalPlanNode {
     #[prost(
         oneof = "physical_plan_node::PhysicalPlanType",
-        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36"
+        tags = "1, 2, 3, 4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38"
     )]
     pub physical_plan_type: ::core::option::Option<physical_plan_node::PhysicalPlanType>,
 }
@@ -1161,6 +1161,10 @@ pub mod physical_plan_node {
         MemoryScan(super::MemoryScanExecNode),
         #[prost(message, tag = "36")]
         AsyncFunc(::prost::alloc::boxed::Box<super::AsyncFuncExecNode>),
+        #[prost(message, tag = "37")]
+        Buffer(::prost::alloc::boxed::Box<super::BufferExecNode>),
+        #[prost(message, tag = "38")]
+        ArrowScan(super::ArrowScanExecNode),
     }
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1188,6 +1192,9 @@ pub struct FileSinkConfig {
     pub insert_op: i32,
     #[prost(string, tag = "11")]
     pub file_extension: ::prost::alloc::string::String,
+    /// Determines how the output path is interpreted.
+    #[prost(enumeration = "FileOutputMode", tag = "12")]
+    pub file_output_mode: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct JsonSink {
@@ -1279,6 +1286,14 @@ pub struct PhysicalExtensionNode {
 /// physical expressions
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PhysicalExprNode {
+    /// Unique identifier for this expression to do deduplication during deserialization.
+    /// When serializing, this is set to a unique identifier for each combination of
+    /// expression, process and serialization run.
+    /// When deserializing, if this ID has been seen before, the cached Arc is returned
+    /// instead of creating a new one, enabling reconstruction of referential integrity
+    /// across serde roundtrips.
+    #[prost(uint64, optional, tag = "30")]
+    pub expr_id: ::core::option::Option<u64>,
     #[prost(
         oneof = "physical_expr_node::ExprType",
         tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 18, 19, 20, 21"
@@ -1548,6 +1563,10 @@ pub struct FilterExecNode {
     pub default_filter_selectivity: u32,
     #[prost(uint32, repeated, tag = "9")]
     pub projection: ::prost::alloc::vec::Vec<u32>,
+    #[prost(uint32, tag = "10")]
+    pub batch_size: u32,
+    #[prost(uint32, optional, tag = "11")]
+    pub fetch: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FileGroup {
@@ -1656,6 +1675,11 @@ pub struct AvroScanExecNode {
     pub base_conf: ::core::option::Option<FileScanExecConf>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ArrowScanExecNode {
+    #[prost(message, optional, tag = "1")]
+    pub base_conf: ::core::option::Option<FileScanExecConf>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MemoryScanExecNode {
     #[prost(bytes = "vec", repeated, tag = "1")]
     pub partitions: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
@@ -1693,6 +1717,8 @@ pub struct HashJoinExecNode {
     pub filter: ::core::option::Option<JoinFilter>,
     #[prost(uint32, repeated, tag = "9")]
     pub projection: ::prost::alloc::vec::Vec<u32>,
+    #[prost(bool, tag = "10")]
+    pub null_aware: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SymmetricHashJoinExecNode {
@@ -1835,6 +1861,9 @@ pub struct AggLimit {
     /// wrap into a message to make it optional
     #[prost(uint64, tag = "1")]
     pub limit: u64,
+    /// Optional ordering direction for TopK aggregation (true = descending, false = ascending)
+    #[prost(bool, optional, tag = "2")]
+    pub descending: ::core::option::Option<bool>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AggregateExecNode {
@@ -2139,6 +2168,13 @@ pub struct AsyncFuncExecNode {
     #[prost(string, repeated, tag = "3")]
     pub async_expr_names: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BufferExecNode {
+    #[prost(message, optional, boxed, tag = "1")]
+    pub input: ::core::option::Option<::prost::alloc::boxed::Box<PhysicalPlanNode>>,
+    #[prost(uint64, tag = "2")]
+    pub capacity: u64,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum WindowFrameUnits {
@@ -2249,6 +2285,39 @@ impl DateUnit {
         }
     }
 }
+/// Determines how file sink output paths are interpreted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum FileOutputMode {
+    /// Infer output mode from the URL (extension/trailing `/` heuristic).
+    Automatic = 0,
+    /// Write to a single file at the exact output path.
+    SingleFile = 1,
+    /// Write to a directory with generated filenames.
+    Directory = 2,
+}
+impl FileOutputMode {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Automatic => "FILE_OUTPUT_MODE_AUTOMATIC",
+            Self::SingleFile => "FILE_OUTPUT_MODE_SINGLE_FILE",
+            Self::Directory => "FILE_OUTPUT_MODE_DIRECTORY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "FILE_OUTPUT_MODE_AUTOMATIC" => Some(Self::Automatic),
+            "FILE_OUTPUT_MODE_SINGLE_FILE" => Some(Self::SingleFile),
+            "FILE_OUTPUT_MODE_DIRECTORY" => Some(Self::Directory),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum InsertOp {
@@ -2341,6 +2410,7 @@ pub enum AggregateMode {
     FinalPartitioned = 2,
     Single = 3,
     SinglePartitioned = 4,
+    PartialReduce = 5,
 }
 impl AggregateMode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -2354,6 +2424,7 @@ impl AggregateMode {
             Self::FinalPartitioned => "FINAL_PARTITIONED",
             Self::Single => "SINGLE",
             Self::SinglePartitioned => "SINGLE_PARTITIONED",
+            Self::PartialReduce => "PARTIAL_REDUCE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -2364,6 +2435,7 @@ impl AggregateMode {
             "FINAL_PARTITIONED" => Some(Self::FinalPartitioned),
             "SINGLE" => Some(Self::Single),
             "SINGLE_PARTITIONED" => Some(Self::SinglePartitioned),
+            "PARTIAL_REDUCE" => Some(Self::PartialReduce),
             _ => None,
         }
     }

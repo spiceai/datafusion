@@ -39,7 +39,7 @@ use crate::{
     PhysicalSortRequirement,
 };
 
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::SchemaRef;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{Constraint, Constraints, HashMap, Result, plan_err};
 use datafusion_expr::interval_arithmetic::Interval;
@@ -207,27 +207,13 @@ impl EquivalenceProperties {
     }
 
     /// Adds constraints to the properties.
-    pub fn with_constraints(mut self, constraints: Constraints) -> Self {
+    pub fn set_constraints(&mut self, constraints: Constraints) {
         self.constraints = constraints;
-        self
     }
 
-    /// Extends the schema by appending additional fields at the end.
-    ///
-    /// This is useful for adding metadata columns that don't participate in
-    /// any ordering or equivalence relationships. Existing column indices
-    /// remain valid since new fields are only appended.
-    pub fn with_extra_fields(
-        mut self,
-        fields: impl IntoIterator<Item = FieldRef>,
-    ) -> Self {
-        let mut all_fields: Vec<FieldRef> =
-            self.schema.fields().iter().cloned().collect();
-        all_fields.extend(fields);
-        self.schema = Arc::new(Schema::new_with_metadata(
-            all_fields,
-            self.schema.metadata().clone(),
-        ));
+    /// Adds constraints to the properties.
+    pub fn with_constraints(mut self, constraints: Constraints) -> Self {
+        self.set_constraints(constraints);
         self
     }
 
@@ -1296,7 +1282,7 @@ impl EquivalenceProperties {
             // Rewriting equivalence properties in terms of new schema is not
             // safe when schemas are not aligned:
             return plan_err!(
-                "Schemas have to be aligned to rewrite equivalences:\n Old schema: {:?}\n New schema: {:?}",
+                "Schemas have to be aligned to rewrite equivalences:\n Old schema: {}\n New schema: {}",
                 self.schema,
                 schema
             );

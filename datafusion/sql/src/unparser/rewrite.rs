@@ -25,7 +25,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
-use sqlparser::ast::{display_separated, Ident};
+use sqlparser::ast::Ident;
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -498,15 +498,13 @@ pub fn remove_dangling_identifiers(
     available_idents: &Vec<String>,
 ) -> () {
     if idents.len() > 1 {
-        let ident_source = display_separated(
-            &idents
-                .clone()
-                .into_iter()
-                .take(idents.len() - 1)
-                .collect::<Vec<Ident>>(),
-            ".",
-        )
-        .to_string();
+        // sqlparser 0.61 made `display_separated` pub(crate); join via Display instead.
+        let ident_source = idents
+            .iter()
+            .take(idents.len() - 1)
+            .map(ToString::to_string)
+            .collect::<Vec<String>>()
+            .join(".");
         // If the identifier is not present in the list of all identifiers, it refers to a table that does not exist
         if !available_idents.contains(&ident_source) {
             let Some(last) = idents.last() else {

@@ -28,6 +28,7 @@ use crate::physical_expr::physical_exprs_bag_equal;
 use arrow::array::*;
 use arrow::buffer::{BooleanBuffer, NullBuffer};
 use arrow::compute::kernels::boolean::{not, or_kleene};
+use arrow::compute::kernels::cmp::eq as arrow_eq;
 use arrow::compute::{SortOptions, take};
 use arrow::datatypes::*;
 use arrow::util::bit_iterator::BitIndexIterator;
@@ -142,6 +143,21 @@ impl StaticFilter for ArrayStaticFilter {
                 })
                 .collect())
         })
+    }
+}
+
+/// Returns true if Arrow's vectorized `eq` kernel supports this data type.
+///
+/// Supported: primitives, boolean, strings (Utf8/LargeUtf8/Utf8View),
+/// binary (Binary/LargeBinary/BinaryView/FixedSizeBinary), Null, and
+/// Dictionary-encoded variants of the above.
+/// Unsupported: nested types (Struct, List, Map, Union) and RunEndEncoded.
+fn supports_arrow_eq(dt: &DataType) -> bool {
+    use DataType::*;
+    match dt {
+        Boolean | Binary | LargeBinary | BinaryView | FixedSizeBinary(_) => true,
+        Dictionary(_, v) => supports_arrow_eq(v.as_ref()),
+        _ => dt.is_primitive() || dt.is_null() || dt.is_string(),
     }
 }
 
@@ -778,32 +794,45 @@ impl PhysicalExpr for InListExpr {
                 }
             }
             None => {
-                // No static filter: iterate through each expression, compare, and OR results
+                // No static filter: iterate through each expression, compare, and OR results.
+                // Use Arrow's vectorized eq kernel for types it supports (primitive,
+                // boolean, string, binary, dictionary), falling back to row-by-row
+                // comparator for unsupported types (nested, RunEndEncoded, etc.).
                 let value = value.into_array(num_rows)?;
+                let lhs_supports_arrow_eq = supports_arrow_eq(value.data_type());
                 let found = self.list.iter().map(|expr| expr.evaluate(batch)).try_fold(
                     BooleanArray::new(BooleanBuffer::new_unset(num_rows), None),
                     |result, expr| -> Result<BooleanArray> {
                         let rhs = match expr? {
                             ColumnarValue::Array(array) => {
-                                let cmp = make_comparator(
-                                    value.as_ref(),
-                                    array.as_ref(),
-                                    SortOptions::default(),
-                                )?;
-                                (0..num_rows)
-                                    .map(|i| {
-                                        if value.is_null(i) || array.is_null(i) {
-                                            return None;
-                                        }
-                                        Some(cmp(i, i).is_eq())
-                                    })
-                                    .collect::<BooleanArray>()
+                                if lhs_supports_arrow_eq
+                                    && supports_arrow_eq(array.data_type())
+                                {
+                                    arrow_eq(&value, &array)?
+                                } else {
+                                    let cmp = make_comparator(
+                                        value.as_ref(),
+                                        array.as_ref(),
+                                        SortOptions::default(),
+                                    )?;
+                                    (0..num_rows)
+                                        .map(|i| {
+                                            if value.is_null(i) || array.is_null(i) {
+                                                return None;
+                                            }
+                                            Some(cmp(i, i).is_eq())
+                                        })
+                                        .collect::<BooleanArray>()
+                                }
                             }
                             ColumnarValue::Scalar(scalar) => {
                                 // Check if scalar is null once, before the loop
                                 if scalar.is_null() {
                                     // If scalar is null, all comparisons return null
                                     BooleanArray::from(vec![None; num_rows])
+                                } else if lhs_supports_arrow_eq {
+                                    let scalar_datum = scalar.to_scalar()?;
+                                    arrow_eq(&value, &scalar_datum)?
                                 } else {
                                     // Convert scalar to 1-element array
                                     let array = scalar.to_array()?;
@@ -3514,6 +3543,7 @@ mod tests {
 
         Ok(())
     }
+
     /// Helper: creates an InListExpr with `static_filter = None`
     /// to force the column-reference evaluation path.
     fn make_in_list_with_columns(
@@ -3701,7 +3731,6 @@ mod tests {
         assert_eq!(result, &BooleanArray::from(vec![true, false, false]));
         Ok(())
     }
-
     /// Tests that short-circuit evaluation produces correct results.
     /// When all rows match after the first list item, remaining items
     /// should be skipped without affecting correctness.

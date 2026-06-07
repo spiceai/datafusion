@@ -1534,6 +1534,7 @@ impl Unparser<'_> {
         ast::TableAlias {
             name: self.new_ident_quoted_if_needs(alias),
             columns,
+            explicit: true,
         }
     }
 

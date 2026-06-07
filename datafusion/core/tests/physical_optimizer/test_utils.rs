@@ -53,7 +53,6 @@ use datafusion_physical_optimizer::limited_distinct_aggregation::LimitedDistinct
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
-use datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec;
 use datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion_physical_plan::filter::FilterExec;
@@ -248,6 +247,7 @@ pub fn hash_join_exec(
         None,
         PartitionMode::Partitioned,
         NullEquality::NullEqualsNothing,
+        false,
     )?))
 }
 
@@ -360,13 +360,6 @@ pub fn aggregate_exec(input: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
     )
 }
 
-pub fn coalesce_batches_exec(
-    input: Arc<dyn ExecutionPlan>,
-    batch_size: usize,
-) -> Arc<dyn ExecutionPlan> {
-    Arc::new(CoalesceBatchesExec::new(input, batch_size))
-}
-
 pub fn sort_exec(
     ordering: LexOrdering,
     input: Arc<dyn ExecutionPlan>,
@@ -461,7 +454,7 @@ impl ExecutionPlan for RequirementsTestExec {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         self.input.properties()
     }
 
@@ -832,7 +825,7 @@ pub fn sort_expr_named(name: &str, index: usize) -> PhysicalSortExpr {
 pub struct TestScan {
     schema: SchemaRef,
     output_ordering: Vec<LexOrdering>,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     // Store the requested ordering for display
     requested_ordering: Option<LexOrdering>,
 }
@@ -866,7 +859,7 @@ impl TestScan {
         Self {
             schema,
             output_ordering,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
             requested_ordering: None,
         }
     }
@@ -922,7 +915,7 @@ impl ExecutionPlan for TestScan {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 

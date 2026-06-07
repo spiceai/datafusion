@@ -27,8 +27,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use crate::file_scan_config::{ExtendedColumnProjector, FileScanConfig};
 use crate::PartitionedFile;
+use crate::file_scan_config::FileScanConfig;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::error::Result;
 use datafusion_execution::RecordBatchStream;
@@ -38,8 +38,6 @@ use datafusion_physical_plan::metrics::{
 
 use arrow::record_batch::RecordBatch;
 use datafusion_common::instant::Instant;
-use datafusion_common::ScalarValue;
-use object_store::ObjectMeta;
 
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
@@ -57,8 +55,6 @@ pub struct FileStream {
     /// A dynamic [`FileOpener`]. Calling `open()` returns a [`FileOpenFuture`],
     /// which can be resolved to a stream of `RecordBatch`.
     file_opener: Arc<dyn FileOpener>,
-    /// The extended (partition + metadata) column projector
-    col_projector: ExtendedColumnProjector,
     /// The stream state
     state: FileStreamState,
     /// File stream specific metrics
@@ -78,13 +74,6 @@ impl FileStream {
         metrics: &ExecutionPlanMetricsSet,
     ) -> Result<Self> {
         let projected_schema = config.projected_schema()?;
-        // In DF52 partition columns are injected by the opener (ProjectionOpener /
-        // ParquetOpener), so the projector only needs to handle metadata columns.
-        let col_projector = ExtendedColumnProjector::new(
-            Arc::clone(&projected_schema),
-            &[],
-            &config.metadata_cols,
-        );
 
         let file_group = config.file_groups[partition].clone();
 
@@ -93,7 +82,6 @@ impl FileStream {
             projected_schema,
             remain: config.limit,
             file_opener,
-            col_projector,
             state: FileStreamState::Idle,
             file_stream_metrics: FileStreamMetrics::new(metrics, partition),
             baseline_metrics: BaselineMetrics::new(metrics, partition),
@@ -114,16 +102,9 @@ impl FileStream {
     ///
     /// Since file opening is mostly IO (and may involve a
     /// bunch of sequential IO), it can be parallelized with decoding.
-    fn start_next_file(&mut self) -> Option<Result<(FileOpenFuture, Vec<ScalarValue>, ObjectMeta)>> {
+    fn start_next_file(&mut self) -> Option<Result<FileOpenFuture>> {
         let part_file = self.file_iter.pop_front()?;
-
-        let partition_values = part_file.partition_values.clone();
-        let object_meta = part_file.object_meta.clone();
-        Some(
-            self.file_opener
-                .open(part_file)
-                .map(|future| (future, partition_values, object_meta)),
-        )
+        Some(self.file_opener.open(part_file))
     }
 
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<RecordBatch>>> {
@@ -133,13 +114,7 @@ impl FileStream {
                     self.file_stream_metrics.time_opening.start();
 
                     match self.start_next_file().transpose() {
-                        Ok(Some((future, partition_values, object_meta))) => {
-                            self.state = FileStreamState::Open {
-                                future,
-                                partition_values,
-                                object_meta,
-                            }
-                        }
+                        Ok(Some(future)) => self.state = FileStreamState::Open { future },
                         Ok(None) => return Poll::Ready(None),
                         Err(e) => {
                             self.state = FileStreamState::Error;
@@ -147,15 +122,8 @@ impl FileStream {
                         }
                     }
                 }
-                FileStreamState::Open {
-                    future,
-                    partition_values,
-                    object_meta,
-                } => match ready!(future.poll_unpin(cx)) {
+                FileStreamState::Open { future } => match ready!(future.poll_unpin(cx)) {
                     Ok(reader) => {
-                        let partition_values = mem::take(partition_values);
-                        let object_meta = object_meta.clone();
-
                         // include time needed to start opening in `start_next_file`
                         self.file_stream_metrics.time_opening.stop();
                         let next = self.start_next_file().transpose();
@@ -163,25 +131,14 @@ impl FileStream {
                         self.file_stream_metrics.time_scanning_total.start();
 
                         match next {
-                            Ok(Some((next_future, next_partition_values, next_object_meta))) => {
+                            Ok(Some(next_future)) => {
                                 self.state = FileStreamState::Scan {
-                                    partition_values,
-                                    object_meta,
                                     reader,
-                                    next: Some((
-                                        NextOpen::Pending(next_future),
-                                        next_partition_values,
-                                        next_object_meta,
-                                    )),
+                                    next: Some(NextOpen::Pending(next_future)),
                                 };
                             }
                             Ok(None) => {
-                                self.state = FileStreamState::Scan {
-                                    reader,
-                                    partition_values,
-                                    object_meta,
-                                    next: None,
-                                };
+                                self.state = FileStreamState::Scan { reader, next: None };
                             }
                             Err(e) => {
                                 self.state = FileStreamState::Error;
@@ -203,43 +160,34 @@ impl FileStream {
                         }
                     }
                 },
-                FileStreamState::Scan {
-                    reader,
-                    partition_values: _,
-                    object_meta,
-                    next,
-                } => {
+                FileStreamState::Scan { reader, next } => {
                     // We need to poll the next `FileOpenFuture` here to drive it forward
-                    if let Some((next_open_future, _, _)) = next {
-                        if let NextOpen::Pending(f) = next_open_future {
-                            if let Poll::Ready(reader) = f.as_mut().poll(cx) {
-                                *next_open_future = NextOpen::Ready(reader);
-                            }
-                        }
+                    if let Some(next_open_future) = next
+                        && let NextOpen::Pending(f) = next_open_future
+                        && let Poll::Ready(reader) = f.as_mut().poll(cx)
+                    {
+                        *next_open_future = NextOpen::Ready(reader);
                     }
                     match ready!(reader.poll_next_unpin(cx)) {
                         Some(Ok(batch)) => {
                             self.file_stream_metrics.time_scanning_until_data.stop();
                             self.file_stream_metrics.time_scanning_total.stop();
-                            let result = self
-                                .col_projector
-                                .project(batch, &[], object_meta)
-                                .map(|batch| match &mut self.remain {
-                                    Some(remain) => {
-                                        if *remain > batch.num_rows() {
-                                            *remain -= batch.num_rows();
-                                            batch
-                                        } else {
-                                            let batch = batch.slice(0, *remain);
-                                            self.state = FileStreamState::Limit;
-                                            *remain = 0;
-                                            batch
-                                        }
+                            let batch = match &mut self.remain {
+                                Some(remain) => {
+                                    if *remain > batch.num_rows() {
+                                        *remain -= batch.num_rows();
+                                        batch
+                                    } else {
+                                        let batch = batch.slice(0, *remain);
+                                        self.state = FileStreamState::Limit;
+                                        *remain = 0;
+                                        batch
                                     }
-                                    None => batch,
-                                });
+                                }
+                                None => batch,
+                            };
                             self.file_stream_metrics.time_scanning_total.start();
-                            return Poll::Ready(Some(result));
+                            return Poll::Ready(Some(Ok(batch)));
                         }
                         Some(Err(err)) => {
                             self.file_stream_metrics.file_scan_errors.add(1);
@@ -249,24 +197,19 @@ impl FileStream {
                             match self.on_error {
                                 // If `OnError::Skip` we skip the file as soon as we hit the first error
                                 OnError::Skip => match mem::take(next) {
-                                    Some((future, partition_values, object_meta)) => {
+                                    Some(future) => {
                                         self.file_stream_metrics.time_opening.start();
 
                                         match future {
                                             NextOpen::Pending(future) => {
-                                                self.state = FileStreamState::Open {
-                                                    future,
-                                                    partition_values,
-                                                    object_meta,
-                                                }
+                                                self.state =
+                                                    FileStreamState::Open { future }
                                             }
                                             NextOpen::Ready(reader) => {
                                                 self.state = FileStreamState::Open {
                                                     future: Box::pin(std::future::ready(
                                                         reader,
                                                     )),
-                                                    partition_values,
-                                                    object_meta,
                                                 }
                                             }
                                         }
@@ -284,24 +227,18 @@ impl FileStream {
                             self.file_stream_metrics.time_scanning_total.stop();
 
                             match mem::take(next) {
-                                Some((future, partition_values, object_meta)) => {
+                                Some(future) => {
                                     self.file_stream_metrics.time_opening.start();
 
                                     match future {
                                         NextOpen::Pending(future) => {
-                                            self.state = FileStreamState::Open {
-                                                future,
-                                                partition_values,
-                                                object_meta,
-                                            }
+                                            self.state = FileStreamState::Open { future }
                                         }
                                         NextOpen::Ready(reader) => {
                                             self.state = FileStreamState::Open {
                                                 future: Box::pin(std::future::ready(
                                                     reader,
                                                 )),
-                                                partition_values,
-                                                object_meta,
                                             }
                                         }
                                     }
@@ -379,25 +316,16 @@ pub enum FileStreamState {
     Open {
         /// A [`FileOpenFuture`] returned by [`FileOpener::open`]
         future: FileOpenFuture,
-        /// The partition values for this file
-        partition_values: Vec<ScalarValue>,
-        /// The object metadata for this file
-        object_meta: ObjectMeta,
     },
     /// Scanning the [`BoxStream`] returned by the completion of a [`FileOpenFuture`]
     /// returned by [`FileOpener::open`]
     Scan {
-        /// Partitioning column values for the current batch_iter
-        partition_values: Vec<ScalarValue>,
-        /// The object metadata for this file
-        object_meta: ObjectMeta,
         /// The reader instance
         reader: BoxStream<'static, Result<RecordBatch>>,
-        /// A [`FileOpenFuture`] for the next file to be processed,
-        /// and its corresponding partition column values and object metadata, if any.
+        /// A [`FileOpenFuture`] for the next file to be processed.
         /// This allows the next file to be opened in parallel while the
         /// current file is read.
-        next: Option<(NextOpen, Vec<ScalarValue>, ObjectMeta)>,
+        next: Option<NextOpen>,
     },
     /// Encountered an error
     Error,
@@ -972,324 +900,6 @@ mod tests {
             "| 0 |",
             "+---+",
         ], &batches);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_extended_column_projector() -> Result<()> {
-        use crate::file_scan_config::ExtendedColumnProjector;
-        use crate::metadata::MetadataColumn;
-        use arrow::array::{StringArray, UInt64Array};
-        use arrow::datatypes::{DataType, Field, Schema};
-        use chrono::Utc;
-        use datafusion_common::ScalarValue;
-        use object_store::path::Path;
-        use object_store::ObjectMeta;
-        use std::sync::Arc;
-
-        // Create a simple file batch
-        let file_schema = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Utf8, true),
-        ]));
-
-        let file_batch = RecordBatch::try_new(
-            file_schema.clone(),
-            vec![
-                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )?;
-
-        // Create a test object meta
-        let timestamp = Utc::now();
-        let object_meta = ObjectMeta {
-            location: Path::from("test/file.parquet"),
-            last_modified: timestamp,
-            size: 1024,
-            e_tag: None,
-            version: None,
-        };
-
-        // Test 1: Projector with partition columns
-
-        // Create a schema that includes both file columns and a partition column
-        let schema_with_partition = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Utf8, true),
-            Field::new("year", DataType::Utf8, true),
-        ]));
-
-        // Create the partition values
-        let partition_values = vec![ScalarValue::Utf8(Some("2023".to_string()))];
-
-        // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
-            schema_with_partition.clone(),
-            &["year".to_string()],
-            &[],
-        );
-
-        // Project the batch
-        let projected_batch =
-            projector.project(file_batch.clone(), &partition_values, &object_meta)?;
-
-        // Verify the projected batch
-        assert_eq!(projected_batch.schema().fields().len(), 3);
-        assert_eq!(projected_batch.num_rows(), 3);
-        assert_eq!(projected_batch.column(0).len(), 3);
-        assert_eq!(projected_batch.column(1).len(), 3);
-        assert_eq!(projected_batch.column(2).len(), 3);
-
-        // Check the partition column
-        let year_col = projected_batch.column(2);
-        let year_array = year_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(year_array.value(0), "2023");
-        assert_eq!(year_array.value(1), "2023");
-        assert_eq!(year_array.value(2), "2023");
-
-        // Test 2: Projector with metadata columns
-
-        // Create a schema that includes both file columns and metadata columns
-        let schema_with_metadata = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Utf8, true),
-            Field::new("_location", DataType::Utf8, true),
-            Field::new("_size", DataType::UInt64, true),
-        ]));
-
-        // Create the projector with metadata columns
-        let mut projector = ExtendedColumnProjector::new(
-            schema_with_metadata.clone(),
-            &[],
-            &[MetadataColumn::Location(None), MetadataColumn::Size],
-        );
-
-        // Project the batch
-        let projected_batch = projector.project(file_batch.clone(), &[], &object_meta)?;
-
-        // Verify the projected batch
-        assert_eq!(projected_batch.schema().fields().len(), 4);
-        assert_eq!(projected_batch.num_rows(), 3);
-
-        // Check the metadata columns
-        let location_col = projected_batch.column(2);
-        let location_array = location_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(location_array.value(0), "test/file.parquet");
-        assert_eq!(location_array.value(1), "test/file.parquet");
-        assert_eq!(location_array.value(2), "test/file.parquet");
-
-        let size_col = projected_batch.column(3);
-        let size_array = size_col.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!(size_array.value(0), 1024);
-        assert_eq!(size_array.value(1), 1024);
-        assert_eq!(size_array.value(2), 1024);
-
-        // Test 3: Projector with both partition and metadata columns
-
-        // Create a schema that includes file, partition, and metadata columns
-        let schema_combined = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Utf8, true),
-            Field::new("year", DataType::Utf8, true),
-            Field::new("_location", DataType::Utf8, true),
-            Field::new("_size", DataType::UInt64, true),
-        ]));
-
-        // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
-            schema_combined.clone(),
-            &["year".to_string()],
-            &[MetadataColumn::Location(None), MetadataColumn::Size],
-        );
-
-        // Project the batch
-        let projected_batch =
-            projector.project(file_batch.clone(), &partition_values, &object_meta)?;
-
-        // Verify the projected batch
-        assert_eq!(projected_batch.schema().fields().len(), 5);
-        assert_eq!(projected_batch.num_rows(), 3);
-
-        // Check the partition column
-        let year_col = projected_batch.column(2);
-        let year_array = year_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(year_array.value(0), "2023");
-
-        // Check the metadata columns
-        let location_col = projected_batch.column(3);
-        let location_array = location_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(location_array.value(0), "test/file.parquet");
-
-        let size_col = projected_batch.column(4);
-        let size_array = size_col.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!(size_array.value(0), 1024);
-
-        // Test 4: Projector with columns in mixed order
-
-        // Create a schema with columns in a different order
-        let schema_mixed = Arc::new(Schema::new(vec![
-            Field::new("_location", DataType::Utf8, true), // metadata column first
-            Field::new("id", DataType::Int32, false),     // file column
-            Field::new("year", DataType::Utf8, true),     // partition column
-            Field::new("value", DataType::Utf8, true),    // file column
-            Field::new("_size", DataType::UInt64, true),   // metadata column last
-        ]));
-
-        // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
-            schema_mixed.clone(),
-            &["year".to_string()],
-            &[MetadataColumn::Location(None), MetadataColumn::Size],
-        );
-
-        // We need to reorder the file batch to match the expected file columns in the mixed schema
-        // The expected order is: [id, value]
-        let file_batch_reordered = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Int32, false),
-                Field::new("value", DataType::Utf8, true),
-            ])),
-            vec![
-                Arc::new(arrow::array::Int32Array::from(vec![1, 2, 3])),
-                Arc::new(StringArray::from(vec!["a", "b", "c"])),
-            ],
-        )?;
-
-        // Project the batch
-        let projected_batch =
-            projector.project(file_batch_reordered, &partition_values, &object_meta)?;
-
-        // Verify the projected batch
-        assert_eq!(projected_batch.schema().fields().len(), 5);
-        assert_eq!(projected_batch.num_rows(), 3);
-
-        let schema = projected_batch.schema();
-        let field_indices: std::collections::HashMap<_, _> = schema
-            .fields()
-            .iter()
-            .enumerate()
-            .map(|(i, f)| (f.name().as_str(), i))
-            .collect();
-
-        // Check location column
-        let location_idx = *field_indices.get("_location").unwrap();
-        let location_col = projected_batch.column(location_idx);
-        let location_array = location_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(location_array.value(0), "test/file.parquet");
-
-        // Check ID column
-        let id_idx = *field_indices.get("id").unwrap();
-        let id_col = projected_batch.column(id_idx);
-        let id_array = id_col
-            .as_any()
-            .downcast_ref::<arrow::array::Int32Array>()
-            .unwrap();
-        assert_eq!(id_array.value(0), 1);
-
-        // Check year column (partition value)
-        let year_idx = *field_indices.get("year").unwrap();
-        let year_col = projected_batch.column(year_idx);
-        let year_array = year_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(year_array.value(0), "2023");
-
-        // Check value column (file data)
-        let value_idx = *field_indices.get("value").unwrap();
-        let value_col = projected_batch.column(value_idx);
-        let value_array = value_col.as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(value_array.value(0), "a");
-
-        // Check size column
-        let size_idx = *field_indices.get("_size").unwrap();
-        let size_col = projected_batch.column(size_idx);
-        let size_array = size_col.as_any().downcast_ref::<UInt64Array>().unwrap();
-        assert_eq!(size_array.value(0), 1024);
-
-        // Test 5: Test with dictionary-encoded partition values
-
-        // Create a schema with dictionary type for the partition column
-        // We need to use UInt16 as the key type to match the implementation's default
-        let schema_with_dict = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int32, false),
-            Field::new("value", DataType::Utf8, true),
-            Field::new(
-                "year",
-                DataType::Dictionary(
-                    Box::new(DataType::UInt16),
-                    Box::new(DataType::Utf8),
-                ),
-                true,
-            ),
-        ]));
-
-        // Create the partition values with dictionary encoding
-        // Must use the same UInt16 key type to match
-        let partition_values = vec![ScalarValue::Dictionary(
-            Box::new(DataType::UInt16),
-            Box::new(ScalarValue::Utf8(Some("2023".to_string()))),
-        )];
-
-        // Create the projector
-        let mut projector = ExtendedColumnProjector::new(
-            schema_with_dict.clone(),
-            &["year".to_string()],
-            &[],
-        );
-
-        // Project the batch
-        let projected_batch =
-            projector.project(file_batch.clone(), &partition_values, &object_meta)?;
-
-        // Verify the projected batch
-        assert_eq!(projected_batch.schema().fields().len(), 3);
-        assert_eq!(projected_batch.num_rows(), 3);
-
-        // Check that the partition column has the correct dictionary type
-        {
-            let schema_ref = projected_batch.schema();
-            let year_field = schema_ref.field(2);
-
-            if let DataType::Dictionary(key_type, _) = year_field.data_type() {
-                // Ensure the key type is UInt16 as expected
-                assert_eq!(**key_type, DataType::UInt16);
-            } else {
-                panic!("Expected Dictionary type, got {:?}", year_field.data_type());
-            }
-        }
-
-        // Test 6: Auto-fix for non-dictionary partition values
-
-        // Create a projector expecting dictionary-encoded values
-        let mut projector = ExtendedColumnProjector::new(
-            schema_with_dict.clone(),
-            &["year".to_string()],
-            &[],
-        );
-
-        // Use non-dictionary values (the projector should auto-fix)
-        let non_dict_values = vec![ScalarValue::Utf8(Some("2023".to_string()))];
-
-        // Project the batch
-        let projected_batch =
-            projector.project(file_batch.clone(), &non_dict_values, &object_meta)?;
-
-        // Verify the projected batch
-        assert_eq!(projected_batch.schema().fields().len(), 3);
-        assert_eq!(projected_batch.num_rows(), 3);
-
-        // Check that the partition column has the correct dictionary type
-        {
-            let schema_ref = projected_batch.schema();
-            let year_field = schema_ref.field(2);
-
-            if let DataType::Dictionary(key_type, _) = year_field.data_type() {
-                // Ensure the key type is UInt16 as expected
-                assert_eq!(**key_type, DataType::UInt16);
-            } else {
-                panic!("Expected Dictionary type, got {:?}", year_field.data_type());
-            }
-        }
 
         Ok(())
     }

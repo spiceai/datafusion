@@ -18,16 +18,13 @@
 use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_catalog::Session;
 use datafusion_common::plan_err;
-use datafusion_datasource::file_format::FileFormat;
-use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_datasource::file_format::FileFormat;
 use datafusion_execution::config::SessionConfig;
 use datafusion_expr::SortExpr;
 use futures::StreamExt;
 use futures::{TryStreamExt, future};
 use itertools::Itertools;
-use parquet::arrow::async_reader::ObjectVersionType;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 /// Options for creating a [`crate::ListingTable`]
@@ -64,13 +61,6 @@ pub struct ListingOptions {
     ///       multiple equivalent orderings, the outer `Vec` will have a
     ///       single element.
     pub file_sort_order: Vec<Vec<SortExpr>>,
-    /// Metadata columns to include in the output schema.
-    /// These columns provide file metadata like location, size, and last_modified.
-    pub metadata_cols: Vec<MetadataColumn>,
-    /// Object versioning type for reading files.
-    /// This is used to handle different versions of objects in object stores,
-    /// ensuring that objects listed during planning are consistent with objects read during execution.
-    pub object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl ListingOptions {
@@ -88,8 +78,6 @@ impl ListingOptions {
             collect_stat: false,
             target_partitions: 1,
             file_sort_order: vec![],
-            metadata_cols: vec![],
-            object_versioning_type: None,
         }
     }
 
@@ -270,82 +258,6 @@ impl ListingOptions {
     pub fn with_file_sort_order(mut self, file_sort_order: Vec<Vec<SortExpr>>) -> Self {
         self.file_sort_order = file_sort_order;
         self
-    }
-
-    /// Set metadata columns on [`ListingOptions`] and returns self.
-    ///
-    /// Metadata columns provide file metadata like location, size, and last_modified
-    /// as additional columns in the query output.
-    ///
-    /// # Example
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use datafusion_catalog_listing::ListingOptions;
-    /// # use datafusion_datasource_parquet::file_format::ParquetFormat;
-    /// # use datafusion_datasource::metadata::MetadataColumn;
-    ///
-    /// let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-    ///   .with_metadata_cols(vec![MetadataColumn::LastModified]);
-    ///
-    /// assert_eq!(listing_options.metadata_cols, vec![MetadataColumn::LastModified]);
-    /// ```
-    pub fn with_metadata_cols(mut self, metadata_cols: Vec<MetadataColumn>) -> Self {
-        self.metadata_cols = metadata_cols;
-        self
-    }
-
-    /// Set object versioning type on [`ListingOptions`] and returns self.
-    ///
-    /// This is used to handle different versions of objects in object stores,
-    /// ensuring that objects listed during planning are consistent with objects read during execution.
-    ///
-    /// # Example
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use datafusion_catalog_listing::ListingOptions;
-    /// # use datafusion_datasource_parquet::file_format::ParquetFormat;
-    /// # use parquet::arrow::async_reader::ObjectVersionType;
-    ///
-    /// let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-    ///   .with_object_versioning_type(Some(ObjectVersionType::Version));
-    ///
-    /// assert!(listing_options.object_versioning_type.is_some());
-    /// ```
-    pub fn with_object_versioning_type(
-        mut self,
-        object_versioning_type: Option<ObjectVersionType>,
-    ) -> Self {
-        self.object_versioning_type = object_versioning_type;
-        self
-    }
-
-    /// Validate that the metadata columns don't conflict with existing schema columns
-    /// and are not duplicated.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if:
-    /// - A metadata column name already exists in the provided schema
-    /// - There are duplicate metadata columns
-    pub fn validate_metadata_cols(
-        &self,
-        schema: &SchemaRef,
-    ) -> datafusion_common::Result<()> {
-        let mut seen = HashSet::with_capacity(self.metadata_cols.len());
-
-        for col in self.metadata_cols.iter() {
-            // Check if column already exists in the schema
-            if schema.column_with_name(col.name()).is_some() {
-                return plan_err!("Column {} already exists in schema", col);
-            }
-
-            // Check for duplicate metadata columns
-            if !seen.insert(col.clone()) {
-                return plan_err!("Duplicate metadata column: {}", col);
-            }
-        }
-
-        Ok(())
     }
 
     /// Infer the schema of the files at the given path on the provided object store.
