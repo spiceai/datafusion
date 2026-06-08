@@ -21,7 +21,13 @@ use arrow::datatypes::Schema;
 use datafusion_common::{Result, tree_node::TreeNode};
 use std::sync::Arc;
 
-use crate::{PhysicalExpr, simplifier::not::simplify_not_expr};
+use crate::{
+    PhysicalExpr,
+    simplifier::{
+        const_evaluator::dummy_batch, not::simplify_not_expr,
+        unwrap_cast::unwrap_cast_in_comparison,
+    },
+};
 
 pub mod const_evaluator;
 pub mod not;
@@ -49,6 +55,8 @@ impl<'a> PhysicalExprSimplifier<'a> {
         let mut current_expr = expr;
         let mut count = 0;
         let schema = self.schema;
+
+        let batch = dummy_batch()?;
 
         while count < MAX_LOOP_COUNT {
             count += 1;

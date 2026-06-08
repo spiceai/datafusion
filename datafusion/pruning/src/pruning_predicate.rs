@@ -47,7 +47,9 @@ use datafusion_physical_expr::utils::{
     Guarantee, LiteralGuarantee, build_balanced_binary_tree, collect_columns,
 };
 use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
-use datafusion_physical_expr_common::physical_expr::{snapshot_physical_expr, snapshot_physical_expr_opt};
+use datafusion_physical_expr_common::physical_expr::{
+    snapshot_physical_expr, snapshot_physical_expr_opt,
+};
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
@@ -490,11 +492,20 @@ impl PruningPredicate {
             &mut required_columns,
             &unhandled_hook,
         );
-        let predicate_schema = required_columns.schema();
-        // Simplify the newly created predicate to get rid of redundant casts, comparisons, etc.
-        let predicate_expr =
-            PhysicalExprSimplifier::new(&predicate_schema).simplify(predicate_expr)?;
-
+        // Simplify the newly created predicate to get rid of redundant casts,
+        // comparisons, etc. `build_predicate_expression` already folds constant
+        // `AND`/`OR` branches inline and only emits nodes the simplifier can act
+        // on (casts, `NOT`, negation, constant-only subexpressions) when the
+        // predicate actually contains them. When none are present the simplify
+        // pass is a guaranteed no-op, so skip it — this is a hot path (once per
+        // opened file) and the skipped predicate is byte-identical to the
+        // simplified one.
+        let predicate_expr = if predicate_needs_simplification(&predicate_expr) {
+            let predicate_schema = required_columns.schema();
+            PhysicalExprSimplifier::new(&predicate_schema).simplify(predicate_expr)?
+        } else {
+            predicate_expr
+        };
         let literal_guarantees = LiteralGuarantee::analyze(&expr);
 
         Ok(Self {
@@ -1431,6 +1442,50 @@ impl PredicateRewriter {
 /// Returns the pruning predicate as an [`PhysicalExpr`]
 ///
 /// Notice: Does not handle [`phys_expr::InListExpr`] greater than 20, which will fall back to calling `unhandled_hook`
+/// Returns `true` if [`PhysicalExprSimplifier`] could rewrite `expr`.
+///
+/// The simplifier only unwraps casts, simplifies `NOT`/negation, and folds
+/// constant-only subexpressions. This is a deliberate *superset* of those
+/// trigger conditions, so a `false` result guarantees that simplifying `expr`
+/// would return it unchanged. It lets [`PruningPredicate::try_new`] skip the
+/// simplify pass on the (common) freshly built predicates that contain none of
+/// these — the dominant cost when constructing pruning predicates per file.
+fn predicate_needs_simplification(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    let mut needs = false;
+    expr.apply(|node| {
+        let any = node.as_any();
+        // Casts (unwrap_cast), NOT (not-simplify), and negation are all
+        // rewritten by the simplifier.
+        if any.is::<phys_expr::CastExpr>()
+            || any.is::<phys_expr::TryCastExpr>()
+            || any.is::<CastColumnExpr>()
+            || any.is::<phys_expr::NotExpr>()
+            || any.is::<phys_expr::NegativeExpr>()
+        {
+            needs = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        // A non-leaf node whose children are all literals can be constant
+        // folded. Volatile nodes are skipped by the const evaluator, but
+        // flagging them here only costs an unnecessary (still correct) simplify.
+        if !any.is::<phys_expr::Literal>() && !any.is::<phys_expr::Column>() {
+            let children = node.children();
+            if !children.is_empty()
+                && children
+                    .iter()
+                    .all(|child| child.as_any().is::<phys_expr::Literal>())
+            {
+                needs = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    // the closure is infallible, mirroring `ColumnReferenceCount::from_expression`
+    .expect("no way to return error during recursion");
+    needs
+}
+
 fn build_predicate_expression(
     expr: &Arc<dyn PhysicalExpr>,
     schema: &SchemaRef,
