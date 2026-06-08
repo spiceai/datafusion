@@ -27,6 +27,11 @@ itertools = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 datafusion-expr = { workspace = true }
 datafusion-functions-nested = { workspace = true }
 insta = { workspace = true }
+
+[[bench]]
+harness = false
+name = "pruning_predicate"

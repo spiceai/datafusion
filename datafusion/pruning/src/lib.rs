@@ -23,6 +23,6 @@ mod pruning_predicate;
 pub use file_pruner::FilePruner;
 pub use pruning_predicate::{
     BoolVecBuilder, PredicateRewriter, PruningPredicate, PruningStatistics,
-    RequiredColumns, StatisticsType, UnhandledPredicateHook,
-    build_pruning_predicate, build_statistics_record_batch,
+    RequiredColumns, StatisticsType, UnhandledPredicateHook, build_pruning_predicate,
+    build_statistics_record_batch,
 };

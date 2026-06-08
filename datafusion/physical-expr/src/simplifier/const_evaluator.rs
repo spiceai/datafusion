@@ -17,7 +17,7 @@
 
 //! Constant expression evaluation for the physical expression simplifier
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use arrow::array::new_null_array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -27,7 +27,10 @@ use datafusion_common::{Result, ScalarValue};
 use datafusion_expr_common::columnar_value::ColumnarValue;
 
 use crate::PhysicalExpr;
-use crate::expressions::{Column, Literal};
+use crate::expressions::{
+    BinaryExpr, CastExpr, Column, IsNotNullExpr, IsNullExpr, Literal, NegativeExpr,
+    NotExpr, TryCastExpr,
+};
 
 /// Simplify expressions that consist only of literals by evaluating them.
 ///
@@ -107,12 +110,7 @@ pub(crate) fn simplify_const_expr_immediate(
     // Since transform visits bottom-up, children have already been simplified.
     // If all children are now Literals, this node can be const-evaluated.
     // This is O(k) where k = number of children, instead of O(subtree).
-    let all_children_literal = expr
-        .children()
-        .iter()
-        .all(|child| child.as_any().is::<Literal>());
-
-    if !all_children_literal {
+    if !children_are_all_literals(&expr) {
         return Ok(Transformed::no(expr));
     }
 
@@ -137,6 +135,68 @@ pub(crate) fn simplify_const_expr_immediate(
             Ok(Transformed::no(expr))
         }
     }
+}
+
+/// Returns `true` if every child of `expr` is a [`Literal`].
+///
+/// Semantically equivalent to
+/// `expr.children().iter().all(|c| c.as_any().is::<Literal>())` (including the
+/// `true` result for childless nodes), but avoids the per-node `Vec`
+/// allocation that [`PhysicalExpr::children`] performs by reading the fields of
+/// the common fixed-arity expression types directly. This check runs for every
+/// non-leaf node on every simplifier pass, so that allocation is pure overhead
+/// on the pruning hot path. Variable-arity and rarer node types fall back to
+/// the allocating accessor.
+fn children_are_all_literals(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    fn is_literal(expr: &Arc<dyn PhysicalExpr>) -> bool {
+        expr.as_any().is::<Literal>()
+    }
+
+    let any = expr.as_any();
+    if let Some(binary) = any.downcast_ref::<BinaryExpr>() {
+        is_literal(binary.left()) && is_literal(binary.right())
+    } else if let Some(cast) = any.downcast_ref::<CastExpr>() {
+        is_literal(cast.expr())
+    } else if let Some(try_cast) = any.downcast_ref::<TryCastExpr>() {
+        is_literal(try_cast.expr())
+    } else if let Some(not) = any.downcast_ref::<NotExpr>() {
+        is_literal(not.arg())
+    } else if let Some(negative) = any.downcast_ref::<NegativeExpr>() {
+        is_literal(negative.arg())
+    } else if let Some(is_null) = any.downcast_ref::<IsNullExpr>() {
+        is_literal(is_null.arg())
+    } else if let Some(is_not_null) = any.downcast_ref::<IsNotNullExpr>() {
+        is_literal(is_not_null.arg())
+    } else {
+        // Variable-arity or rarer node types (CASE, scalar functions, IN-list,
+        // ...): fall back to the allocating accessor. `all` is `true` for nodes
+        // with no children, matching the original behaviour.
+        expr.children().iter().all(|child| is_literal(child))
+    }
+}
+
+/// Return the shared 1-row dummy [`RecordBatch`] used to evaluate constant
+/// expressions.
+///
+/// The batch is identical and immutable across every call, so it is built once
+/// and memoized. The simplifier invokes this on every `simplify` call (often
+/// hundreds of thousands of times when opening files for pruning), and building
+/// the schema, null array, and batch each time was pure allocation overhead on
+/// that hot path.
+///
+/// # Errors
+///
+/// Returns an error if the (constant) dummy batch cannot be constructed, which
+/// should never happen for a single null column.
+pub(crate) fn dummy_batch() -> Result<&'static RecordBatch> {
+    static DUMMY_BATCH: OnceLock<RecordBatch> = OnceLock::new();
+    if let Some(batch) = DUMMY_BATCH.get() {
+        return Ok(batch);
+    }
+    // `OnceLock::get_or_init` cannot propagate the construction error, so build
+    // the batch here (racing threads simply rebuild and discard) and publish it.
+    let batch = create_dummy_batch()?;
+    Ok(DUMMY_BATCH.get_or_init(|| batch))
 }
 
 /// Create a 1-row dummy RecordBatch for evaluating constant expressions.

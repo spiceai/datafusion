@@ -23,9 +23,7 @@ use std::sync::Arc;
 
 use crate::{
     PhysicalExpr,
-    simplifier::{
-        const_evaluator::create_dummy_batch, unwrap_cast::unwrap_cast_in_comparison,
-    },
+    simplifier::{const_evaluator::dummy_batch, unwrap_cast::unwrap_cast_in_comparison},
 };
 
 pub mod const_evaluator;
@@ -55,7 +53,7 @@ impl<'a> PhysicalExprSimplifier<'a> {
         let mut count = 0;
         let schema = self.schema;
 
-        let batch = create_dummy_batch()?;
+        let batch = dummy_batch()?;
 
         while count < MAX_LOOP_COUNT {
             count += 1;
@@ -69,7 +67,7 @@ impl<'a> PhysicalExprSimplifier<'a> {
                 let rewritten = not::simplify_not_expr(node, schema)?
                     .transform_data(|node| unwrap_cast_in_comparison(node, schema))?
                     .transform_data(|node| {
-                        const_evaluator::simplify_const_expr_immediate(node, &batch)
+                        const_evaluator::simplify_const_expr_immediate(node, batch)
                     })?;
 
                 #[cfg(debug_assertions)]
