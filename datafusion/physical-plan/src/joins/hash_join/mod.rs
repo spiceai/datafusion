@@ -17,8 +17,11 @@
 
 //! [`HashJoinExec`] Partitioned Hash Join Operator
 
-pub use exec::{HashJoinExec, HashJoinExecBuilder};
+pub use exec::{
+    CollectLeftAccumulator, HashJoinExec, HashJoinExecBuilder, MinMaxLeftAccumulator,
+};
 pub use partitioned_hash_eval::{HashExpr, HashTableLookupExpr, SeededRandomState};
+pub use shared_bounds::{ColumnBounds, MinMaxColumnBounds};
 
 mod exec;
 mod inlist_builder;

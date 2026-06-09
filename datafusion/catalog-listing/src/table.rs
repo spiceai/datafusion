@@ -176,9 +176,11 @@ pub struct ListingTable {
     ///     - Represents the actual fields found in files like Parquet, CSV, etc.
     ///     - Used when reading the raw data from files
     file_schema: SchemaRef,
-    /// `table_schema` combines `file_schema` + partition columns
+    /// `table_schema` combines `file_schema` + partition columns + metadata columns
     ///     - Partition columns are derived from directory paths (not stored in files)
     ///     - These are columns like "year=2022/month=01" in paths like `/data/year=2022/month=01/file.parquet`
+    ///     - Metadata columns (Spice extension: `_location`/`_size`/`_last_modified`)
+    ///       are appended after the partition columns so SQL can reference them
     table_schema: SchemaRef,
     /// Indicates how the schema was derived (inferred or explicitly specified)
     schema_source: SchemaSource,
@@ -213,10 +215,22 @@ impl ListingTable {
             .options
             .ok_or_else(|| internal_datafusion_err!("No ListingOptions provided"))?;
 
+        // Validate metadata columns (Spice extension) don't conflict with the
+        // file schema before they are folded into the table schema.
+        options.validate_metadata_cols(&file_schema)?;
+
         // Add the partition columns to the file schema
         let mut builder = SchemaBuilder::from(file_schema.as_ref().to_owned());
         for (part_col_name, part_col_type) in &options.table_partition_cols {
             builder.push(Field::new(part_col_name, part_col_type.clone(), false));
+        }
+
+        // Append metadata columns (Spice extension) after the partition columns
+        // so that `schema()` (the provider schema) exposes `_location`/`_size`/
+        // `_last_modified`, matching the scan's TableSchema and allowing SQL to
+        // reference them. This mirrors the pre-DF53 (spiceai-52.5) behavior.
+        for col in &options.metadata_cols {
+            builder.push(col.field());
         }
 
         let table_schema = Arc::new(
@@ -332,7 +346,9 @@ impl ListingTable {
                 .iter()
                 .map(|(col, field)| Arc::new(Field::new(col, field.clone(), false)))
                 .collect(),
-        );
+        )
+        // Append metadata columns (Spice extension) after the partition columns.
+        .with_metadata_cols(self.options.metadata_cols.clone());
 
         self.options.format.file_source(table_schema)
     }
@@ -579,6 +595,9 @@ impl TableProvider for ListingTable {
                     .with_file_groups(partitioned_file_lists)
                     .with_constraints(self.constraints.clone())
                     .with_statistics(statistics)
+                    .with_object_versioning_type(
+                        self.options.object_versioning_type.clone(),
+                    )
                     .with_projection_indices(projection)?
                     .with_limit(limit)
                     .with_output_ordering(output_ordering)

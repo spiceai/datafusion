@@ -580,6 +580,21 @@ impl FileSource for ParquetSource {
         &self.table_schema
     }
 
+    fn with_metadata_cols(
+        &self,
+        metadata_cols: Vec<datafusion_datasource::metadata::MetadataColumn>,
+    ) -> Option<Arc<dyn FileSource>> {
+        let mut source = self.clone();
+        source.table_schema = source.table_schema.with_metadata_cols(metadata_cols);
+        // Recompute the default full-table projection so that an unprojected
+        // scan emits the newly appended metadata columns. A subsequent
+        // projection pushdown (via `try_pushdown_projection`) will override this.
+        let full_schema = source.table_schema.table_schema();
+        let indices: Vec<usize> = (0..full_schema.fields().len()).collect();
+        source.projection = ProjectionExprs::from_indices(&indices, full_schema);
+        Some(Arc::new(source))
+    }
+
     fn filter(&self) -> Option<Arc<dyn PhysicalExpr>> {
         self.predicate.clone()
     }

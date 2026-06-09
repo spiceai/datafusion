@@ -67,10 +67,12 @@ impl CachedFileMetadata {
 
     /// Check if this cached entry is still valid for the given metadata.
     ///
-    /// Returns true if the file size and last modified time match.
+    /// Returns true if the file size, last modified time, and object version
+    /// (`version` / `e_tag`) all match.
     pub fn is_valid_for(&self, current_meta: &ObjectMeta) -> bool {
         self.meta.size == current_meta.size
             && self.meta.last_modified == current_meta.last_modified
+            && crate::cache::cache_unit::is_same_file_version(&self.meta, current_meta)
     }
 }
 
@@ -237,9 +239,13 @@ impl CachedFileMetadataEntry {
     }
 
     /// Check if this cached entry is still valid for the given metadata.
+    ///
+    /// Returns true if the file size, last modified time, and object version
+    /// (`version` / `e_tag`) all match.
     pub fn is_valid_for(&self, current_meta: &ObjectMeta) -> bool {
         self.meta.size == current_meta.size
             && self.meta.last_modified == current_meta.last_modified
+            && crate::cache::cache_unit::is_same_file_version(&self.meta, current_meta)
     }
 }
 

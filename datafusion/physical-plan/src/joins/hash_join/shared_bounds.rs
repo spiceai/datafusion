@@ -18,7 +18,8 @@
 //! Utilities for shared build-side information. Used in dynamic filter pushdown in Hash Joins.
 // TODO: include the link to the Dynamic Filter blog post.
 
-use std::fmt;
+use std::any::Any;
+use std::fmt::{self, Debug};
 use std::sync::Arc;
 
 use crate::ExecutionPlan;
@@ -44,37 +45,101 @@ use datafusion_physical_expr::{PhysicalExpr, PhysicalExprRef, ScalarFunctionExpr
 use parking_lot::Mutex;
 use tokio::sync::Barrier;
 
+/// Trait representing some set of bounds for a column used in join dynamic filtering.
+///
+/// Bounds could be min/max values, or some other type of custom bounds that can be
+/// represented by a physical expression. This is the dyn-able bounds type returned by
+/// [`CollectLeftAccumulator::evaluate`](super::exec::CollectLeftAccumulator::evaluate),
+/// allowing downstream code to plug a custom left-side accumulator.
+///
+/// Refer to the [`MinMaxColumnBounds`] implementation for an example of min/max bounds,
+/// which is the native default behavior of [`HashJoinExec`](super::exec::HashJoinExec).
+pub trait ColumnBounds: Send + Sync + Debug {
+    /// Upcast to [`Any`] so callers can downcast to a concrete bounds type.
+    ///
+    /// The native perfect-hash-join path downcasts to [`MinMaxColumnBounds`] to recover
+    /// the concrete min/max values; custom bounds types simply will not match.
+    fn as_any(&self) -> &dyn Any;
+
+    /// Creates a physical expression representing the bounds for this column (the
+    /// probe-side / right expression the dynamic filter is applied to).
+    ///
+    /// # Arguments
+    ///
+    /// * `expr` - The physical expression to constrain with these bounds.
+    ///
+    /// # Returns
+    /// `Ok(Arc<dyn PhysicalExpr>)` if creating the bounds expression succeeds, or an error otherwise.
+    fn physical_expr(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>>;
+}
+
 /// Represents the minimum and maximum values for a specific column.
 /// Used in dynamic filter pushdown to establish value boundaries.
+///
+/// This is the native [`ColumnBounds`] implementation backing the default
+/// `MinMaxLeftAccumulator`; it preserves the min/max range-predicate behavior and is the
+/// concrete type the perfect-hash-join path downcasts to.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ColumnBounds {
+pub struct MinMaxColumnBounds {
     /// The minimum value observed for this column
     pub(crate) min: ScalarValue,
-    /// The maximum value observed for this column  
+    /// The maximum value observed for this column
     pub(crate) max: ScalarValue,
 }
 
-impl ColumnBounds {
+impl MinMaxColumnBounds {
     pub(crate) fn new(min: ScalarValue, max: ScalarValue) -> Self {
         Self { min, max }
     }
 }
 
+impl ColumnBounds for MinMaxColumnBounds {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn physical_expr(
+        &self,
+        expr: Arc<dyn PhysicalExpr>,
+    ) -> Result<Arc<dyn PhysicalExpr>> {
+        // Create predicate: col >= min AND col <= max
+        let min_expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&expr),
+            Operator::GtEq,
+            lit(self.min.clone()),
+        )) as Arc<dyn PhysicalExpr>;
+        let max_expr = Arc::new(BinaryExpr::new(
+            Arc::clone(&expr),
+            Operator::LtEq,
+            lit(self.max.clone()),
+        )) as Arc<dyn PhysicalExpr>;
+        let range_expr = Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
+            as Arc<dyn PhysicalExpr>;
+        Ok(range_expr)
+    }
+}
+
 /// Represents the bounds for all join key columns from a single partition.
-/// This contains the min/max values computed from one partition's build-side data.
+/// This contains the bounds computed from one partition's build-side data.
 #[derive(Debug, Clone)]
 pub(crate) struct PartitionBounds {
-    /// Min/max bounds for each join key column in this partition.
+    /// Bounds for each join key column in this partition.
     /// Index corresponds to the join key expression index.
-    column_bounds: Vec<ColumnBounds>,
+    column_bounds: Vec<Arc<dyn ColumnBounds>>,
 }
 
 impl PartitionBounds {
-    pub(crate) fn new(column_bounds: Vec<ColumnBounds>) -> Self {
+    pub(crate) fn new(column_bounds: Vec<Arc<dyn ColumnBounds>>) -> Self {
         Self { column_bounds }
     }
 
-    pub(crate) fn get_column_bounds(&self, index: usize) -> Option<&ColumnBounds> {
+    pub(crate) fn get_column_bounds(
+        &self,
+        index: usize,
+    ) -> Option<&Arc<dyn ColumnBounds>> {
         self.column_bounds.get(index)
     }
 }
@@ -146,32 +211,22 @@ fn create_membership_predicate(
 fn create_bounds_predicate(
     on_right: &[PhysicalExprRef],
     bounds: &PartitionBounds,
-) -> Option<Arc<dyn PhysicalExpr>> {
+) -> Result<Option<Arc<dyn PhysicalExpr>>> {
     let mut column_predicates = Vec::new();
 
     for (col_idx, right_expr) in on_right.iter().enumerate() {
         if let Some(column_bounds) = bounds.get_column_bounds(col_idx) {
-            // Create predicate: col >= min AND col <= max
-            let min_expr = Arc::new(BinaryExpr::new(
-                Arc::clone(right_expr),
-                Operator::GtEq,
-                lit(column_bounds.min.clone()),
-            )) as Arc<dyn PhysicalExpr>;
-            let max_expr = Arc::new(BinaryExpr::new(
-                Arc::clone(right_expr),
-                Operator::LtEq,
-                lit(column_bounds.max.clone()),
-            )) as Arc<dyn PhysicalExpr>;
-            let range_expr = Arc::new(BinaryExpr::new(min_expr, Operator::And, max_expr))
-                as Arc<dyn PhysicalExpr>;
+            // Delegate to the bounds implementation. For the native
+            // `MinMaxColumnBounds` this produces `col >= min AND col <= max`.
+            let range_expr = column_bounds.physical_expr(Arc::clone(right_expr))?;
             column_predicates.push(range_expr);
         }
     }
 
     if column_predicates.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(
+        Ok(Some(
             column_predicates
                 .into_iter()
                 .reduce(|acc, pred| {
@@ -179,7 +234,7 @@ fn create_bounds_predicate(
                         as Arc<dyn PhysicalExpr>
                 })
                 .unwrap(),
-        )
+        ))
     }
 }
 
@@ -414,7 +469,7 @@ impl SharedBuildAccumulator {
                         let bounds_expr = create_bounds_predicate(
                             &self.on_right,
                             &partition_data.bounds,
-                        );
+                        )?;
 
                         // Combine membership and bounds expressions for multi-layer optimization:
                         // - Bounds (min/max): Enable statistics-based pruning (Parquet row group/file skipping)
@@ -524,7 +579,7 @@ impl SharedBuildAccumulator {
                                 let bounds_expr = create_bounds_predicate(
                                     &self.on_right,
                                     &partition.bounds,
-                                );
+                                )?;
 
                                 // 3. Combine membership and bounds expressions
                                 let then_expr = match (membership_expr, bounds_expr) {
@@ -587,7 +642,7 @@ impl SharedBuildAccumulator {
     }
 }
 
-impl fmt::Debug for SharedBuildAccumulator {
+impl Debug for SharedBuildAccumulator {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SharedBuildAccumulator")
     }

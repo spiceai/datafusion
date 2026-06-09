@@ -1115,6 +1115,21 @@ config_namespace! {
         /// See: <https://trino.io/docs/current/admin/dynamic-filtering.html#dynamic-filter-collection-thresholds>
         pub hash_join_inlist_pushdown_max_distinct_values: usize, default = 150
 
+        /// Maximum size in bytes of the exact join filter (e.g. an exact `InList` of
+        /// build-side keys) that a custom build-side
+        /// [`CollectLeftAccumulator`](https://docs.rs/datafusion-physical-plan/latest/datafusion_physical_plan/joins/trait.CollectLeftAccumulator.html)
+        /// may materialize for dynamic filter pushdown.
+        ///
+        /// This is an additional budget consulted by pluggable exact-membership
+        /// accumulators (the accumulator seam); build sides whose exact filter would
+        /// exceed this size are expected to fall back to a coarser strategy. It does
+        /// not affect the native min/max accumulator, whose InList budget is governed
+        /// by `hash_join_inlist_pushdown_max_size`.
+        ///
+        /// The default (`usize::MAX`) imposes no additional limit, preserving existing
+        /// behavior.
+        pub exact_join_filter_max_bytes: usize, default = usize::MAX
+
         /// The default filter selectivity used by Filter Statistics
         /// when an exact selectivity cannot be determined. Valid values are
         /// between 0 (no selectivity) and 100 (all rows are selected).
