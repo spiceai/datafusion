@@ -17,6 +17,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::marker::PhantomData;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -35,7 +36,8 @@ use crate::joins::Map;
 use crate::joins::array_map::ArrayMap;
 use crate::joins::hash_join::inlist_builder::build_struct_inlist_values;
 use crate::joins::hash_join::shared_bounds::{
-    ColumnBounds, PartitionBounds, PushdownStrategy, SharedBuildAccumulator,
+    ColumnBounds, MinMaxColumnBounds, PartitionBounds, PushdownStrategy,
+    SharedBuildAccumulator,
 };
 use crate::joins::hash_join::stream::{
     BuildSide, BuildSideInitialState, HashJoinStream, HashJoinStreamState,
@@ -127,7 +129,14 @@ fn try_create_array_map(
     }
 
     let (min_val, max_val) = if let Some(bounds) = bounds {
-        let (min_val, max_val) = if let Some(cb) = bounds.get_column_bounds(0) {
+        // The perfect-hash-join optimization requires concrete min/max values.
+        // Recover them by downcasting to the native `MinMaxColumnBounds`. A custom
+        // (non-min/max) `ColumnBounds` implementation will not match, in which case
+        // we simply skip the ArrayMap optimization (returning `None`).
+        let (min_val, max_val) = if let Some(cb) = bounds
+            .get_column_bounds(0)
+            .and_then(|cb| cb.as_any().downcast_ref::<MinMaxColumnBounds>())
+        {
             (cb.min.clone(), cb.max.clone())
         } else {
             return Ok(None);
@@ -263,12 +272,13 @@ impl JoinLeftData {
 /// flag is set to false if modifying the field requires a recomputation of the plan's
 /// properties.
 ///
-pub struct HashJoinExecBuilder {
-    exec: HashJoinExec,
+pub struct HashJoinExecBuilder<A: CollectLeftAccumulator + 'static = MinMaxLeftAccumulator>
+{
+    exec: HashJoinExec<A>,
     preserve_properties: bool,
 }
 
-impl HashJoinExecBuilder {
+impl<A: CollectLeftAccumulator + 'static> HashJoinExecBuilder<A> {
     /// Make a new [`HashJoinExecBuilder`].
     pub fn new(
         left: Arc<dyn ExecutionPlan>,
@@ -296,6 +306,7 @@ impl HashJoinExecBuilder {
                 // Will be computed at when plan will be built.
                 cache: stub_properties(),
                 join_schema: Arc::new(Schema::empty()),
+                _phantom_accumulator: PhantomData,
             },
             // As `exec` is initialized with stub properties,
             // they will be properly computed when plan will be built.
@@ -395,7 +406,7 @@ impl HashJoinExecBuilder {
     }
 
     /// Build resulting execution plan.
-    pub fn build(self) -> Result<HashJoinExec> {
+    pub fn build(self) -> Result<HashJoinExec<A>> {
         let Self {
             exec,
             preserve_properties,
@@ -437,6 +448,7 @@ impl HashJoinExecBuilder {
             null_aware,
             dynamic_filter,
             fetch,
+            _phantom_accumulator: phantom_accumulator,
             // Recomputed.
             join_schema: _,
             column_indices: _,
@@ -458,7 +470,7 @@ impl HashJoinExecBuilder {
         // Check if the projection is valid.
         can_project(&join_schema, projection.as_deref())?;
 
-        let cache = HashJoinExec::compute_properties(
+        let cache = HashJoinExec::<A>::compute_properties(
             &left,
             &right,
             &join_schema,
@@ -486,6 +498,7 @@ impl HashJoinExecBuilder {
             cache: Arc::new(cache),
             dynamic_filter,
             fetch,
+            _phantom_accumulator: phantom_accumulator,
         })
     }
 
@@ -495,8 +508,10 @@ impl HashJoinExecBuilder {
     }
 }
 
-impl From<&HashJoinExec> for HashJoinExecBuilder {
-    fn from(exec: &HashJoinExec) -> Self {
+impl<A: CollectLeftAccumulator + 'static> From<&HashJoinExec<A>>
+    for HashJoinExecBuilder<A>
+{
+    fn from(exec: &HashJoinExec<A>) -> Self {
         Self {
             exec: HashJoinExec {
                 left: Arc::clone(exec.left()),
@@ -516,6 +531,7 @@ impl From<&HashJoinExec> for HashJoinExecBuilder {
                 cache: Arc::clone(&exec.cache),
                 dynamic_filter: exec.dynamic_filter.clone(),
                 fetch: exec.fetch,
+                _phantom_accumulator: PhantomData,
             },
             preserve_properties: true,
         }
@@ -714,7 +730,7 @@ impl From<&HashJoinExec> for HashJoinExecBuilder {
 /// Note this structure includes a [`OnceAsync`] that is used to coordinate the
 /// loading of the left side with the processing in each output stream.
 /// Therefore it can not be [`Clone`]
-pub struct HashJoinExec {
+pub struct HashJoinExec<A: CollectLeftAccumulator + 'static = MinMaxLeftAccumulator> {
     /// left (build) side which gets hashed
     pub left: Arc<dyn ExecutionPlan>,
     /// right (probe) side which are filtered by the hash table
@@ -757,6 +773,9 @@ pub struct HashJoinExec {
     dynamic_filter: Option<HashJoinExecDynamicFilter>,
     /// Maximum number of rows to return
     fetch: Option<usize>,
+    /// Marker for the pluggable build-side (left) accumulator type.
+    /// Defaults to [`MinMaxLeftAccumulator`] (native min/max behavior).
+    _phantom_accumulator: PhantomData<A>,
 }
 
 #[derive(Clone)]
@@ -768,7 +787,7 @@ struct HashJoinExecDynamicFilter {
     build_accumulator: OnceLock<Arc<SharedBuildAccumulator>>,
 }
 
-impl fmt::Debug for HashJoinExec {
+impl<A: CollectLeftAccumulator + 'static> fmt::Debug for HashJoinExec<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HashJoinExec")
             .field("left", &self.left)
@@ -785,19 +804,24 @@ impl fmt::Debug for HashJoinExec {
             .field("column_indices", &self.column_indices)
             .field("null_equality", &self.null_equality)
             .field("cache", &self.cache)
+            .field("accumulator", &A::static_name())
             // Explicitly exclude dynamic_filter to avoid runtime state differences in tests
             .finish()
     }
 }
 
-impl EmbeddedProjection for HashJoinExec {
+impl<A: CollectLeftAccumulator + 'static> EmbeddedProjection for HashJoinExec<A> {
     fn with_projection(&self, projection: Option<Vec<usize>>) -> Result<Self> {
         self.with_projection(projection)
     }
 }
 
-impl HashJoinExec {
-    /// Tries to create a new [`HashJoinExec`].
+impl HashJoinExec<MinMaxLeftAccumulator> {
+    /// Tries to create a new [`HashJoinExec`] with the default (native min/max)
+    /// build-side accumulator.
+    ///
+    /// To use a custom [`CollectLeftAccumulator`], create the join with this
+    /// constructor and then call [`HashJoinExec::recreate_with_accumulator`].
     ///
     /// # Error
     /// This function errors when it is not possible to join the left and right sides on keys `on`.
@@ -821,14 +845,49 @@ impl HashJoinExec {
             .with_null_aware(null_aware)
             .build()
     }
+}
 
+impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
     /// Create a builder based on the existing [`HashJoinExec`].
     ///
     /// Returned builder preserves all existing fields. If a field requiring properties
     /// recomputation is modified, this will be done automatically during the node build.
     ///
-    pub fn builder(&self) -> HashJoinExecBuilder {
+    pub fn builder(&self) -> HashJoinExecBuilder<A> {
         self.into()
+    }
+
+    /// Recreate this [`HashJoinExec`] with a different build-side (left)
+    /// accumulator type `B`.
+    ///
+    /// This is the extension seam that lets downstream code swap the native
+    /// [`MinMaxLeftAccumulator`] for a custom [`CollectLeftAccumulator`]
+    /// implementation while preserving all other configuration. Runtime state
+    /// (the `dynamic_filter`/build accumulator) is carried over as-is; the build
+    /// accumulator is reset during execution to reflect actual partition counts.
+    pub fn recreate_with_accumulator<B: CollectLeftAccumulator + 'static>(
+        &self,
+    ) -> HashJoinExec<B> {
+        HashJoinExec {
+            left: Arc::clone(&self.left),
+            right: Arc::clone(&self.right),
+            on: self.on.clone(),
+            filter: self.filter.clone(),
+            join_type: self.join_type,
+            join_schema: Arc::clone(&self.join_schema),
+            left_fut: Arc::clone(&self.left_fut),
+            random_state: self.random_state.clone(),
+            mode: self.mode,
+            metrics: self.metrics.clone(),
+            projection: self.projection.clone(),
+            column_indices: self.column_indices.clone(),
+            null_equality: self.null_equality,
+            null_aware: self.null_aware,
+            cache: Arc::clone(&self.cache),
+            dynamic_filter: self.dynamic_filter.clone(),
+            fetch: self.fetch,
+            _phantom_accumulator: PhantomData,
+        }
     }
 
     fn create_dynamic_filter(on: &JoinOn) -> Arc<DynamicFilterPhysicalExpr> {
@@ -1087,7 +1146,7 @@ impl HashJoinExec {
     }
 }
 
-impl DisplayAs for HashJoinExec {
+impl<A: CollectLeftAccumulator + 'static> DisplayAs for HashJoinExec<A> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
@@ -1174,7 +1233,7 @@ impl DisplayAs for HashJoinExec {
     }
 }
 
-impl ExecutionPlan for HashJoinExec {
+impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
     fn name(&self) -> &'static str {
         "HashJoinExec"
     }
@@ -1302,7 +1361,7 @@ impl ExecutionPlan for HashJoinExec {
                 let reservation =
                     MemoryConsumer::new("HashJoinInput").register(context.memory_pool());
 
-                Ok(collect_left_input(
+                Ok(collect_left_input::<A>(
                     self.random_state.random_state().clone(),
                     left_stream,
                     on_left.clone(),
@@ -1323,7 +1382,7 @@ impl ExecutionPlan for HashJoinExec {
                     MemoryConsumer::new(format!("HashJoinInput[{partition}]"))
                         .register(context.memory_pool());
 
-                OnceFut::new(collect_left_input(
+                OnceFut::new(collect_left_input::<A>(
                     self.random_state.random_state().clone(),
                     left_stream,
                     on_left.clone(),
@@ -1676,6 +1735,60 @@ fn lr_is_preserved(join_type: JoinType) -> (bool, bool) {
     }
 }
 
+/// Trait defining an accumulator for collecting build-side data during hash joins.
+///
+/// The accumulator processes batches of data from the build side and computes the
+/// per-column bounds needed for dynamic filtering. This is the extension seam that lets
+/// downstream code plug a custom left-side accumulator (for example, an exact
+/// membership accumulator) in place of the native min/max one.
+///
+/// [`HashJoinExec`] is generic over this trait and defaults to [`MinMaxLeftAccumulator`],
+/// which collects minimum and maximum values for join key expressions across all
+/// build-side batches and preserves DataFusion's native behavior.
+pub trait CollectLeftAccumulator: Send + Sync {
+    /// Returns the name of the accumulator.
+    fn name(&self) -> &'static str;
+
+    /// Returns the static name of the accumulator type.
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        std::any::type_name::<Self>()
+    }
+
+    /// Creates a new accumulator for the given expression and schema.
+    ///
+    /// # Arguments
+    /// * `expr` - The physical expression to track bounds for
+    /// * `schema` - The schema of the input data
+    ///
+    /// # Returns
+    /// A new accumulator instance configured for the expression's data type
+    fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> Result<Self>
+    where
+        Self: Sized;
+
+    /// Updates the accumulator with values from a new batch.
+    ///
+    /// # Arguments
+    /// * `batch` - The record batch to process
+    ///
+    /// # Returns
+    /// Ok(()) if the update succeeds, or an error if updating fails.
+    fn update_batch(&mut self, batch: &RecordBatch) -> Result<()>;
+
+    /// Finalizes the accumulation and returns the computed bounds.
+    ///
+    /// Consumes self to extract the final bounds from the accumulator.
+    ///
+    /// # Returns
+    /// The [`ColumnBounds`] computed from the observed build-side data.
+    fn evaluate(self) -> Result<Arc<dyn ColumnBounds>>
+    where
+        Self: Sized;
+}
+
 /// Accumulator for collecting min/max bounds from build-side data during hash join.
 ///
 /// This struct encapsulates the logic for progressively computing column bounds
@@ -1684,8 +1797,9 @@ fn lr_is_preserved(join_type: JoinType) -> (bool, bool) {
 ///
 /// The bounds are used for dynamic filter pushdown optimization, where filters
 /// based on the actual data ranges can be pushed down to the probe side to
-/// eliminate unnecessary data early.
-struct CollectLeftAccumulator {
+/// eliminate unnecessary data early. This is the native default
+/// [`CollectLeftAccumulator`] used by [`HashJoinExec`].
+pub struct MinMaxLeftAccumulator {
     /// The physical expression to evaluate for each batch
     expr: Arc<dyn PhysicalExpr>,
     /// Accumulator for tracking the minimum value across all batches
@@ -1694,15 +1808,19 @@ struct CollectLeftAccumulator {
     max: MaxAccumulator,
 }
 
-impl CollectLeftAccumulator {
+impl CollectLeftAccumulator for MinMaxLeftAccumulator {
+    fn name(&self) -> &'static str {
+        "MinMaxLeftAccumulator"
+    }
+
+    fn static_name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "MinMaxLeftAccumulator"
+    }
+
     /// Creates a new accumulator for tracking bounds of a join key expression.
-    ///
-    /// # Arguments
-    /// * `expr` - The physical expression to track bounds for
-    /// * `schema` - The schema of the input data
-    ///
-    /// # Returns
-    /// A new `CollectLeftAccumulator` instance configured for the expression's data type
     fn try_new(expr: Arc<dyn PhysicalExpr>, schema: &SchemaRef) -> Result<Self> {
         /// Recursively unwraps dictionary types to get the underlying value type.
         fn dictionary_value_type(data_type: &DataType) -> DataType {
@@ -1725,16 +1843,8 @@ impl CollectLeftAccumulator {
         })
     }
 
-    /// Updates the accumulators with values from a new batch.
-    ///
     /// Evaluates the expression on the batch and updates both min and max
     /// accumulators with the resulting values.
-    ///
-    /// # Arguments
-    /// * `batch` - The record batch to process
-    ///
-    /// # Returns
-    /// Ok(()) if the update succeeds, or an error if expression evaluation fails
     fn update_batch(&mut self, batch: &RecordBatch) -> Result<()> {
         let array = self.expr.evaluate(batch)?.into_array(batch.num_rows())?;
         self.min.update_batch(std::slice::from_ref(&array))?;
@@ -1742,30 +1852,25 @@ impl CollectLeftAccumulator {
         Ok(())
     }
 
-    /// Finalizes the accumulation and returns the computed bounds.
-    ///
     /// Consumes self to extract the final min and max values from the accumulators.
-    ///
-    /// # Returns
-    /// The `ColumnBounds` containing the minimum and maximum values observed
-    fn evaluate(mut self) -> Result<ColumnBounds> {
-        Ok(ColumnBounds::new(
+    fn evaluate(mut self) -> Result<Arc<dyn ColumnBounds>> {
+        Ok(Arc::new(MinMaxColumnBounds::new(
             self.min.evaluate()?,
             self.max.evaluate()?,
-        ))
+        )))
     }
 }
 
 /// State for collecting the build-side data during hash join
-struct BuildSideState {
+struct BuildSideState<A: CollectLeftAccumulator> {
     batches: Vec<RecordBatch>,
     num_rows: usize,
     metrics: BuildProbeJoinMetrics,
     reservation: MemoryReservation,
-    bounds_accumulators: Option<Vec<CollectLeftAccumulator>>,
+    bounds_accumulators: Option<Vec<A>>,
 }
 
-impl BuildSideState {
+impl<A: CollectLeftAccumulator> BuildSideState<A> {
     /// Create a new BuildSideState with optional accumulators for bounds computation
     fn try_new(
         metrics: BuildProbeJoinMetrics,
@@ -1783,7 +1888,7 @@ impl BuildSideState {
                 .then(|| {
                     on_left
                         .into_iter()
-                        .map(|expr| CollectLeftAccumulator::try_new(expr, schema))
+                        .map(|expr| A::try_new(expr, schema))
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()?,
@@ -1833,7 +1938,7 @@ fn should_collect_min_max_for_perfect_hash(
 /// `JoinLeftData` containing the hash map, consolidated batch, join key values,
 /// visited indices bitmap, and computed bounds (if requested).
 #[expect(clippy::too_many_arguments)]
-async fn collect_left_input(
+async fn collect_left_input<A: CollectLeftAccumulator>(
     random_state: RandomState,
     left_stream: SendableRecordBatchStream,
     on_left: Vec<PhysicalExprRef>,
@@ -1851,7 +1956,7 @@ async fn collect_left_input(
     let should_collect_min_max_for_phj =
         should_collect_min_max_for_perfect_hash(&on_left, &schema)?;
 
-    let initial = BuildSideState::try_new(
+    let initial = BuildSideState::<A>::try_new(
         metrics,
         reservation,
         on_left.clone(),
@@ -1898,7 +2003,7 @@ async fn collect_left_input(
         Some(accumulators) if num_rows > 0 => {
             let bounds = accumulators
                 .into_iter()
-                .map(CollectLeftAccumulator::evaluate)
+                .map(A::evaluate)
                 .collect::<Result<Vec<_>>>()?;
             Some(PartitionBounds::new(bounds))
         }
@@ -5367,7 +5472,8 @@ mod tests {
         )];
 
         // Create a dynamic filter manually
-        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter =
+            HashJoinExec::<MinMaxLeftAccumulator>::create_dynamic_filter(&on);
         let dynamic_filter_clone = Arc::clone(&dynamic_filter);
 
         // Create HashJoinExec with the dynamic filter
@@ -5416,7 +5522,8 @@ mod tests {
         )];
 
         // Create a dynamic filter manually
-        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter =
+            HashJoinExec::<MinMaxLeftAccumulator>::create_dynamic_filter(&on);
         let dynamic_filter_clone = Arc::clone(&dynamic_filter);
 
         // Create HashJoinExec with the dynamic filter

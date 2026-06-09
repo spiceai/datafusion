@@ -661,7 +661,15 @@ impl ProjectionExprs {
         for proj_expr in self.exprs.iter() {
             let expr = &proj_expr.expr;
             let col_stats = if let Some(col) = expr.as_any().downcast_ref::<Column>() {
-                std::mem::take(&mut stats.column_statistics[col.index()])
+                // Spice metadata columns (and projected partition columns) reference
+                // table-schema indices that fall beyond the upstream file-level
+                // statistics, which only cover the file (and partition) columns. Those
+                // injected columns have no known statistics, so fall back to unknown
+                if col.index() < stats.column_statistics.len() {
+                    std::mem::take(&mut stats.column_statistics[col.index()])
+                } else {
+                    ColumnStatistics::new_unknown()
+                }
             } else if let Some(literal) = expr.as_any().downcast_ref::<Literal>() {
                 // Handle literal expressions (constants) by calculating proper statistics
                 let data_type = expr.data_type(output_schema)?;
@@ -2732,6 +2740,54 @@ pub(crate) mod tests {
         assert_eq!(
             output_stats.column_statistics[1].distinct_count,
             Precision::Exact(1)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_column_index_beyond_input_stats() -> Result<()> {
+        // File-level statistics only cover the three file columns.
+        let input_stats = get_stats();
+        assert_eq!(input_stats.column_statistics.len(), 3);
+
+        // The table schema additionally exposes a metadata column at index 3.
+        let table_schema = Schema::new(vec![
+            Field::new("col0", DataType::Int64, false),
+            Field::new("col1", DataType::Utf8, false),
+            Field::new("col2", DataType::Float32, false),
+            Field::new("_location", DataType::Utf8, true),
+        ]);
+
+        // SELECT col0, _location — the metadata column (index 3) is beyond the
+        // input statistics width (3).
+        let projection = ProjectionExprs::new(vec![
+            ProjectionExpr {
+                expr: Arc::new(Column::new("col0", 0)),
+                alias: "col0".to_string(),
+            },
+            ProjectionExpr {
+                expr: Arc::new(Column::new("_location", 3)),
+                alias: "_location".to_string(),
+            },
+        ]);
+
+        let output_stats = projection
+            .project_statistics(input_stats, &projection.project_schema(&table_schema)?)?;
+
+        assert_eq!(output_stats.num_rows, Precision::Exact(5));
+        assert_eq!(output_stats.column_statistics.len(), 2);
+
+        // col0 keeps its known statistics.
+        assert_eq!(
+            output_stats.column_statistics[0].max_value,
+            Precision::Exact(ScalarValue::Int64(Some(21)))
+        );
+
+        // The metadata column has no upstream statistics -> unknown, not a panic.
+        assert_eq!(
+            output_stats.column_statistics[1],
+            ColumnStatistics::new_unknown()
         );
 
         Ok(())
