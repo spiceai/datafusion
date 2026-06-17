@@ -2932,34 +2932,6 @@ fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
     Ok(())
 }
 
-// Modifies expr to match the DataType, metadata, and nullability of other if it is
-// a placeholder with previously unspecified type information (i.e., most placeholders)
-fn rewrite_placeholder_with_field(
-    expr: &mut Expr,
-    other: &Expr,
-    schema: &DFSchema,
-) -> Result<()> {
-    if let Expr::Placeholder(Placeholder { id: _, field }) = expr {
-        if field.is_none() {
-            let other_field = other.to_field(schema);
-            match other_field {
-                Err(e) => {
-                    Err(e.context(format!(
-                        "Can not find type of {other} needed to infer type of {expr}"
-                    )))?;
-                }
-                Ok((_, other_field)) => {
-                    // We can't infer the nullability of the future parameter that might
-                    // be bound, so ensure this is set to true
-                    *field =
-                        Some(other_field.as_ref().clone().with_nullable(true).into());
-                }
-            }
-        };
-    }
-    Ok(())
-}
-
 fn find_first_non_null_data_type_expr_placeholder<'a>(
     exprs: impl Iterator<Item = &'a Expr>,
     schema: &DFSchema,
@@ -3797,9 +3769,7 @@ mod test {
     use crate::{
         ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Volatility, case,
         lit, placeholder, qualified_wildcard, wildcard, wildcard_with_options,
-        case, lit, placeholder, qualified_wildcard, wildcard, wildcard_with_options,
-        ColumnarValue, LogicalPlan, LogicalTableSource, Projection, ScalarFunctionArgs,
-        ScalarUDF, ScalarUDFImpl, TableScan, Volatility,
+        LogicalPlan, LogicalTableSource, Projection, TableScan,
     };
     use arrow::datatypes::{Field, Schema, TimeUnit};
     use sqlparser::ast;
@@ -3867,7 +3837,6 @@ mod test {
         let placeholder_expr = Expr::Placeholder(Placeholder {
             id: "$1".to_string(),
             field: None,
-            data_type: None,
         });
         let in_list = Expr::InList(InList {
             expr: Box::new(placeholder_expr),
@@ -3896,8 +3865,6 @@ mod test {
                     assert_eq!(
                         placeholder.field.as_ref().unwrap().data_type(),
                         &DataType::Int32,
-                        placeholder.data_type,
-                        Some(DataType::Int32),
                         "Placeholder {} should infer Int32",
                         placeholder.id
                     );
@@ -3922,7 +3889,6 @@ mod test {
         let placeholder = Expr::Placeholder(Placeholder {
             id: "$1".to_string(),
             field: None,
-            data_type: None,
         });
 
         // Subquery: SELECT A FROM my_table WHERE B > 3
@@ -3979,8 +3945,6 @@ mod test {
                     assert_eq!(
                         placeholder.field.as_ref().unwrap().data_type(),
                         &DataType::Int32,
-                        placeholder.data_type,
-                        Some(DataType::Int32),
                         "Placeholder $1 should infer Int32"
                     );
                 }
@@ -4274,7 +4238,7 @@ mod test {
     }
 
     use super::*;
-    use crate::logical_plan::{EmptyRelation, LogicalPlan};
+    use crate::logical_plan::EmptyRelation;
 
     #[test]
     fn test_display_wildcard() {

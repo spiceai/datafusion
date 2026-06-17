@@ -450,7 +450,13 @@ mod tests {
         // - Position 1 (b) is skipped (optional, uses default)
         // positional_count = 1, so only position 0 must be filled ✓
         let args = vec![lit(1), lit(3.0)];
-        let arg_names = vec![None, Some("c".to_string())];
+        let arg_names = vec![
+            None,
+            Some(ArgumentName {
+                value: "c".to_string(),
+                is_quoted: false,
+            }),
+        ];
 
         let result = resolve_function_arguments(&param_names, args, arg_names).unwrap();
 
@@ -476,7 +482,14 @@ mod tests {
 
         // 2 positional args + 1 named arg that targets position 5
         let args = vec![lit("foo"), lit("yellow"), lit(100)];
-        let arg_names = vec![None, None, Some("rank_weight".to_string())];
+        let arg_names = vec![
+            None,
+            None,
+            Some(ArgumentName {
+                value: "rank_weight".to_string(),
+                is_quoted: false,
+            }),
+        ];
 
         let result = resolve_function_arguments(&param_names, args, arg_names).unwrap();
 
@@ -506,14 +519,11 @@ mod tests {
             }),
         ];
 
-        let result = resolve_function_arguments(&param_names, args, arg_names);
-        assert!(result.is_err());
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Missing required parameter")
-        );
+        let result = resolve_function_arguments(&param_names, args, arg_names).unwrap();
+        // Should return [a, c] = [1, 3.0], skipping b
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0], lit(1));
+        assert_eq!(result[1], lit(3.0));
     }
 
     #[test]
@@ -722,11 +732,5 @@ mod tests {
         assert_eq!(result4[0], lit("a"));
         assert_eq!(result4[1], lit(1));
         assert_eq!(result4[2], lit(5));
-        let result = resolve_function_arguments(&param_names, args, arg_names).unwrap();
-
-        // Should return [a, c] = [1, 3.0], skipping b
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], lit(1));
-        assert_eq!(result[1], lit(3.0));
     }
 }
