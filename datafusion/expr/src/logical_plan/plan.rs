@@ -1621,6 +1621,22 @@ impl LogicalPlan {
         let mut param_types: HashMap<String, Option<FieldRef>> = HashMap::new();
 
         self.apply_with_subqueries(|plan| {
+            // OFFSET/LIMIT operands are always Int64, but the expressions carry no
+            // surrounding type context for `infer_placeholder_types` to work from.
+            // Type any placeholders used directly as `skip`/`fetch` here so e.g.
+            // `LIMIT $1` resolves the parameter to Int64.
+            if let LogicalPlan::Limit(Limit { skip, fetch, .. }) = plan {
+                for operand in [skip, fetch].into_iter().flatten() {
+                    if let Expr::Placeholder(Placeholder { id, field: None }) =
+                        operand.as_ref()
+                    {
+                        param_types.insert(
+                            id.clone(),
+                            Some(Arc::new(Field::new("", DataType::Int64, true))),
+                        );
+                    }
+                }
+            }
             plan.apply_expressions(|expr| {
                 expr.apply(|expr| {
                     if let Expr::Placeholder(Placeholder { id, field }) = expr {
@@ -1637,6 +1653,9 @@ impl LogicalPlan {
                             (_, Some(field)) => {
                                 param_types.insert(id.clone(), Some(Arc::clone(field)));
                             }
+                            // Keep an already-inferred type (e.g. Int64 from a LIMIT
+                            // operand above) rather than downgrading it to unknown.
+                            (Some(Some(_)), None) => {}
                             _ => {
                                 param_types.insert(id.clone(), None);
                             }
