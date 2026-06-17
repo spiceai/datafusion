@@ -977,7 +977,7 @@ pub fn test_scan_with_ordering(
 #[derive(Debug, Clone)]
 pub struct ExactTestScan {
     schema: SchemaRef,
-    plan_properties: PlanProperties,
+    plan_properties: Arc<PlanProperties>,
     requested_ordering: Option<LexOrdering>,
     fetch: Option<usize>,
 }
@@ -993,7 +993,7 @@ impl ExactTestScan {
         );
         Self {
             schema,
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
             requested_ordering: None,
             fetch: None,
         }
@@ -1036,7 +1036,7 @@ impl ExecutionPlan for ExactTestScan {
         self
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.plan_properties
     }
 
@@ -1097,7 +1097,7 @@ impl ExecutionPlan for ExactTestScan {
 
         let new_scan = ExactTestScan {
             schema: Arc::clone(&self.schema),
-            plan_properties,
+            plan_properties: Arc::new(plan_properties),
             requested_ordering,
             fetch: self.fetch,
         };
