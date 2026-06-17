@@ -2209,13 +2209,13 @@ impl Expr {
             #[expect(deprecated)]
             match &mut expr {
                 Expr::BinaryExpr(BinaryExpr { left, op: _, right }) => {
-                    let binary_expr_type = find_first_non_null_data_type_expr_placeholder(
+                    let binary_expr_field = find_first_non_null_field_expr_placeholder(
                         [left.as_ref(), right.as_ref()].into_iter(),
                         schema,
                     );
-                    if let Some(binary_expr_type) = binary_expr_type {
-                        rewrite_placeholder_type(left.as_mut(), &binary_expr_type)?;
-                        rewrite_placeholder_type(right.as_mut(), &binary_expr_type)?;
+                    if let Some(binary_expr_field) = binary_expr_field {
+                        rewrite_placeholder_field(left.as_mut(), &binary_expr_field)?;
+                        rewrite_placeholder_field(right.as_mut(), &binary_expr_field)?;
                     }
                 }
                 Expr::Between(Between {
@@ -2224,14 +2224,14 @@ impl Expr {
                     low,
                     high,
                 }) => {
-                    let between_type = find_first_non_null_data_type_expr_placeholder(
+                    let between_field = find_first_non_null_field_expr_placeholder(
                         [low.as_ref(), high.as_ref(), expr.as_ref()].into_iter(),
                         schema,
                     );
-                    if let Some(between_type) = between_type {
-                        rewrite_placeholder_type(expr.as_mut(), &between_type)?;
-                        rewrite_placeholder_type(low.as_mut(), &between_type)?;
-                        rewrite_placeholder_type(high.as_mut(), &between_type)?;
+                    if let Some(between_field) = between_field {
+                        rewrite_placeholder_field(expr.as_mut(), &between_field)?;
+                        rewrite_placeholder_field(low.as_mut(), &between_field)?;
+                        rewrite_placeholder_field(high.as_mut(), &between_field)?;
                     }
                 }
                 Expr::InList(InList {
@@ -2239,26 +2239,26 @@ impl Expr {
                     list,
                     negated: _,
                 }) => {
-                    let in_list_type = find_first_non_null_data_type_expr_placeholder(
+                    let in_list_field = find_first_non_null_field_expr_placeholder(
                         [expr.as_ref()].into_iter().chain(list.iter()),
                         schema,
                     );
-                    if let Some(in_list_type) = in_list_type {
-                        rewrite_placeholder_type(expr.as_mut(), &in_list_type)?;
+                    if let Some(in_list_field) = in_list_field {
+                        rewrite_placeholder_field(expr.as_mut(), &in_list_field)?;
                         for item in list.iter_mut() {
-                            rewrite_placeholder_type(item, &in_list_type)?;
+                            rewrite_placeholder_field(item, &in_list_field)?;
                         }
                     }
                 }
                 Expr::Like(Like { expr, pattern, .. })
                 | Expr::SimilarTo(Like { expr, pattern, .. }) => {
-                    let like_type = find_first_non_null_data_type_expr_placeholder(
+                    let like_field = find_first_non_null_field_expr_placeholder(
                         [expr.as_ref(), pattern.as_ref()].into_iter(),
                         schema,
                     );
-                    if let Some(like_type) = like_type {
-                        rewrite_placeholder_type(expr.as_mut(), &like_type)?;
-                        rewrite_placeholder_type(pattern.as_mut(), &like_type)?;
+                    if let Some(like_field) = like_field {
+                        rewrite_placeholder_field(expr.as_mut(), &like_field)?;
+                        rewrite_placeholder_field(pattern.as_mut(), &like_field)?;
                     }
                 }
                 Expr::InSubquery(InSubquery {
@@ -2272,7 +2272,7 @@ impl Expr {
                     // Subqueries used in IN expressions must have exactly 1 field
                     // i.e. `SELECT * FROM foo WHERE 'some_val' IN (SELECT val FROM bar)`
                     if let [first_field] = &fields[..] {
-                        rewrite_placeholder_type(expr.as_mut(), first_field.data_type())?;
+                        rewrite_placeholder_field(expr.as_mut(), first_field)?;
                     }
                 }
                 Expr::Case(Case {
@@ -2328,7 +2328,7 @@ impl Expr {
                 // for placeholder inference.
                 Expr::Cast(Cast { expr, field })
                 | Expr::TryCast(TryCast { expr, field }) => {
-                    rewrite_placeholder_type(expr.as_mut(), field.data_type())?;
+                    rewrite_placeholder_field(expr.as_mut(), field)?;
                 }
                 // Negative expressions can technically be any numeric data type, but if we have
                 // an immediate placeholder, let's infer it as Int64.
@@ -3052,15 +3052,35 @@ fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
     Ok(())
 }
 
-fn find_first_non_null_data_type_expr_placeholder<'a>(
+/// Infer the type of an unresolved placeholder from a sibling `field`, preserving
+/// the field's name and metadata (e.g. extension types such as `arrow.uuid`).
+///
+/// Unlike [`rewrite_placeholder_type`], which only carries the `DataType`, this
+/// retains the full [`FieldRef`] so downstream parameter typing keeps the source
+/// column's identity and metadata.
+fn rewrite_placeholder_field(expr: &mut Expr, field: &FieldRef) -> Result<()> {
+    if let Expr::Placeholder(Placeholder { id: _, field: pf }) = expr
+        && pf.is_none()
+    {
+        // Preserve the source field's name, data type, and metadata, but force
+        // the placeholder to be nullable since a bound parameter may be NULL.
+        *pf = Some(Arc::new(field.as_ref().clone().with_nullable(true)));
+    }
+    Ok(())
+}
+
+/// Returns the first non-null [`FieldRef`] among `exprs` (full field, with name
+/// and metadata), used to infer the type of any placeholder siblings.
+fn find_first_non_null_field_expr_placeholder<'a>(
     exprs: impl Iterator<Item = &'a Expr>,
     schema: &DFSchema,
-) -> Option<DataType> {
+) -> Option<FieldRef> {
     for expr in exprs {
-        match expr.get_type(schema) {
-            Ok(dt) if dt != DataType::Null => return Some(dt),
-            _ => {}
-        };
+        if let Ok((_, field)) = expr.to_field(schema)
+            && field.data_type() != &DataType::Null
+        {
+            return Some(field);
+        }
     }
 
     None
