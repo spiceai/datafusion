@@ -17,10 +17,14 @@
 
 use crate::cache::CacheAccessor;
 use crate::cache::DefaultListFilesCache;
-use crate::cache::cache_unit::DefaultFilesMetadataCache;
+use crate::cache::file_statistics_cache::{
+    DEFAULT_FILE_STATISTICS_MEMORY_LIMIT, DefaultFileStatisticsCache,
+    DefaultFilesMetadataCache,
+};
 use crate::cache::list_files_cache::ListFilesEntry;
 use crate::cache::list_files_cache::TableScopedPath;
 use datafusion_common::TableReference;
+use datafusion_common::heap_size::{DFHeapSize, DFHeapSizeCtx};
 use datafusion_common::stats::Precision;
 use datafusion_common::{Result, Statistics};
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -37,11 +41,73 @@ pub use super::list_files_cache::{
     DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT, DEFAULT_LIST_FILES_CACHE_TTL,
 };
 
+/// Helper function to normalize an optional string (treats empty strings as `None`).
+fn normalize_optional_string(opt: &Option<String>) -> Option<&str> {
+    match opt {
+        Some(s) if !s.is_empty() => Some(s.as_str()),
+        _ => None,
+    }
+}
+
+/// Check if two [`ObjectMeta`] represent the same file version.
+///
+/// Returns `true` if the files are considered the same version, `false` otherwise.
+///
+/// Unlike a plain `size` + `last_modified` comparison, this also takes the
+/// object `version` and `e_tag` into account, which is required to correctly
+/// invalidate cache entries for versioned object stores (e.g. S3 with object
+/// versioning enabled) where a new version of an object can share the same size
+/// and last-modified timestamp.
+///
+/// Logic (in priority order):
+/// - If `version` is present (non-empty) in BOTH, it is authoritative: same file
+///   iff the versions are equal. A difference in `e_tag` presence/value is
+///   ignored in this case, because the object store has already told us the
+///   definitive version identity.
+/// - Otherwise, if `version` presence differs (one side has it, the other does
+///   not) -> different file (one read saw a versioned object, the other didn't).
+/// - Otherwise (neither side has a usable `version`), fall back to `e_tag`:
+///     - both present and equal -> same file
+///     - both present and different -> different file
+///     - presence differs -> different file
+/// - If neither `version` nor `e_tag` is available on either side -> same file
+///   (no versioning information to distinguish them).
+///
+/// Empty strings are normalized to "absent" (see [`normalize_optional_string`]).
+pub(crate) fn is_same_file_version(cached: &ObjectMeta, current: &ObjectMeta) -> bool {
+    let cached_version = normalize_optional_string(&cached.version);
+    let current_version = normalize_optional_string(&current.version);
+    let cached_etag = normalize_optional_string(&cached.e_tag);
+    let current_etag = normalize_optional_string(&current.e_tag);
+
+    // `version`, when present on BOTH sides, is authoritative and decides on its
+    // own. e_tag presence/value differences must not force invalidation here.
+    if let (Some(cv), Some(curv)) = (cached_version, current_version) {
+        return cv == curv;
+    }
+
+    // `version` could not decide. If its presence differs, the two reads
+    // disagree on whether the object is versioned -> treat as different files.
+    if cached_version.is_some() != current_version.is_some() {
+        return false;
+    }
+
+    // Neither side has a usable `version`; fall back to `e_tag` semantics.
+    match (cached_etag, current_etag) {
+        // Both present: same file iff the e_tags match.
+        (Some(ce), Some(cure)) => ce == cure,
+        // e_tag presence differs -> different files.
+        (Some(_), None) | (None, Some(_)) => false,
+        // No versioning information available at all -> consider same file.
+        (None, None) => true,
+    }
+}
+
 /// Cached metadata for a file, including statistics and ordering.
 ///
 /// This struct embeds the [`ObjectMeta`] used for cache validation,
 /// along with the cached statistics and ordering information.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedFileMetadata {
     /// File metadata used for cache validation (size, last_modified).
     pub meta: ObjectMeta,
@@ -72,7 +138,7 @@ impl CachedFileMetadata {
     pub fn is_valid_for(&self, current_meta: &ObjectMeta) -> bool {
         self.meta.size == current_meta.size
             && self.meta.last_modified == current_meta.last_modified
-            && crate::cache::cache_unit::is_same_file_version(&self.meta, current_meta)
+            && is_same_file_version(&self.meta, current_meta)
     }
 }
 
@@ -83,7 +149,7 @@ impl CachedFileMetadata {
 /// - Statistics for the file
 /// - Ordering information for the file
 ///
-/// If enabled via [`CacheManagerConfig::with_files_statistics_cache`] this
+/// If enabled via [`CacheManagerConfig::with_file_statistics_cache`] this
 /// cache avoids inferring the same file statistics repeatedly during the
 /// session lifetime.
 ///
@@ -93,9 +159,31 @@ impl CachedFileMetadata {
 /// 3. If invalid or missing, compute new value and call `put(path, new_value)`
 ///
 /// See [`crate::runtime_env::RuntimeEnv`] for more details
-pub trait FileStatisticsCache: CacheAccessor<Path, CachedFileMetadata> {
+pub trait FileStatisticsCache:
+    CacheAccessor<TableScopedPath, CachedFileMetadata>
+{
+    /// Cache memory limit in bytes.
+    fn cache_limit(&self) -> usize;
+
+    /// Updates the cache with a new memory limit in bytes.
+    fn update_cache_limit(&self, limit: usize);
+
     /// Retrieves the information about the entries currently cached.
-    fn list_entries(&self) -> HashMap<Path, FileStatisticsCacheEntry>;
+    fn list_entries(&self) -> HashMap<TableScopedPath, FileStatisticsCacheEntry>;
+
+    fn drop_table_entries(&self, table_ref: &Option<TableReference>) -> Result<()>;
+}
+
+impl DFHeapSize for CachedFileMetadata {
+    fn heap_size(&self, ctx: &mut DFHeapSizeCtx) -> usize {
+        self.meta.size.heap_size(ctx)
+            + self.meta.last_modified.heap_size(ctx)
+            + self.meta.version.heap_size(ctx)
+            + self.meta.e_tag.heap_size(ctx)
+            + self.meta.location.as_ref().heap_size(ctx)
+            + self.statistics.heap_size(ctx)
+        //TODO add ordering once LexOrdering/PhysicalExpr implements DFHeapSize
+    }
 }
 
 /// Represents information about a cached statistics entry.
@@ -245,7 +333,7 @@ impl CachedFileMetadataEntry {
     pub fn is_valid_for(&self, current_meta: &ObjectMeta) -> bool {
         self.meta.size == current_meta.size
             && self.meta.last_modified == current_meta.last_modified
-            && crate::cache::cache_unit::is_same_file_version(&self.meta, current_meta)
+            && is_same_file_version(&self.meta, current_meta)
     }
 }
 
@@ -336,8 +424,19 @@ pub struct CacheManager {
 
 impl CacheManager {
     pub fn try_new(config: &CacheManagerConfig) -> Result<Arc<Self>> {
-        let file_statistic_cache =
-            config.table_files_statistics_cache.as_ref().map(Arc::clone);
+        let file_statistic_cache = match &config.file_statistics_cache {
+            Some(fsc) if config.file_statistics_cache_limit > 0 => {
+                fsc.update_cache_limit(config.file_statistics_cache_limit);
+                Some(Arc::clone(fsc))
+            }
+            None if config.file_statistics_cache_limit > 0 => {
+                let fsc: Arc<dyn FileStatisticsCache> = Arc::new(
+                    DefaultFileStatisticsCache::new(config.file_statistics_cache_limit),
+                );
+                Some(fsc)
+            }
+            _ => None,
+        };
 
         let list_files_cache = match &config.list_files_cache {
             Some(lfc) if config.list_files_cache_limit > 0 => {
@@ -377,9 +476,16 @@ impl CacheManager {
         }))
     }
 
-    /// Get the cache of listing files statistics.
+    /// Get the file statistics cache.
     pub fn get_file_statistic_cache(&self) -> Option<Arc<dyn FileStatisticsCache>> {
         self.file_statistic_cache.clone()
+    }
+
+    /// Get the memory limit of the file statistics cache.
+    pub fn get_file_statistic_cache_limit(&self) -> usize {
+        self.file_statistic_cache
+            .as_ref()
+            .map_or(0, |c| c.cache_limit())
     }
 
     /// Get the cache for storing the result of listing [`ObjectMeta`]s under the same path.
@@ -416,15 +522,17 @@ pub const DEFAULT_METADATA_CACHE_LIMIT: usize = 50 * 1024 * 1024; // 50M
 pub struct CacheManagerConfig {
     /// Enable caching of file statistics when listing files.
     /// Enabling the cache avoids repeatedly reading file statistics in a DataFusion session.
-    /// Default is disabled. Currently only Parquet files are supported.
-    pub table_files_statistics_cache: Option<Arc<dyn FileStatisticsCache>>,
+    /// Default is enabled. Currently only Parquet files are supported.
+    pub file_statistics_cache: Option<Arc<dyn FileStatisticsCache>>,
+    /// Limit of the file statistics cache, in bytes. Default: 20MiB.
+    pub file_statistics_cache_limit: usize,
     /// Enable caching of file metadata when listing files.
     /// Enabling the cache avoids repeat list and object metadata fetch operations, which may be
     /// expensive in certain situations (e.g. remote object storage), for objects under paths that
     /// are cached.
     /// Note that if this option is enabled, DataFusion will not see any updates to the underlying
     /// storage for at least `list_files_cache_ttl` duration.
-    /// Default is disabled.
+    /// Default is enabled.
     pub list_files_cache: Option<Arc<dyn ListFilesCache>>,
     /// Limit of the `list_files_cache`, in bytes. Default: 1MiB.
     pub list_files_cache_limit: usize,
@@ -443,7 +551,8 @@ pub struct CacheManagerConfig {
 impl Default for CacheManagerConfig {
     fn default() -> Self {
         Self {
-            table_files_statistics_cache: Default::default(),
+            file_statistics_cache: Default::default(),
+            file_statistics_cache_limit: DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
             list_files_cache: Default::default(),
             list_files_cache_limit: DEFAULT_LIST_FILES_CACHE_MEMORY_LIMIT,
             list_files_cache_ttl: DEFAULT_LIST_FILES_CACHE_TTL,
@@ -454,14 +563,18 @@ impl Default for CacheManagerConfig {
 }
 
 impl CacheManagerConfig {
-    /// Set the cache for files statistics.
-    ///
-    /// Default is `None` (disabled).
-    pub fn with_files_statistics_cache(
+    /// Set the cache for file statistics.
+    pub fn with_file_statistics_cache(
         mut self,
         cache: Option<Arc<dyn FileStatisticsCache>>,
     ) -> Self {
-        self.table_files_statistics_cache = cache;
+        self.file_statistics_cache = cache;
+        self
+    }
+
+    /// Specifies the memory limit for the file statistics cache, in bytes.
+    pub fn with_file_statistics_cache_limit(mut self, limit: usize) -> Self {
+        self.file_statistics_cache_limit = limit;
         self
     }
 
@@ -513,15 +626,113 @@ impl CacheManagerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::DefaultListFilesCache;
+    use chrono::DateTime;
+
+    /// Build an [`ObjectMeta`] with the given optional `version` and `e_tag`.
+    /// Empty strings are passed through verbatim to exercise the empty-string
+    /// normalization in [`is_same_file_version`].
+    fn meta_with_version_etag(version: Option<&str>, e_tag: Option<&str>) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from("test"),
+            last_modified: DateTime::parse_from_rfc3339("2022-09-27T22:36:00+02:00")
+                .unwrap()
+                .into(),
+            size: 1024,
+            e_tag: e_tag.map(str::to_string),
+            version: version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_is_same_file_version_both_none() {
+        // No versioning info on either side -> same file.
+        let cached = meta_with_version_etag(None, None);
+        let current = meta_with_version_etag(None, None);
+        assert!(is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_empty_string_normalization() {
+        // Empty strings are treated as absent, so empty/None on both sides ->
+        // same file (no versioning info), and empty == None is indistinguishable.
+        let cached = meta_with_version_etag(Some(""), Some(""));
+        let current = meta_with_version_etag(None, None);
+        assert!(is_same_file_version(&cached, &current));
+
+        // An empty `version` must not be treated as an authoritative match
+        // against a real version; it normalizes to "absent" and the present
+        // version on the other side forces a difference.
+        let cached_empty = meta_with_version_etag(Some(""), None);
+        let current_v = meta_with_version_etag(Some("v2"), None);
+        assert!(!is_same_file_version(&cached_empty, &current_v));
+    }
+
+    #[test]
+    fn test_is_same_file_version_version_match_etag_one_side() {
+        // Versions present and equal on both sides: `version` is authoritative,
+        // so e_tag presence differing on one side must NOT force invalidation.
+        let cached = meta_with_version_etag(Some("v1"), None);
+        let current = meta_with_version_etag(Some("v1"), Some("etag-current"));
+        assert!(is_same_file_version(&cached, &current));
+
+        let cached = meta_with_version_etag(Some("v1"), Some("etag-cached"));
+        let current = meta_with_version_etag(Some("v1"), None);
+        assert!(is_same_file_version(&cached, &current));
+
+        // Versions present and equal but e_tags differ on both sides ->
+        // still the same file (version wins over a stale/changed e_tag).
+        let cached = meta_with_version_etag(Some("v1"), Some("etag-a"));
+        let current = meta_with_version_etag(Some("v1"), Some("etag-b"));
+        assert!(is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_version_mismatch() {
+        // Versions present on both sides but different -> different file,
+        // regardless of e_tag.
+        let cached = meta_with_version_etag(Some("v1"), Some("same-etag"));
+        let current = meta_with_version_etag(Some("v2"), Some("same-etag"));
+        assert!(!is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_version_presence_differs() {
+        // `version` present on one side only -> different file (the reads
+        // disagree on whether the object is versioned).
+        let cached = meta_with_version_etag(Some("v1"), None);
+        let current = meta_with_version_etag(None, None);
+        assert!(!is_same_file_version(&cached, &current));
+
+        // Even with a matching e_tag, a one-sided version still invalidates.
+        let cached = meta_with_version_etag(Some("v1"), Some("etag"));
+        let current = meta_with_version_etag(None, Some("etag"));
+        assert!(!is_same_file_version(&cached, &current));
+    }
+
+    #[test]
+    fn test_is_same_file_version_etag_only() {
+        // No versions on either side: fall back to e_tag.
+        // Matching e_tag -> same file.
+        let cached = meta_with_version_etag(None, Some("etag-1"));
+        let current = meta_with_version_etag(None, Some("etag-1"));
+        assert!(is_same_file_version(&cached, &current));
+
+        // Mismatched e_tag with no versions -> different file.
+        let cached = meta_with_version_etag(None, Some("etag-1"));
+        let current = meta_with_version_etag(None, Some("etag-2"));
+        assert!(!is_same_file_version(&cached, &current));
+
+        // e_tag presence differs (no versions) -> different file.
+        let cached = meta_with_version_etag(None, Some("etag-1"));
+        let current = meta_with_version_etag(None, None);
+        assert!(!is_same_file_version(&cached, &current));
+    }
 
     /// Test to verify that TTL is preserved when not explicitly set in config.
     /// This fixes issue #19396 where TTL was being unset from DefaultListFilesCache
     /// when CacheManagerConfig::list_files_cache_ttl was not set explicitly.
     #[test]
     fn test_ttl_preserved_when_not_set_in_config() {
-        use std::time::Duration;
-
         // Create a cache with TTL = 1 second
         let list_file_cache =
             DefaultListFilesCache::new(1024, Some(Duration::from_secs(1)));
@@ -559,8 +770,6 @@ mod tests {
     /// Test to verify that TTL can still be overridden when explicitly set in config.
     #[test]
     fn test_ttl_overridden_when_set_in_config() {
-        use std::time::Duration;
-
         // Create a cache with TTL = 1 second
         let list_file_cache =
             DefaultListFilesCache::new(1024, Some(Duration::from_secs(1)));

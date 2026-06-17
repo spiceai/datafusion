@@ -20,7 +20,6 @@
 //! the input data seen so far), which makes it appropriate when processing
 //! infinite inputs.
 
-use std::any::Any;
 use std::cmp::{Ordering, min};
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -29,6 +28,7 @@ use std::task::{Context, Poll};
 
 use super::utils::create_schema;
 use crate::metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet};
+use crate::stream::EmptyRecordBatchStream;
 use crate::windows::{
     calc_requirements, get_ordered_partition_by_indices, get_partition_by_sort_exprs,
     window_equivalence_properties,
@@ -65,7 +65,8 @@ use datafusion_physical_expr_common::sort_expr::{
     OrderingRequirements, PhysicalSortExpr,
 };
 
-use ahash::RandomState;
+use crate::execution_plan::CardinalityEffect;
+use datafusion_common::hash_utils::RandomState;
 use futures::stream::Stream;
 use futures::{StreamExt, ready};
 use hashbrown::hash_table::HashTable;
@@ -311,10 +312,6 @@ impl ExecutionPlan for BoundedWindowAggExec {
     }
 
     /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
@@ -380,9 +377,14 @@ impl ExecutionPlan for BoundedWindowAggExec {
         Some(self.metrics.clone_inner())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        let input_stat = self.input.partition_statistics(partition)?;
-        self.statistics_helper(input_stat)
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        let input_stat =
+            Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
+        Ok(Arc::new(self.statistics_helper(input_stat)?))
+    }
+
+    fn cardinality_effect(&self) -> CardinalityEffect {
+        CardinalityEffect::Equal
     }
 }
 
@@ -1068,6 +1070,10 @@ impl BoundedWindowAggStream {
                 let _timer = elapsed_compute.timer();
 
                 self.finished = true;
+                // Release the input pipeline's resources before computing the
+                // final aggregates.
+                let input_schema = self.input.schema();
+                self.input = Box::pin(EmptyRecordBatchStream::new(input_schema));
                 for (_, partition_batch_state) in self.partition_buffers.iter_mut() {
                     partition_batch_state.is_end = true;
                 }
@@ -1252,6 +1258,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::common::collect;
+    use crate::execution_plan::CardinalityEffect;
     use crate::expressions::PhysicalSortExpr;
     use crate::projection::{ProjectionExec, ProjectionExpr};
     use crate::streaming::{PartitionStream, StreamingTableExec};
@@ -1834,6 +1841,23 @@ mod tests {
         +----+------+-------+
         ");
 
+        Ok(())
+    }
+
+    #[test]
+    fn test_bounded_window_agg_cardinality_effect() -> Result<()> {
+        let schema = test_schema();
+        let input: Arc<dyn ExecutionPlan> =
+            Arc::new(TestMemoryExec::try_new(&[], Arc::clone(&schema), None)?);
+        let plan = bounded_window_exec_pb_latent_range(input, 1, "hash", "sn")?;
+        let plan = plan
+            .downcast_ref::<BoundedWindowAggExec>()
+            .expect("expected BoundedWindowAggExec");
+
+        assert!(matches!(
+            plan.cardinality_effect(),
+            CardinalityEffect::Equal
+        ));
         Ok(())
     }
 }

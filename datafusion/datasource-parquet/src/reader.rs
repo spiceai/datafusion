@@ -39,7 +39,7 @@ use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Interface for reading parquet files.
+/// Interface for reading Apache Parquet files.
 ///
 /// The combined implementations of [`ParquetFileReaderFactory`] and
 /// [`AsyncFileReader`] can be used to provide custom data access operations
@@ -175,9 +175,11 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
             metrics,
         );
         let store = Arc::clone(&self.store);
-        let mut inner =
-            ParquetObjectReader::new_with_meta(store, partitioned_file.object_meta.clone())
-                .with_object_versioning_type(self.object_versioning_type.clone());
+        let mut inner = ParquetObjectReader::new_with_meta(
+            store,
+            partitioned_file.object_meta.clone(),
+        )
+        .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
             inner = inner.with_footer_size_hint(hint)
@@ -244,9 +246,11 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
         );
         let store = Arc::clone(&self.store);
 
-        let mut inner =
-            ParquetObjectReader::new_with_meta(store, partitioned_file.object_meta.clone())
-                .with_object_versioning_type(self.object_versioning_type.clone());
+        let mut inner = ParquetObjectReader::new_with_meta(
+            store,
+            partitioned_file.object_meta.clone(),
+        )
+        .with_object_versioning_type(self.object_versioning_type.clone());
 
         if let Some(hint) = metadata_size_hint {
             inner = inner.with_footer_size_hint(hint)

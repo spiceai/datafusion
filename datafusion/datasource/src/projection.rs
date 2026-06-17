@@ -148,9 +148,8 @@ fn inject_metadata_columns_into_projection(
         metadata_columns
             .iter()
             .map(|mci| {
-                let literal: Arc<dyn datafusion_physical_plan::PhysicalExpr> = Arc::new(
-                    Literal::new(mci.metadata_col.to_scalar_value(object_meta)),
-                );
+                let literal: Arc<dyn datafusion_physical_plan::PhysicalExpr> =
+                    Arc::new(Literal::new(mci.metadata_col.to_scalar_value(object_meta)));
                 (mci.in_remainder_projection, literal)
             })
             .collect();
@@ -161,7 +160,7 @@ fn inject_metadata_columns_into_projection(
             let expr = Arc::clone(&projection.expr)
                 .transform(|expr| {
                     let original_expr = Arc::clone(&expr);
-                    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+                    if let Some(column) = expr.downcast_ref::<Column>() {
                         if let Some((_, literal)) = metadata_literals
                             .iter()
                             .find(|(idx, _)| *idx == column.index())
@@ -196,7 +195,7 @@ fn inject_partition_columns_into_projection(
             let expr = Arc::clone(&projection.expr)
                 .transform(|expr| {
                     let original_expr = Arc::clone(&expr);
-                    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+                    if let Some(column) = expr.downcast_ref::<Column>() {
                         // Check if this column index corresponds to a partition column
                         if let Some(pci) = partition_columns
                             .iter()
@@ -317,7 +316,7 @@ impl SplitProjection {
             proj_expr
                 .expr
                 .apply(|expr| {
-                    if let Some(column) = expr.as_any().downcast_ref::<Column>() {
+                    if let Some(column) = expr.downcast_ref::<Column>() {
                         all_columns
                             .entry(column.index())
                             .or_insert_with(|| column.name().to_string());
@@ -374,7 +373,7 @@ impl SplitProjection {
                 let expr = Arc::clone(&proj_expr.expr)
                     .transform(|expr| {
                         let original_expr = Arc::clone(&expr);
-                        if let Some(column) = expr.as_any().downcast_ref::<Column>()
+                        if let Some(column) = expr.downcast_ref::<Column>()
                             && let Some(new_column) = column_mapping.get(&column.index())
                         {
                             return Ok(Transformed::yes(Arc::clone(new_column)));

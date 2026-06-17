@@ -17,7 +17,6 @@
 
 //! EmptyRelation produce_one_row=true execution plan
 
-use std::any::Any;
 use std::sync::Arc;
 
 use crate::coop::cooperative;
@@ -128,10 +127,6 @@ impl ExecutionPlan for PlaceholderRowExec {
     }
 
     /// Return a reference to Any that can be used for downcasting
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
@@ -169,7 +164,7 @@ impl ExecutionPlan for PlaceholderRowExec {
         Ok(Box::pin(cooperative(ms)))
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         let batches = self
             .data()
             .expect("Create single row placeholder RecordBatch should not fail");
@@ -180,11 +175,11 @@ impl ExecutionPlan for PlaceholderRowExec {
             None => vec![batches; self.partitions],
         };
 
-        Ok(common::compute_record_batch_statistics(
+        Ok(Arc::new(common::compute_record_batch_statistics(
             &batches,
             &self.schema,
             None,
-        ))
+        )))
     }
 }
 

@@ -23,7 +23,9 @@ use std::sync::Arc;
 use arrow::datatypes::DataType;
 use indexmap::IndexSet;
 use itertools::Itertools;
+use log::{Level, debug, log_enabled};
 
+use datafusion_common::instant::Instant;
 use datafusion_common::tree_node::{
     Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
 };
@@ -43,7 +45,9 @@ use datafusion_expr::{
 
 use crate::optimizer::ApplyOrder;
 use crate::simplify_expressions::simplify_predicates;
-use crate::utils::{has_all_column_refs, is_restrict_null_predicate};
+use crate::utils::{
+    ColumnReference, has_all_column_refs, is_restrict_null_predicate, schema_columns,
+};
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_expr::ExpressionPlacement;
 
@@ -62,7 +66,7 @@ use datafusion_expr::ExpressionPlacement;
 ///    Sort (a, b)
 /// ```
 ///
-/// A better plan is to  filter the data *before* the Sort, which sorts fewer
+/// A better plan is to filter the data *before* the Sort, which sorts fewer
 /// rows and therefore does less work overall:
 ///
 /// ```text
@@ -76,7 +80,7 @@ use datafusion_expr::ExpressionPlacement;
 /// different result.
 ///
 /// ```text
-///  Filter (a > 10)   <-- can not move this Filter before the limit
+///  Filter (a > 10)   <-- cannot move this Filter before the limit
 ///    Limit (fetch=3)
 ///      Sort (a, b)
 /// ```
@@ -86,46 +90,46 @@ use datafusion_expr::ExpressionPlacement;
 /// satisfies `filter(op(data)) = op(filter(data))`.
 ///
 /// The filter-commutative property is plan and column-specific. A filter on `a`
-/// can be pushed through a `Aggregate(group_by = [a], agg=[sum(b))`. However, a
-/// filter on  `sum(b)` can not be pushed through the same aggregate.
+/// can be pushed through a `Aggregate(group_by = [a], agg=[sum(b)])`. However, a
+/// filter on `sum(b)` cannot be pushed through the same aggregate.
 ///
 /// # Handling Conjunctions
 ///
-/// It is possible to only push down **part** of a filter expression if is
+/// It is possible to only push down **part** of a filter expression if it is
 /// connected with `AND`s (more formally if it is a "conjunction").
 ///
 /// For example, given the following plan:
 ///
 /// ```text
 /// Filter(a > 10 AND sum(b) < 5)
-///   Aggregate(group_by = [a], agg = [sum(b))
+///   Aggregate(group_by = [a], agg = [sum(b)])
 /// ```
 ///
-/// The `a > 10` is commutative with the `Aggregate` but  `sum(b) < 5` is not.
-/// Therefore it is possible to only push part of the expression, resulting in:
+/// The `a > 10` is commutative with the `Aggregate` but `sum(b) < 5` is not.
+/// Therefore it is possible to only push down part of the expression, resulting in:
 ///
 /// ```text
 /// Filter(sum(b) < 5)
-///   Aggregate(group_by = [a], agg = [sum(b))
+///   Aggregate(group_by = [a], agg = [sum(b)])
 ///     Filter(a > 10)
 /// ```
 ///
 /// # Handling Column Aliases
 ///
-/// This optimizer must sometimes handle re-writing filter expressions when they
-/// pushed, for example if there is a projection that aliases `a+1` to `"b"`:
+/// This optimizer must sometimes handle rewriting filter expressions when they are
+/// pushed. For example, consider a projection that aliases `a+1` to `"b"`:
 ///
 /// ```text
 /// Filter (b > 10)
 ///     Projection: [a+1 AS "b"]  <-- changes the name of `a+1` to `b`
 /// ```
 ///
-/// To apply the filter prior to the `Projection`, all references to `b` must be
+/// To push this filter below the `Projection`, all references to `b` must be
 /// rewritten to `a+1`:
 ///
 /// ```text
-/// Projection: a AS "b"
-///     Filter: (a + 1 > 10)  <--- changed from b to a + 1
+/// Projection: [a+1 AS "b"]
+///     Filter: (a+1 > 10)  <--- changed from b to a+1
 /// ```
 /// # Implementation Notes
 ///
@@ -176,27 +180,9 @@ pub(crate) fn lr_is_preserved(join_type: JoinType) -> (bool, bool) {
     }
 }
 
-/// For a given JOIN type, determine whether each input of the join is preserved
-/// for the join condition (`ON` clause filters).
-///
-/// It is only correct to push filters below a join for preserved inputs.
-///
-/// # Return Value
-/// A tuple of booleans - (left_preserved, right_preserved).
-///
-/// See [`lr_is_preserved`] for a definition of "preserved".
+/// See [`JoinType::on_lr_is_preserved`] for details.
 pub(crate) fn on_lr_is_preserved(join_type: JoinType) -> (bool, bool) {
-    match join_type {
-        JoinType::Inner => (true, true),
-        JoinType::Left => (false, true),
-        JoinType::Right => (true, false),
-        JoinType::Full => (false, false),
-        JoinType::LeftSemi | JoinType::RightSemi => (true, true),
-        JoinType::LeftAnti => (false, true),
-        JoinType::RightAnti => (true, false),
-        JoinType::LeftMark => (false, true),
-        JoinType::RightMark => (true, false),
-    }
+    join_type.on_lr_is_preserved()
 }
 
 /// Evaluates the columns referenced in the given expression to see if they refer
@@ -206,11 +192,11 @@ struct ColumnChecker<'a> {
     /// schema of left join input
     left_schema: &'a DFSchema,
     /// columns in left_schema, computed on demand
-    left_columns: Option<HashSet<Column>>,
+    left_columns: Option<HashSet<ColumnReference<'a>>>,
     /// schema of right join input
     right_schema: &'a DFSchema,
     /// columns in left_schema, computed on demand
-    right_columns: Option<HashSet<Column>>,
+    right_columns: Option<HashSet<ColumnReference<'a>>>,
 }
 
 impl<'a> ColumnChecker<'a> {
@@ -238,20 +224,6 @@ impl<'a> ColumnChecker<'a> {
         }
         has_all_column_refs(predicate, self.right_columns.as_ref().unwrap())
     }
-}
-
-/// Returns all columns in the schema
-fn schema_columns(schema: &DFSchema) -> HashSet<Column> {
-    schema
-        .iter()
-        .flat_map(|(qualifier, field)| {
-            [
-                Column::new(qualifier.cloned(), field.name()),
-                // we need to push down filter using unqualified column as well
-                Column::new_unqualified(field.name()),
-            ]
-        })
-        .collect::<HashSet<_>>()
 }
 
 /// Determine whether the predicate can evaluate as the join conditions
@@ -290,7 +262,10 @@ fn can_evaluate_as_join_condition(predicate: &Expr) -> Result<bool> {
         | Expr::Cast(_)
         | Expr::TryCast(_)
         | Expr::InList { .. }
-        | Expr::ScalarFunction(_) => Ok(TreeNodeRecursion::Continue),
+        | Expr::ScalarFunction(_)
+        | Expr::HigherOrderFunction(_)
+        | Expr::Lambda(_)
+        | Expr::LambdaVariable(_) => Ok(TreeNodeRecursion::Continue),
         // TODO: remove the next line after `Expr::Wildcard` is removed
         #[expect(deprecated)]
         Expr::AggregateFunction(_)
@@ -336,10 +311,8 @@ fn can_evaluate_as_join_condition(predicate: &Expr) -> Result<bool> {
 /// * do nothing.
 fn extract_or_clauses_for_join<'a>(
     filters: &'a [Expr],
-    schema: &'a DFSchema,
+    schema_cols: &'a HashSet<ColumnReference>,
 ) -> impl Iterator<Item = Expr> + 'a {
-    let schema_columns = schema_columns(schema);
-
     // new formed OR clauses and their column references
     filters.iter().filter_map(move |expr| {
         if let Expr::BinaryExpr(BinaryExpr {
@@ -348,8 +321,8 @@ fn extract_or_clauses_for_join<'a>(
             right,
         }) = expr
         {
-            let left_expr = extract_or_clause(left.as_ref(), &schema_columns);
-            let right_expr = extract_or_clause(right.as_ref(), &schema_columns);
+            let left_expr = extract_or_clause(left.as_ref(), schema_cols);
+            let right_expr = extract_or_clause(right.as_ref(), schema_cols);
 
             // If nothing can be extracted from any sub clauses, do nothing for this OR clause.
             if let (Some(left_expr), Some(right_expr)) = (left_expr, right_expr) {
@@ -371,7 +344,10 @@ fn extract_or_clauses_for_join<'a>(
 /// Otherwise, return None.
 ///
 /// For other clause, apply the rule above to extract clause.
-fn extract_or_clause(expr: &Expr, schema_columns: &HashSet<Column>) -> Option<Expr> {
+fn extract_or_clause(
+    expr: &Expr,
+    schema_columns: &HashSet<ColumnReference>,
+) -> Option<Expr> {
     let mut predicate = None;
 
     match expr {
@@ -437,6 +413,10 @@ fn push_down_all_join(
     // 3) should be kept as filter conditions
     let left_schema = join.left.schema();
     let right_schema = join.right.schema();
+
+    let left_schema_columns = schema_columns(left_schema.as_ref());
+    let right_schema_columns = schema_columns(right_schema.as_ref());
+
     let mut left_push = vec![];
     let mut right_push = vec![];
     let mut keep_predicates = vec![];
@@ -483,12 +463,24 @@ fn push_down_all_join(
     // Extract from OR clause, generate new predicates for both side of join if possible.
     // We only track the unpushable predicates above.
     if left_preserved {
-        left_push.extend(extract_or_clauses_for_join(&keep_predicates, left_schema));
-        left_push.extend(extract_or_clauses_for_join(&join_conditions, left_schema));
+        left_push.extend(extract_or_clauses_for_join(
+            &keep_predicates,
+            &left_schema_columns,
+        ));
+        left_push.extend(extract_or_clauses_for_join(
+            &join_conditions,
+            &left_schema_columns,
+        ));
     }
     if right_preserved {
-        right_push.extend(extract_or_clauses_for_join(&keep_predicates, right_schema));
-        right_push.extend(extract_or_clauses_for_join(&join_conditions, right_schema));
+        right_push.extend(extract_or_clauses_for_join(
+            &keep_predicates,
+            &right_schema_columns,
+        ));
+        right_push.extend(extract_or_clauses_for_join(
+            &join_conditions,
+            &right_schema_columns,
+        ));
     }
 
     // For predicates from join filter, we should check with if a join side is preserved
@@ -496,13 +488,13 @@ fn push_down_all_join(
     if on_left_preserved {
         left_push.extend(extract_or_clauses_for_join(
             &on_filter_join_conditions,
-            left_schema,
+            &left_schema_columns,
         ));
     }
     if on_right_preserved {
         right_push.extend(extract_or_clauses_for_join(
             &on_filter_join_conditions,
-            right_schema,
+            &right_schema_columns,
         ));
     }
 
@@ -543,8 +535,19 @@ fn push_down_join(
         .map_or_else(Vec::new, |filter| split_conjunction_owned(filter.clone()));
 
     // Are there any new join predicates that can be inferred from the filter expressions?
-    let inferred_join_predicates =
-        infer_join_predicates(&join, &predicates, &on_filters)?;
+    let inferred_join_predicates = with_debug_timing("infer_join_predicates", || {
+        infer_join_predicates(&join, &predicates, &on_filters)
+    })?;
+
+    if log_enabled!(Level::Debug) {
+        debug!(
+            "push_down_filter: join_type={:?}, parent_predicates={}, on_filters={}, inferred_join_predicates={}",
+            join.join_type,
+            predicates.len(),
+            on_filters.len(),
+            inferred_join_predicates.len()
+        );
+    }
 
     if on_filters.is_empty()
         && predicates.is_empty()
@@ -783,7 +786,15 @@ impl OptimizerRule for PushDownFilter {
 
         let predicate = split_conjunction_owned(filter.predicate.clone());
         let old_predicate_len = predicate.len();
-        let new_predicates = simplify_predicates(predicate)?;
+        let new_predicates =
+            with_debug_timing("simplify_predicates", || simplify_predicates(predicate))?;
+        if log_enabled!(Level::Debug) {
+            debug!(
+                "push_down_filter: simplify_predicates old_count={}, new_count={}",
+                old_predicate_len,
+                new_predicates.len()
+            );
+        }
         if old_predicate_len != new_predicates.len() {
             let Some(new_predicate) = conjunction(new_predicates) else {
                 // new_predicates is empty - remove the filter entirely
@@ -802,25 +813,22 @@ impl OptimizerRule for PushDownFilter {
 
         match Arc::unwrap_or_clone(filter.input) {
             LogicalPlan::Filter(child_filter) => {
-                let parents_predicates = split_conjunction_owned(filter.predicate);
-
-                // remove duplicated filters
-                let child_predicates = split_conjunction_owned(child_filter.predicate);
-                let new_predicates = parents_predicates
+                // child filters first to preserve execution order
+                let new_predicates = split_conjunction_owned(child_filter.predicate)
                     .into_iter()
-                    .chain(child_predicates)
-                    // use IndexSet to remove dupes while preserving predicate order
-                    .collect::<IndexSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                    .chain(split_conjunction_owned(filter.predicate))
+                    // use IndexSet to remove duplicates while preserving predicate order
+                    .collect::<IndexSet<_>>();
 
                 let Some(new_predicate) = conjunction(new_predicates) else {
                     return plan_err!("at least one expression exists");
                 };
+
                 let new_filter = LogicalPlan::Filter(Filter::try_new(
                     new_predicate,
                     child_filter.input,
                 )?);
+
                 self.rewrite(new_filter, config)
             }
             LogicalPlan::Repartition(repartition) => {
@@ -1136,8 +1144,16 @@ impl OptimizerRule for PushDownFilter {
             LogicalPlan::TableScan(scan) => {
                 let filter_predicates = split_conjunction(&filter.predicate);
 
-                let (volatile_filters, non_volatile_filters): (Vec<&Expr>, Vec<&Expr>) =
+                // Filters containing scalar subqueries cannot be pushed to
+                // providers because the subquery result is not available
+                // until execution time.
+                let (subquery_filters, pushdown_candidates): (Vec<&Expr>, Vec<&Expr>) =
                     filter_predicates
+                        .into_iter()
+                        .partition(|pred| pred.contains_scalar_subquery());
+
+                let (volatile_filters, non_volatile_filters): (Vec<&Expr>, Vec<&Expr>) =
+                    pushdown_candidates
                         .into_iter()
                         .partition(|pred| pred.is_volatile());
 
@@ -1170,11 +1186,13 @@ impl OptimizerRule for PushDownFilter {
                     .cloned()
                     .collect();
 
-                // Compose predicates to be of `Unsupported` or `Inexact` pushdown type, and also include volatile filters
+                // Compose predicates to be of `Unsupported` or `Inexact` pushdown type,
+                // and also include volatile and subquery-containing filters
                 let new_predicate: Vec<Expr> = zip
                     .filter(|(_, res)| res != &TableProviderFilterPushDown::Exact)
                     .map(|(pred, _)| pred)
                     .chain(volatile_filters)
+                    .chain(subquery_filters)
                     .cloned()
                     .collect();
 
@@ -1227,7 +1245,7 @@ impl OptimizerRule for PushDownFilter {
                 let mut push_predicates = vec![];
                 for (push, expr) in predicate_push_or_keep
                     .into_iter()
-                    .zip(split_conjunction_owned(filter.predicate).into_iter())
+                    .zip(split_conjunction_owned(filter.predicate))
                 {
                     if !push {
                         keep_predicates.push(expr);
@@ -1402,6 +1420,22 @@ impl PushDownFilter {
     }
 }
 
+fn with_debug_timing<T, F>(label: &'static str, f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T>,
+{
+    if !log_enabled!(Level::Debug) {
+        return f();
+    }
+    let start = Instant::now();
+    let result = f();
+    debug!(
+        "push_down_filter_timing: section={label}, elapsed_us={}",
+        start.elapsed().as_micros()
+    );
+    result
+}
+
 /// replaces columns by its name on the projection.
 pub fn replace_cols_by_name(
     e: Expr,
@@ -1442,15 +1476,14 @@ fn contain(e: &Expr, check_map: &HashMap<String, Expr>) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
     use std::cmp::Ordering;
     use std::fmt::{Debug, Formatter};
 
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::datatypes::{Field, Schema, SchemaRef};
     use async_trait::async_trait;
 
     use datafusion_common::{DFSchemaRef, DataFusionError, ScalarValue};
-    use datafusion_expr::expr::{ScalarFunction, WindowFunction};
+    use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::logical_plan::table_scan;
     use datafusion_expr::{
         ColumnarValue, ExprFunctionExt, Extension, LogicalPlanBuilder,
@@ -2450,7 +2483,7 @@ mod tests {
             plan,
             @r"
         Projection: test.a
-          Filter: test.a >= Int64(1) AND test.a <= Int64(1)
+          Filter: test.a <= Int64(1) AND test.a >= Int64(1)
             Limit: skip=0, fetch=1
               TableScan: test
         "
@@ -3116,10 +3149,6 @@ mod tests {
                 .map(|_| self.filter_support.clone())
                 .collect())
         }
-
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
     }
 
     fn table_scan_with_pushdown_provider_builder(
@@ -3230,6 +3259,28 @@ mod tests {
     }
 
     #[test]
+    fn multi_combined_two_filters() -> Result<()> {
+        let plan = table_scan_with_pushdown_provider_builder(
+            TableProviderFilterPushDown::Inexact,
+            vec![col("a").eq(lit(10i64)), col("b").gt(lit(11i64))],
+            Some(vec![0]),
+        )?
+        .filter(col("a").eq(lit(10i64)))?
+        .filter(col("b").gt(lit(11i64)))?
+        .project(vec![col("a"), col("b")])?
+        .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: a, b
+          Filter: a = Int64(10) AND b > Int64(11)
+            TableScan: test projection=[a], partial_filters=[a = Int64(10), b > Int64(11)]
+        "
+        )
+    }
+
+    #[test]
     fn multi_combined_filter_exact() -> Result<()> {
         let plan = table_scan_with_pushdown_provider_builder(
             TableProviderFilterPushDown::Exact,
@@ -3237,6 +3288,27 @@ mod tests {
             Some(vec![0]),
         )?
         .filter(and(col("a").eq(lit(10i64)), col("b").gt(lit(11i64))))?
+        .project(vec![col("a"), col("b")])?
+        .build()?;
+
+        assert_optimized_plan_equal!(
+            plan,
+            @r"
+        Projection: a, b
+          TableScan: test projection=[a], full_filters=[a = Int64(10), b > Int64(11)]
+        "
+        )
+    }
+
+    #[test]
+    fn multi_combined_two_filters_exact() -> Result<()> {
+        let plan = table_scan_with_pushdown_provider_builder(
+            TableProviderFilterPushDown::Exact,
+            vec![],
+            Some(vec![0]),
+        )?
+        .filter(col("a").eq(lit(10i64)))?
+        .filter(col("b").gt(lit(11i64)))?
         .project(vec![col("a"), col("b")])?
         .build()?;
 
@@ -3941,9 +4013,6 @@ mod tests {
     }
 
     impl ScalarUDFImpl for TestScalarUDF {
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
         fn name(&self) -> &str {
             "TestScalarUDF"
         }

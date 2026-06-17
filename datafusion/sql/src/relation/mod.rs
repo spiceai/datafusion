@@ -25,11 +25,11 @@ use datafusion_common::{
     DFSchema, Diagnostic, Result, Span, Spans, TableReference, not_impl_err, plan_err,
 };
 use datafusion_expr::builder::subquery_alias;
+use datafusion_expr::expr::FieldMetadata;
 use datafusion_expr::planner::{
     PlannedRelation, RelationPlannerContext, RelationPlanning,
 };
 use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, expr::Unnest};
-use datafusion_expr::expr::FieldMetadata;
 use datafusion_expr::{Subquery, SubqueryAlias};
 use sqlparser::ast::{
     Expr as SQLExpr, FunctionArg, FunctionArgExpr, Spanned, TableFactor,
@@ -101,7 +101,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                 }
             };
 
-        let optimized_plan = optimize_subquery_sort(planned_relation.plan)?.data;
+        let optimized_plan = optimize_subquery_sort(
+            planned_relation.plan,
+            self.context_provider
+                .options()
+                .sql_parser
+                .enable_subquery_sort_elimination,
+        )?
+        .data;
         if let Some(alias) = planned_relation.alias {
             self.apply_table_alias(optimized_plan, alias)
         } else {
@@ -399,7 +406,14 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
     }
 }
 
-fn optimize_subquery_sort(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+fn optimize_subquery_sort(
+    plan: LogicalPlan,
+    enable_subquery_sort_elimination: bool,
+) -> Result<Transformed<LogicalPlan>> {
+    if !enable_subquery_sort_elimination {
+        return Ok(Transformed::no(plan));
+    }
+
     // When initializing subqueries, we examine sort options since they might be unnecessary.
     // They are only important if the subquery result is affected by the ORDER BY statement,
     // which can happen when we have:
@@ -417,7 +431,7 @@ fn optimize_subquery_sort(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>>
             LogicalPlan::Sort(s) => {
                 if !has_limit {
                     has_limit = false;
-                    return Ok(Transformed::yes(s.input.as_ref().clone()));
+                    return Ok(Transformed::yes(Arc::unwrap_or_clone(s.input)));
                 }
                 Ok(Transformed::no(LogicalPlan::Sort(s)))
             }

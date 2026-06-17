@@ -91,7 +91,7 @@ use futures::stream::{StreamExt, TryStreamExt};
 ///
 /// [`datafusion-examples`]: https://github.com/apache/datafusion/tree/main/datafusion-examples
 /// [`memory_pool_execution_plan.rs`]: https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/execution_monitoring/memory_pool_execution_plan.rs
-pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
+pub trait ExecutionPlan: Any + Debug + DisplayAs + Send + Sync {
     /// Short name for the ExecutionPlan, such as 'DataSourceExec'.
     ///
     /// Implementation note: this method can just proxy to
@@ -115,9 +115,29 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         }
     }
 
-    /// Returns the execution plan as [`Any`] so that it can be
-    /// downcast to a specific implementation.
-    fn as_any(&self) -> &dyn Any;
+    /// Returns the plan that provides this plan's public
+    /// [`ExecutionPlan`] downcast identity.
+    ///
+    /// This hook is for wrapper nodes that delegate their public downcast
+    /// identity to another plan while adding cross-cutting behavior such as
+    /// instrumentation. The default implementation returns `None`, meaning this
+    /// plan's concrete type is used for type introspection.
+    ///
+    /// Most `ExecutionPlan` implementations should use the default `None`;
+    /// override this only for wrapper plans that intentionally delegate their
+    /// public downcast identity to another plan.
+    ///
+    /// The `is` and `downcast_ref` helpers follow the returned delegate instead
+    /// of checking the current concrete type, making intermediate delegating
+    /// wrappers invisible to normal downcast-based inspection.
+    ///
+    /// Implementations that opt in should return the delegate plan, not `self`.
+    ///
+    /// This is independent from [`Self::children`] and should not be used for
+    /// plan traversal or optimizer rewrites.
+    fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+        None
+    }
 
     /// Get the schema for this execution plan
     fn schema(&self) -> SchemaRef {
@@ -477,7 +497,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
     /// If statistics are not available, should return [`Statistics::new_unknown`]
     /// (the default), not an error.
     /// If `partition` is `None`, it returns statistics for the entire plan.
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         if let Some(idx) = partition {
             // Validate partition index
             let partition_count = self.properties().partitioning.partition_count();
@@ -488,7 +508,7 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
                 partition_count
             );
         }
-        Ok(Statistics::new_unknown(&self.schema()))
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
 
     /// Returns `true` if a limit can be safely pushed down through this
@@ -503,6 +523,10 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
 
     /// Returns a fetching variant of this `ExecutionPlan` node, if it supports
     /// fetch limits. Returns `None` otherwise.
+    ///
+    /// See physical optimizer rule [`limit_pushdown`] for details.
+    ///
+    /// [`limit_pushdown`]: https://docs.rs/datafusion/latest/datafusion/physical_optimizer/limit_pushdown/index.html
     fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
         None
     }
@@ -712,6 +736,38 @@ pub trait ExecutionPlan: Debug + DisplayAs + Send + Sync {
         _preserve_order: bool,
     ) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+}
+
+impl dyn ExecutionPlan {
+    /// Returns `true` if the plan is of type `T`.
+    ///
+    /// If this plan provides a [`ExecutionPlan::downcast_delegate`], delegates
+    /// to it.
+    ///
+    /// Prefer this over `downcast_ref::<T>().is_some()`. Works correctly when
+    /// called on `Arc<dyn ExecutionPlan>` via auto-deref.
+    pub fn is<T: ExecutionPlan>(&self) -> bool {
+        match self.downcast_delegate() {
+            Some(delegate) => delegate.is::<T>(),
+            None => (self as &dyn Any).is::<T>(),
+        }
+    }
+
+    /// Attempts to downcast this plan to a concrete type `T`, returning `None`
+    /// if the plan is not of that type.
+    ///
+    /// If this plan provides a [`ExecutionPlan::downcast_delegate`], delegates
+    /// to it.
+    ///
+    /// Works correctly when called on `Arc<dyn ExecutionPlan>` via auto-deref,
+    /// unlike `(&arc as &dyn Any).downcast_ref::<T>()` which would attempt to
+    /// downcast the `Arc` itself.
+    pub fn downcast_ref<T: ExecutionPlan>(&self) -> Option<&T> {
+        match self.downcast_delegate() {
+            Some(delegate) => delegate.downcast_ref::<T>(),
+            None => (self as &dyn Any).downcast_ref(),
+        }
     }
 }
 
@@ -1498,16 +1554,12 @@ pub(crate) fn stub_properties() -> Arc<PlanProperties> {
 
 #[cfg(test)]
 mod tests {
-    use std::any::Any;
-    use std::sync::Arc;
 
     use super::*;
     use crate::{DisplayAs, DisplayFormatType, ExecutionPlan};
 
     use arrow::array::{DictionaryArray, Int32Array, NullArray, RunArray};
-    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion_common::{Result, Statistics};
-    use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+    use arrow::datatypes::{DataType, Field, Schema};
 
     #[derive(Debug)]
     pub struct EmptyExec;
@@ -1533,10 +1585,6 @@ mod tests {
             Self::static_name()
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn properties(&self) -> &Arc<PlanProperties> {
             unimplemented!()
         }
@@ -1560,7 +1608,10 @@ mod tests {
             unimplemented!()
         }
 
-        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        fn partition_statistics(
+            &self,
+            _partition: Option<usize>,
+        ) -> Result<Arc<Statistics>> {
             unimplemented!()
         }
     }
@@ -1596,10 +1647,6 @@ mod tests {
             "MyRenamedEmptyExec"
         }
 
-        fn as_any(&self) -> &dyn Any {
-            self
-        }
-
         fn properties(&self) -> &Arc<PlanProperties> {
             unimplemented!()
         }
@@ -1623,11 +1670,66 @@ mod tests {
             unimplemented!()
         }
 
-        fn partition_statistics(&self, _partition: Option<usize>) -> Result<Statistics> {
+        fn partition_statistics(
+            &self,
+            _partition: Option<usize>,
+        ) -> Result<Arc<Statistics>> {
             unimplemented!()
         }
     }
 
+    #[derive(Debug)]
+    struct DowncastDelegatingExec(Arc<dyn ExecutionPlan>);
+
+    impl DisplayAs for DowncastDelegatingExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            _f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            unimplemented!()
+        }
+    }
+
+    impl ExecutionPlan for DowncastDelegatingExec {
+        fn name(&self) -> &'static str {
+            Self::static_name()
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            unimplemented!()
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            unimplemented!()
+        }
+
+        fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
+            Some(self.0.as_ref())
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            unimplemented!()
+        }
+
+        fn partition_statistics(
+            &self,
+            _partition: Option<usize>,
+        ) -> Result<Arc<Statistics>> {
+            unimplemented!()
+        }
+    }
     #[test]
     fn test_execution_plan_name() {
         let schema1 = Arc::new(Schema::empty());
@@ -1638,6 +1740,24 @@ mod tests {
         let renamed_exec = RenamedEmptyExec::new(schema2);
         assert_eq!(renamed_exec.name(), "MyRenamedEmptyExec");
         assert_eq!(RenamedEmptyExec::static_name(), "MyRenamedEmptyExec");
+    }
+
+    #[test]
+    fn test_execution_plan_downcast_delegates_to_downcast_delegate() {
+        let schema = Arc::new(Schema::empty());
+        let inner: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(schema));
+        let wrapped: Arc<dyn ExecutionPlan> = Arc::new(DowncastDelegatingExec(inner));
+        let nested: Arc<dyn ExecutionPlan> =
+            Arc::new(DowncastDelegatingExec(Arc::clone(&wrapped)));
+
+        for plan in [wrapped.as_ref(), nested.as_ref()] {
+            assert!(!plan.is::<DowncastDelegatingExec>());
+            assert!(plan.downcast_ref::<DowncastDelegatingExec>().is_none());
+            assert!(plan.is::<EmptyExec>());
+            assert!(plan.downcast_ref::<EmptyExec>().is_some());
+            assert!(!plan.is::<RenamedEmptyExec>());
+            assert!(plan.downcast_ref::<RenamedEmptyExec>().is_none());
+        }
     }
 
     /// A compilation test to ensure that the `ExecutionPlan::name()` method can

@@ -466,7 +466,9 @@ impl RecursiveUnnestRewriter<'_> {
             }
             DataType::List(_)
             | DataType::FixedSizeList(_, _)
-            | DataType::LargeList(_) => {
+            | DataType::LargeList(_)
+            | DataType::ListView(_)
+            | DataType::LargeListView(_) => {
                 push_projection_dedupl(
                     self.inner_projection_exprs,
                     expr_in_unnest.clone().alias(placeholder_name.clone()),
@@ -701,7 +703,8 @@ mod tests {
     use arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema};
     use datafusion_common::{Column, DFSchema, Result};
     use datafusion_expr::{
-        ColumnUnnestList, EmptyRelation, LogicalPlan, col, lit, unnest,
+        ColumnUnnestList, EmptyRelation, Expr, LogicalPlan, col, expr::Alias, lit,
+        unnest,
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
     use datafusion_functions_aggregate::expr_fn::count;
@@ -809,12 +812,17 @@ mod tests {
             &original_expr_2,
         )?;
 
+        // The inner `UNNEST(3d_col)` alias is produced by the unnest rewriter and the
+        // outer `2d_col` alias is re-applied by the tree-node reconstruction, which
+        // wraps (rather than collapses) the existing alias. Build the expected value
+        // explicitly because chaining `.alias().alias()` collapses the two aliases.
         assert_eq!(
             transformed_exprs,
-            vec![
-                (col("__unnest_placeholder(3d_col,depth=1)").alias("UNNEST(3d_col)"))
-                    .alias("2d_col")
-            ]
+            vec![Expr::Alias(Alias::new(
+                col("__unnest_placeholder(3d_col,depth=1)").alias("UNNEST(3d_col)"),
+                None::<&str>,
+                "2d_col",
+            ))]
         );
         column_unnests_eq(
             vec![

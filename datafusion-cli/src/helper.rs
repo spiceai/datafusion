@@ -124,6 +124,10 @@ impl Highlighter for CliHelper {
     fn highlight_char(&self, line: &str, pos: usize, kind: CmdKind) -> bool {
         self.highlighter.highlight_char(line, pos, kind)
     }
+
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        Color::gray(hint).into()
+    }
 }
 
 impl Hinter for CliHelper {

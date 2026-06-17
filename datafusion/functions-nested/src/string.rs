@@ -26,14 +26,13 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field};
 
 use datafusion_common::utils::ListCoercion;
-use datafusion_common::{DataFusionError, Result, not_impl_err};
+use datafusion_common::{DataFusionError, Result, ScalarValue, not_impl_err};
 
-use std::any::Any;
-use std::fmt::Write;
+use std::fmt::{self, Write};
 
 use crate::utils::make_scalar_function;
 use arrow::array::{
-    GenericStringArray, StringArrayType, StringViewArray,
+    StringArrayType, StringViewArray,
     builder::{ArrayBuilder, LargeStringBuilder, StringViewBuilder},
     cast::AsArray,
 };
@@ -44,12 +43,12 @@ use arrow::datatypes::DataType::{
 use datafusion_common::cast::{
     as_fixed_size_list_array, as_large_list_array, as_list_array,
 };
-use datafusion_common::exec_err;
 use datafusion_common::types::logical_string;
+use datafusion_common::{exec_datafusion_err, exec_err};
 use datafusion_expr::{
     ArrayFunctionArgument, ArrayFunctionSignature, Coercion, ColumnarValue,
-    Documentation, ScalarUDFImpl, Signature, TypeSignature, TypeSignatureClass,
-    Volatility,
+    Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignature,
+    TypeSignatureClass, Volatility,
 };
 use datafusion_functions::downcast_arg;
 use datafusion_macros::user_doc;
@@ -131,10 +130,6 @@ impl ArrayToString {
 }
 
 impl ScalarUDFImpl for ArrayToString {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "array_to_string"
     }
@@ -147,10 +142,7 @@ impl ScalarUDFImpl for ArrayToString {
         Ok(Utf8)
     }
 
-    fn invoke_with_args(
-        &self,
-        args: datafusion_expr::ScalarFunctionArgs,
-    ) -> Result<ColumnarValue> {
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         make_scalar_function(array_to_string_inner)(&args.args)
     }
 
@@ -197,9 +189,15 @@ make_udf_expr_and_func!(
     )
 )]
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub(super) struct StringToArray {
+pub struct StringToArray {
     signature: Signature,
     aliases: Vec<String>,
+}
+
+impl Default for StringToArray {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl StringToArray {
@@ -225,10 +223,6 @@ impl StringToArray {
 }
 
 impl ScalarUDFImpl for StringToArray {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn name(&self) -> &str {
         "string_to_array"
     }
@@ -244,17 +238,72 @@ impl ScalarUDFImpl for StringToArray {
         ))))
     }
 
-    fn invoke_with_args(
-        &self,
-        args: datafusion_expr::ScalarFunctionArgs,
-    ) -> Result<ColumnarValue> {
-        let args = &args.args;
-        match args[0].data_type() {
-            Utf8 | Utf8View => make_scalar_function(string_to_array_inner::<i32>)(args),
-            LargeUtf8 => make_scalar_function(string_to_array_inner::<i64>)(args),
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        let ScalarFunctionArgs { args, .. } = args;
+
+        let delimiter_is_scalar = matches!(&args[1], ColumnarValue::Scalar(_));
+        let null_str_is_scalar = args
+            .get(2)
+            .is_none_or(|a| matches!(a, ColumnarValue::Scalar(_)));
+
+        if !(delimiter_is_scalar && null_str_is_scalar) {
+            return make_scalar_function(string_to_array_fallback)(&args);
+        }
+
+        // Delimiter and null_str (if given) are scalar, so use the fast path
+        let delimiter = match &args[1] {
+            ColumnarValue::Scalar(s) => s.try_as_str().ok_or_else(|| {
+                exec_datafusion_err!(
+                    "unsupported type for string_to_array delimiter: {:?}",
+                    args[1].data_type()
+                )
+            })?,
+            _ => unreachable!("delimiter must be scalar in this branch"),
+        };
+        let null_value = match args.get(2) {
+            Some(ColumnarValue::Scalar(s)) => s.try_as_str().ok_or_else(|| {
+                exec_datafusion_err!(
+                    "unsupported type for string_to_array null_str: {:?}",
+                    args[2].data_type()
+                )
+            })?,
+            _ => None,
+        };
+
+        let (all_scalar, string_array) = match &args[0] {
+            ColumnarValue::Array(a) => (false, Arc::clone(a)),
+            ColumnarValue::Scalar(s) => (true, s.to_array_of_size(1)?),
+        };
+
+        let result = match string_array.data_type() {
+            Utf8 => {
+                let arr = string_array.as_string::<i32>();
+                let builder =
+                    StringBuilder::with_capacity(arr.len(), arr.get_buffer_memory_size());
+                string_to_array_scalar_args(&arr, delimiter, null_value, builder)
+            }
+            Utf8View => {
+                let arr = string_array.as_string_view();
+                let builder = StringViewBuilder::with_capacity(arr.len());
+                string_to_array_scalar_args(&arr, delimiter, null_value, builder)
+            }
+            LargeUtf8 => {
+                let arr = string_array.as_string::<i64>();
+                let builder = LargeStringBuilder::with_capacity(
+                    arr.len(),
+                    arr.get_buffer_memory_size(),
+                );
+                string_to_array_scalar_args(&arr, delimiter, null_value, builder)
+            }
             other => {
                 exec_err!("unsupported type for string_to_array function as {other:?}")
             }
+        }?;
+
+        if all_scalar {
+            ScalarValue::try_from_array(&result, 0).map(ColumnarValue::Scalar)
+        } else {
+            Ok(ColumnarValue::Array(result))
         }
     }
 
@@ -264,6 +313,201 @@ impl ScalarUDFImpl for StringToArray {
 
     fn documentation(&self) -> Option<&Documentation> {
         self.doc()
+    }
+}
+
+/// Appends `value` to the string builder, or NULL if it matches `null_value`.
+#[inline(always)]
+fn append_part(
+    builder: &mut impl StringArrayBuilderType,
+    value: &str,
+    null_value: Option<&str>,
+) {
+    if null_value == Some(value) {
+        builder.append_null();
+    } else {
+        builder.append_value(value);
+    }
+}
+
+/// Optimized `string_to_array` implementation for the common case where
+/// delimiter and null_value are scalar values.
+fn string_to_array_scalar_args<'a, StringArrType, StringBuilderType>(
+    string_array: &StringArrType,
+    delimiter: Option<&str>,
+    null_value: Option<&str>,
+    string_builder: StringBuilderType,
+) -> Result<ArrayRef>
+where
+    StringArrType: StringArrayType<'a>,
+    StringBuilderType: StringArrayBuilderType,
+{
+    let mut list_builder = ListBuilder::new(string_builder);
+
+    match delimiter {
+        Some("") => {
+            // Empty delimiter: each non-empty string becomes a single-element list.
+            // Empty strings produce an empty array (PostgreSQL compat).
+            for i in 0..string_array.len() {
+                if string_array.is_null(i) {
+                    list_builder.append(false);
+                    continue;
+                }
+                let string = string_array.value(i);
+                if !string.is_empty() {
+                    append_part(list_builder.values(), string, null_value);
+                }
+                list_builder.append(true);
+            }
+        }
+        Some(delimiter) => {
+            // Rather than using `str::split`, do the split ourselves using
+            // `memmem::Finder`. This allows pre-compiling the delimiter search
+            // pattern once and reusing it for all rows.
+            let finder = memchr::memmem::Finder::new(delimiter.as_bytes());
+            let delim_len = delimiter.len();
+
+            for i in 0..string_array.len() {
+                if string_array.is_null(i) {
+                    list_builder.append(false);
+                    continue;
+                }
+                let string = string_array.value(i);
+                if !string.is_empty() {
+                    let bytes = string.as_bytes();
+                    let mut start = 0;
+                    for pos in finder.find_iter(bytes) {
+                        append_part(
+                            list_builder.values(),
+                            &string[start..pos],
+                            null_value,
+                        );
+                        start = pos + delim_len;
+                    }
+                    // Trailing part after last delimiter (or entire string if no
+                    // delimiter was found).
+                    append_part(list_builder.values(), &string[start..], null_value);
+                }
+                list_builder.append(true);
+            }
+        }
+        None => {
+            // NULL delimiter: split into individual characters.
+            for i in 0..string_array.len() {
+                if string_array.is_null(i) {
+                    list_builder.append(false);
+                    continue;
+                }
+                let string = string_array.value(i);
+                for (pos, c) in string.char_indices() {
+                    append_part(
+                        list_builder.values(),
+                        &string[pos..pos + c.len_utf8()],
+                        null_value,
+                    );
+                }
+                list_builder.append(true);
+            }
+        }
+    }
+
+    Ok(Arc::new(list_builder.finish()) as ArrayRef)
+}
+
+/// Fallback path for `string_to_array` when delimiter and/or null_value
+/// are array columns rather than scalars.
+fn string_to_array_fallback(args: &[ArrayRef]) -> Result<ArrayRef> {
+    let null_value_array = args.get(2);
+
+    match args[0].data_type() {
+        Utf8 => {
+            let arr = args[0].as_string::<i32>();
+            let builder =
+                StringBuilder::with_capacity(arr.len(), arr.get_buffer_memory_size());
+            string_to_array_column_args(&arr, &args[1], null_value_array, builder)
+        }
+        Utf8View => {
+            let arr = args[0].as_string_view();
+            let builder = StringViewBuilder::with_capacity(arr.len());
+            string_to_array_column_args(&arr, &args[1], null_value_array, builder)
+        }
+        LargeUtf8 => {
+            let arr = args[0].as_string::<i64>();
+            let builder = LargeStringBuilder::with_capacity(
+                arr.len(),
+                arr.get_buffer_memory_size(),
+            );
+            string_to_array_column_args(&arr, &args[1], null_value_array, builder)
+        }
+        other => exec_err!("unsupported type for string_to_array function as {other:?}"),
+    }
+}
+
+fn string_to_array_column_args<'a, StringArrType, StringBuilderType>(
+    string_array: &StringArrType,
+    delimiter_array: &ArrayRef,
+    null_value_array: Option<&ArrayRef>,
+    string_builder: StringBuilderType,
+) -> Result<ArrayRef>
+where
+    StringArrType: StringArrayType<'a>,
+    StringBuilderType: StringArrayBuilderType,
+{
+    let mut list_builder = ListBuilder::new(string_builder);
+
+    for i in 0..string_array.len() {
+        if string_array.is_null(i) {
+            list_builder.append(false);
+            continue;
+        }
+
+        let string = string_array.value(i);
+        let delimiter = get_str_value(delimiter_array, i);
+        let null_value = null_value_array.and_then(|arr| get_str_value(arr, i));
+
+        match delimiter {
+            Some("") => {
+                if !string.is_empty() {
+                    append_part(list_builder.values(), string, null_value);
+                }
+            }
+            Some(delimiter) => {
+                if !string.is_empty() {
+                    for part in string.split(delimiter) {
+                        append_part(list_builder.values(), part, null_value);
+                    }
+                }
+            }
+            None => {
+                for (pos, c) in string.char_indices() {
+                    append_part(
+                        list_builder.values(),
+                        &string[pos..pos + c.len_utf8()],
+                        null_value,
+                    );
+                }
+            }
+        }
+
+        list_builder.append(true);
+    }
+
+    Ok(Arc::new(list_builder.finish()) as ArrayRef)
+}
+
+/// Returns the string value at index `i` from a string array of any type.
+fn get_str_value(array: &ArrayRef, i: usize) -> Option<&str> {
+    if array.is_null(i) {
+        return None;
+    }
+    match array.data_type() {
+        Utf8 => Some(array.as_string::<i32>().value(i)),
+        LargeUtf8 => Some(array.as_string::<i64>().value(i)),
+        Utf8View => Some(array.as_string_view().value(i)),
+        other => {
+            debug_assert!(false, "unexpected type in get_str_value: {other:?}");
+            None
+        }
     }
 }
 
@@ -324,7 +568,6 @@ fn generate_string_array<O: OffsetSizeTrait>(
     null_strings: &[Option<&str>],
 ) -> Result<StringArray> {
     let mut builder = StringBuilder::with_capacity(list_arr.len(), 0);
-    let mut buf = String::new();
 
     for ((arr, &delimiter), &null_string) in list_arr
         .iter()
@@ -336,17 +579,16 @@ fn generate_string_array<O: OffsetSizeTrait>(
             continue;
         };
 
-        buf.clear();
         let mut first = true;
-        compute_array_to_string(&mut buf, &arr, delimiter, null_string, &mut first)?;
-        builder.append_value(&buf);
+        compute_array_to_string(&mut builder, &arr, delimiter, null_string, &mut first)?;
+        builder.append_value("");
     }
 
     Ok(builder.finish())
 }
 
 fn compute_array_to_string(
-    buf: &mut String,
+    w: &mut impl Write,
     arr: &ArrayRef,
     delimiter: &str,
     null_string: Option<&str>,
@@ -358,7 +600,7 @@ fn compute_array_to_string(
             for i in 0..$list_array.len() {
                 if !$list_array.is_null(i) {
                     compute_array_to_string(
-                        buf,
+                        w,
                         &$list_array.value(i),
                         delimiter,
                         null_string,
@@ -368,9 +610,9 @@ fn compute_array_to_string(
                     if *first {
                         *first = false;
                     } else {
-                        buf.push_str(delimiter);
+                        w.write_str(delimiter)?;
                     }
-                    buf.push_str(ns);
+                    w.write_str(ns)?;
                 }
             }
         };
@@ -399,71 +641,69 @@ fn compute_array_to_string(
                 DataFusionError::from(e)
                     .context("Casting dictionary to values in compute_array_to_string")
             })?;
-            compute_array_to_string(buf, &values, delimiter, null_string, first)
+            compute_array_to_string(w, &values, delimiter, null_string, first)
         }
         Null => Ok(()),
         data_type => {
             macro_rules! str_leaf {
                 ($ARRAY_TYPE:ident) => {
                     write_leaf_to_string(
-                        buf,
+                        w,
                         downcast_arg!(arr, $ARRAY_TYPE),
                         delimiter,
                         null_string,
                         first,
-                        |buf, x: &str| buf.push_str(x),
-                    )
+                        |w, x: &str| w.write_str(x),
+                    )?
                 };
             }
             macro_rules! bool_leaf {
                 ($ARRAY_TYPE:ident) => {
                     write_leaf_to_string(
-                        buf,
+                        w,
                         downcast_arg!(arr, $ARRAY_TYPE),
                         delimiter,
                         null_string,
                         first,
-                        |buf, x: bool| {
+                        |w, x: bool| {
                             if x {
-                                buf.push_str("true");
+                                w.write_str("true")
                             } else {
-                                buf.push_str("false");
+                                w.write_str("false")
                             }
                         },
-                    )
+                    )?
                 };
             }
             macro_rules! int_leaf {
                 ($ARRAY_TYPE:ident) => {
                     write_leaf_to_string(
-                        buf,
+                        w,
                         downcast_arg!(arr, $ARRAY_TYPE),
                         delimiter,
                         null_string,
                         first,
-                        |buf, x| {
+                        |w, x| {
                             let mut itoa_buf = itoa::Buffer::new();
-                            buf.push_str(itoa_buf.format(x));
+                            w.write_str(itoa_buf.format(x))
                         },
-                    )
+                    )?
                 };
             }
             macro_rules! float_leaf {
                 ($ARRAY_TYPE:ident) => {
                     write_leaf_to_string(
-                        buf,
+                        w,
                         downcast_arg!(arr, $ARRAY_TYPE),
                         delimiter,
                         null_string,
                         first,
-                        |buf, x| {
-                            // TODO: Consider switching to a more efficient
-                            // floating point display library (e.g., ryu). This
-                            // might result in some differences in the output
-                            // format, however.
-                            write!(buf, "{}", x).unwrap();
-                        },
-                    )
+                        // TODO: Consider switching to a more efficient
+                        // floating point display library (e.g., ryu). This
+                        // might result in some differences in the output
+                        // format, however.
+                        |w, x| write!(w, "{}", x),
+                    )?
                 };
             }
             match data_type {
@@ -487,7 +727,7 @@ fn compute_array_to_string(
                             .context("Casting to string in array_to_string")
                     })?;
                     return compute_array_to_string(
-                        buf,
+                        w,
                         &str_arr,
                         delimiter,
                         null_string,
@@ -506,17 +746,18 @@ fn compute_array_to_string(
 }
 
 /// Appends the string representation of each element in a leaf (non-list)
-/// array to `buf`, separated by `delimiter`. Null elements are rendered
+/// array to `w`, separated by `delimiter`. Null elements are rendered
 /// using `null_string` if provided, or skipped otherwise. The `append`
-/// closure controls how each non-null element is written to the buffer.
-fn write_leaf_to_string<'a, A, T>(
-    buf: &mut String,
+/// closure controls how each non-null element is written.
+fn write_leaf_to_string<'a, W: Write, A, T>(
+    w: &mut W,
     arr: &'a A,
     delimiter: &str,
     null_string: Option<&str>,
     first: &mut bool,
-    append: impl Fn(&mut String, T),
-) where
+    append: impl Fn(&mut W, T) -> fmt::Result,
+) -> Result<()>
+where
     &'a A: IntoIterator<Item = Option<T>>,
 {
     for x in arr {
@@ -528,279 +769,15 @@ fn write_leaf_to_string<'a, A, T>(
         if *first {
             *first = false;
         } else {
-            buf.push_str(delimiter);
+            w.write_str(delimiter)?;
         }
 
         match x {
-            Some(x) => append(buf, x),
-            None => buf.push_str(null_string.unwrap()),
+            Some(x) => append(w, x)?,
+            None => w.write_str(null_string.unwrap())?,
         }
     }
-}
-
-/// String_to_array SQL function
-/// Splits string at occurrences of delimiter and returns an array of parts
-/// string_to_array('abc~@~def~@~ghi', '~@~') = '["abc", "def", "ghi"]'
-fn string_to_array_inner<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
-    if args.len() < 2 || args.len() > 3 {
-        return exec_err!("string_to_array expects two or three arguments");
-    }
-
-    match args[0].data_type() {
-        Utf8 => {
-            let string_array = args[0].as_string::<T>();
-            let builder = StringBuilder::with_capacity(
-                string_array.len(),
-                string_array.get_buffer_memory_size(),
-            );
-            string_to_array_inner_2::<&GenericStringArray<T>, StringBuilder>(
-                args,
-                &string_array,
-                builder,
-            )
-        }
-        Utf8View => {
-            let string_array = args[0].as_string_view();
-            let builder = StringViewBuilder::with_capacity(string_array.len());
-            string_to_array_inner_2::<&StringViewArray, StringViewBuilder>(
-                args,
-                &string_array,
-                builder,
-            )
-        }
-        LargeUtf8 => {
-            let string_array = args[0].as_string::<T>();
-            let builder = LargeStringBuilder::with_capacity(
-                string_array.len(),
-                string_array.get_buffer_memory_size(),
-            );
-            string_to_array_inner_2::<&GenericStringArray<T>, LargeStringBuilder>(
-                args,
-                &string_array,
-                builder,
-            )
-        }
-        other => exec_err!(
-            "unsupported type for first argument to string_to_array function as {other:?}"
-        ),
-    }
-}
-
-fn string_to_array_inner_2<'a, StringArrType, StringBuilderType>(
-    args: &'a [ArrayRef],
-    string_array: &StringArrType,
-    string_builder: StringBuilderType,
-) -> Result<ArrayRef>
-where
-    StringArrType: StringArrayType<'a>,
-    StringBuilderType: StringArrayBuilderType,
-{
-    match args[1].data_type() {
-        Utf8 => {
-            let delimiter_array = args[1].as_string::<i32>();
-            if args.len() == 2 {
-                string_to_array_impl::<
-                    StringArrType,
-                    &GenericStringArray<i32>,
-                    &StringViewArray,
-                    StringBuilderType,
-                >(string_array, &delimiter_array, None, string_builder)
-            } else {
-                string_to_array_inner_3::<
-                    StringArrType,
-                    &GenericStringArray<i32>,
-                    StringBuilderType,
-                >(args, string_array, &delimiter_array, string_builder)
-            }
-        }
-        Utf8View => {
-            let delimiter_array = args[1].as_string_view();
-
-            if args.len() == 2 {
-                string_to_array_impl::<
-                    StringArrType,
-                    &StringViewArray,
-                    &StringViewArray,
-                    StringBuilderType,
-                >(string_array, &delimiter_array, None, string_builder)
-            } else {
-                string_to_array_inner_3::<
-                    StringArrType,
-                    &StringViewArray,
-                    StringBuilderType,
-                >(args, string_array, &delimiter_array, string_builder)
-            }
-        }
-        LargeUtf8 => {
-            let delimiter_array = args[1].as_string::<i64>();
-            if args.len() == 2 {
-                string_to_array_impl::<
-                    StringArrType,
-                    &GenericStringArray<i64>,
-                    &StringViewArray,
-                    StringBuilderType,
-                >(string_array, &delimiter_array, None, string_builder)
-            } else {
-                string_to_array_inner_3::<
-                    StringArrType,
-                    &GenericStringArray<i64>,
-                    StringBuilderType,
-                >(args, string_array, &delimiter_array, string_builder)
-            }
-        }
-        other => exec_err!(
-            "unsupported type for second argument to string_to_array function as {other:?}"
-        ),
-    }
-}
-
-fn string_to_array_inner_3<'a, StringArrType, DelimiterArrType, StringBuilderType>(
-    args: &'a [ArrayRef],
-    string_array: &StringArrType,
-    delimiter_array: &DelimiterArrType,
-    string_builder: StringBuilderType,
-) -> Result<ArrayRef>
-where
-    StringArrType: StringArrayType<'a>,
-    DelimiterArrType: StringArrayType<'a>,
-    StringBuilderType: StringArrayBuilderType,
-{
-    match args[2].data_type() {
-        Utf8 => {
-            let null_type_array = Some(args[2].as_string::<i32>());
-            string_to_array_impl::<
-                StringArrType,
-                DelimiterArrType,
-                &GenericStringArray<i32>,
-                StringBuilderType,
-            >(
-                string_array,
-                delimiter_array,
-                null_type_array,
-                string_builder,
-            )
-        }
-        Utf8View => {
-            let null_type_array = Some(args[2].as_string_view());
-            string_to_array_impl::<
-                StringArrType,
-                DelimiterArrType,
-                &StringViewArray,
-                StringBuilderType,
-            >(
-                string_array,
-                delimiter_array,
-                null_type_array,
-                string_builder,
-            )
-        }
-        LargeUtf8 => {
-            let null_type_array = Some(args[2].as_string::<i64>());
-            string_to_array_impl::<
-                StringArrType,
-                DelimiterArrType,
-                &GenericStringArray<i64>,
-                StringBuilderType,
-            >(
-                string_array,
-                delimiter_array,
-                null_type_array,
-                string_builder,
-            )
-        }
-        other => {
-            exec_err!("unsupported type for string_to_array function as {other:?}")
-        }
-    }
-}
-
-fn string_to_array_impl<
-    'a,
-    StringArrType,
-    DelimiterArrType,
-    NullValueArrType,
-    StringBuilderType,
->(
-    string_array: &StringArrType,
-    delimiter_array: &DelimiterArrType,
-    null_value_array: Option<NullValueArrType>,
-    string_builder: StringBuilderType,
-) -> Result<ArrayRef>
-where
-    StringArrType: StringArrayType<'a>,
-    DelimiterArrType: StringArrayType<'a>,
-    NullValueArrType: StringArrayType<'a>,
-    StringBuilderType: StringArrayBuilderType,
-{
-    let mut list_builder = ListBuilder::new(string_builder);
-
-    match null_value_array {
-        None => {
-            string_array.iter().zip(delimiter_array.iter()).for_each(
-                |(string, delimiter)| {
-                    match (string, delimiter) {
-                        (Some(string), Some("")) => {
-                            list_builder.values().append_value(string);
-                            list_builder.append(true);
-                        }
-                        (Some(string), Some(delimiter)) => {
-                            string.split(delimiter).for_each(|s| {
-                                list_builder.values().append_value(s);
-                            });
-                            list_builder.append(true);
-                        }
-                        (Some(string), None) => {
-                            string.chars().map(|c| c.to_string()).for_each(|c| {
-                                list_builder.values().append_value(c.as_str());
-                            });
-                            list_builder.append(true);
-                        }
-                        _ => list_builder.append(false), // null value
-                    }
-                },
-            )
-        }
-        Some(null_value_array) => string_array
-            .iter()
-            .zip(delimiter_array.iter())
-            .zip(null_value_array.iter())
-            .for_each(|((string, delimiter), null_value)| {
-                match (string, delimiter) {
-                    (Some(string), Some("")) => {
-                        if Some(string) == null_value {
-                            list_builder.values().append_null();
-                        } else {
-                            list_builder.values().append_value(string);
-                        }
-                        list_builder.append(true);
-                    }
-                    (Some(string), Some(delimiter)) => {
-                        string.split(delimiter).for_each(|s| {
-                            if Some(s) == null_value {
-                                list_builder.values().append_null();
-                            } else {
-                                list_builder.values().append_value(s);
-                            }
-                        });
-                        list_builder.append(true);
-                    }
-                    (Some(string), None) => {
-                        string.chars().map(|c| c.to_string()).for_each(|c| {
-                            if Some(c.as_str()) == null_value {
-                                list_builder.values().append_null();
-                            } else {
-                                list_builder.values().append_value(c.as_str());
-                            }
-                        });
-                        list_builder.append(true);
-                    }
-                    _ => list_builder.append(false), // null value
-                }
-            }),
-    };
-
-    let list_array = list_builder.finish();
-    Ok(Arc::new(list_array) as ArrayRef)
+    Ok(())
 }
 
 trait StringArrayBuilderType: ArrayBuilder {

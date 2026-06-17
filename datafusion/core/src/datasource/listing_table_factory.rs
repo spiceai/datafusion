@@ -233,16 +233,18 @@ mod tests {
     };
     use datafusion_execution::cache::CacheAccessor;
     use datafusion_execution::cache::cache_manager::CacheManagerConfig;
-    use datafusion_execution::cache::cache_unit::DefaultFileStatisticsCache;
+    use datafusion_execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
     use datafusion_execution::config::SessionConfig;
     use datafusion_execution::runtime_env::RuntimeEnvBuilder;
     use glob::Pattern;
     use std::collections::HashMap;
     use std::fs;
+    use std::fs::File;
     use std::path::PathBuf;
 
     use datafusion_common::parsers::CompressionTypeVariant;
     use datafusion_common::{DFSchema, TableReference};
+    use datafusion_expr::registry::ExtensionTypeRegistryRef;
 
     #[tokio::test]
     async fn test_create_using_non_std_file_ext() {
@@ -265,10 +267,7 @@ mod tests {
         .with_options(HashMap::from([("format.has_header".into(), "true".into())]))
         .build();
         let table_provider = factory.create(&state, &cmd).await.unwrap();
-        let listing_table = table_provider
-            .as_any()
-            .downcast_ref::<ListingTable>()
-            .unwrap();
+        let listing_table = table_provider.downcast_ref::<ListingTable>().unwrap();
         let listing_options = listing_table.options();
         assert_eq!(".tbl", listing_options.file_extension);
     }
@@ -298,13 +297,10 @@ mod tests {
         .with_options(options)
         .build();
         let table_provider = factory.create(&state, &cmd).await.unwrap();
-        let listing_table = table_provider
-            .as_any()
-            .downcast_ref::<ListingTable>()
-            .unwrap();
+        let listing_table = table_provider.downcast_ref::<ListingTable>().unwrap();
 
         let format = listing_table.options().format.clone();
-        let csv_format = format.as_any().downcast_ref::<CsvFormat>().unwrap();
+        let csv_format = format.downcast_ref::<CsvFormat>().unwrap();
         let csv_options = csv_format.options().clone();
         assert_eq!(csv_options.schema_infer_max_rec, Some(1000));
         let listing_options = listing_table.options();
@@ -316,6 +312,10 @@ mod tests {
     #[tokio::test]
     async fn test_create_using_folder_with_compression() {
         let dir = tempfile::tempdir().unwrap();
+        // Schema inference now requires at least one file at the location.
+        // The file itself can be 0-byte — it will be filtered out before the
+        // format-specific inference runs, leaving an empty inferred schema.
+        File::create_new(dir.path().join("placeholder.csv.gz")).unwrap();
 
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
@@ -335,14 +335,11 @@ mod tests {
         .with_options(options)
         .build();
         let table_provider = factory.create(&state, &cmd).await.unwrap();
-        let listing_table = table_provider
-            .as_any()
-            .downcast_ref::<ListingTable>()
-            .unwrap();
+        let listing_table = table_provider.downcast_ref::<ListingTable>().unwrap();
 
         // Verify compression is used
         let format = listing_table.options().format.clone();
-        let csv_format = format.as_any().downcast_ref::<CsvFormat>().unwrap();
+        let csv_format = format.downcast_ref::<CsvFormat>().unwrap();
         let csv_options = csv_format.options().clone();
         assert_eq!(csv_options.compression, CompressionTypeVariant::GZIP);
 
@@ -361,6 +358,9 @@ mod tests {
     #[tokio::test]
     async fn test_create_using_folder_without_compression() {
         let dir = tempfile::tempdir().unwrap();
+        // See `test_create_using_folder_with_compression` — a placeholder file
+        // is required so schema inference does not error on an empty location.
+        File::create_new(dir.path().join("placeholder.csv")).unwrap();
 
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
@@ -379,10 +379,7 @@ mod tests {
         .with_options(options)
         .build();
         let table_provider = factory.create(&state, &cmd).await.unwrap();
-        let listing_table = table_provider
-            .as_any()
-            .downcast_ref::<ListingTable>()
-            .unwrap();
+        let listing_table = table_provider.downcast_ref::<ListingTable>().unwrap();
 
         let listing_options = listing_table.options();
         assert_eq!("", listing_options.file_extension);
@@ -400,6 +397,8 @@ mod tests {
         let mut path = PathBuf::from(dir.path());
         path.extend(["odd.v1", "odd.v2"]);
         fs::create_dir_all(&path).unwrap();
+        // Placeholder so schema inference does not error on an empty location.
+        File::create_new(path.join("placeholder.parquet")).unwrap();
 
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
@@ -414,10 +413,7 @@ mod tests {
         )
         .build();
         let table_provider = factory.create(&state, &cmd).await.unwrap();
-        let listing_table = table_provider
-            .as_any()
-            .downcast_ref::<ListingTable>()
-            .unwrap();
+        let listing_table = table_provider.downcast_ref::<ListingTable>().unwrap();
 
         let listing_options = listing_table.options();
         assert_eq!("", listing_options.file_extension);
@@ -430,7 +426,7 @@ mod tests {
         path.extend(["key1=value1", "key2=value2"]);
         fs::create_dir_all(&path).unwrap();
         path.push("data.parquet");
-        fs::File::create_new(&path).unwrap();
+        File::create_new(&path).unwrap();
 
         let factory = ListingTableFactory::new();
         let context = SessionContext::new();
@@ -445,10 +441,7 @@ mod tests {
         )
         .build();
         let table_provider = factory.create(&state, &cmd).await.unwrap();
-        let listing_table = table_provider
-            .as_any()
-            .downcast_ref::<ListingTable>()
-            .unwrap();
+        let listing_table = table_provider.downcast_ref::<ListingTable>().unwrap();
 
         let listing_options = listing_table.options();
         let dtype =
@@ -477,10 +470,7 @@ mod tests {
         )
         .build();
         let table_provider = factory.create(&state, &cmd).await.unwrap();
-        let listing_table = table_provider
-            .as_any()
-            .downcast_ref::<ListingTable>()
-            .unwrap();
+        let listing_table = table_provider.downcast_ref::<ListingTable>().unwrap();
 
         let listing_options = listing_table.options();
         assert!(listing_options.table_partition_cols.is_empty());
@@ -498,7 +488,7 @@ mod tests {
         // Test with collect_statistics enabled
         let file_statistics_cache = Arc::new(DefaultFileStatisticsCache::default());
         let cache_config = CacheManagerConfig::default()
-            .with_files_statistics_cache(Some(file_statistics_cache.clone()));
+            .with_file_statistics_cache(Some(file_statistics_cache.clone()));
         let runtime = RuntimeEnvBuilder::new()
             .with_cache_manager(cache_config)
             .build_arc()
@@ -528,7 +518,7 @@ mod tests {
         // Test with collect_statistics disabled
         let file_statistics_cache = Arc::new(DefaultFileStatisticsCache::default());
         let cache_config = CacheManagerConfig::default()
-            .with_files_statistics_cache(Some(file_statistics_cache.clone()));
+            .with_file_statistics_cache(Some(file_statistics_cache.clone()));
         let runtime = RuntimeEnvBuilder::new()
             .with_cache_manager(cache_config)
             .build_arc()
@@ -559,9 +549,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_with_invalid_session() {
-        use async_trait::async_trait;
-        use datafusion_catalog::Session;
-        use datafusion_common::Result;
         use datafusion_common::config::TableOptions;
         use datafusion_execution::TaskContext;
         use datafusion_execution::config::SessionConfig;
@@ -569,7 +556,6 @@ mod tests {
         use datafusion_physical_plan::ExecutionPlan;
         use std::any::Any;
         use std::collections::HashMap;
-        use std::sync::Arc;
 
         // A mock Session that is NOT SessionState
         #[derive(Debug)]
@@ -601,6 +587,11 @@ mod tests {
             ) -> &HashMap<String, Arc<datafusion_expr::ScalarUDF>> {
                 unimplemented!()
             }
+            fn higher_order_functions(
+                &self,
+            ) -> &HashMap<String, Arc<datafusion_expr::HigherOrderUDF>> {
+                unimplemented!()
+            }
             fn aggregate_functions(
                 &self,
             ) -> &HashMap<String, Arc<datafusion_expr::AggregateUDF>> {
@@ -611,6 +602,11 @@ mod tests {
             ) -> &HashMap<String, Arc<datafusion_expr::WindowUDF>> {
                 unimplemented!()
             }
+
+            fn extension_type_registry(&self) -> &ExtensionTypeRegistryRef {
+                unreachable!()
+            }
+
             fn runtime_env(&self) -> &Arc<datafusion_execution::runtime_env::RuntimeEnv> {
                 unimplemented!()
             }

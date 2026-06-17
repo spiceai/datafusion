@@ -38,7 +38,7 @@ name = "datafusion_proto"
 default = ["parquet"]
 json = ["pbjson", "serde", "serde_json", "datafusion-proto-common/json"]
 parquet = ["datafusion-datasource-parquet", "datafusion-common/parquet", "datafusion/parquet"]
-avro = ["datafusion-datasource-avro", "datafusion-common/avro"]
+avro = ["datafusion-datasource-avro"]
 vortex = ["vortex-datafusion"]
 
 # Note to developers: do *not* add `datafusion` as a dependency in
@@ -68,7 +68,6 @@ object_store = { workspace = true }
 vortex-datafusion = { workspace = true, optional = true }
 pbjson = { workspace = true, optional = true }
 prost = { workspace = true }
-rand = { workspace = true }
 serde = { version = "1.0", optional = true }
 serde_json = { workspace = true, optional = true }
 

@@ -20,8 +20,8 @@ use std::fmt;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use datafusion_common::plan_err;
 use datafusion_common::Result;
+use datafusion_common::plan_err;
 
 use arrow::{
     array::{Array, StringBuilder, TimestampMicrosecondBuilder, UInt64Builder},
@@ -267,7 +267,10 @@ mod tests {
     #[test]
     fn test_metadata_column_display() {
         assert_eq!(format!("{}", MetadataColumn::Location(None)), "_location");
-        assert_eq!(format!("{}", MetadataColumn::LastModified), "_last_modified");
+        assert_eq!(
+            format!("{}", MetadataColumn::LastModified),
+            "_last_modified"
+        );
         assert_eq!(format!("{}", MetadataColumn::Size), "_size");
     }
 

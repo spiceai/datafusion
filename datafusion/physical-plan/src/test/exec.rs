@@ -28,7 +28,6 @@ use crate::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{
-    any::Any,
     pin::Pin,
     sync::{Arc, Weak},
     task::{Context, Poll},
@@ -188,10 +187,6 @@ impl ExecutionPlan for MockExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
@@ -254,9 +249,9 @@ impl ExecutionPlan for MockExec {
     }
 
     // Panics if one of the batches is an error
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         if partition.is_some() {
-            return Ok(Statistics::new_unknown(&self.schema));
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema)));
         }
         let data: Result<Vec<_>> = self
             .data
@@ -269,11 +264,11 @@ impl ExecutionPlan for MockExec {
 
         let data = data?;
 
-        Ok(common::compute_record_batch_statistics(
+        Ok(Arc::new(common::compute_record_batch_statistics(
             &[data],
             &self.schema,
             None,
-        ))
+        )))
     }
 }
 
@@ -418,10 +413,6 @@ impl ExecutionPlan for BarrierExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
@@ -483,15 +474,15 @@ impl ExecutionPlan for BarrierExec {
         Ok(builder.build())
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         if partition.is_some() {
-            return Ok(Statistics::new_unknown(&self.schema));
+            return Ok(Arc::new(Statistics::new_unknown(&self.schema)));
         }
-        Ok(common::compute_record_batch_statistics(
+        Ok(Arc::new(common::compute_record_batch_statistics(
             &self.data,
             &self.schema,
             None,
-        ))
+        )))
     }
 }
 
@@ -552,10 +543,6 @@ impl DisplayAs for ErrorExec {
 impl ExecutionPlan for ErrorExec {
     fn name(&self) -> &'static str {
         Self::static_name()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -644,10 +631,6 @@ impl ExecutionPlan for StatisticsExec {
         Self::static_name()
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.cache
     }
@@ -671,12 +654,12 @@ impl ExecutionPlan for StatisticsExec {
         unimplemented!("This plan only serves for testing statistics")
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Statistics> {
-        Ok(if partition.is_some() {
+    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(if partition.is_some() {
             Statistics::new_unknown(&self.schema)
         } else {
             self.stats.clone()
-        })
+        }))
     }
 }
 
@@ -745,10 +728,6 @@ impl DisplayAs for BlockingExec {
 impl ExecutionPlan for BlockingExec {
     fn name(&self) -> &'static str {
         Self::static_name()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -891,10 +870,6 @@ impl DisplayAs for PanicExec {
 impl ExecutionPlan for PanicExec {
     fn name(&self) -> &'static str {
         Self::static_name()
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
