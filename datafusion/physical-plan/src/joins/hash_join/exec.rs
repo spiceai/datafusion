@@ -1207,9 +1207,10 @@ impl<A: CollectLeftAccumulator + 'static> DisplayAs for HashJoinExec<A> {
                     .map(|(c1, c2)| format!("({c1}, {c2})"))
                     .collect::<Vec<String>>()
                     .join(", ");
+                let accumulator = A::static_name();
                 write!(
                     f,
-                    "HashJoinExec: mode={:?}, join_type={:?}, on=[{}]{}{}{}{}",
+                    "HashJoinExec: mode={:?}, join_type={:?}, accumulator={accumulator}, on=[{}]{}{}{}{}",
                     self.mode,
                     self.join_type,
                     on,
@@ -1246,6 +1247,8 @@ impl<A: CollectLeftAccumulator + 'static> DisplayAs for HashJoinExec<A> {
                 if let Some(fetch) = self.fetch {
                     writeln!(f, "fetch={fetch}")?;
                 }
+
+                writeln!(f, "accumulator={}", A::static_name())?;
 
                 Ok(())
             }
