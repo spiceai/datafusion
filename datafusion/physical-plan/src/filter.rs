@@ -413,13 +413,23 @@ impl FilterExec {
         // filtering to constants.
         let constants = collect_columns(predicate)
             .into_iter()
-            .filter(|column| stats.column_statistics[column.index()].is_singleton())
-            .map(|column| {
-                let value = stats.column_statistics[column.index()]
+            .filter(|column| {
+                stats
+                    .column_statistics
+                    .get(column.index())
+                    .is_some_and(|cs| cs.is_singleton())
+            })
+            .filter_map(|column| {
+                let value = stats
+                    .column_statistics
+                    .get(column.index())?
                     .min_value
                     .get_value();
                 let expr = Arc::new(column) as _;
-                ConstExpr::new(expr, AcrossPartitions::Uniform(value.cloned()))
+                Some(ConstExpr::new(
+                    expr,
+                    AcrossPartitions::Uniform(value.cloned()),
+                ))
             });
         // This is for statistics
         eq_properties.add_constants(constants)?;

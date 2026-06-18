@@ -476,8 +476,16 @@ fn estimate_join_cardinality(
                 right.downcast_ref::<Column>(),
             ) {
                 (Some(left), Some(right)) => (
-                    left_stats.column_statistics[left.index()].clone(),
-                    right_stats.column_statistics[right.index()].clone(),
+                    left_stats
+                        .column_statistics
+                        .get(left.index())
+                        .cloned()
+                        .unwrap_or_else(ColumnStatistics::new_unknown),
+                    right_stats
+                        .column_statistics
+                        .get(right.index())
+                        .cloned()
+                        .unwrap_or_else(ColumnStatistics::new_unknown),
                 ),
                 _ => (
                     ColumnStatistics::new_unknown(),
