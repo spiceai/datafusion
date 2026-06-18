@@ -28,9 +28,10 @@ use super::{
     },
     utils::{
         find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters,
-        unproject_sort_expr, unproject_unnest_expr,
-        unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
+        find_window_nodes_within_select, partition_subquery_filters,
+        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
+        unproject_unnest_expr, unproject_unnest_expr_as_flatten_value,
+        unproject_window_exprs,
     },
 };
 use crate::unparser::extension_unparser::{
@@ -251,23 +252,26 @@ impl Unparser<'_> {
 
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
-        projection
-            .iter_mut()
-            .for_each(|select_item| if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) = select_item {
+        projection.iter_mut().for_each(|select_item| {
+            if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) =
+                select_item
+            {
                 remove_dangling_identifiers(idents, &all_idents);
-            });
+            }
+        });
 
         // Check the order by as well
         if let Some(query) = query.as_mut()
-            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by() {
-                order_by.iter_mut().for_each(|sort_item| {
-                    if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                        remove_dangling_identifiers(idents, &all_idents);
-                    }
-                });
+            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
+        {
+            order_by.iter_mut().for_each(|sort_item| {
+                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
+                    remove_dangling_identifiers(idents, &all_idents);
+                }
+            });
 
-                query.order_by(OrderByKind::Expressions(order_by));
-            }
+            query.order_by(OrderByKind::Expressions(order_by));
+        }
 
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
@@ -997,11 +1001,13 @@ impl Unparser<'_> {
                     &mut right_relation,
                 )?;
 
-                let (join_filters, where_filters) = Self::split_join_on_and_where_filters(
-                    join.join_type,
-                    &join.filter,
-                    table_scan_filters,
-                );
+                let (join_filters, where_filters) =
+                    Self::split_join_on_and_where_filters(
+                        join.join_type,
+                        &join.filter,
+                        table_scan_filters,
+                        self.dialect.supports_subquery_in_join_predicate(),
+                    )?;
                 for filter in where_filters {
                     let filter_expr = self.expr_to_sql(&filter)?;
                     select.selection(Some(filter_expr));
@@ -2120,28 +2126,45 @@ impl Unparser<'_> {
     /// Decides where extracted table-scan filters belong in the unparsed SQL:
     /// in the `JOIN ON` clause or in `WHERE`.
     ///
-    /// For inner joins the two are semantically equivalent, so filters go to
-    /// `WHERE` (some dialects reject subqueries inside `JOIN ON`).
-    /// For outer joins the filters are AND-folded into `ON` to preserve correctness.
+    /// When the dialect reports `supports_subquery_in_join_predicate() == true`
+    /// (the default), all table-scan filters are AND-folded into the `ON`
+    /// clause alongside any existing join filter.
+    ///
+    /// When the dialect does **not** support subqueries inside `JOIN ON`
+    /// (e.g. BigQuery, Spice Cloud), subquery-containing filters are separated
+    /// from simple ones. For inner joins the subquery filters are moved to
+    /// `WHERE` (semantically equivalent), while simple filters stay in `ON`.
+    /// For non-inner joins (LEFT/RIGHT/FULL) moving filters to `WHERE` would
+    /// change join semantics, so an error is returned when subquery filters are
+    /// present.
     ///
     /// Returns `(on_filter, where_filters)`.
     fn split_join_on_and_where_filters(
         join_type: JoinType,
         join_filter: &Option<Expr>,
         table_scan_filters: Vec<Expr>,
-    ) -> (Option<Expr>, Vec<Expr>) {
+        supports_subquery_in_join_predicate: bool,
+    ) -> Result<(Option<Expr>, Vec<Expr>)> {
         if table_scan_filters.is_empty() {
-            return (join_filter.clone(), vec![]);
+            return Ok((join_filter.clone(), vec![]));
         }
 
-        if join_type == JoinType::Inner {
-            // ON and WHERE are equivalent for inner joins; prefer WHERE
-            // because some dialects reject subqueries inside JOIN ON.
-            return (join_filter.clone(), table_scan_filters);
-        }
+        let (on_filters, where_filters) = if supports_subquery_in_join_predicate {
+            (table_scan_filters, vec![])
+        } else {
+            let (simple, subquery) = partition_subquery_filters(table_scan_filters);
 
-        // Outer joins: fold table-scan filters into ON to preserve semantics.
-        let combined = table_scan_filters.into_iter().reduce(|acc, filter| {
+            if !subquery.is_empty() && join_type != JoinType::Inner {
+                return not_impl_err!(
+                    "Subqueries in JOIN ON predicates are not supported for {join_type} joins by this dialect"
+                );
+            }
+
+            (simple, subquery)
+        };
+
+        // AND-fold the ON filters into the existing join filter (if any).
+        let combined = on_filters.into_iter().reduce(|acc, filter| {
             Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(acc),
                 op: Operator::And,
@@ -2160,7 +2183,7 @@ impl Unparser<'_> {
             (None, None) => None,
         };
 
-        (on_filter, vec![])
+        Ok((on_filter, where_filters))
     }
 }
 
