@@ -303,23 +303,6 @@ pub trait Dialect: Send + Sync {
         false
     }
 
-    /// Whether the dialect supports subquery expressions (scalar subqueries,
-    /// `IN` subqueries, `EXISTS`) inside `JOIN ON` predicates.
-    ///
-    /// When `false` and the join is an inner join, subquery-containing filter
-    /// predicates are moved from the `ON` clause to the `WHERE` clause, which
-    /// is semantically equivalent for inner joins.
-    ///
-    /// For non-inner joins (LEFT, RIGHT, FULL) when this returns `false`, the
-    /// unparser returns an error (not currently supported).
-    ///
-    /// # Default
-    ///
-    /// Returns `true` — most SQL backends accept subqueries in `JOIN ON`.
-    fn supports_subquery_in_join_predicate(&self) -> bool {
-        true
-    }
-
     /// Override the default string literal unparsing.
     ///
     /// Returns `Some(ast::Expr)` to replace the default single-quoted string,
@@ -795,10 +778,6 @@ impl Dialect for BigQueryDialect {
         Some('`')
     }
 
-    fn supports_subquery_in_join_predicate(&self) -> bool {
-        false
-    }
-
     fn col_alias_overrides(&self, alias: &str) -> Result<Option<String>> {
         // Check if alias contains any special characters not supported by BigQuery col names
         // https://cloud.google.com/bigquery/docs/schemas#flexible-column-names
@@ -963,7 +942,6 @@ pub struct CustomDialect {
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
     unnest_as_table_factor: bool,
-    supports_subquery_in_join_predicate: bool,
     timezone_cast_style: TimezoneCastStyle,
     unnest_as_lateral_flatten: bool,
 }
@@ -995,7 +973,6 @@ impl Default for CustomDialect {
             window_func_support_window_frame: true,
             full_qualified_col: false,
             unnest_as_table_factor: false,
-            supports_subquery_in_join_predicate: true,
             timezone_cast_style: TimezoneCastStyle::Cast,
             unnest_as_lateral_flatten: false,
         }
@@ -1127,10 +1104,6 @@ impl Dialect for CustomDialect {
         self.unnest_as_table_factor
     }
 
-    fn supports_subquery_in_join_predicate(&self) -> bool {
-        self.supports_subquery_in_join_predicate
-    }
-
     fn unnest_as_lateral_flatten(&self) -> bool {
         self.unnest_as_lateral_flatten
     }
@@ -1172,7 +1145,6 @@ pub struct CustomDialectBuilder {
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
     unnest_as_table_factor: bool,
-    supports_subquery_in_join_predicate: bool,
     timezone_cast_style: TimezoneCastStyle,
     unnest_as_lateral_flatten: bool,
 }
@@ -1210,7 +1182,6 @@ impl CustomDialectBuilder {
             window_func_support_window_frame: true,
             full_qualified_col: false,
             unnest_as_table_factor: false,
-            supports_subquery_in_join_predicate: true,
             timezone_cast_style: TimezoneCastStyle::Cast,
             unnest_as_lateral_flatten: false,
         }
@@ -1240,7 +1211,6 @@ impl CustomDialectBuilder {
             window_func_support_window_frame: self.window_func_support_window_frame,
             full_qualified_col: self.full_qualified_col,
             unnest_as_table_factor: self.unnest_as_table_factor,
-            supports_subquery_in_join_predicate: self.supports_subquery_in_join_predicate,
             timezone_cast_style: self.timezone_cast_style,
             unnest_as_lateral_flatten: self.unnest_as_lateral_flatten,
         }
@@ -1396,16 +1366,6 @@ impl CustomDialectBuilder {
 
     pub fn with_unnest_as_table_factor(mut self, unnest_as_table_factor: bool) -> Self {
         self.unnest_as_table_factor = unnest_as_table_factor;
-        self
-    }
-
-    /// Customize whether the dialect supports subquery expressions inside
-    /// `JOIN ON` predicates.
-    pub fn with_supports_subquery_in_join_predicate(
-        mut self,
-        supports_subquery_in_join_predicate: bool,
-    ) -> Self {
-        self.supports_subquery_in_join_predicate = supports_subquery_in_join_predicate;
         self
     }
 
