@@ -487,7 +487,29 @@ fn estimate_join_cardinality(
                         .cloned()
                         .unwrap_or_else(ColumnStatistics::new_unknown),
                 ),
-                _ => (
+                // One side is a plain column, the other an expression key
+                // (e.g. `mod(s_w_id * s_i_id, 10000) = su_suppkey` or
+                // `ascii(substr(c_state,1,1)) - 65 = su_nationkey`). The
+                // expression's distinct count is unknown, but for an equi-join
+                // the match selectivity is bounded by the known column's NDV
+                // Reuse the column's statistics as a proxy for *both* sides
+                (Some(left), None) => {
+                    let stat = left_stats
+                        .column_statistics
+                        .get(left.index())
+                        .cloned()
+                        .unwrap_or_else(ColumnStatistics::new_unknown);
+                    (stat.clone(), stat)
+                }
+                (None, Some(right)) => {
+                    let stat = right_stats
+                        .column_statistics
+                        .get(right.index())
+                        .cloned()
+                        .unwrap_or_else(ColumnStatistics::new_unknown);
+                    (stat.clone(), stat)
+                }
+                (None, None) => (
                     ColumnStatistics::new_unknown(),
                     ColumnStatistics::new_unknown(),
                 ),
@@ -648,22 +670,25 @@ fn estimate_inner_join_cardinality(
         }
     }
 
-    // With the assumption that the smaller input's domain is generally represented in the bigger
-    // input's domain, we can estimate the inner join's cardinality by taking the cartesian product
-    // of the two inputs and normalizing it by the selectivity factor.
+    // With the assumption that the smaller input's domain is generally represented
+    // in the bigger input's domain, the inner join cardinality is the cartesian
+    // product normalized by the selectivity factor. Use `checked_mul`: an upstream
+    // reorder can feed inflated intermediate row estimates whose product exceeds
+    // `usize::MAX`. Vanilla DataFusion multiplies unchecked and *panics* ("attempt
+    // to multiply with overflow", seen on chbench q8); return `None` (unknown —
+    // handled like the Absent-selectivity case) on overflow instead.
     let left_num_rows = left_stats.num_rows.get_value()?;
     let right_num_rows = right_stats.num_rows.get_value()?;
-    match join_selectivity {
-        Precision::Exact(value) if value > 0 => {
-            Some(Precision::Exact((left_num_rows * right_num_rows) / value))
+    let cartesian = left_num_rows.checked_mul(*right_num_rows);
+    match (join_selectivity, cartesian) {
+        (Precision::Exact(value), Some(card)) if value > 0 => {
+            Some(Precision::Exact(card / value))
         }
-        Precision::Inexact(value) if value > 0 => {
-            Some(Precision::Inexact((left_num_rows * right_num_rows) / value))
+        (Precision::Inexact(value), Some(card)) if value > 0 => {
+            Some(Precision::Inexact(card / value))
         }
-        // Since we don't have any information about the selectivity (which is derived
-        // from the number of distinct rows information) we can give up here for now.
-        // And let other passes handle this (otherwise we would need to produce an
-        // overestimation using just the cartesian product).
+        // No selectivity information, or the cartesian product overflowed: give up
+        // here and let other passes handle it (rather than over-estimate).
         _ => None,
     }
 }

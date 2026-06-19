@@ -735,6 +735,28 @@ impl ProjectionExprs {
     }
 }
 
+/// Upper bound on the distinct values of `mod(_, k)` when `k` is a positive
+/// integer literal: the result lies in `{0, …, k-1}`, so at most `k` distinct
+/// values.
+fn modulo_result_distinct_count(expr: &dyn PhysicalExpr) -> Option<usize> {
+    let func = expr.downcast_ref::<ScalarFunctionExpr>()?;
+    if !func.name().eq_ignore_ascii_case("mod") || func.args().len() != 2 {
+        return None;
+    }
+    let divisor = func.args()[1].as_ref().downcast_ref::<Literal>()?;
+    match divisor.value() {
+        ScalarValue::Int8(Some(k)) if *k > 0 => Some(*k as usize),
+        ScalarValue::Int16(Some(k)) if *k > 0 => Some(*k as usize),
+        ScalarValue::Int32(Some(k)) if *k > 0 => Some(*k as usize),
+        ScalarValue::Int64(Some(k)) if *k > 0 => Some(*k as usize),
+        ScalarValue::UInt8(Some(k)) if *k > 0 => Some(*k as usize),
+        ScalarValue::UInt16(Some(k)) if *k > 0 => Some(*k as usize),
+        ScalarValue::UInt32(Some(k)) if *k > 0 => Some(*k as usize),
+        ScalarValue::UInt64(Some(k)) if *k > 0 => Some(*k as usize),
+        _ => None,
+    }
+}
+
 /// Propagate column statistics through CAST projections. Other expressions
 /// return unknown — generalizing via [`PhysicalExpr::evaluate_bounds`] is
 /// unsafe for aggregate folding since many impls (e.g. `sin`) return a fixed
@@ -745,6 +767,14 @@ fn project_column_statistics_through_expr(
 ) -> ColumnStatistics {
     if let Some(col) = expr.downcast_ref::<Column>() {
         return column_stats[col.index()].clone();
+    }
+    // A `mod(.., k)` result takes at most `k` distinct values.  Otherwise the join
+    // cardinality falls back to row-count and JoinSelection picks the wrong (huge) build side.
+    if let Some(k) = modulo_result_distinct_count(expr) {
+        return ColumnStatistics {
+            distinct_count: Precision::Inexact(k),
+            ..ColumnStatistics::new_unknown()
+        };
     }
     let Some(cast_expr) = expr.downcast_ref::<CastExpr>() else {
         return ColumnStatistics::new_unknown();
