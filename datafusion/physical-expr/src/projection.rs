@@ -735,26 +735,33 @@ impl ProjectionExprs {
     }
 }
 
-/// Upper bound on the distinct values of `mod(_, k)` when `k` is a positive
-/// integer literal: the result lies in `{0, …, k-1}`, so at most `k` distinct
-/// values.
+/// Conservative estimate of the distinct values produced by `mod(_, k)` for a
+/// positive integer literal `k`. For a non-negative dividend (the targeted
+/// `mod(id * id, k)` join keys) the result lies in `{0, …, k-1}`, so `k` is an
+/// exact upper bound. Truncated-remainder semantics allow `{-(k-1), …, k-1}`
+/// for negative dividends; there `k` under-counts the NDV, which only
+/// over-estimates cardinality (the safe direction — never collapses the join).
+/// Reported as `Inexact` either way.
 fn modulo_result_distinct_count(expr: &dyn PhysicalExpr) -> Option<usize> {
     let func = expr.downcast_ref::<ScalarFunctionExpr>()?;
     if !func.name().eq_ignore_ascii_case("mod") || func.args().len() != 2 {
         return None;
     }
     let divisor = func.args()[1].as_ref().downcast_ref::<Literal>()?;
-    match divisor.value() {
-        ScalarValue::Int8(Some(k)) if *k > 0 => Some(*k as usize),
-        ScalarValue::Int16(Some(k)) if *k > 0 => Some(*k as usize),
-        ScalarValue::Int32(Some(k)) if *k > 0 => Some(*k as usize),
-        ScalarValue::Int64(Some(k)) if *k > 0 => Some(*k as usize),
-        ScalarValue::UInt8(Some(k)) if *k > 0 => Some(*k as usize),
-        ScalarValue::UInt16(Some(k)) if *k > 0 => Some(*k as usize),
-        ScalarValue::UInt32(Some(k)) if *k > 0 => Some(*k as usize),
-        ScalarValue::UInt64(Some(k)) if *k > 0 => Some(*k as usize),
-        _ => None,
-    }
+    // Normalize the positive literal to u64, then do a single fallible
+    // conversion to usize (guards against truncation on 32-bit targets).
+    let k: u64 = match divisor.value() {
+        ScalarValue::Int8(Some(k)) if *k > 0 => *k as u64,
+        ScalarValue::Int16(Some(k)) if *k > 0 => *k as u64,
+        ScalarValue::Int32(Some(k)) if *k > 0 => *k as u64,
+        ScalarValue::Int64(Some(k)) if *k > 0 => *k as u64,
+        ScalarValue::UInt8(Some(k)) if *k > 0 => u64::from(*k),
+        ScalarValue::UInt16(Some(k)) if *k > 0 => u64::from(*k),
+        ScalarValue::UInt32(Some(k)) if *k > 0 => u64::from(*k),
+        ScalarValue::UInt64(Some(k)) if *k > 0 => *k,
+        _ => return None,
+    };
+    usize::try_from(k).ok()
 }
 
 /// Propagate column statistics through CAST projections. Other expressions
@@ -1335,8 +1342,44 @@ pub(crate) mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::{DataType, TimeUnit};
     use datafusion_common::config::ConfigOptions;
-    use datafusion_expr::{Operator, ScalarUDF};
+    use datafusion_expr::{
+        ColumnarValue, Operator, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature,
+        Volatility,
+    };
     use insta::assert_snapshot;
+
+    /// Minimal `mod(a, b)` UDF used only to drive statistics propagation in
+    /// tests — it is never executed, so `invoke_with_args` is unreachable.
+    #[derive(Debug, PartialEq, Eq, Hash)]
+    struct ModUdf {
+        signature: Signature,
+    }
+
+    impl ModUdf {
+        fn new() -> Self {
+            Self {
+                signature: Signature::exact(
+                    vec![DataType::Int64, DataType::Int64],
+                    Volatility::Immutable,
+                ),
+            }
+        }
+    }
+
+    impl ScalarUDFImpl for ModUdf {
+        fn name(&self) -> &str {
+            "mod"
+        }
+        fn signature(&self) -> &Signature {
+            &self.signature
+        }
+        fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+            Ok(DataType::Int64)
+        }
+        fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+            unimplemented!("mod UDF is statistics-only in tests and never invoked")
+        }
+    }
 
     pub(crate) fn output_schema(
         mapping: &ProjectionMapping,
@@ -2940,6 +2983,47 @@ pub(crate) mod tests {
         assert_eq!(
             output_stats.column_statistics[0].max_value,
             Precision::Exact(ScalarValue::Int32(Some(21)))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_project_statistics_modulo_distinct_count() -> Result<()> {
+        let input_stats = get_stats();
+        let input_schema = get_schema();
+
+        // SELECT mod(col0, 10) AS bucket
+        //
+        // col0 is Int64 with distinct_count=Exact(5). A `mod(_, 10)` result has
+        // at most 10 distinct values, so the projected column reports
+        // distinct_count = Inexact(10) instead of the Absent it would otherwise
+        // get for an arbitrary scalar function. Keeping an NDV on modulo join
+        // keys stops join planning from falling back to row counts.
+        let mod_udf = Arc::new(ScalarUDF::new_from_impl(ModUdf::new()));
+        let mod_expr = Arc::new(ScalarFunctionExpr::try_new(
+            mod_udf,
+            vec![
+                Arc::new(Column::new("col0", 0)),
+                Arc::new(Literal::new(ScalarValue::Int64(Some(10)))),
+            ],
+            &input_schema,
+            Arc::new(ConfigOptions::default()),
+        )?) as PhysicalExprRef;
+
+        let projection = ProjectionExprs::new(vec![ProjectionExpr {
+            expr: mod_expr,
+            alias: "bucket".to_string(),
+        }]);
+
+        let output_stats = projection.project_statistics(
+            input_stats,
+            &projection.project_schema(&input_schema)?,
+        )?;
+
+        assert_eq!(
+            output_stats.column_statistics[0].distinct_count,
+            Precision::Inexact(10)
         );
 
         Ok(())
