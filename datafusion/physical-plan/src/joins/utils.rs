@@ -487,7 +487,29 @@ fn estimate_join_cardinality(
                         .cloned()
                         .unwrap_or_else(ColumnStatistics::new_unknown),
                 ),
-                _ => (
+                // One side is a plain column, the other an expression key
+                // (e.g. `mod(s_w_id * s_i_id, 10000) = su_suppkey` or
+                // `ascii(substr(c_state,1,1)) - 65 = su_nationkey`). The
+                // expression's distinct count is unknown, but for an equi-join
+                // the match selectivity is bounded by the known column's NDV
+                // Reuse the column's statistics as a proxy for *both* sides
+                (Some(left), None) => {
+                    let stat = left_stats
+                        .column_statistics
+                        .get(left.index())
+                        .cloned()
+                        .unwrap_or_else(ColumnStatistics::new_unknown);
+                    (stat.clone(), stat)
+                }
+                (None, Some(right)) => {
+                    let stat = right_stats
+                        .column_statistics
+                        .get(right.index())
+                        .cloned()
+                        .unwrap_or_else(ColumnStatistics::new_unknown);
+                    (stat.clone(), stat)
+                }
+                (None, None) => (
                     ColumnStatistics::new_unknown(),
                     ColumnStatistics::new_unknown(),
                 ),
@@ -648,22 +670,25 @@ fn estimate_inner_join_cardinality(
         }
     }
 
-    // With the assumption that the smaller input's domain is generally represented in the bigger
-    // input's domain, we can estimate the inner join's cardinality by taking the cartesian product
-    // of the two inputs and normalizing it by the selectivity factor.
+    // With the assumption that the smaller input's domain is generally represented
+    // in the bigger input's domain, the inner join cardinality is the cartesian
+    // product normalized by the selectivity factor. Use `checked_mul`: an upstream
+    // reorder can feed inflated intermediate row estimates whose product exceeds
+    // `usize::MAX`. Vanilla DataFusion multiplies unchecked and *panics* ("attempt
+    // to multiply with overflow", seen on chbench q8); return `None` (unknown —
+    // handled like the Absent-selectivity case) on overflow instead.
     let left_num_rows = left_stats.num_rows.get_value()?;
     let right_num_rows = right_stats.num_rows.get_value()?;
-    match join_selectivity {
-        Precision::Exact(value) if value > 0 => {
-            Some(Precision::Exact((left_num_rows * right_num_rows) / value))
+    let cartesian = left_num_rows.checked_mul(*right_num_rows);
+    match (join_selectivity, cartesian) {
+        (Precision::Exact(value), Some(card)) if value > 0 => {
+            Some(Precision::Exact(card / value))
         }
-        Precision::Inexact(value) if value > 0 => {
-            Some(Precision::Inexact((left_num_rows * right_num_rows) / value))
+        (Precision::Inexact(value), Some(card)) if value > 0 => {
+            Some(Precision::Inexact(card / value))
         }
-        // Since we don't have any information about the selectivity (which is derived
-        // from the number of distinct rows information) we can give up here for now.
-        // And let other passes handle this (otherwise we would need to produce an
-        // overestimation using just the cartesian product).
+        // No selectivity information, or the cartesian product overflowed: give up
+        // here and let other passes handle it (rather than over-estimate).
         _ => None,
     }
 }
@@ -2154,6 +2179,7 @@ mod tests {
     use datafusion_common::stats::Precision::{Absent, Exact, Inexact};
     use datafusion_common::{ScalarValue, arrow_datafusion_err, arrow_err};
     use datafusion_physical_expr::PhysicalSortExpr;
+    use datafusion_physical_expr::expressions::CastExpr;
 
     use rstest::rstest;
 
@@ -2787,6 +2813,89 @@ mod tests {
                 [left_col_stats.clone(), right_col_stats.clone()].concat()
             );
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_join_cardinality_with_expression_key() -> Result<()> {
+        // Regression test for the `Column = <non-Column expr>` heuristic.
+        //
+        // When one equi-join key is a plain column (with a known NDV) and the
+        // other is a computed expression (e.g. `mod(s_w_id * s_i_id, 10000)`),
+        // the expression's distinct count is unknown. Previously such a key fell
+        // through to fully-unknown stats, so `max_distinct_count` defaulted the
+        // selectivity to each side's row count (the cartesian product normalized
+        // by `num_rows`). Now we reuse the known column's statistics as a proxy
+        // for *both* sides, so the selectivity is driven by the column's NDV
+        // rather than by row counts.
+        //
+        // Left table (rows=1000): a: min=0, max=100, distinct=100
+        // Right table (rows=2000): c: min=0, max=100, distinct=50
+        //
+        // A non-Column expression is just a Cast wrapping the other side's column.
+        let left_col_stats = vec![create_column_stats(
+            Inexact(0),
+            Inexact(100),
+            Inexact(100),
+            Absent,
+        )];
+        let right_col_stats = vec![create_column_stats(
+            Inexact(0),
+            Inexact(100),
+            Inexact(50),
+            Absent,
+        )];
+
+        let column_a = || Arc::new(Column::new("a", 0)) as Arc<dyn PhysicalExpr>;
+        let column_c = || Arc::new(Column::new("c", 0)) as Arc<dyn PhysicalExpr>;
+        let expr_key = |inner: Arc<dyn PhysicalExpr>| {
+            Arc::new(CastExpr::new(inner, DataType::Int64, None)) as Arc<dyn PhysicalExpr>
+        };
+
+        // Left key is the plain column `a` (NDV=100), right key is an expression.
+        // The column's NDV is reused for both sides:
+        //   selectivity = max_distinct = 100
+        //   cardinality = (1000 * 2000) / 100 = 20_000
+        let left_column_on = vec![(column_a(), expr_key(column_c()))];
+        let stats = estimate_join_cardinality(
+            &JoinType::Inner,
+            create_stats(Some(1000), left_col_stats.clone(), false),
+            create_stats(Some(2000), right_col_stats.clone(), false),
+            &left_column_on,
+        )
+        .expect("column NDV should drive a finite estimate");
+        assert_eq!(stats.num_rows, 20_000);
+
+        // Symmetric case: right key is the plain column `c` (NDV=50), left key is
+        // an expression. The column's NDV is reused for both sides:
+        //   cardinality = (1000 * 2000) / 50 = 40_000
+        let right_column_on = vec![(expr_key(column_a()), column_c())];
+        let stats = estimate_join_cardinality(
+            &JoinType::Inner,
+            create_stats(Some(1000), left_col_stats.clone(), false),
+            create_stats(Some(2000), right_col_stats.clone(), false),
+            &right_column_on,
+        )
+        .expect("column NDV should drive a finite estimate");
+        assert_eq!(stats.num_rows, 40_000);
+
+        // Contrast: when *both* keys are expressions there is no column NDV to
+        // lean on, so we fall back to the old behaviour — fully-unknown stats
+        // make `max_distinct_count` default to each side's row count:
+        //   selectivity = max(1000, 2000) = 2000
+        //   cardinality = (1000 * 2000) / 2000 = 1000
+        // This is the `num_rows` fallback the heuristic above avoids whenever one
+        // side is a plain column.
+        let both_expr_on = vec![(expr_key(column_a()), expr_key(column_c()))];
+        let stats = estimate_join_cardinality(
+            &JoinType::Inner,
+            create_stats(Some(1000), left_col_stats.clone(), false),
+            create_stats(Some(2000), right_col_stats.clone(), false),
+            &both_expr_on,
+        )
+        .expect("num_rows fallback still yields an estimate");
+        assert_eq!(stats.num_rows, 1000);
 
         Ok(())
     }
