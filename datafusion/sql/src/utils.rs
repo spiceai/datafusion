@@ -703,8 +703,7 @@ mod tests {
     use arrow::datatypes::{DataType as ArrowDataType, Field, Fields, Schema};
     use datafusion_common::{Column, DFSchema, Result};
     use datafusion_expr::{
-        ColumnUnnestList, EmptyRelation, Expr, LogicalPlan, col, expr::Alias, lit,
-        unnest,
+        ColumnUnnestList, EmptyRelation, Expr, LogicalPlan, col, expr::Alias, lit, unnest,
     };
     use datafusion_functions::core::expr_ext::FieldAccessor;
     use datafusion_functions_aggregate::expr_fn::count;
