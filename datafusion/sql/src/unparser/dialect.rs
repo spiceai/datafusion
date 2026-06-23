@@ -18,8 +18,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    Unparser, utils::character_length_to_sql, utils::date_part_to_sql,
-    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
+    Unparser, utils::bigquery_date_trunc_to_sql, utils::character_length_to_sql,
+    utils::date_part_to_sql, utils::sqlite_date_trunc_to_sql,
+    utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
@@ -854,6 +855,10 @@ impl Dialect for BigQueryDialect {
     ) -> Result<Option<ast::Expr>> {
         if func_name == "date_part" {
             return date_part_to_sql(unparser, self.date_field_extract_style(), args);
+        }
+
+        if func_name == "date_trunc" {
+            return bigquery_date_trunc_to_sql(unparser, args);
         }
 
         Ok(None)

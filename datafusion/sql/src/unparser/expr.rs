@@ -3465,6 +3465,7 @@ mod tests {
     fn test_date_trunc() -> Result<()> {
         let default_dialect: Arc<dyn Dialect> = Arc::new(DefaultDialect {});
         let sqlite_dialect: Arc<dyn Dialect> = Arc::new(SqliteDialect {});
+        let bigquery_dialect: Arc<dyn Dialect> = Arc::new(BigQueryDialect::new());
 
         for (dialect, precision, expected) in [
             (
@@ -3476,6 +3477,33 @@ mod tests {
                 Arc::clone(&sqlite_dialect),
                 "YEAR",
                 "strftime('%Y', `date_col`)",
+            ),
+            // BigQuery reverses the argument order and emits the granularity as
+            // a bare keyword (not a quoted string).
+            (
+                Arc::clone(&bigquery_dialect),
+                "YEAR",
+                "TIMESTAMP_TRUNC(`date_col`, YEAR)",
+            ),
+            (
+                Arc::clone(&bigquery_dialect),
+                "QUARTER",
+                "TIMESTAMP_TRUNC(`date_col`, QUARTER)",
+            ),
+            (
+                Arc::clone(&bigquery_dialect),
+                "WEEK",
+                "TIMESTAMP_TRUNC(`date_col`, WEEK)",
+            ),
+            (
+                Arc::clone(&bigquery_dialect),
+                "MONTH",
+                "TIMESTAMP_TRUNC(`date_col`, MONTH)",
+            ),
+            (
+                Arc::clone(&bigquery_dialect),
+                "SECOND",
+                "TIMESTAMP_TRUNC(`date_col`, SECOND)",
             ),
             (
                 Arc::clone(&default_dialect),
