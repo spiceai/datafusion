@@ -642,12 +642,15 @@ pub(crate) fn sqlite_date_trunc_to_sql(
 ///    second (`TIMESTAMP_TRUNC(ts, MONTH)` vs `date_trunc('month', ts)`).
 /// 2. **The granularity is a bare keyword**, not a quoted string literal
 ///    (`MONTH`, not `'month'`), so it is emitted as an unquoted identifier.
-/// 3. The function name is type-specific. We emit `TIMESTAMP_TRUNC`, which is
-///    the correct choice for DataFusion's `date_trunc` since it operates on (and
-///    returns) `Timestamp` values. BigQuery `DATETIME`/`DATE` columns (arrow
-///    `Timestamp` without a timezone / `Date32`) would need `DATETIME_TRUNC` /
-///    `DATE_TRUNC`, but the source type is not available at unparse time, so
-///    callers truncating those types should not push the function down.
+/// 3. The function name is type-specific. We always emit `TIMESTAMP_TRUNC`,
+///    which is correct for the common case of a `Timestamp` (with timezone)
+///    input. DataFusion's `date_trunc` also accepts `Timestamp` *without* a
+///    timezone, `Date32`, and `Time32`/`Time64`, which in BigQuery map to
+///    `DATETIME_TRUNC`, `DATE_TRUNC`, and `TIME_TRUNC` respectively. The source
+///    type is not available at unparse time, so those inputs are rendered as
+///    `TIMESTAMP_TRUNC` too — which BigQuery rejects or mis-types. Callers
+///    truncating non-`TIMESTAMP` types should therefore not push the function
+///    down.
 ///
 /// Returns `Ok(None)` (falling back to default unparsing) when the arguments
 /// don't match the expected shape or the granularity is not one BigQuery
@@ -656,12 +659,11 @@ pub(crate) fn bigquery_date_trunc_to_sql(
     unparser: &Unparser,
     date_trunc_args: &[Expr],
 ) -> Result<Option<ast::Expr>> {
-    assert_eq_or_internal_err!(
-        date_trunc_args.len(),
-        2,
-        "date_trunc for BigQuery expects 2 arguments, found {}",
-        date_trunc_args.len()
-    );
+    // Fall back to default unparsing rather than erroring if the shape is
+    // unexpected; date_trunc is documented as taking exactly 2 arguments.
+    if date_trunc_args.len() != 2 {
+        return Ok(None);
+    }
 
     let Expr::Literal(ScalarValue::Utf8(Some(granularity)), _) = &date_trunc_args[0]
     else {
@@ -674,7 +676,9 @@ pub(crate) fn bigquery_date_trunc_to_sql(
         "year" => "YEAR",
         "quarter" => "QUARTER",
         "month" => "MONTH",
-        "week" => "WEEK",
+        // DataFusion truncates weeks to Monday; BigQuery's bare `WEEK` is
+        // Sunday-based, so use `ISOWEEK`, which truncates to Monday.
+        "week" => "ISOWEEK",
         "day" => "DAY",
         "hour" => "HOUR",
         "minute" => "MINUTE",

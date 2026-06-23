@@ -3490,10 +3490,12 @@ mod tests {
                 "QUARTER",
                 "TIMESTAMP_TRUNC(`date_col`, QUARTER)",
             ),
+            // DataFusion truncates weeks to Monday → BigQuery ISOWEEK (also
+            // Monday-based), not the Sunday-based bare WEEK.
             (
                 Arc::clone(&bigquery_dialect),
                 "WEEK",
-                "TIMESTAMP_TRUNC(`date_col`, WEEK)",
+                "TIMESTAMP_TRUNC(`date_col`, ISOWEEK)",
             ),
             (
                 Arc::clone(&bigquery_dialect),
