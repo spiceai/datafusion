@@ -304,14 +304,35 @@ fn pushdown_requirement_to_children(
         // Push down through operator with fetch when:
         // - requirement is aligned with output ordering
         // - it preserves ordering during execution
+        //
+        // A `ProjectionExec` reports a `fetch()` forwarded from its input and
+        // can renumber/reorder columns, so the requirement (expressed in the
+        // projection's output schema) must be remapped into the child schema
+        // before being pushed down — forwarding it unchanged would let a key
+        // such as `score@1` (valid in the output schema) refer to a different
+        // column in the child schema, producing a `SortExec` whose key points
+        // at the wrong column ("does not satisfy order requirements ...
+        // Child-0 order: []"). If a required column maps to a computed
+        // (non-`Column`) projection expression it cannot be expressed below the
+        // projection, so the sort is kept above it.
+        let child_required = if let Some(projection) =
+            plan.downcast_ref::<ProjectionExec>()
+        {
+            match remap_requirement_through_projection(projection, &parent_required) {
+                Some(remapped) => remapped,
+                None => return Ok(None),
+            }
+        } else {
+            parent_required.clone()
+        };
         let Some(ordering) = plan.properties().output_ordering() else {
-            return Ok(Some(vec![Some(parent_required)]));
+            return Ok(Some(vec![Some(child_required)]));
         };
         if plan.properties().eq_properties.requirements_compatible(
             parent_required.first().clone(),
             ordering.clone().into(),
         ) {
-            Ok(Some(vec![Some(parent_required)]))
+            Ok(Some(vec![Some(child_required)]))
         } else {
             Ok(None)
         }
@@ -360,7 +381,10 @@ fn pushdown_requirement_to_children(
         || !maintains_input_order.iter().any(|o| *o)
         || plan.is::<RepartitionExec>()
         || plan.is::<FilterExec>()
-        // TODO: Add support for Projection push down
+        // A `ProjectionExec` with a fetch is handled in the fetch branch above
+        // (it remaps the requirement through the projection's column mapping).
+        // Without a fetch we do not push a sort requirement through a
+        // projection (the sort is placed above it).
         || plan.is::<ProjectionExec>()
         || pushdown_would_violate_requirements(&parent_required, plan.as_ref())
     {
@@ -388,7 +412,31 @@ fn pushdown_requirement_to_children(
     } else {
         handle_custom_pushdown(plan, parent_required, &maintains_input_order)
     }
-    // TODO: Add support for Projection push down
+}
+
+/// Remap an ordering requirement expressed in a [`ProjectionExec`]'s output
+/// schema into its child (input) schema.
+///
+/// Each requirement column at output index `i` is rewritten to the column the
+/// projection produces at that index (`projection.expr()[i]`). Returns `None`
+/// if any required column maps to a computed (non-[`Column`]) projection
+/// expression, since that ordering cannot be expressed in the child schema.
+fn remap_requirement_through_projection(
+    projection: &ProjectionExec,
+    parent_required: &OrderingRequirements,
+) -> Option<OrderingRequirements> {
+    let exprs = projection.expr();
+    let mut child_reqs = Vec::with_capacity(parent_required.first().len());
+    for req in parent_required.first().iter() {
+        let col = req.expr.downcast_ref::<Column>()?;
+        let proj_expr = exprs.get(col.index())?;
+        let child_col = proj_expr.expr.downcast_ref::<Column>()?;
+        child_reqs.push(PhysicalSortRequirement::new(
+            Arc::new(child_col.clone()),
+            req.options,
+        ));
+    }
+    LexRequirement::new(child_reqs).map(OrderingRequirements::from)
 }
 
 /// Try to push sorting through  [`AggregateExec`]
