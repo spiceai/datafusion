@@ -461,6 +461,17 @@ pub(crate) fn estimate_join_statistics(
     })
 }
 
+/// Whether a column's statistics let [`max_distinct_count`] derive a real NDV
+/// bound (a `distinct_count`, or both `min` and `max` for the range cap). When
+/// neither is present, `max_distinct_count` falls back to the row count — which,
+/// on the large side of a join, becomes a huge divisor and collapses the
+/// cardinality estimate. Used to decide when to borrow the partner key's stats.
+fn is_informative_for_join_ndv(stats: &ColumnStatistics) -> bool {
+    stats.distinct_count.get_value().is_some()
+        || (stats.min_value.get_value().is_some()
+            && stats.max_value.get_value().is_some())
+}
+
 // Estimate the cardinality for the given join with input statistics.
 fn estimate_join_cardinality(
     join_type: &JoinType,
@@ -475,18 +486,32 @@ fn estimate_join_cardinality(
                 left.downcast_ref::<Column>(),
                 right.downcast_ref::<Column>(),
             ) {
-                (Some(left), Some(right)) => (
-                    left_stats
+                (Some(left), Some(right)) => {
+                    let l = left_stats
                         .column_statistics
                         .get(left.index())
                         .cloned()
-                        .unwrap_or_else(ColumnStatistics::new_unknown),
-                    right_stats
+                        .unwrap_or_else(ColumnStatistics::new_unknown);
+                    let r = right_stats
                         .column_statistics
                         .get(right.index())
                         .cloned()
-                        .unwrap_or_else(ColumnStatistics::new_unknown),
-                ),
+                        .unwrap_or_else(ColumnStatistics::new_unknown);
+                    // If exactly one side carries a usable key-domain signal
+                    // (distinct_count, or min/max for the range cap) and the
+                    // other does not — e.g. a key that is a projected expression
+                    // column (`ascii(substr(c_state,1,1)) - 65`) whose stats are
+                    // unknown — reuse the informative side's stats for both. For
+                    // an equi-join the matching NDV is bounded by the side whose
+                    // key domain we know, so this avoids the uninformative side
+                    // falling back to the row count (which blows up the divisor
+                    // and collapses the estimate, mispicking the build side).
+                    match (is_informative_for_join_ndv(&l), is_informative_for_join_ndv(&r)) {
+                        (true, false) => (l.clone(), l),
+                        (false, true) => (r.clone(), r),
+                        _ => (l, r),
+                    }
+                }
                 // One side is a plain column, the other an expression key
                 // (e.g. `mod(s_w_id * s_i_id, 10000) = su_suppkey` or
                 // `ascii(substr(c_state,1,1)) - 65 = su_nationkey`). The
@@ -652,9 +677,17 @@ fn estimate_inner_join_cardinality(
         ..
     } = right_stats;
 
-    // The algorithm here is partly based on the non-histogram selectivity estimation
-    // from Spark's Catalyst optimizer.
-    let mut join_selectivity = Precision::Absent;
+    // The algorithm here is partly based on the non-histogram selectivity
+    // estimation from Spark's Catalyst optimizer.
+    //
+    // Selectivity for an equi-join is governed by the number of distinct values
+    // of the *composite* join key, which (under the independence assumption) is
+    // the product of the per-key distinct counts — each taken as
+    // `max(left_ndv, right_ndv)`. This is the same per-key-NDV product used by
+    // `JoinStatisticsProvider::equi_join_estimate` (the `StatisticsRegistry`
+    // path in `operator_statistics`);
+    let mut composite_ndv: Option<usize> = None;
+    let mut ndv_exact = true;
     for (left_stat, right_stat) in left_column_statistics
         .iter()
         .zip(right_column_statistics.iter())
@@ -662,34 +695,40 @@ fn estimate_inner_join_cardinality(
         let left_max_distinct = max_distinct_count(&left_num_rows, left_stat);
         let right_max_distinct = max_distinct_count(&right_num_rows, right_stat);
         let max_distinct = left_max_distinct.max(&right_max_distinct);
-        if max_distinct.get_value().is_some() {
-            // Seems like there are a few implementations of this algorithm that implement
-            // exponential decay for the selectivity (like Hive's Optiq Optimizer). Needs
-            // further exploration.
-            join_selectivity = max_distinct;
+        if let Some(&ndv) = max_distinct.get_value() {
+            if ndv > 0 {
+                composite_ndv = Some(composite_ndv.unwrap_or(1).saturating_mul(ndv));
+                ndv_exact &= max_distinct.is_exact().unwrap_or(false);
+            }
         }
     }
 
-    // With the assumption that the smaller input's domain is generally represented
-    // in the bigger input's domain, the inner join cardinality is the cartesian
-    // product normalized by the selectivity factor. Use `checked_mul`: an upstream
-    // reorder can feed inflated intermediate row estimates whose product exceeds
-    // `usize::MAX`. Vanilla DataFusion multiplies unchecked and *panics* ("attempt
-    // to multiply with overflow", seen on chbench q8); return `None` (unknown —
-    // handled like the Absent-selectivity case) on overflow instead.
-    let left_num_rows = left_stats.num_rows.get_value()?;
-    let right_num_rows = right_stats.num_rows.get_value()?;
-    let cartesian = left_num_rows.checked_mul(*right_num_rows);
-    match (join_selectivity, cartesian) {
-        (Precision::Exact(value), Some(card)) if value > 0 => {
-            Some(Precision::Exact(card / value))
+    // With the assumption that the smaller input's domain is generally
+    // represented in the bigger input's domain, the inner join cardinality is the
+    // cartesian product normalized by the selectivity factor. A composite key
+    // cannot have more distinct values than either input has rows, so cap the
+    // divisor at `max(left_rows, right_rows)`; otherwise per-column NDVs whose
+    // product exceeds the row count would under-estimate the join. Use
+    // `checked_mul`: an upstream reorder can feed inflated intermediate row
+    // estimates whose product exceeds `usize::MAX`. Return `None` (unknown — handled
+    // like the Absent-selectivity case) on overflow instead.
+    let composite_ndv = composite_ndv?;
+    let left_num_rows = *left_stats.num_rows.get_value()?;
+    let right_num_rows = *right_stats.num_rows.get_value()?;
+    let divisor = composite_ndv.min(left_num_rows.max(right_num_rows)).max(1);
+    match left_num_rows.checked_mul(right_num_rows) {
+        Some(card) => {
+            let estimate = card / divisor;
+            // Exact only when every key NDV was exact and the row-count cap did
+            // not have to step in.
+            Some(if ndv_exact && divisor == composite_ndv {
+                Precision::Exact(estimate)
+            } else {
+                Precision::Inexact(estimate)
+            })
         }
-        (Precision::Inexact(value), Some(card)) if value > 0 => {
-            Some(Precision::Inexact(card / value))
-        }
-        // No selectivity information, or the cartesian product overflowed: give up
-        // here and let other passes handle it (rather than over-estimate).
-        _ => None,
+        // The cartesian product overflowed: give up rather than over-estimate.
+        None => None,
     }
 }
 
@@ -2628,8 +2667,11 @@ mod tests {
             create_column_stats(Inexact(100), Inexact(500), Inexact(200), Absent),
         ];
 
-        // We have statistics about 4 columns, where the highest distinct
-        // count is 200, so we are going to pick it.
+        // Two join-key columns: per-key NDV is max(100,50)=100 and
+        // max(150,200)=200, so the composite-key NDV is 100*200=20_000. That
+        // exceeds both inputs' row counts, so the divisor is capped at
+        // max(left_rows, right_rows)=400 (a composite key cannot have more
+        // distinct values than there are rows). Cardinality = (400*400)/400.
         assert_eq!(
             estimate_inner_join_cardinality(
                 Statistics {
@@ -2643,8 +2685,93 @@ mod tests {
                     column_statistics: right_col_stats,
                 },
             ),
-            Some(Inexact((400 * 400) / 200))
+            Some(Inexact((400 * 400) / 400))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_inner_join_cardinality_composite_key_uses_product() -> Result<()> {
+        // Regression test for hash-join build-side selection on multi-column
+        // equi-joins (the CH-benCHmark Q18 `customer ⋈ oorder` shape). The join
+        // key is the 3-column (w_id, d_id, c_id) composite.
+        //
+        // Estimating the join by dividing the cartesian product by a *single*
+        // key's NDV treats the other two key columns as constant and massively
+        // over-estimates the result, which inverts the build/probe choice at the
+        // enclosing join. Dividing by the product of the per-key NDVs (the
+        // composite-key cardinality) yields the correct ~FK-row-count estimate.
+        //
+        //   customer: 3_000 rows, key NDVs w=10, d=10, c=30 (composite is unique)
+        //   oorder:   3_300 rows, key NDVs w=10, d=10, c=30 (FK into customer)
+        //
+        //   composite divisor = max(10,10)*max(10,10)*max(30,30) = 3_000
+        //   cartesian         = 3_000 * 3_300                     = 9_900_000
+        //   estimate          = 9_900_000 / 3_000                 = 3_300  (= FK rows)
+        //
+        // The old single-most-selective-key estimate would have been
+        //   9_900_000 / 30 = 330_000 — 100x too high, and larger than either
+        // input, which is what flipped the build side.
+        let customer = vec![
+            create_column_stats(Inexact(1), Inexact(1000), Inexact(10), Absent), // w_id
+            create_column_stats(Inexact(1), Inexact(10), Inexact(10), Absent),   // d_id
+            create_column_stats(Inexact(1), Inexact(3000), Inexact(30), Absent), // c_id
+        ];
+        let oorder = vec![
+            create_column_stats(Inexact(1), Inexact(1000), Inexact(10), Absent), // o_w_id
+            create_column_stats(Inexact(1), Inexact(10), Inexact(10), Absent),   // o_d_id
+            create_column_stats(Inexact(1), Inexact(3000), Inexact(30), Absent), // o_c_id
+        ];
+
+        assert_eq!(
+            estimate_inner_join_cardinality(
+                Statistics {
+                    num_rows: Inexact(3_000),
+                    total_byte_size: Absent,
+                    column_statistics: customer,
+                },
+                Statistics {
+                    num_rows: Inexact(3_300),
+                    total_byte_size: Absent,
+                    column_statistics: oorder,
+                },
+            ),
+            Some(Inexact(3_300))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_join_cardinality_borrows_stats_for_uninformative_key() -> Result<()> {
+        // CH-benCHmark Q10: `n_nationkey = ascii(substr(c_state,1,1)) - 65`.
+        // The expression is materialized by a ProjectionExec, so the customer-side
+        // join key is a plain Column whose statistics are unknown, while the other
+        // key (`n_nationkey`) has min/max [0,61] (NDV 62 via the range cap).
+        //
+        // Without borrowing, the unknown side falls back to the row count (3M) as
+        // its NDV, the divisor becomes max(62, 3M) = 3M, and the join collapses to
+        // (62 * 3M) / 3M = 62 — which flips the hash-join build side / mode
+        // downstream. Borrowing the informative key's stats for the uninformative
+        // side gives divisor 62 and the correct ~FK-row-count estimate.
+        let nation = vec![create_column_stats(Inexact(0), Inexact(61), Absent, Absent)];
+        let customer_expr_key = vec![ColumnStatistics::new_unknown()];
+
+        let on = vec![(
+            Arc::new(Column::new("n_nationkey", 0)) as _,
+            // Name mirrors a projected expression column; stats are unknown.
+            Arc::new(Column::new("ascii(substr(c_state,1,1)) - 65", 0)) as _,
+        )];
+
+        let stats = estimate_join_cardinality(
+            &JoinType::Inner,
+            create_stats(Some(62), nation, false),
+            create_stats(Some(3_000_000), customer_expr_key, false),
+            &on,
+        )
+        .expect("cardinality should be estimable via the borrowed key stats");
+
+        // (62 * 3_000_000) / 62 = 3_000_000  — not the collapsed 62.
+        assert_eq!(stats.num_rows, 3_000_000);
         Ok(())
     }
 
