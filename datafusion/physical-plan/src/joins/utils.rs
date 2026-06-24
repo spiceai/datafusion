@@ -462,14 +462,71 @@ pub(crate) fn estimate_join_statistics(
 }
 
 /// Whether a column's statistics let [`max_distinct_count`] derive a real NDV
-/// bound (a `distinct_count`, or both `min` and `max` for the range cap). When
-/// neither is present, `max_distinct_count` falls back to the row count — which,
-/// on the large side of a join, becomes a huge divisor and collapses the
-/// cardinality estimate. Used to decide when to borrow the partner key's stats.
+/// bound — i.e. a `distinct_count` is present, OR min/max are present *and* the
+/// value type has a computable interval cardinality (integers, temporal,
+/// decimals, ...).
+///
+/// Min/max alone are NOT enough: for types without an `Interval::cardinality()`
+/// (e.g. `Utf8`), `max_distinct_count` can't turn them into an NDV and falls
+/// back to the row count. Treating such a column as informative would (a) borrow
+/// a stat that still collapses the estimate, and worse (b) *block* borrowing the
+/// partner key's usable NDV (both sides look informative → no borrow). So this
+/// mirrors the exact range-cap condition in [`max_distinct_count`].
 fn is_informative_for_join_ndv(stats: &ColumnStatistics) -> bool {
-    stats.distinct_count.get_value().is_some()
-        || (stats.min_value.get_value().is_some()
-            && stats.max_value.get_value().is_some())
+    if stats.distinct_count.get_value().is_some() {
+        return true;
+    }
+    match (stats.min_value.get_value(), stats.max_value.get_value()) {
+        (Some(min), Some(max)) => Interval::try_new(min.clone(), max.clone())
+            .ok()
+            .and_then(|interval| interval.cardinality())
+            .is_some(),
+        _ => false,
+    }
+}
+
+/// Look up the statistics for one side of a join key. A key that is a plain
+/// [`Column`] resolves to that column's statistics; any other expression
+/// (e.g. `ascii(substr(c_state,1,1)) - 65`, or a column index out of range)
+/// has no statistics and resolves to `unknown`.
+fn key_column_stats(key: &PhysicalExprRef, side: &Statistics) -> ColumnStatistics {
+    key.downcast_ref::<Column>()
+        .and_then(|c| side.column_statistics.get(c.index()).cloned())
+        .unwrap_or_else(ColumnStatistics::new_unknown)
+}
+
+/// Reconcile the statistics of the two sides of an equi-join key when one side
+/// is uninformative.
+///
+/// Both join-cardinality estimators ([`estimate_inner_join_cardinality`] and
+/// [`estimate_semi_join_cardinality`]) derive each key's NDV with
+/// [`max_distinct_count`], which **falls back to the row count** when a column
+/// has neither a `distinct_count` nor min/max. On the large side of a join that
+/// fallback masquerades as a huge NDV: it inflates the divisor and collapses the
+/// estimate toward `min(rows)` — which then mis-drives `JoinSelection`'s
+/// build-side / partition-mode choice.
+///
+/// For an equi-join only key values present on *both* sides can match, so the
+/// number of distinct matching keys is bounded by the side whose key domain we
+/// actually know. When exactly one side is informative we therefore reuse its
+/// statistics for both sides. This errs toward **over**-estimating the join —
+/// the safe direction for build-side selection, since it never collapses the
+/// estimate into the row-count fallback. When both sides are informative we keep
+/// each side's own stats; when neither is, there is nothing to borrow.
+fn borrow_uninformative_join_key(
+    left: ColumnStatistics,
+    right: ColumnStatistics,
+) -> (ColumnStatistics, ColumnStatistics) {
+    match (
+        is_informative_for_join_ndv(&left),
+        is_informative_for_join_ndv(&right),
+    ) {
+        (true, false) => (left.clone(), left),
+        (false, true) => (right.clone(), right),
+        // Both informative (use each side's own) or both unknown (nothing to
+        // borrow — the join falls back to the row-count NDV as before).
+        _ => (left, right),
+    }
 }
 
 // Estimate the cardinality for the given join with input statistics.
@@ -482,63 +539,15 @@ fn estimate_join_cardinality(
     let (left_col_stats, right_col_stats) = on
         .iter()
         .map(|(left, right)| {
-            match (
-                left.downcast_ref::<Column>(),
-                right.downcast_ref::<Column>(),
-            ) {
-                (Some(left), Some(right)) => {
-                    let l = left_stats
-                        .column_statistics
-                        .get(left.index())
-                        .cloned()
-                        .unwrap_or_else(ColumnStatistics::new_unknown);
-                    let r = right_stats
-                        .column_statistics
-                        .get(right.index())
-                        .cloned()
-                        .unwrap_or_else(ColumnStatistics::new_unknown);
-                    // If exactly one side carries a usable key-domain signal
-                    // (distinct_count, or min/max for the range cap) and the
-                    // other does not — e.g. a key that is a projected expression
-                    // column (`ascii(substr(c_state,1,1)) - 65`) whose stats are
-                    // unknown — reuse the informative side's stats for both. For
-                    // an equi-join the matching NDV is bounded by the side whose
-                    // key domain we know, so this avoids the uninformative side
-                    // falling back to the row count (which blows up the divisor
-                    // and collapses the estimate, mispicking the build side).
-                    match (is_informative_for_join_ndv(&l), is_informative_for_join_ndv(&r)) {
-                        (true, false) => (l.clone(), l),
-                        (false, true) => (r.clone(), r),
-                        _ => (l, r),
-                    }
-                }
-                // One side is a plain column, the other an expression key
-                // (e.g. `mod(s_w_id * s_i_id, 10000) = su_suppkey` or
-                // `ascii(substr(c_state,1,1)) - 65 = su_nationkey`). The
-                // expression's distinct count is unknown, but for an equi-join
-                // the match selectivity is bounded by the known column's NDV
-                // Reuse the column's statistics as a proxy for *both* sides
-                (Some(left), None) => {
-                    let stat = left_stats
-                        .column_statistics
-                        .get(left.index())
-                        .cloned()
-                        .unwrap_or_else(ColumnStatistics::new_unknown);
-                    (stat.clone(), stat)
-                }
-                (None, Some(right)) => {
-                    let stat = right_stats
-                        .column_statistics
-                        .get(right.index())
-                        .cloned()
-                        .unwrap_or_else(ColumnStatistics::new_unknown);
-                    (stat.clone(), stat)
-                }
-                (None, None) => (
-                    ColumnStatistics::new_unknown(),
-                    ColumnStatistics::new_unknown(),
-                ),
-            }
+            // Look up each key column's statistics. A key that is an expression
+            // rather than a plain column (e.g. `ascii(substr(c_state,1,1)) - 65`,
+            // whether inline or materialized into a projected column with no
+            // stats) has no usable statistics, so it resolves to `unknown`.
+            let l = key_column_stats(left, &left_stats);
+            let r = key_column_stats(right, &right_stats);
+            // Reconcile an unevenly-informative key pair before either cardinality
+            // estimator consumes it (see `borrow_uninformative_join_key`).
+            borrow_uninformative_join_key(l, r)
         })
         .unzip::<_, _, Vec<_>, Vec<_>>();
 
@@ -695,11 +704,17 @@ fn estimate_inner_join_cardinality(
         let left_max_distinct = max_distinct_count(&left_num_rows, left_stat);
         let right_max_distinct = max_distinct_count(&right_num_rows, right_stat);
         let max_distinct = left_max_distinct.max(&right_max_distinct);
-        if let Some(&ndv) = max_distinct.get_value() {
-            if ndv > 0 {
+        match max_distinct.get_value() {
+            Some(&ndv) if ndv > 0 => {
                 composite_ndv = Some(composite_ndv.unwrap_or(1).saturating_mul(ndv));
                 ndv_exact &= max_distinct.is_exact().unwrap_or(false);
             }
+            // A key contributing no usable NDV (Absent) or zero distinct values
+            // leaves the composite NDV partial, so the estimate cannot be exact.
+            // (An Absent NDV only arises with an Absent row count, which makes the
+            // function bail below — but this keeps exactness honest regardless,
+            // and covers the reachable zero-NDV case.)
+            _ => ndv_exact = false,
         }
     }
 
@@ -713,10 +728,10 @@ fn estimate_inner_join_cardinality(
     // estimates whose product exceeds `usize::MAX`. Return `None` (unknown — handled
     // like the Absent-selectivity case) on overflow instead.
     let composite_ndv = composite_ndv?;
-    let left_num_rows = *left_stats.num_rows.get_value()?;
-    let right_num_rows = *right_stats.num_rows.get_value()?;
-    let divisor = composite_ndv.min(left_num_rows.max(right_num_rows)).max(1);
-    match left_num_rows.checked_mul(right_num_rows) {
+    let left_rows = *left_num_rows.get_value()?;
+    let right_rows = *right_num_rows.get_value()?;
+    let divisor = composite_ndv.min(left_rows.max(right_rows)).max(1);
+    match left_rows.checked_mul(right_rows) {
         Some(card) => {
             let estimate = card / divisor;
             // Exact only when every key NDV was exact and the row-count cap did
@@ -840,13 +855,10 @@ fn estimate_semi_join_cardinality(
     let mut has_selectivity_estimate = false;
 
     for (outer_stat, inner_stat) in outer_col_stats.iter().zip(inner_col_stats.iter()) {
-        let outer_has_stats = outer_stat.distinct_count.get_value().is_some()
-            || (outer_stat.min_value.get_value().is_some()
-                && outer_stat.max_value.get_value().is_some());
-        let inner_has_stats = inner_stat.distinct_count.get_value().is_some()
-            || (inner_stat.min_value.get_value().is_some()
-                && inner_stat.max_value.get_value().is_some());
-        if !outer_has_stats || !inner_has_stats {
+        // Skip keys with no usable NDV signal on a side.
+        if !is_informative_for_join_ndv(outer_stat)
+            || !is_informative_for_join_ndv(inner_stat)
+        {
             continue;
         }
 
@@ -2772,6 +2784,80 @@ mod tests {
 
         // (62 * 3_000_000) / 62 = 3_000_000  — not the collapsed 62.
         assert_eq!(stats.num_rows, 3_000_000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_join_cardinality_utf8_minmax_key_is_uninformative_and_borrows() -> Result<()>
+    {
+        // A `Utf8` key with min/max but no `distinct_count` is NOT informative:
+        // `Utf8` has no `Interval::cardinality()`, so `max_distinct_count` falls
+        // back to the row count. If it were treated as informative, both sides
+        // would look informative, no borrow would happen, and the Utf8 side's
+        // row-count fallback would collapse the estimate. With the corrected
+        // predicate the Utf8 side borrows the partner's real NDV.
+        let utf8_fk = vec![ColumnStatistics {
+            null_count: Absent,
+            min_value: Inexact(ScalarValue::Utf8(Some("AA".into()))),
+            max_value: Inexact(ScalarValue::Utf8(Some("ZZ".into()))),
+            sum_value: Absent,
+            distinct_count: Absent, // no NDV; min/max are Utf8 (no interval cardinality)
+            byte_size: Absent,
+        }];
+        let dim_pk = vec![create_column_stats(
+            Inexact(1),
+            Inexact(50),
+            Inexact(50),
+            Absent,
+        )];
+
+        let on = vec![(
+            Arc::new(Column::new("fk", 0)) as _,
+            Arc::new(Column::new("pk", 0)) as _,
+        )];
+
+        let stats = estimate_join_cardinality(
+            &JoinType::Inner,
+            create_stats(Some(1000), utf8_fk, false),
+            create_stats(Some(50), dim_pk, false),
+            &on,
+        )
+        .expect("cardinality should be estimable via the borrowed partner NDV");
+
+        // Borrow the dim's NDV=50 for both sides → (1000 * 50) / 50 = 1000
+        // (every FK row matches a dim key), not the collapsed 50.
+        assert_eq!(stats.num_rows, 1000);
+        Ok(())
+    }
+
+    #[test]
+    fn test_semi_join_cardinality_borrows_stats_for_uninformative_key() -> Result<()> {
+        // The borrow applies to semi/anti joins too: the reconciled key stats
+        // are produced once at extraction and feed both estimators. Here the
+        // outer key has min/max [0,99] (NDV 100 via range cap) and the inner key
+        // column is unknown (e.g. a projected expression). Borrowing the outer
+        // stats for the inner side gives inner NDV = min(100, inner_rows) = 50,
+        // so selectivity = min(100,50)/100 = 0.5 and the semi join keeps ~half
+        // the outer rows — instead of the unknown side being skipped (which would
+        // leave selectivity unconstrained and keep all 1000 outer rows).
+        let outer = vec![create_column_stats(Inexact(0), Inexact(99), Absent, Absent)];
+        let inner_expr_key = vec![ColumnStatistics::new_unknown()];
+
+        let on = vec![(
+            Arc::new(Column::new("k", 0)) as _,
+            Arc::new(Column::new("expr_key", 0)) as _,
+        )];
+
+        let stats = estimate_join_cardinality(
+            &JoinType::LeftSemi,
+            create_stats(Some(1000), outer, false),
+            create_stats(Some(50), inner_expr_key, false),
+            &on,
+        )
+        .expect("semi cardinality should be estimable via the borrowed key stats");
+
+        // ceil(1000 * (min(100,50)/100)) = ceil(1000 * 0.5) = 500.
+        assert_eq!(stats.num_rows, 500);
         Ok(())
     }
 
