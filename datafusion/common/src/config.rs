@@ -1082,6 +1082,35 @@ config_namespace! {
         /// predicate push down.
         pub filter_null_join_keys: bool, default = false
 
+        /// When set to true, a physical optimizer rule pushes partial aggregations
+        /// below joins ("eager aggregation"), so the join operates on
+        /// pre-aggregated, lower-cardinality inputs, and re-aggregates the partial
+        /// results above the join. This can dramatically reduce the number of rows
+        /// processed by the join for star/snowflake-style queries (e.g.
+        /// FK -> dimension joins).
+        ///
+        /// The rewrite is gated by a statistics-based cost model: it only fires
+        /// when the pre-aggregation is estimated to pay off (the join is not so
+        /// selective that the rows would be discarded anyway, and the reduction is
+        /// substantial — see the threshold options below). Defaults to false
+        /// while the optimization matures.
+        pub enable_eager_aggregation: bool, default = false
+
+        /// Cost-gate threshold for [`enable_eager_aggregation`]: the
+        /// pushed-down pre-aggregation must reduce its input by at least this
+        /// factor (estimated input rows >= estimated group count * factor) to be
+        /// applied. This guards against pushing an aggregation that barely
+        /// reduces rows yet still materializes a large, expensive hash table
+        /// (e.g. a 1.7x reduction producing millions of groups). A value of 1
+        /// accepts any reduction.
+        pub eager_aggregation_min_reduction_factor: usize, default = 4
+
+        /// Cost-gate cap for [`enable_eager_aggregation`]: if non-zero,
+        /// decline the push-down when the estimated pushed-down group count
+        /// exceeds this value (an absolute guard on the pre-aggregation's memory
+        /// footprint). 0 disables the cap.
+        pub eager_aggregation_max_pushed_groups: usize, default = 0
+
         /// Should DataFusion repartition data using the aggregate keys to execute aggregates
         /// in parallel using the provided `target_partitions` level
         pub repartition_aggregations: bool, default = true

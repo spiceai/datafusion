@@ -2935,6 +2935,7 @@ dependencies = [
  "datafusion-expr 54.0.0",
  "datafusion-expr-common 54.0.0",
  "datafusion-functions 54.0.0",
+ "datafusion-functions-aggregate",
  "datafusion-functions-window",
  "datafusion-physical-expr 54.0.0",
  "datafusion-physical-expr-common 54.0.0",
@@ -2942,6 +2943,7 @@ dependencies = [
  "datafusion-pruning 54.0.0",
  "insta",
  "itertools 0.14.0",
+ "log",
  "recursive",
  "tokio",
 ]
