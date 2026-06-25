@@ -48,10 +48,13 @@
 //! Matches `Final/FinalPartitioned( Partial( HashJoinExec ) )` (the shape the
 //! default physical planner emits for `GROUP BY` over a join) and pushes a
 //! pre-aggregation into the join input that supplies all aggregate arguments.
-//! Supports `SUM`/`MIN`/`MAX` (whose merge reuses the same UDAF, so no function
-//! registry is needed), with no residual (non-equi) join filter and plain-column
-//! join keys (group-by may be any expression — its push-side columns are pushed
-//! into the pre-aggregation grouping). Join types:
+//! Supports `SUM`/`MIN`/`MAX` (whose merge reuses the same UDAF) and `COUNT`
+//! (whose per-group partial counts are merged with `SUM`), with no residual
+//! (non-equi) join filter and plain-column join keys (group-by may be any
+//! expression — its push-side columns are pushed into the pre-aggregation
+//! grouping). `COUNT(*)` (which names no column, so no side can be inferred) is
+//! pushed only for semi/anti joins, where the surviving side is forced. Join
+//! types:
 //! * **inner** — push into the side that supplies the aggregate arguments;
 //! * **`LeftSemi`/`LeftAnti`/`RightSemi`/`RightAnti`** (from IN/EXISTS) — the
 //!   output is a single side; push into it. A row of that side survives the join
@@ -82,7 +85,8 @@ use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_expr::JoinType;
+use datafusion_expr::{AggregateUDF, JoinType};
+use datafusion_functions_aggregate::sum::sum_udaf;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
 use datafusion_physical_expr::expressions::Column;
@@ -109,9 +113,14 @@ impl PhysicalOptimizerRule for EagerAggregation {
     }
 
     fn schema_check(&self) -> bool {
-        // The rewrite must preserve the output schema exactly; let the framework
-        // assert it.
-        true
+        // The rewrite preserves column types and order, but COUNT decomposes to
+        // SUM(partial_count), and SUM is nullable while COUNT is not — a
+        // non-null -> nullable widening that the framework's schema check
+        // forbids (it only permits the reverse). The widening is value-safe
+        // (every final group has >= 1 partial, so the merged count is never
+        // actually NULL), so we opt out of the check, as the trait docs sanction
+        // for rules that change nullability.
+        false
     }
 
     fn optimize(
@@ -289,9 +298,9 @@ fn try_push_aggregate(
     }
     let mut arg_indices: Vec<usize> = Vec::new();
     for agg in aggrs {
-        if !is_self_mergeable(agg) {
+        if !is_decomposable(agg) {
             decline!(
-                "aggregate {:?} (distinct={}) is not self-mergeable (only SUM/MIN/MAX)",
+                "aggregate {:?} (distinct={}) is not decomposable (only SUM/MIN/MAX/COUNT)",
                 agg.fun().name(),
                 agg.is_distinct()
             );
@@ -523,7 +532,9 @@ fn try_push_aggregate(
     for (i, agg) in aggrs.iter().enumerate() {
         let idx = new_join_schema.index_of(&internal_names[i])?;
         let arg = Arc::new(Column::new(&internal_names[i], idx)) as Arc<dyn PhysicalExpr>;
-        let built = AggregateExprBuilder::new(Arc::new(agg.fun().clone()), vec![arg])
+        // SUM/MIN/MAX merge by re-applying themselves; COUNT merges its partial
+        // counts with SUM. See `merge_udaf`.
+        let built = AggregateExprBuilder::new(merge_udaf(agg), vec![arg])
             .schema(Arc::clone(&new_join_schema))
             .alias(agg.name().to_string())
             .build()?;
@@ -554,13 +565,25 @@ fn try_push_aggregate(
     Ok(Some(new_top_final))
 }
 
-/// True if `agg` merges by re-applying its own function (SUM/MIN/MAX), is not
-/// DISTINCT, and has no ORDER BY.
-fn is_self_mergeable(agg: &AggregateFunctionExpr) -> bool {
+/// True if `agg` can be split into a pushed partial plus a merge above the join,
+/// is not DISTINCT, and has no ORDER BY. SUM/MIN/MAX merge by re-applying
+/// themselves; COUNT merges its partial counts with SUM (see [`merge_udaf`]).
+fn is_decomposable(agg: &AggregateFunctionExpr) -> bool {
     if agg.is_distinct() {
         return false;
     }
-    matches!(agg.fun().name(), "sum" | "min" | "max")
+    matches!(agg.fun().name(), "sum" | "min" | "max" | "count")
+}
+
+/// The UDAF that merges the *partial* results of `agg` (computed on the push
+/// side) above the join. SUM/MIN/MAX are self-merging; COUNT's partials are
+/// per-group row counts that must be **summed**, not re-counted.
+fn merge_udaf(agg: &AggregateFunctionExpr) -> Arc<AggregateUDF> {
+    if agg.fun().name() == "count" {
+        sum_udaf()
+    } else {
+        Arc::new(agg.fun().clone())
+    }
 }
 
 /// Collect the indices of all `Column`s referenced by a physical expression.
@@ -689,7 +712,9 @@ mod tests {
     use datafusion_common::NullEquality;
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::stats::{ColumnStatistics, Statistics};
+    use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::sum::sum_udaf;
+    use datafusion_physical_expr::expressions::lit;
     use datafusion_physical_plan::joins::PartitionMode;
     use datafusion_physical_plan::test::exec::StatisticsExec;
 
@@ -910,6 +935,217 @@ mod tests {
             join_child_is_aggregate(&optimized),
             "expected the aggregation pushed into the RightAnti output (right) side"
         );
+    }
+
+    /// Aggregate function names of the root (top) `AggregateExec`.
+    fn outer_agg_fun_names(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        let agg = plan
+            .downcast_ref::<AggregateExec>()
+            .expect("root is an AggregateExec");
+        agg.aggr_expr()
+            .iter()
+            .map(|a| a.fun().name().to_string())
+            .collect()
+    }
+
+    /// Aggregate function names of the first `AggregateExec` found as a direct
+    /// child of a `HashJoinExec` (the pushed pre-aggregation).
+    fn pushed_agg_fun_names(plan: &Arc<dyn ExecutionPlan>) -> Vec<String> {
+        fn rec(p: &Arc<dyn ExecutionPlan>) -> Option<Vec<String>> {
+            if let Some(j) = p.downcast_ref::<HashJoinExec>() {
+                for child in [j.left(), j.right()] {
+                    if let Some(a) = child.downcast_ref::<AggregateExec>() {
+                        return Some(
+                            a.aggr_expr()
+                                .iter()
+                                .map(|x| x.fun().name().to_string())
+                                .collect(),
+                        );
+                    }
+                }
+            }
+            p.children().into_iter().find_map(rec)
+        }
+        rec(plan).expect("a pre-aggregation pushed below a join")
+    }
+
+    // COUNT decomposition over an inner join: the pushed side computes per-group
+    // partial COUNTs, and the top aggregate merges them with SUM (not COUNT).
+    #[test]
+    fn fires_with_count_on_inner_join() {
+        // Same beneficial fact/dim shape as `agg_over_join`, but COUNT(f_amount).
+        let fact = stats_leaf(
+            vec![
+                Field::new("f_dim", DataType::Int32, false),
+                Field::new("f_amount", DataType::Float64, true),
+            ],
+            10_000_000,
+            &[Some(100), None],
+        );
+        let dim = stats_leaf(
+            vec![
+                Field::new("d_id", DataType::Int32, false),
+                Field::new("d_name", DataType::Utf8, true),
+            ],
+            100,
+            &[Some(100), Some(100)],
+        );
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                fact,
+                dim,
+                vec![(
+                    Arc::new(Column::new("f_dim", 0)),
+                    Arc::new(Column::new("d_id", 0)),
+                )],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema();
+
+        let count_expr = Arc::new(
+            AggregateExprBuilder::new(
+                count_udaf(),
+                vec![Arc::new(Column::new("f_amount", 1))],
+            )
+            .schema(Arc::clone(&join_schema))
+            .alias("count(f_amount)")
+            .build()
+            .unwrap(),
+        );
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+            "d_name".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                vec![Arc::clone(&count_expr)],
+                vec![None],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                vec![count_expr],
+                vec![None],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let optimized = run_rule(plan);
+        assert!(
+            join_child_is_aggregate(&optimized),
+            "expected a pre-aggregation pushed below the join"
+        );
+        assert_eq!(
+            pushed_agg_fun_names(&optimized),
+            vec!["count"],
+            "pushed side should compute partial COUNTs"
+        );
+        assert_eq!(
+            outer_agg_fun_names(&optimized),
+            vec!["sum"],
+            "top aggregate should merge partial counts with SUM"
+        );
+    }
+
+    // COUNT(*) (no column argument) over a LeftSemi join: no side can be inferred
+    // from the (empty) arguments, but the semi join's surviving side is forced, so
+    // the count is pushed there and merged with SUM above the join.
+    #[test]
+    fn fires_with_count_star_on_semi_join() {
+        // left = output side ("customer"); right = existence side ("oorder").
+        // Low-NDV join key (100) so the pushed [c_id, c_state] grouping (100*50)
+        // still reduces 10M rows, and the semi join keeps ~10% -> join_out large.
+        let customer = stats_leaf(
+            vec![
+                Field::new("c_id", DataType::Int32, false),
+                Field::new("c_state", DataType::Utf8, true),
+            ],
+            10_000_000,
+            &[Some(100), Some(50)],
+        );
+        let oorder = stats_leaf(
+            vec![Field::new("o_c_id", DataType::Int32, false)],
+            1_000,
+            &[Some(10)],
+        );
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                customer,
+                oorder,
+                vec![(
+                    Arc::new(Column::new("c_id", 0)),
+                    Arc::new(Column::new("o_c_id", 0)),
+                )],
+                None,
+                &JoinType::LeftSemi,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema(); // LeftSemi output = customer columns
+
+        let count_expr = Arc::new(
+            AggregateExprBuilder::new(count_udaf(), vec![lit(1i64)])
+                .schema(Arc::clone(&join_schema))
+                .alias("count(*)")
+                .build()
+                .unwrap(),
+        );
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("c_state", 1)) as Arc<dyn PhysicalExpr>,
+            "c_state".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                vec![Arc::clone(&count_expr)],
+                vec![None],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                vec![count_expr],
+                vec![None],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let optimized = run_rule(plan);
+        assert!(
+            join_child_is_aggregate(&optimized),
+            "expected COUNT(*) pushed into the LeftSemi output (left) side"
+        );
+        assert_eq!(pushed_agg_fun_names(&optimized), vec!["count"]);
+        assert_eq!(outer_agg_fun_names(&optimized), vec!["sum"]);
     }
 
     // Fix #1: a chain of column-only projections between the partial aggregate
