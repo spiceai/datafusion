@@ -49,12 +49,14 @@
 //! default physical planner emits for `GROUP BY` over a join) and pushes a
 //! pre-aggregation into the join input that supplies all aggregate arguments.
 //! Supports `SUM`/`MIN`/`MAX` (whose merge reuses the same UDAF) and `COUNT`
-//! (whose per-group partial counts are merged with `SUM`), with no residual
-//! (non-equi) join filter and plain-column join keys (group-by may be any
-//! expression — its push-side columns are pushed into the pre-aggregation
-//! grouping). `COUNT(*)` (which names no column, so no side can be inferred) is
-//! pushed only for semi/anti joins, where the surviving side is forced. Join
-//! types:
+//! (whose per-group partial counts are merged with `SUM`), and plain-column
+//! join keys (group-by may be any expression — its push-side columns are pushed
+//! into the pre-aggregation grouping). `COUNT(*)` (which names no column, so no
+//! side can be inferred) is pushed only for semi/anti joins, where the surviving
+//! side is forced. A residual (non-equi) `join.filter()` is preserved by adding
+//! its push-side columns to the pre-aggregation grouping (so the filter, remapped
+//! onto the pre-aggregated side, still accepts/rejects each group as a unit).
+//! Join types:
 //! * **inner** — push into the side that supplies the aggregate arguments;
 //! * **`LeftSemi`/`LeftAnti`/`RightSemi`/`RightAnti`** (from IN/EXISTS) — the
 //!   output is a single side; push into it. A row of that side survives the join
@@ -82,6 +84,7 @@ use std::sync::Arc;
 use crate::PhysicalOptimizerRule;
 
 use arrow::datatypes::DataType;
+use datafusion_common::JoinSide;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
@@ -98,6 +101,7 @@ use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
 use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
 use datafusion_physical_plan::projection::ProjectionExec;
 
 /// Cost-based physical eager-aggregation rule. See the [module docs](self).
@@ -261,9 +265,9 @@ fn try_push_aggregate(
         JoinType::RightSemi | JoinType::RightAnti => Some(Side::Right),
         _ => decline!("join_type {join_type:?} not supported"),
     };
-    if join.filter().is_some() {
-        decline!("join carries a non-equi filter");
-    }
+    // A residual (non-equi) `join.filter()` is supported by pushing its push-side
+    // columns into the pre-aggregation grouping (below) and re-applying the filter
+    // at the rebuilt join; it is not a reason to decline.
 
     let left = join.left();
     let right = join.right();
@@ -404,6 +408,33 @@ fn try_push_aggregate(
 
     let push_schema = push_plan.schema();
 
+    // The join side the pre-aggregation replaces, in `JoinFilter` terms.
+    let push_join_side = match side {
+        Side::Left => JoinSide::Left,
+        Side::Right => JoinSide::Right,
+    };
+    // To preserve a residual join filter, add every push-side column it
+    // references to the pushdown grouping. Each pre-aggregated group then has a
+    // single value for those columns, so the filter (re-applied at the rebuilt
+    // join) accepts/rejects the whole group exactly as it would the original
+    // rows. `JoinFilter` column indices are already side-local. (A high-NDV
+    // filter column inflates the group count, which the cost gate then weighs.)
+    if let Some(filter) = join.filter() {
+        for ci in filter.column_indices() {
+            if ci.side != push_join_side {
+                continue;
+            }
+            if !seen.contains(&ci.index) {
+                seen.push(ci.index);
+                let name = push_schema.field(ci.index).name();
+                pushdown_group.push((
+                    Arc::new(Column::new(name, ci.index)) as Arc<dyn PhysicalExpr>,
+                    name.to_string(),
+                ));
+            }
+        }
+    }
+
     // Cost gate: only push when the pre-aggregation produces fewer rows than the
     // join emits (otherwise the join is selective enough that pre-aggregating is
     // wasted work). Requires statistics; absent stats => do not fire.
@@ -524,11 +555,45 @@ fn try_push_aggregate(
         })
         .collect::<Result<Vec<_>>>()?;
 
+    // Remap a residual filter onto the pre-aggregated side: its push-side column
+    // indices now point at the (reordered, narrower) pre-aggregation output,
+    // located by name (each such column was added to the grouping above). The
+    // filter expression and intermediate schema are unchanged — only the
+    // side-local indices move.
+    let new_filter = match join.filter() {
+        None => None,
+        Some(filter) => {
+            let pf_schema = pre_final.schema();
+            let mut new_cols = Vec::with_capacity(filter.column_indices().len());
+            for ci in filter.column_indices() {
+                if ci.side == push_join_side {
+                    let name = push_schema.field(ci.index).name();
+                    let Ok(index) = pf_schema.index_of(name) else {
+                        decline!(
+                            "filter push-side column {name} missing after pre-aggregation"
+                        );
+                    };
+                    new_cols.push(ColumnIndex {
+                        index,
+                        side: ci.side,
+                    });
+                } else {
+                    new_cols.push(ci.clone());
+                }
+            }
+            Some(JoinFilter::new(
+                Arc::clone(filter.expression()),
+                new_cols,
+                Arc::clone(filter.schema()),
+            ))
+        }
+    };
+
     let new_join = Arc::new(HashJoinExec::try_new(
         new_left,
         new_right,
         new_on,
-        None,
+        new_filter,
         join.join_type(),
         None,
         *join.partition_mode(),
@@ -1895,6 +1960,172 @@ mod tests {
             sorted_rows(&on_rows),
             sorted_rows(&off_rows),
             "eager-on results must match eager-off"
+        );
+    }
+
+    /// True if some `HashJoinExec` in the tree carries a residual filter.
+    fn any_join_has_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
+        if let Some(j) = plan.downcast_ref::<HashJoinExec>()
+            && j.filter().is_some()
+        {
+            return true;
+        }
+        plan.children().into_iter().any(any_join_has_filter)
+    }
+
+    // End-to-end value correctness with a *cross-side* residual join filter
+    // (`f_date >= d_since`, the shape of CH-benCHmark q12). The push-side filter
+    // column (f_date) is folded into the pre-aggregation grouping and the filter
+    // is re-applied at the rebuilt join; results must match eager-off.
+    #[tokio::test]
+    async fn cross_side_join_filter_eager_push_preserves_values() {
+        // fact(f_dim, f_amount, f_date).
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("f_dim", DataType::Int32, false),
+            Field::new("f_amount", DataType::Float64, true),
+            Field::new("f_date", DataType::Int32, false),
+        ]));
+        let fact_batch = RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2, 2, 1])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0])),
+                Arc::new(Int32Array::from(vec![5, 9, 3, 7, 8, 2])),
+            ],
+        )
+        .unwrap();
+        let fact = Arc::new(DataStatsExec::new(
+            vec![fact_batch],
+            stats_with(10_000_000, &[Some(2), None, Some(10)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        // dim(d_id, d_name, d_since).
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("d_id", DataType::Int32, false),
+            Field::new("d_name", DataType::Utf8, true),
+            Field::new("d_since", DataType::Int32, false),
+        ]));
+        let dim_batch = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int32Array::from(vec![4, 6])),
+            ],
+        )
+        .unwrap();
+        let dim = Arc::new(DataStatsExec::new(
+            vec![dim_batch],
+            stats_with(2, &[Some(2), Some(2), Some(2)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        // Residual filter: f_date (Left@2) >= d_since (Right@2).
+        let intermediate = Schema::new(vec![
+            Field::new("f_date", DataType::Int32, false),
+            Field::new("d_since", DataType::Int32, false),
+        ]);
+        let filter_expr = binary(
+            Arc::new(Column::new("f_date", 0)),
+            Operator::GtEq,
+            Arc::new(Column::new("d_since", 1)),
+            &intermediate,
+        )
+        .unwrap();
+        let filter = JoinFilter::new(
+            filter_expr,
+            vec![
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Left,
+                },
+                ColumnIndex {
+                    index: 2,
+                    side: JoinSide::Right,
+                },
+            ],
+            Arc::new(intermediate),
+        );
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                fact,
+                dim,
+                vec![(
+                    Arc::new(Column::new("f_dim", 0)),
+                    Arc::new(Column::new("d_id", 0)),
+                )],
+                Some(filter),
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema(); // [f_dim, f_amount, f_date, d_id, d_name, d_since]
+
+        let sum_expr = Arc::new(
+            AggregateExprBuilder::new(
+                sum_udaf(),
+                vec![Arc::new(Column::new("f_amount", 1))],
+            )
+            .schema(Arc::clone(&join_schema))
+            .alias("sum(f_amount)")
+            .build()
+            .unwrap(),
+        );
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("d_name", 4)) as Arc<dyn PhysicalExpr>,
+            "d_name".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                vec![Arc::clone(&sum_expr)],
+                vec![None],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                vec![sum_expr],
+                vec![None],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let eager_on = run_rule(Arc::clone(&plan));
+        assert!(
+            join_child_is_aggregate(&eager_on),
+            "eager aggregation should have fired"
+        );
+        assert!(
+            any_join_has_filter(&eager_on),
+            "rebuilt join must retain the residual filter"
+        );
+        let on = enforce_distribution(eager_on);
+        let off = enforce_distribution(plan);
+
+        let ctx = Arc::new(TaskContext::default());
+        let on_rows = collect(on, Arc::clone(&ctx)).await.unwrap();
+        let off_rows = collect(off, ctx).await.unwrap();
+
+        // Expected: a -> 10+20 = 30 (date>=4); b -> 40+50 = 90 (date>=6).
+        let total: usize = off_rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "two groups expected");
+        assert_eq!(
+            sorted_rows(&on_rows),
+            sorted_rows(&off_rows),
+            "eager-on results must match eager-off with a cross-side filter"
         );
     }
 }
