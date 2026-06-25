@@ -81,21 +81,24 @@ use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
 
+use arrow::datatypes::DataType;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_expr::{AggregateUDF, JoinType};
+use datafusion_expr::{AggregateUDF, JoinType, Operator};
+use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_functions_aggregate::sum::sum_udaf;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
-use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::expressions::{Column, binary, cast};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
 use datafusion_physical_plan::joins::HashJoinExec;
+use datafusion_physical_plan::projection::ProjectionExec;
 
 /// Cost-based physical eager-aggregation rule. See the [module docs](self).
 #[derive(Debug, Default)]
@@ -199,9 +202,7 @@ fn try_push_aggregate(
             if node.downcast_ref::<HashJoinExec>().is_some() {
                 break;
             }
-            let Some(proj) = node
-                .downcast_ref::<datafusion_physical_plan::projection::ProjectionExec>()
-            else {
+            let Some(proj) = node.downcast_ref::<ProjectionExec>() else {
                 log::debug!(
                     target: "eager_aggregation",
                     "shape: aggregate input chain reaches {}, not a (projected) hash join",
@@ -300,9 +301,18 @@ fn try_push_aggregate(
     for agg in aggrs {
         if !is_decomposable(agg) {
             decline!(
-                "aggregate {:?} (distinct={}) is not decomposable (only SUM/MIN/MAX/COUNT)",
+                "aggregate {:?} (distinct={}) is not decomposable (only SUM/MIN/MAX/COUNT/AVG)",
                 agg.fun().name(),
                 agg.is_distinct()
+            );
+        }
+        // AVG decomposes to SUM/COUNT and is recombined by division. We only
+        // handle the Float64 case (numeric inputs); decimal AVG keeps a Decimal
+        // output whose scale we'd have to reproduce exactly, so decline it.
+        if agg.fun().name() == "avg" && agg.field().data_type() != &DataType::Float64 {
+            decline!(
+                "AVG output type {:?} unsupported (only Float64)",
+                agg.field().data_type()
             );
         }
         for e in agg.expressions() {
@@ -405,21 +415,34 @@ fn try_push_aggregate(
         } => {
             log::debug!(
                 target: "eager_aggregation",
-                "accept: side={:?} push_rows={push_rows} grouped={grouped} join_out={join_out}",
-                side
+                "accept: side={side:?} push_rows={push_rows} grouped={grouped} join_out={join_out}"
             );
         }
         CostGate::Decline(reason) => decline!("cost gate: {reason}"),
     }
 
-    // Build the pushed (pre-)aggregation expressions: reuse each original UDAF,
-    // remap its argument columns into the push side's schema, alias to a stable
-    // internal name. The merge above reuses the same UDAF over this column.
+    // Decompose each aggregate into the partial(s) to push and how to recombine
+    // them above the join. AVG splits into SUM(x)+COUNT(x) and needs a top
+    // projection (the division); SUM/MIN/MAX/COUNT each produce a single merged
+    // column that *is* the output, so no projection is added then.
+    let has_avg = aggrs.iter().any(|a| a.fun().name() == "avg");
+
+    /// Per-input-aggregate plan: how to merge each pushed partial and how to
+    /// recombine the merged columns into the aggregate's output value.
+    struct AggPlan {
+        /// `(merge udaf, pushed partial alias, merged column alias)` per partial.
+        merges: Vec<(Arc<AggregateUDF>, String, String)>,
+        out: OutKind,
+        out_name: String,
+    }
+
+    // Pushed (pre-)aggregation expressions: each partial UDAF over the original
+    // argument columns remapped into the push side's schema, aliased to a stable
+    // internal name.
     let mut pushed_aggrs: Vec<Arc<AggregateFunctionExpr>> =
         Vec::with_capacity(aggrs.len());
-    let mut internal_names: Vec<String> = Vec::with_capacity(aggrs.len());
+    let mut agg_plans: Vec<AggPlan> = Vec::with_capacity(aggrs.len());
     for (i, agg) in aggrs.iter().enumerate() {
-        let internal = format!("__eager_phys_{i}");
         let args = agg
             .expressions()
             .into_iter()
@@ -428,12 +451,30 @@ fn try_push_aggregate(
                 reassign_expr_columns(e, push_schema.as_ref())
             })
             .collect::<Result<Vec<_>>>()?;
-        let built = AggregateExprBuilder::new(Arc::new(agg.fun().clone()), args)
-            .schema(Arc::clone(&push_schema))
-            .alias(internal.clone())
-            .build()?;
-        pushed_aggrs.push(Arc::new(built));
-        internal_names.push(internal);
+        let Decomp { partials, out } = decompose(agg);
+        let mut merges = Vec::with_capacity(partials.len());
+        for (p, (partial_udaf, merge)) in partials.into_iter().enumerate() {
+            let pushed_alias = format!("__eager_p{i}_{p}");
+            let built = AggregateExprBuilder::new(partial_udaf, args.clone())
+                .schema(Arc::clone(&push_schema))
+                .alias(pushed_alias.clone())
+                .build()?;
+            pushed_aggrs.push(Arc::new(built));
+            // The merged column gets an internal alias when a projection will
+            // remap it; with no AVG the single passthrough merge is aliased
+            // straight to the output name (no projection, unchanged shape).
+            let merged_alias = if has_avg {
+                format!("__eager_m{i}_{p}")
+            } else {
+                agg.name().to_string()
+            };
+            merges.push((merge, pushed_alias, merged_alias));
+        }
+        agg_plans.push(AggPlan {
+            merges,
+            out,
+            out_name: agg.name().to_string(),
+        });
     }
 
     let pushdown_group_by = PhysicalGroupBy::new_single(pushdown_group);
@@ -448,11 +489,12 @@ fn try_push_aggregate(
         Arc::clone(push_plan),
         Arc::clone(&push_schema),
     )?);
+    let n_pushed = pushed_aggrs.len();
     let pre_final = Arc::new(AggregateExec::try_new(
         AggregateMode::FinalPartitioned,
         pushdown_group_by.as_final(),
         pushed_aggrs,
-        vec![None; internal_names.len()],
+        vec![None; n_pushed],
         pre_partial,
         Arc::clone(&push_schema),
     )?) as Arc<dyn ExecutionPlan>;
@@ -528,24 +570,25 @@ fn try_push_aggregate(
     let new_group_by = PhysicalGroupBy::new_single(new_group_exprs);
 
     let mut merge_aggrs: Vec<Arc<AggregateFunctionExpr>> =
-        Vec::with_capacity(aggrs.len());
-    for (i, agg) in aggrs.iter().enumerate() {
-        let idx = new_join_schema.index_of(&internal_names[i])?;
-        let arg = Arc::new(Column::new(&internal_names[i], idx)) as Arc<dyn PhysicalExpr>;
-        // SUM/MIN/MAX merge by re-applying themselves; COUNT merges its partial
-        // counts with SUM. See `merge_udaf`.
-        let built = AggregateExprBuilder::new(merge_udaf(agg), vec![arg])
-            .schema(Arc::clone(&new_join_schema))
-            .alias(agg.name().to_string())
-            .build()?;
-        merge_aggrs.push(Arc::new(built));
+        Vec::with_capacity(agg_plans.len());
+    for plan in &agg_plans {
+        for (merge, pushed_alias, merged_alias) in &plan.merges {
+            let idx = new_join_schema.index_of(pushed_alias)?;
+            let arg = Arc::new(Column::new(pushed_alias, idx)) as Arc<dyn PhysicalExpr>;
+            let built = AggregateExprBuilder::new(Arc::clone(merge), vec![arg])
+                .schema(Arc::clone(&new_join_schema))
+                .alias(merged_alias.clone())
+                .build()?;
+            merge_aggrs.push(Arc::new(built));
+        }
     }
+    let n_merge = merge_aggrs.len();
 
     let new_top_partial = Arc::new(AggregateExec::try_new(
         AggregateMode::Partial,
         new_group_by.clone(),
         merge_aggrs.clone(),
-        vec![None; merge_aggrs.len()],
+        vec![None; n_merge],
         new_join,
         Arc::clone(&new_join_schema),
     )?);
@@ -553,36 +596,105 @@ fn try_push_aggregate(
         *top_final.mode(),
         new_group_by.as_final(),
         merge_aggrs,
-        vec![None; aggrs.len()],
+        vec![None; n_merge],
         new_top_partial,
         new_join_schema,
     )?) as Arc<dyn ExecutionPlan>;
+
+    // For AVG, the top aggregate produces internal SUM/COUNT columns; add a
+    // projection that passes group columns through and divides SUM/COUNT (as
+    // Float64) back into the AVG output, restoring the original output schema.
+    // Without AVG the merged columns already carry the output names and order.
+    let result: Arc<dyn ExecutionPlan> = if has_avg {
+        let final_schema = new_top_final.schema();
+        let col = |name: &str| -> Result<Arc<dyn PhysicalExpr>> {
+            let idx = final_schema.index_of(name)?;
+            Ok(Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>)
+        };
+        let mut proj: Vec<(Arc<dyn PhysicalExpr>, String)> =
+            Vec::with_capacity(group.expr().len() + agg_plans.len());
+        for (_, name) in group.expr() {
+            proj.push((col(name)?, name.clone()));
+        }
+        for plan in &agg_plans {
+            let expr = match plan.out {
+                OutKind::Passthrough => col(&plan.merges[0].2)?,
+                OutKind::AvgDiv => {
+                    let sum_f = cast(
+                        col(&plan.merges[0].2)?,
+                        final_schema.as_ref(),
+                        DataType::Float64,
+                    )?;
+                    let cnt_f = cast(
+                        col(&plan.merges[1].2)?,
+                        final_schema.as_ref(),
+                        DataType::Float64,
+                    )?;
+                    binary(sum_f, Operator::Divide, cnt_f, final_schema.as_ref())?
+                }
+            };
+            proj.push((expr, plan.out_name.clone()));
+        }
+        Arc::new(ProjectionExec::try_new(proj, new_top_final)?)
+    } else {
+        new_top_final
+    };
 
     log::debug!(
         target: "eager_aggregation",
         "pushed aggregation into {side:?} side of join"
     );
-    Ok(Some(new_top_final))
+    Ok(Some(result))
 }
 
-/// True if `agg` can be split into a pushed partial plus a merge above the join,
-/// is not DISTINCT, and has no ORDER BY. SUM/MIN/MAX merge by re-applying
-/// themselves; COUNT merges its partial counts with SUM (see [`merge_udaf`]).
+/// True if `agg` can be split into pushed partial(s) plus a merge above the
+/// join, is not DISTINCT, and has no ORDER BY. SUM/MIN/MAX merge by re-applying
+/// themselves; COUNT merges its partial counts with SUM; AVG splits into
+/// SUM(x)+COUNT(x) and is recombined by division (see [`decompose`]).
 fn is_decomposable(agg: &AggregateFunctionExpr) -> bool {
     if agg.is_distinct() {
         return false;
     }
-    matches!(agg.fun().name(), "sum" | "min" | "max" | "count")
+    matches!(agg.fun().name(), "sum" | "min" | "max" | "count" | "avg")
 }
 
-/// The UDAF that merges the *partial* results of `agg` (computed on the push
-/// side) above the join. SUM/MIN/MAX are self-merging; COUNT's partials are
-/// per-group row counts that must be **summed**, not re-counted.
-fn merge_udaf(agg: &AggregateFunctionExpr) -> Arc<AggregateUDF> {
-    if agg.fun().name() == "count" {
-        sum_udaf()
-    } else {
-        Arc::new(agg.fun().clone())
+/// The partial aggregate(s) to push below the join for `agg`, and how its final
+/// output value is recombined above the join.
+struct Decomp {
+    /// `(udaf, merge_udaf)` for each pushed partial: the partial computes `udaf`
+    /// on the push side, and `merge_udaf` merges it above the join.
+    partials: Vec<(Arc<AggregateUDF>, Arc<AggregateUDF>)>,
+    /// How to turn the merged column(s) into `agg`'s output value.
+    out: OutKind,
+}
+
+/// How an aggregate's merged partial column(s) recombine into its output.
+enum OutKind {
+    /// Output is the single merged column (SUM/MIN/MAX/COUNT).
+    Passthrough,
+    /// Output is `merged_sum / merged_count`, cast to Float64 (AVG).
+    AvgDiv,
+}
+
+/// Decompose `agg` into the partial(s) to push and the recombination kind. All
+/// inputs are pre-validated by [`is_decomposable`] (+ the AVG Float64 gate).
+fn decompose(agg: &AggregateFunctionExpr) -> Decomp {
+    match agg.fun().name() {
+        // COUNT's per-group partial counts must be summed, not re-counted.
+        "count" => Decomp {
+            partials: vec![(Arc::new(agg.fun().clone()), sum_udaf())],
+            out: OutKind::Passthrough,
+        },
+        // AVG(x) = SUM(x) / COUNT(x); both partials merge with SUM.
+        "avg" => Decomp {
+            partials: vec![(sum_udaf(), sum_udaf()), (count_udaf(), sum_udaf())],
+            out: OutKind::AvgDiv,
+        },
+        // SUM/MIN/MAX are self-merging.
+        _ => Decomp {
+            partials: vec![(Arc::new(agg.fun().clone()), Arc::new(agg.fun().clone()))],
+            out: OutKind::Passthrough,
+        },
     }
 }
 
@@ -833,9 +945,7 @@ mod tests {
             return j.left().downcast_ref::<AggregateExec>().is_some()
                 || j.right().downcast_ref::<AggregateExec>().is_some();
         }
-        plan.children()
-            .into_iter()
-            .any(|c| join_child_is_aggregate(c))
+        plan.children().into_iter().any(join_child_is_aggregate)
     }
 
     // Accept path: a large fact joined N:1 to a small dim, grouping key reduces
@@ -1148,6 +1258,115 @@ mod tests {
         assert_eq!(outer_agg_fun_names(&optimized), vec!["sum"]);
     }
 
+    // AVG decomposition over an inner join: the push side computes partial
+    // SUM(x)+COUNT(x), the top aggregate merges both with SUM, and a top
+    // ProjectionExec divides them back into the AVG output (restoring the schema).
+    #[test]
+    fn fires_with_avg_on_inner_join() {
+        use datafusion_functions_aggregate::average::avg_udaf;
+
+        let fact = stats_leaf(
+            vec![
+                Field::new("f_dim", DataType::Int32, false),
+                Field::new("f_amount", DataType::Float64, true),
+            ],
+            10_000_000,
+            &[Some(100), None],
+        );
+        let dim = stats_leaf(
+            vec![
+                Field::new("d_id", DataType::Int32, false),
+                Field::new("d_name", DataType::Utf8, true),
+            ],
+            100,
+            &[Some(100), Some(100)],
+        );
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                fact,
+                dim,
+                vec![(
+                    Arc::new(Column::new("f_dim", 0)),
+                    Arc::new(Column::new("d_id", 0)),
+                )],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema();
+
+        let avg_expr = Arc::new(
+            AggregateExprBuilder::new(
+                avg_udaf(),
+                vec![Arc::new(Column::new("f_amount", 1))],
+            )
+            .schema(Arc::clone(&join_schema))
+            .alias("avg(f_amount)")
+            .build()
+            .unwrap(),
+        );
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+            "d_name".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                vec![Arc::clone(&avg_expr)],
+                vec![None],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                vec![avg_expr],
+                vec![None],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let original_schema = plan.schema();
+
+        let optimized = run_rule(plan);
+        assert!(
+            join_child_is_aggregate(&optimized),
+            "expected a pre-aggregation pushed below the join"
+        );
+        // The AVG path wraps the merged aggregate in a division projection.
+        let proj = optimized
+            .downcast_ref::<ProjectionExec>()
+            .expect("AVG output should be recombined by a top projection");
+        assert_eq!(
+            pushed_agg_fun_names(&optimized),
+            vec!["sum", "count"],
+            "push side should compute partial SUM and COUNT"
+        );
+        let top = proj
+            .input()
+            .downcast_ref::<AggregateExec>()
+            .expect("projection over the merged aggregate");
+        let top_funs: Vec<_> = top.aggr_expr().iter().map(|a| a.fun().name()).collect();
+        assert_eq!(
+            top_funs,
+            vec!["sum", "sum"],
+            "both AVG partials merge with SUM"
+        );
+        // Output schema (names, types, order) is preserved.
+        assert_eq!(optimized.schema(), original_schema);
+    }
+
     // Fix #1: a chain of column-only projections between the partial aggregate
     // and the join (the shape the planner emits before ProjectionPushdown) must
     // be peeled, with the column-index map composed through it, so the rule still
@@ -1163,7 +1382,7 @@ mod tests {
 
         // proj1: [f_amount@1, d_name@3, f_dim@0]
         let proj1 = Arc::new(
-            datafusion_physical_plan::projection::ProjectionExec::try_new(
+            ProjectionExec::try_new(
                 vec![
                     (
                         Arc::new(Column::new("f_amount", 1)) as Arc<dyn PhysicalExpr>,
@@ -1178,7 +1397,7 @@ mod tests {
         ) as Arc<dyn ExecutionPlan>;
         // proj2: [d_name@1, f_amount@0]
         let proj2 = Arc::new(
-            datafusion_physical_plan::projection::ProjectionExec::try_new(
+            ProjectionExec::try_new(
                 vec![
                     (
                         Arc::new(Column::new("d_name", 1)) as Arc<dyn PhysicalExpr>,
