@@ -820,15 +820,26 @@ mod tests {
     use super::*;
     use crate::PhysicalOptimizerRule;
 
-    use arrow::datatypes::{DataType, Field, Schema};
+    use crate::enforce_distribution::EnforceDistribution;
+    use arrow::array::{Float64Array, Int32Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use arrow::record_batch::RecordBatch;
     use datafusion_common::NullEquality;
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::stats::{ColumnStatistics, Statistics};
+    use datafusion_execution::TaskContext;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::sum::sum_udaf;
+    use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::expressions::lit;
+    use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion_physical_plan::joins::PartitionMode;
+    use datafusion_physical_plan::memory::MemoryStream;
     use datafusion_physical_plan::test::exec::StatisticsExec;
+    use datafusion_physical_plan::{
+        DisplayAs, DisplayFormatType, Partitioning, PlanProperties,
+        SendableRecordBatchStream, collect,
+    };
 
     fn stats_leaf(
         fields: Vec<Field>,
@@ -1637,5 +1648,253 @@ mod tests {
         assert!(!push_is_beneficial(
             1_000_000, 1_000_000, 1_000_000, FACTOR, NO_CAP
         ));
+    }
+
+    /// A leaf exec that yields fixed `RecordBatch`es **and** reports injected
+    /// `Statistics`. The stats (large NDV/row counts) drive the cost gate so the
+    /// rewrite fires; the batches (tiny) are what actually executes, so the
+    /// ON-vs-OFF value comparison runs on real data.
+    #[derive(Debug)]
+    struct DataStatsExec {
+        batches: Vec<RecordBatch>,
+        schema: SchemaRef,
+        stats: Statistics,
+        cache: Arc<PlanProperties>,
+    }
+
+    impl DataStatsExec {
+        fn new(batches: Vec<RecordBatch>, stats: Statistics) -> Self {
+            let schema = batches[0].schema();
+            let cache = Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(Arc::clone(&schema)),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            ));
+            Self {
+                batches,
+                schema,
+                stats,
+                cache,
+            }
+        }
+    }
+
+    impl DisplayAs for DataStatsExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter,
+        ) -> std::fmt::Result {
+            write!(f, "DataStatsExec")
+        }
+    }
+
+    impl ExecutionPlan for DataStatsExec {
+        fn name(&self) -> &'static str {
+            "DataStatsExec"
+        }
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.cache
+        }
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+        fn with_new_children(
+            self: Arc<Self>,
+            _: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> Result<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> Result<SendableRecordBatchStream> {
+            Ok(Box::pin(MemoryStream::try_new(
+                self.batches.clone(),
+                Arc::clone(&self.schema),
+                None,
+            )?))
+        }
+        fn partition_statistics(
+            &self,
+            partition: Option<usize>,
+        ) -> Result<Arc<Statistics>> {
+            Ok(Arc::new(if partition.is_some() {
+                Statistics::new_unknown(&self.schema)
+            } else {
+                self.stats.clone()
+            }))
+        }
+    }
+
+    fn stats_with(num_rows: usize, distinct: &[Option<usize>]) -> Statistics {
+        Statistics {
+            num_rows: Precision::Inexact(num_rows),
+            total_byte_size: Precision::Absent,
+            column_statistics: distinct
+                .iter()
+                .map(|d| {
+                    let cs = ColumnStatistics::new_unknown();
+                    match d {
+                        Some(n) => cs.with_distinct_count(Precision::Inexact(*n)),
+                        None => cs,
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    /// Format result rows as a sorted multiset of strings, so the comparison is
+    /// insensitive to partition/row ordering.
+    fn sorted_rows(batches: &[RecordBatch]) -> Vec<String> {
+        let s = arrow::util::pretty::pretty_format_batches(batches)
+            .unwrap()
+            .to_string();
+        let mut lines: Vec<String> = s.lines().map(str::to_string).collect();
+        lines.sort();
+        lines
+    }
+
+    fn enforce_distribution(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+        // EnforceDistribution inserts the repartitioning the pushed/top
+        // FinalPartitioned aggregates require to execute correctly.
+        EnforceDistribution::new()
+            .optimize(plan, &ConfigOptions::default())
+            .unwrap()
+    }
+
+    // End-to-end value correctness: COUNT, SUM and AVG over an inner join all
+    // produce identical results with eager aggregation ON vs OFF, and the ON plan
+    // actually pushes a pre-aggregation below the join. Tiny data, big fake stats.
+    #[tokio::test]
+    async fn count_sum_avg_eager_push_preserves_values() {
+        // fact(f_dim, f_amount): real rows are tiny; stats claim 10M rows / NDV 2.
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("f_dim", DataType::Int32, false),
+            Field::new("f_amount", DataType::Float64, true),
+        ]));
+        let fact_batch = RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2, 2, 1])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0])),
+            ],
+        )
+        .unwrap();
+        let fact = Arc::new(DataStatsExec::new(
+            vec![fact_batch],
+            stats_with(10_000_000, &[Some(2), None]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        // dim(d_id, d_name).
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("d_id", DataType::Int32, false),
+            Field::new("d_name", DataType::Utf8, true),
+        ]));
+        let dim_batch = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let dim = Arc::new(DataStatsExec::new(
+            vec![dim_batch],
+            stats_with(2, &[Some(2), Some(2)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                fact,
+                dim,
+                vec![(
+                    Arc::new(Column::new("f_dim", 0)),
+                    Arc::new(Column::new("d_id", 0)),
+                )],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema(); // [f_dim, f_amount, d_id, d_name]
+
+        let mk = |alias: &str, udaf: Arc<AggregateUDF>| {
+            Arc::new(
+                AggregateExprBuilder::new(
+                    udaf,
+                    vec![Arc::new(Column::new("f_amount", 1))],
+                )
+                .schema(Arc::clone(&join_schema))
+                .alias(alias.to_string())
+                .build()
+                .unwrap(),
+            )
+        };
+        let aggrs = vec![
+            mk("count(f_amount)", count_udaf()),
+            mk("sum(f_amount)", sum_udaf()),
+            mk(
+                "avg(f_amount)",
+                datafusion_functions_aggregate::average::avg_udaf(),
+            ),
+        ];
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+            "d_name".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        // Run the rule, assert it fired (before EnforceDistribution inserts a
+        // RepartitionExec between the join and the pushed aggregate), then
+        // distribute both plans so they execute correctly.
+        let eager_on = run_rule(Arc::clone(&plan));
+        assert!(
+            join_child_is_aggregate(&eager_on),
+            "eager aggregation should have fired"
+        );
+        let on = enforce_distribution(eager_on);
+        let off = enforce_distribution(plan);
+
+        let ctx = Arc::new(TaskContext::default());
+        let on_rows = collect(on, Arc::clone(&ctx)).await.unwrap();
+        let off_rows = collect(off, ctx).await.unwrap();
+
+        // Expected per-group: a -> {count 3, sum 90, avg 30}; b -> {3, 120, 40}.
+        let total: usize = off_rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "two groups expected");
+        assert_eq!(
+            sorted_rows(&on_rows),
+            sorted_rows(&off_rows),
+            "eager-on results must match eager-off"
+        );
     }
 }
