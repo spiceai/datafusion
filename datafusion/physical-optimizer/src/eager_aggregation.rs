@@ -49,12 +49,19 @@
 //! default physical planner emits for `GROUP BY` over a join) and pushes a
 //! pre-aggregation into the join input that supplies all aggregate arguments.
 //! Supports `SUM`/`MIN`/`MAX` (whose merge reuses the same UDAF, so no function
-//! registry is needed), inner joins with no residual (non-equi) filter, and
-//! plain-column join keys (group-by may be any expression — its push-side
-//! columns are pushed into the pre-aggregation grouping). It peels an intervening chain of
-//! column-only `ProjectionExec`s between the partial aggregate and the join
-//! (the shape the planner emits before `ProjectionPushdown`). Anything outside
-//! this leaves the plan unchanged.
+//! registry is needed), with no residual (non-equi) join filter and plain-column
+//! join keys (group-by may be any expression — its push-side columns are pushed
+//! into the pre-aggregation grouping). Join types:
+//! * **inner** — push into the side that supplies the aggregate arguments;
+//! * **`LeftSemi`/`LeftAnti`/`RightSemi`/`RightAnti`** (from IN/EXISTS) — the
+//!   output is a single side; push into it. A row of that side survives the join
+//!   based only on its join key's (non-)match on the other side, so collapsing it
+//!   by [join key ∪ group columns] before the join preserves which groups
+//!   survive.
+//!
+//! It peels an intervening chain of column-only `ProjectionExec`s between the
+//! partial aggregate and the join (the shape the planner emits before
+//! `ProjectionPushdown`). Anything outside this leaves the plan unchanged.
 //!
 //! # Cost-gated cascade
 //!
@@ -230,10 +237,20 @@ fn try_push_aggregate(
         }};
     }
 
-    // Guards: inner join, no extra filter.
-    if *join.join_type() != JoinType::Inner {
-        decline!("join_type is {:?}, only Inner supported", join.join_type());
-    }
+    // Supported join types: inner, and the semi/anti joins produced by
+    // IN/EXISTS. For semi/anti the output is a *single* side (left for `Left*`,
+    // right for `Right*`); the aggregate's columns and group-by live entirely on
+    // that side, and we push into it. A row of that side survives the join based
+    // only on whether its join key has (semi) / lacks (anti) a match on the other
+    // side, so collapsing it by [join key ∪ group columns] before the join is
+    // sound — the whole key-group survives or not together.
+    let join_type = *join.join_type();
+    let output_side = match join_type {
+        JoinType::Inner => None,
+        JoinType::LeftSemi | JoinType::LeftAnti => Some(Side::Left),
+        JoinType::RightSemi | JoinType::RightAnti => Some(Side::Right),
+        _ => decline!("join_type {join_type:?} not supported"),
+    };
     if join.filter().is_some() {
         decline!("join carries a non-equi filter");
     }
@@ -283,22 +300,28 @@ fn try_push_aggregate(
             collect_column_indices(&e, &mut arg_indices);
         }
     }
-    // All aggregate arguments must come from a single side (compared in raw
-    // left ++ right index space).
-    let all_left = arg_indices.iter().all(|&i| raw_index(i) < left_len);
-    let all_right = arg_indices.iter().all(|&i| raw_index(i) >= left_len);
-    let side = if all_left && !arg_indices.is_empty() {
-        Side::Left
-    } else if all_right && !arg_indices.is_empty() {
-        Side::Right
+    // Choose the side to push into. For semi/anti joins it is forced to the
+    // output side (the only side with columns; `agg_to_raw` already maps into its
+    // schema). For inner joins, the aggregate arguments must all come from one
+    // side (compared in raw left ++ right index space).
+    let side = if let Some(os) = output_side {
+        os
     } else {
-        decline!(
-            "aggregate args span both sides or are empty: raw_indices={:?} left_len={left_len}",
-            arg_indices
-                .iter()
-                .map(|&i| raw_index(i))
-                .collect::<Vec<_>>()
-        );
+        let all_left = arg_indices.iter().all(|&i| raw_index(i) < left_len);
+        let all_right = arg_indices.iter().all(|&i| raw_index(i) >= left_len);
+        if all_left && !arg_indices.is_empty() {
+            Side::Left
+        } else if all_right && !arg_indices.is_empty() {
+            Side::Right
+        } else {
+            decline!(
+                "aggregate args span both sides or are empty: raw_indices={:?} left_len={left_len}",
+                arg_indices
+                    .iter()
+                    .map(|&i| raw_index(i))
+                    .collect::<Vec<_>>()
+            );
+        }
     };
 
     // Group-by may include computed expressions (e.g. `extract(year from ...)`),
@@ -321,12 +344,15 @@ fn try_push_aggregate(
 
     // Build the pushed-down grouping over the push side: its join keys plus any
     // group-by columns originating from that side. Columns are expressed in the
-    // push side's own schema (left columns keep their index; right columns are
-    // shifted by `left_len` in the join output).
-    let to_push_index = |join_idx: usize| -> usize {
-        match side {
-            Side::Left => join_idx,
-            Side::Right => join_idx - left_len,
+    // push side's own schema. For an inner join, `raw_index` is a left ++ right
+    // index, so left columns keep their index and right columns are shifted by
+    // `left_len`. For a semi/anti join the output is a single side, so
+    // `raw_index` is already push-side-local and every group column is on it.
+    let to_push_index = |raw: usize| -> usize {
+        match (output_side, side) {
+            (Some(_), _) => raw,
+            (None, Side::Left) => raw,
+            (None, Side::Right) => raw - left_len,
         }
     };
     let mut pushdown_group: Vec<(Arc<dyn PhysicalExpr>, String)> = Vec::new();
@@ -342,7 +368,8 @@ fn try_push_aggregate(
     }
     for c in &group_cols {
         let raw = raw_index(c.index());
-        let on_side = (side == Side::Left && raw < left_len)
+        let on_side = output_side.is_some()
+            || (side == Side::Left && raw < left_len)
             || (side == Side::Right && raw >= left_len);
         if on_side {
             let pidx = to_push_index(raw);
@@ -794,6 +821,94 @@ mod tests {
         assert!(
             join_child_is_aggregate(&optimized),
             "expected a pre-aggregation pushed below the join"
+        );
+    }
+
+    // Non-inner (q22 shape): RightAnti join, output = right (customer) side; the
+    // measure and group-by live on that side, so the aggregation is pushed into
+    // it. Synthetic stats: the right join key is low-NDV so the pre-aggregation
+    // reduces (a real PK anti-key would not — see the SF100 caveat — so this test
+    // validates the anti-join mapping/mechanics, not a real-workload win).
+    #[test]
+    fn fires_on_right_anti_join() {
+        // left = existence side ("oorder"); right = output/measured side ("customer").
+        // oorder's join key matches few customer keys (NDV 10 vs 10k), so the
+        // anti-join keeps most customer rows -> join_out stays large.
+        let oorder = stats_leaf(
+            vec![Field::new("o_c_id", DataType::Int32, false)],
+            1_000,
+            &[Some(10)],
+        );
+        let customer = stats_leaf(
+            vec![
+                Field::new("c_id", DataType::Int32, false),
+                Field::new("c_state", DataType::Utf8, true),
+                Field::new("c_balance", DataType::Float64, true),
+            ],
+            10_000_000,
+            &[Some(10_000), Some(50), None],
+        );
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                oorder,
+                customer,
+                vec![(
+                    Arc::new(Column::new("o_c_id", 0)),
+                    Arc::new(Column::new("c_id", 0)),
+                )],
+                None,
+                &JoinType::RightAnti,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema(); // RightAnti output = customer columns
+
+        let sum_expr = Arc::new(
+            AggregateExprBuilder::new(
+                sum_udaf(),
+                vec![Arc::new(Column::new("c_balance", 2))],
+            )
+            .schema(Arc::clone(&join_schema))
+            .alias("sum(c_balance)")
+            .build()
+            .unwrap(),
+        );
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("c_state", 1)) as Arc<dyn PhysicalExpr>,
+            "c_state".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                vec![Arc::clone(&sum_expr)],
+                vec![None],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                vec![sum_expr],
+                vec![None],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let optimized = run_rule(plan);
+        assert!(
+            join_child_is_aggregate(&optimized),
+            "expected the aggregation pushed into the RightAnti output (right) side"
         );
     }
 
