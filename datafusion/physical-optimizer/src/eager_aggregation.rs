@@ -78,6 +78,34 @@
 //! where `join_output <= pre_aggregated_rows`. (This is why the decision must be
 //! physical/cost-based: a logical cascade — the existing logical rule — cannot
 //! tell a beneficial chain from a wasteful push below a selective join.)
+//!
+//! # Deferred / not yet supported
+//!
+//! The shapes below are recognized but intentionally declined for now; each is a
+//! follow-up. Search for `TODO(eager-agg)` for the corresponding bail points.
+//!
+//! * **`FilterExec` between the aggregate and the join.** The peel loop walks
+//!   only column-only `ProjectionExec`s; a `FilterExec` makes it bail. Supporting
+//!   it means keeping the filter (its push-side columns folded into the
+//!   pre-aggregation grouping, exactly like a residual `join.filter()`) and
+//!   re-inserting it above the rebuilt join with its predicate remapped. In
+//!   practice cross-side predicates already arrive as a `join.filter()` (handled);
+//!   single-side ones are sunk below the join before this rule runs — so this is
+//!   low priority until a decline map shows a real case.
+//! * **A nested aggregate between the top aggregate and the join** (subquery
+//!   aggregate; CH-benCHmark q13/q16). The peel reaches an `AggregateExec` rather
+//!   than a join and bails; handling it needs a distinct matcher.
+//! * **Aggregate measures spanning both join inputs** (e.g. `SUM(l.a + r.b)` or a
+//!   `CASE` over both sides; CH-benCHmark q14). Requires linear decomposition
+//!   (`SUM(l.a + r.b) = SUM(l.a)·fanout + SUM(r.b)·fanout`) with the
+//!   Yan–Larson/Fent–Neumann fan-out factors — a larger piece of work.
+//! * **`COUNT(*)` over an inner join.** With no column argument no side can be
+//!   inferred; only forced (semi/anti) sides are handled. An inner `COUNT(*)`
+//!   could ride a heuristic side choice but is declined for now.
+//! * **Decimal `AVG`.** Only Float64 `AVG` is recombined; a decimal result would
+//!   need its exact output scale reproduced in the division projection.
+//! * **`schema_check` is disabled** (COUNT→SUM widens non-null→nullable). A
+//!   `coalesce(_, 0)` in a top projection would let it stay enabled.
 
 use std::sync::Arc;
 
@@ -206,6 +234,12 @@ fn try_push_aggregate(
             if node.downcast_ref::<HashJoinExec>().is_some() {
                 break;
             }
+            // TODO(eager-agg): only column-only projections are peeled. A
+            // `FilterExec` here (filter above the join, pre-FilterPushdown) could
+            // be kept and re-applied with its push-side columns folded into the
+            // pre-aggregation grouping; an intervening `AggregateExec` (nested /
+            // subquery aggregate, e.g. CH-benCHmark q13/q16) would need a separate
+            // matcher. Both bail here for now. See the module "Deferred" section.
             let Some(proj) = node.downcast_ref::<ProjectionExec>() else {
                 log::debug!(
                     target: "eager_aggregation",
@@ -313,6 +347,7 @@ fn try_push_aggregate(
         // AVG decomposes to SUM/COUNT and is recombined by division. We only
         // handle the Float64 case (numeric inputs); decimal AVG keeps a Decimal
         // output whose scale we'd have to reproduce exactly, so decline it.
+        // TODO(eager-agg): support decimal AVG by reproducing the output scale.
         if agg.fun().name() == "avg" && agg.field().data_type() != &DataType::Float64 {
             decline!(
                 "AVG output type {:?} unsupported (only Float64)",
@@ -337,6 +372,10 @@ fn try_push_aggregate(
         } else if all_right && !arg_indices.is_empty() {
             Side::Right
         } else {
+            // TODO(eager-agg): empty args here is `COUNT(*)` over an inner join —
+            // no column pins a side. It could ride a heuristic side choice (push
+            // into the grouped side); declined for now. Args genuinely spanning
+            // both sides is the cross-side-measure case (see module "Deferred").
             decline!(
                 "aggregate args span both sides or are empty: raw_indices={:?} left_len={left_len}",
                 arg_indices
