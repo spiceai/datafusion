@@ -636,6 +636,22 @@ config_namespace! {
         /// Currently experimental
         pub split_file_groups_by_statistics: bool, default = false
 
+        /// Whether sibling partition streams of a single file scan may share a
+        /// common queue of unopened files and steal work from one another
+        /// (dynamic work scheduling).
+        ///
+        /// This is safe and beneficial when all output partitions of a scan are
+        /// executed by sibling streams within the same process, since the shared
+        /// queue guarantees every file is opened exactly once across the siblings.
+        ///
+        /// It MUST be disabled when partitions are executed in isolation from one
+        /// another — for example under a distributed engine (Ballista) where each
+        /// partition runs in a separate process. In that case each process would
+        /// build its own shared queue over *all* files and read the entire input,
+        /// causing N-fold scan amplification and N-fold inflated aggregate results.
+        /// When disabled, each partition reads only its own file group.
+        pub enable_file_scan_work_stealing: bool, default = true
+
         /// Should DataFusion keep the columns used for partition_by in the output RecordBatches
         pub keep_partition_by_columns: bool, default = false
 

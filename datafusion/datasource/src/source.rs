@@ -389,10 +389,23 @@ impl ExecutionPlan for DataSourceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        let shared_state = self
-            .execution_state
-            .get_or_init(|| self.data_source.create_sibling_state())
-            .clone();
+        // Sibling work-stealing shares one queue of unopened files across all
+        // partition streams of this scan. That is only correct when those streams
+        // run in the same process. Under a distributed engine each partition runs
+        // in isolation, so sharing must be disabled (each partition then reads
+        // only its own file group) to avoid reading the whole input per partition.
+        let shared_state = if context
+            .session_config()
+            .options()
+            .execution
+            .enable_file_scan_work_stealing
+        {
+            self.execution_state
+                .get_or_init(|| self.data_source.create_sibling_state())
+                .clone()
+        } else {
+            None
+        };
         let args = OpenArgs::new(partition, Arc::clone(&context))
             .with_shared_state(shared_state);
         let stream = self.data_source.open_with_args(args)?;
