@@ -241,7 +241,7 @@ fn try_push_aggregate(
             // subquery aggregate, e.g. CH-benCHmark q13/q16) would need a separate
             // matcher. Both bail here for now. See the module "Deferred" section.
             let Some(proj) = node.downcast_ref::<ProjectionExec>() else {
-                log::debug!(
+                log::info!(
                     target: "eager_aggregation",
                     "shape: aggregate input chain reaches {}, not a (projected) hash join",
                     node.name()
@@ -252,7 +252,7 @@ fn try_push_aggregate(
             let mut proj_map = Vec::with_capacity(proj.expr().len());
             for pe in proj.expr() {
                 let Some(c) = pe.expr.downcast_ref::<Column>() else {
-                    log::debug!(
+                    log::info!(
                         target: "eager_aggregation",
                         "shape: intervening projection has a computed expression (not a plain column)"
                     );
@@ -276,11 +276,14 @@ fn try_push_aggregate(
     }
 
     // From here the shape matched (Final <- Partial <- [Projection] <- Join), so
-    // any decline is informative: log the reason at debug level. Enable with
-    // `RUST_LOG=datafusion_physical_optimizer::eager_aggregation=debug`.
+    // any decline is informative: log the reason (and the accept decision with
+    // push_rows/grouped/join_out) at INFO so it survives release builds, which
+    // compile out debug!. Filter the target `eager_aggregation` to isolate it.
+    // (The high-frequency "input is not a partial aggregate" shape miss stays at
+    // debug — it fires for every aggregate node in every plan.)
     macro_rules! decline {
         ($($arg:tt)*) => {{
-            log::debug!(target: "eager_aggregation", "decline: {}", format!($($arg)*));
+            log::info!(target: "eager_aggregation", "decline: {}", format!($($arg)*));
             return Ok(None);
         }};
     }
@@ -483,7 +486,7 @@ fn try_push_aggregate(
             grouped,
             join_out,
         } => {
-            log::debug!(
+            log::info!(
                 target: "eager_aggregation",
                 "accept: side={side:?} push_rows={push_rows} grouped={grouped} join_out={join_out}"
             );
@@ -744,7 +747,7 @@ fn try_push_aggregate(
         new_top_final
     };
 
-    log::debug!(
+    log::info!(
         target: "eager_aggregation",
         "pushed aggregation into {side:?} side of join"
     );
