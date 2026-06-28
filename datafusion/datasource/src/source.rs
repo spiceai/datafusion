@@ -389,19 +389,10 @@ impl ExecutionPlan for DataSourceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // Sibling work-stealing shares one queue of unopened files across all
-        // partition streams of this scan. That is only correct when those streams
-        // run in the same process. Under a distributed engine each partition runs
-        // in isolation, so sharing must be disabled (each partition then reads
-        // only its own file group) to avoid reading the whole input per partition.
-        //
-        // `create_sibling_state` is the work-stealing hook and is currently only
-        // implemented by file-scan sources (`FileScanConfig`); every other
-        // `DataSource` inherits the default `None`, so this gate is effectively
-        // file-scan scoped and the `enable_file_scan_work_stealing` name is
-        // accurate. A future `DataSource` that introduces its own sibling state
-        // would also be governed by this flag and should revisit whether that is
-        // the intended behavior.
+        // Sibling work-stealing shares one file queue across a scan's partition
+        // streams, which is only correct when they run in the same process.
+        // Disable it for isolated partitions (e.g. distributed execution) so each
+        // reads only its own file group.
         let shared_state = if context
             .session_config()
             .options()
@@ -649,12 +640,8 @@ mod work_stealing_gate_tests {
     use datafusion_execution::config::SessionConfig;
     use datafusion_physical_plan::stream::EmptyRecordBatchStream;
 
-    /// A minimal [`DataSource`] that always offers sibling (work-stealing) state and
-    /// records whether that state was actually handed to it through
-    /// [`DataSource::open_with_args`]. This lets the test observe how
-    /// [`DataSourceExec::execute`] gates work-stealing on the
-    /// `enable_file_scan_work_stealing` option without depending on a real file
-    /// scan.
+    /// A [`DataSource`] that always offers sibling state and records whether
+    /// [`DataSourceExec::execute`] actually handed it that state.
     #[derive(Debug)]
     struct GateProbeSource {
         schema: SchemaRef,
@@ -718,9 +705,8 @@ mod work_stealing_gate_tests {
         }
     }
 
-    /// Execute partition 0 of a `DataSourceExec` wrapping a [`GateProbeSource`] with
-    /// the given `enable_file_scan_work_stealing` setting; returns whether the
-    /// source was handed sibling (work-stealing) state.
+    /// Execute partition 0 with the given `enable_file_scan_work_stealing` value
+    /// and return whether the source was handed sibling state.
     fn executed_with_sibling_state(enable_work_stealing: bool) -> Result<bool> {
         let schema: SchemaRef = Arc::new(Schema::empty());
         let saw_sibling_state = Arc::new(AtomicBool::new(false));
@@ -745,15 +731,12 @@ mod work_stealing_gate_tests {
 
     #[test]
     fn work_stealing_gate_controls_sibling_state() -> Result<()> {
-        // Single-process default: work-stealing on, sibling state is shared so
-        // partitions cooperatively drain one file queue.
+        // Default (single-process): sibling state is shared for work-stealing.
         assert!(
             executed_with_sibling_state(true)?,
             "enable_file_scan_work_stealing=true should pass shared sibling state to the source",
         );
-        // Distributed setting: work-stealing off, the source opens each partition in
-        // isolation (no shared file queue) so it reads only its own file group and
-        // does not re-read files belonging to other partitions.
+        // Disabled (distributed): no sibling state, so no cross-partition stealing.
         assert!(
             !executed_with_sibling_state(false)?,
             "enable_file_scan_work_stealing=false must NOT pass sibling state (no cross-partition work-stealing)",
