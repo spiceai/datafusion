@@ -97,21 +97,28 @@ pub(crate) fn should_swap_join_order(
     let left_stats = get_stats(left, registry)?;
     let right_stats = get_stats(right, registry)?;
 
+    let l_b = left_stats.total_byte_size.get_value().copied();
+    let r_b = right_stats.total_byte_size.get_value().copied();
+    let l_r = left_stats.num_rows.get_value().copied();
+    let r_r = right_stats.num_rows.get_value().copied();
+
     // First compare total_byte_size, then fall back to num_rows if byte
     // sizes are unavailable.
-    match (
-        left_stats.total_byte_size.get_value(),
-        right_stats.total_byte_size.get_value(),
-    ) {
-        (Some(l), Some(r)) => Ok(l > r),
-        _ => match (
-            left_stats.num_rows.get_value(),
-            right_stats.num_rows.get_value(),
-        ) {
-            (Some(l), Some(r)) => Ok(l > r),
-            _ => Ok(false),
+    let swap = match (l_b, r_b) {
+        (Some(l), Some(r)) => l > r,
+        _ => match (l_r, r_r) {
+            (Some(l), Some(r)) => l > r,
+            _ => false,
         },
-    }
+    };
+
+    log::trace!(
+        "should_swap_join_order left={} right={} left_bytes={l_b:?} right_bytes={r_b:?} left_rows={l_r:?} right_rows={r_r:?} swap={swap}",
+        left.name(),
+        right.name()
+    );
+
+    Ok(swap)
 }
 
 fn supports_collect_by_thresholds(
