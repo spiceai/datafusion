@@ -1101,15 +1101,19 @@ impl DataSource for FileScanConfig {
     /// Create any shared state that should be passed between sibling streams
     /// during one execution.
     ///
+    /// The shared source starts empty. Each opened partition registers its own
+    /// file group, so sibling streams can only steal work from partitions that
+    /// are actually executing in this process.
+    ///
     /// This returns `None` when sibling streams must not share work, such as
     /// when file order must be preserved or the file groups define the output
-    /// partitioning needed for the rest of the plan
+    /// partitioning needed for the rest of the plan.
     fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
         if self.preserve_order || self.partitioned_by_file_group {
             return None;
         }
 
-        Some(Arc::new(SharedWorkSource::from_config(self)) as Arc<dyn Any + Send + Sync>)
+        Some(Arc::new(SharedWorkSource::empty()) as Arc<dyn Any + Send + Sync>)
     }
 }
 

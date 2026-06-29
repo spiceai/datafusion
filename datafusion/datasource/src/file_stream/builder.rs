@@ -114,14 +114,17 @@ impl<'a> FileStreamBuilder<'a> {
             return internal_err!("FileStreamBuilder missing required metrics");
         };
         let projected_schema = config.projected_schema()?;
-        let Some(file_group) = config.file_groups.get(partition).cloned() else {
+        let Some(file_group) = config.file_groups.get(partition) else {
             return internal_err!(
                 "FileStreamBuilder invalid partition index: {partition}"
             );
         };
         let work_source = match shared_work_source {
-            Some(shared) => WorkSource::Shared(shared),
-            None => WorkSource::Local(file_group.into_inner().into()),
+            Some(shared) => {
+                shared.register_partition(partition, config);
+                WorkSource::Shared(shared)
+            }
+            None => WorkSource::Local(file_group.clone().into_inner().into()),
         };
 
         let file_stream_metrics = FileStreamMetrics::new(metrics, partition);

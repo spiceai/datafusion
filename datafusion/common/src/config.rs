@@ -636,12 +636,6 @@ config_namespace! {
         /// Currently experimental
         pub split_file_groups_by_statistics: bool, default = false
 
-        /// Whether sibling partition streams of a file scan share a queue of
-        /// unopened files and steal work from one another. Must be disabled when
-        /// partitions run in separate processes (e.g. distributed execution),
-        /// where each would otherwise scan the whole input, not just its group.
-        pub enable_file_scan_work_stealing: bool, default = true
-
         /// Should DataFusion keep the columns used for partition_by in the output RecordBatches
         pub keep_partition_by_columns: bool, default = false
 

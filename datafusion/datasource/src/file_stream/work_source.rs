@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
 use crate::PartitionedFile;
-use crate::file_groups::FileGroup;
 use crate::file_scan_config::FileScanConfig;
 use parking_lot::Mutex;
 
@@ -55,14 +54,18 @@ impl WorkSource {
     }
 }
 
-/// Shared source of work for sibling `FileStream`s
+/// Shared source of work for sibling `FileStream`s.
 ///
-/// The queue is created once per execution and shared by all reorderable
-/// sibling streams for that execution. Whichever stream becomes idle first may
-/// take the next unopened file from the front of the queue.
+/// The source is created once per execution and shared by all reorderable
+/// sibling streams for that execution. It starts empty: each stream registers
+/// its own partition's files when it is opened. Whichever stream becomes idle
+/// first may then take the next unopened file from any partition that has been
+/// registered in this process.
 ///
-/// It uses a [`Mutex`] internally to provide thread-safe access
-/// to the shared file queue.
+/// Registering files lazily keeps distributed execution correct. If a process
+/// opens only partition `p`, only that partition's files are available to the
+/// shared queue; if it opens all partitions, all files are available for local
+/// work stealing.
 #[derive(Debug, Clone)]
 pub(crate) struct SharedWorkSource {
     inner: Arc<SharedWorkSourceInner>,
@@ -70,40 +73,47 @@ pub(crate) struct SharedWorkSource {
 
 #[derive(Debug, Default)]
 pub(super) struct SharedWorkSourceInner {
-    files: Mutex<VecDeque<PartitionedFile>>,
+    state: Mutex<SharedWorkSourceState>,
+}
+
+#[derive(Debug, Default)]
+struct SharedWorkSourceState {
+    files: VecDeque<PartitionedFile>,
+    registered_partitions: HashSet<usize>,
 }
 
 impl SharedWorkSource {
-    /// Create a shared work source containing the provided unopened files.
-    pub(crate) fn new(files: impl IntoIterator<Item = PartitionedFile>) -> Self {
-        let files = files.into_iter().collect();
+    /// Create an empty shared work source.
+    pub(crate) fn empty() -> Self {
         Self {
-            inner: Arc::new(SharedWorkSourceInner {
-                files: Mutex::new(files),
-            }),
+            inner: Arc::new(SharedWorkSourceInner::default()),
         }
     }
 
-    /// Create a shared work source for the unopened files in `config`.
+    /// Register the files for `partition` in this process-local work source.
     ///
-    /// Files are reordered by the file source (e.g. by statistics for TopK)
-    /// before being placed in the shared queue, so the most promising files
-    /// are processed first across all partitions.
-    pub(crate) fn from_config(config: &FileScanConfig) -> Self {
-        let files: Vec<_> = config
-            .file_groups
-            .iter()
-            .flat_map(FileGroup::iter)
-            .cloned()
-            .collect();
-        let files = config.file_source.reorder_files(files);
-        Self::new(files)
+    /// A partition is registered at most once. Files are reordered by the file
+    /// source (e.g. by statistics for TopK) together with any already queued
+    /// files before becoming available for sibling streams to steal.
+    pub(crate) fn register_partition(&self, partition: usize, config: &FileScanConfig) {
+        let Some(file_group) = config.file_groups.get(partition) else {
+            return;
+        };
+
+        let mut state = self.inner.state.lock();
+        if !state.registered_partitions.insert(partition) || file_group.is_empty() {
+            return;
+        }
+
+        state.files.extend(file_group.iter().cloned());
+        let files = state.files.drain(..).collect();
+        state.files = config.file_source.reorder_files(files).into();
     }
 
     /// Pop the next file from the shared work queue.
     ///
-    /// Returns `None` if the queue is empty
+    /// Returns `None` if the queue is empty.
     fn pop_front(&self) -> Option<PartitionedFile> {
-        self.inner.files.lock().pop_front()
+        self.inner.state.lock().files.pop_front()
     }
 }

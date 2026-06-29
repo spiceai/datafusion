@@ -1077,6 +1077,31 @@ mod tests {
         Ok(())
     }
 
+    /// Verifies that a process that opens only one partition only registers
+    /// that partition's files in the shared queue.
+    #[tokio::test]
+    async fn morsel_only_opened_partition_is_registered() -> Result<()> {
+        let test = two_partition_morsel_test();
+        let config = test.test_config();
+        let shared_work_source = config
+            .create_sibling_state()
+            .and_then(|state| state.as_ref().downcast_ref::<SharedWorkSource>().cloned())
+            .expect("shared work source");
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        let stream = FileStreamBuilder::new(&config)
+            .with_partition(1)
+            .with_shared_work_source(Some(shared_work_source))
+            .with_morselizer(Box::new(test.morselizer))
+            .with_metrics(&metrics)
+            .build()?;
+
+        insta::assert_snapshot!(drain_stream_output(stream).await?, @"Batch: 201");
+        assert_eq!(metric_count(&metrics, "files_opened"), 1);
+
+        Ok(())
+    }
+
     /// Verifies that a stream that must preserve order keeps its files local
     /// and therefore cannot steal from a sibling shared queue.
     #[tokio::test]
@@ -1166,11 +1191,11 @@ mod tests {
         Ok(())
     }
 
-    /// Ensures that if a sibling is built and polled
-    /// before another sibling has been built and contributed its files to the
-    /// shared queue, the first sibling does not finish prematurely.
+    /// Ensures that if an empty sibling is built and polled before another
+    /// partition registers its files, the later partition still reads its own
+    /// files.
     #[tokio::test]
-    async fn morsel_empty_sibling_can_finish_before_shared_work_exists() -> Result<()> {
+    async fn morsel_empty_sibling_before_late_registration() -> Result<()> {
         let test = FileStreamMorselTest::new()
             .with_file_in_partition(
                 PartitionId(0),
@@ -1185,21 +1210,19 @@ mod tests {
                     .return_none(),
             )
             // Build streams lazily so partition 1 can poll the shared queue
-            // before partition 0 has contributed its files. Once partition 0
-            // is built, a later poll of partition 1 can still steal one of
-            // them from the shared queue.
+            // before partition 0 has registered its files.
             .with_build_streams_on_first_read(true)
             .with_reads(vec![PartitionId(1), PartitionId(0), PartitionId(1)])
             .with_file_stream_events(false);
 
-        // Partition 1 polls too early once, then later steals one file after
-        // partition 0 has populated the shared queue.
+        // Partition 1 polls too early and finishes. Partition 0 later
+        // registers and reads its own files; no work is lost.
         insta::assert_snapshot!(test.run().await.unwrap(), @r"
         ----- Partition 0 -----
+        Batch: 101
         Batch: 102
         Done
         ----- Partition 1 -----
-        Batch: 101
         Done
         ----- File Stream Events -----
         (omitted due to with_file_stream_events(false))
@@ -1222,18 +1245,18 @@ mod tests {
         let limited_metrics = ExecutionPlanMetricsSet::new();
         let unlimited_metrics = ExecutionPlanMetricsSet::new();
 
-        let limited_stream = FileStreamBuilder::new(&limited_config)
-            .with_partition(1)
-            .with_shared_work_source(Some(shared_work_source.clone()))
-            .with_morselizer(Box::new(test.morselizer.clone()))
-            .with_metrics(&limited_metrics)
-            .build()?;
-
         let unlimited_stream = FileStreamBuilder::new(&unlimited_config)
             .with_partition(0)
+            .with_shared_work_source(Some(shared_work_source.clone()))
+            .with_morselizer(Box::new(test.morselizer.clone()))
+            .with_metrics(&unlimited_metrics)
+            .build()?;
+
+        let limited_stream = FileStreamBuilder::new(&limited_config)
+            .with_partition(1)
             .with_shared_work_source(Some(shared_work_source))
             .with_morselizer(Box::new(test.morselizer))
-            .with_metrics(&unlimited_metrics)
+            .with_metrics(&limited_metrics)
             .build()?;
 
         let limited_output = drain_stream_output(limited_stream).await?;
@@ -1406,7 +1429,7 @@ mod tests {
         ///
         /// The default builds all streams before polling begins, which matches
         /// normal execution. Tests may enable lazy creation to model races
-        /// where one sibling polls before another has contributed its files to
+        /// where one sibling polls before another has registered its files in
         /// the shared queue.
         fn with_build_streams_on_first_read(
             mut self,
@@ -1449,30 +1472,18 @@ mod tests {
                 .map(|_| PartitionState::new())
                 .collect::<Vec<_>>();
 
-            let mut build_order = Vec::new();
-            for partition in self.reads.iter().map(|partition| partition.0) {
-                if !build_order.contains(&partition) {
-                    build_order.push(partition);
-                }
-            }
-            for partition in 0..partition_count {
-                if !build_order.contains(&partition) {
-                    build_order.push(partition);
-                }
-            }
-
             let config = self.test_config();
             // `DataSourceExec::execute` creates one execution-local shared
             // state object via `create_sibling_state()` and then passes it
-            // to `open_with_sibling_state(...)`. These tests build
-            // `FileStream`s directly, bypassing `DataSourceExec`, so they must
-            // perform the same setup explicitly when exercising sibling-stream
-            // work stealing.
+            // to `open_with_args(...)`. These tests build `FileStream`s
+            // directly, bypassing `DataSourceExec`, so they must perform the
+            // same setup explicitly when exercising sibling-stream work
+            // stealing.
             let shared_work_source = config.create_sibling_state().and_then(|state| {
                 state.as_ref().downcast_ref::<SharedWorkSource>().cloned()
             });
             if !self.build_streams_on_first_read {
-                for partition in build_order {
+                for partition in 0..partition_count {
                     let stream = FileStreamBuilder::new(&config)
                         .with_partition(partition)
                         .with_shared_work_source(shared_work_source.clone())

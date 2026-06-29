@@ -389,22 +389,10 @@ impl ExecutionPlan for DataSourceExec {
         partition: usize,
         context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
-        // Sibling work-stealing shares one file queue across a scan's partition
-        // streams, which is only correct when they run in the same process.
-        // Disable it for isolated partitions (e.g. distributed execution) so each
-        // reads only its own file group.
-        let shared_state = if context
-            .session_config()
-            .options()
-            .execution
-            .enable_file_scan_work_stealing
-        {
-            self.execution_state
-                .get_or_init(|| self.data_source.create_sibling_state())
-                .clone()
-        } else {
-            None
-        };
+        let shared_state = self
+            .execution_state
+            .get_or_init(|| self.data_source.create_sibling_state())
+            .clone();
         let args = OpenArgs::new(partition, Arc::clone(&context))
             .with_shared_state(shared_state);
         let stream = self.data_source.open_with_args(args)?;
@@ -627,120 +615,5 @@ where
 {
     fn from(source: S) -> Self {
         Self::new(Arc::new(source))
-    }
-}
-
-#[cfg(test)]
-mod work_stealing_gate_tests {
-    use super::*;
-    use std::any::Any;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    use arrow::datatypes::{Schema, SchemaRef};
-    use datafusion_execution::config::SessionConfig;
-    use datafusion_physical_plan::stream::EmptyRecordBatchStream;
-
-    /// A [`DataSource`] that always offers sibling state and records whether
-    /// [`DataSourceExec::execute`] actually handed it that state.
-    #[derive(Debug)]
-    struct GateProbeSource {
-        schema: SchemaRef,
-        saw_sibling_state: Arc<AtomicBool>,
-    }
-
-    impl DataSource for GateProbeSource {
-        fn open(
-            &self,
-            _partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            Ok(Box::pin(EmptyRecordBatchStream::new(Arc::clone(
-                &self.schema,
-            ))))
-        }
-
-        fn open_with_args(&self, args: OpenArgs) -> Result<SendableRecordBatchStream> {
-            self.saw_sibling_state
-                .store(args.sibling_state.is_some(), Ordering::SeqCst);
-            self.open(args.partition, args.context)
-        }
-
-        /// Always offer sibling state so the gate has an observable effect.
-        fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-            Some(Arc::new(()) as Arc<dyn Any + Send + Sync>)
-        }
-
-        fn fmt_as(&self, _t: DisplayFormatType, _f: &mut Formatter) -> fmt::Result {
-            Ok(())
-        }
-
-        fn output_partitioning(&self) -> Partitioning {
-            Partitioning::UnknownPartitioning(1)
-        }
-
-        fn eq_properties(&self) -> EquivalenceProperties {
-            EquivalenceProperties::new(Arc::clone(&self.schema))
-        }
-
-        fn partition_statistics(
-            &self,
-            _partition: Option<usize>,
-        ) -> Result<Arc<Statistics>> {
-            Ok(Arc::new(Statistics::new_unknown(self.schema.as_ref())))
-        }
-
-        fn with_fetch(&self, _limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
-            None
-        }
-
-        fn fetch(&self) -> Option<usize> {
-            None
-        }
-
-        fn try_swapping_with_projection(
-            &self,
-            _projection: &ProjectionExprs,
-        ) -> Result<Option<Arc<dyn DataSource>>> {
-            Ok(None)
-        }
-    }
-
-    /// Execute partition 0 with the given `enable_file_scan_work_stealing` value
-    /// and return whether the source was handed sibling state.
-    fn executed_with_sibling_state(enable_work_stealing: bool) -> Result<bool> {
-        let schema: SchemaRef = Arc::new(Schema::empty());
-        let saw_sibling_state = Arc::new(AtomicBool::new(false));
-        let source = Arc::new(GateProbeSource {
-            schema,
-            saw_sibling_state: Arc::clone(&saw_sibling_state),
-        });
-        let exec = DataSourceExec::new(source);
-
-        let mut config = SessionConfig::new();
-        config
-            .options_mut()
-            .execution
-            .enable_file_scan_work_stealing = enable_work_stealing;
-        let ctx = Arc::new(TaskContext::default().with_session_config(config));
-
-        // execute() calls `open_with_args` synchronously before returning the
-        // stream, so the probe flag is set by the time this returns.
-        let _stream = exec.execute(0, ctx)?;
-        Ok(saw_sibling_state.load(Ordering::SeqCst))
-    }
-
-    #[test]
-    fn work_stealing_gate_controls_sibling_state() -> Result<()> {
-        // Default (single-process): sibling state is shared for work-stealing.
-        assert!(
-            executed_with_sibling_state(true)?,
-            "enable_file_scan_work_stealing=true should pass shared sibling state to the source",
-        );
-        // Disabled (distributed): no sibling state, so no cross-partition stealing.
-        assert!(
-            !executed_with_sibling_state(false)?,
-            "enable_file_scan_work_stealing=false must NOT pass sibling state (no cross-partition work-stealing)",
-        );
-        Ok(())
     }
 }
