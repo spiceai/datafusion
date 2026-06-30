@@ -416,29 +416,64 @@ impl Statistics {
         }
     }
 
-    /// Calculates `total_byte_size` based on the schema and `num_rows`.
-    /// If any of the columns has non-primitive width, `total_byte_size` is set to inexact.
+    /// Recalculates `total_byte_size` from the per-column statistics and `schema`.
+    ///
+    /// Each column contributes, in priority order:
+    /// 1. its own `byte_size` (a per-column total across all rows) when known
+    /// 2. `primitive_width() * num_rows` for a fixed-width type whose `byte_size`
+    ///    is absent.
+    ///
+    /// This matters after a projection: without per-column accounting, a scan
+    /// that projects a wide table down to a few narrow columns would keep the
+    /// full unprojected `total_byte_size` the moment one variable-width column
+    /// (e.g. `Utf8`) survived — drastically over-reporting the materialized size
+    ///
+    /// Falls back to the existing `total_byte_size` (downgraded to inexact) only
+    /// when it cannot be derived: `num_rows` is unknown, or some column is
+    /// variable-width *and* has no `byte_size` (nothing to size it from).
+    ///
+    /// Requires `column_statistics` to be aligned with `schema`.
     pub fn calculate_total_byte_size(&mut self, schema: &Schema) {
-        let mut row_size = Some(0);
-        for field in schema.fields() {
+        let Some(&num_rows) = self.num_rows.get_value() else {
+            // No row-count signal to derive sizes from; keep the prior estimate.
+            self.total_byte_size = self.total_byte_size.to_inexact();
+            return;
+        };
+
+        let mut sum: usize = 0;
+        let mut exact = true;
+        let num_rows_exact = self.num_rows.is_exact().unwrap_or(false);
+
+        for (i, field) in schema.fields().iter().enumerate() {
+            // 1) Prefer the column's own byte_size (a per-column total).
+            if let Some(col) = self.column_statistics.get(i) {
+                if let Some(&bytes) = col.byte_size.get_value() {
+                    sum = sum.saturating_add(bytes);
+                    exact &= col.byte_size.is_exact().unwrap_or(false);
+                    continue;
+                }
+            }
+            // 2) Fall back to the type width when byte_size is absent.
             match field.data_type().primitive_width() {
                 Some(width) => {
-                    row_size = row_size.map(|s| s + width);
+                    sum = sum.saturating_add(width.saturating_mul(num_rows));
+                    exact &= num_rows_exact;
                 }
                 None => {
-                    row_size = None;
-                    break;
+                    // Variable-width column with no byte_size: nothing to size it
+                    // from. Preserve the prior behavior — keep the existing
+                    // estimate, downgraded to inexact — rather than under-counting.
+                    self.total_byte_size = self.total_byte_size.to_inexact();
+                    return;
                 }
             }
         }
-        match row_size {
-            None => {
-                self.total_byte_size = self.total_byte_size.to_inexact();
-            }
-            Some(size) => {
-                self.total_byte_size = self.num_rows.multiply(&Precision::Exact(size));
-            }
-        }
+
+        self.total_byte_size = if exact {
+            Precision::Exact(sum)
+        } else {
+            Precision::Inexact(sum)
+        };
     }
 
     /// Returns an unbounded `ColumnStatistics` for each field in the schema.
@@ -1482,6 +1517,68 @@ mod tests {
         let projection = Some(vec![1, 2, 1, 1, 0, 2]);
         let stats = make_stats(vec![10, 20, 30]).project(projection.as_ref());
         assert_eq!(stats, make_stats(vec![20, 30, 20, 20, 10, 30]));
+    }
+
+    #[test]
+    fn test_calculate_total_byte_size_sums_per_column_byte_size() {
+        // Mixed fixed/variable-width schema; every column carries its own
+        // byte_size (as Vortex surfaces via UncompressedSizeInBytes).
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false), // variable-width
+        ]);
+        let mut stats = Statistics {
+            num_rows: Precision::Exact(1000),
+            // A stale, inflated total (as if inherited from an unprojected table).
+            total_byte_size: Precision::Exact(999_999_999),
+            column_statistics: vec![
+                ColumnStatistics::new_unknown().with_byte_size(Precision::Exact(4_000)),
+                ColumnStatistics::new_unknown().with_byte_size(Precision::Exact(6_000)),
+            ],
+        };
+        stats.calculate_total_byte_size(&schema);
+        // Sum of per-column byte_size, NOT the stale total — and the surviving
+        // Utf8 column no longer forces a fallback to the full size.
+        assert_eq!(stats.total_byte_size, Precision::Exact(10_000));
+    }
+
+    #[test]
+    fn test_calculate_total_byte_size_fixed_width_fallback() {
+        // No per-column byte_size: fall back to type widths * num_rows.
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false), // 4 bytes
+            Field::new("b", DataType::Int64, false), // 8 bytes
+        ]);
+        let mut stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Absent,
+            column_statistics: vec![
+                ColumnStatistics::new_unknown(),
+                ColumnStatistics::new_unknown(),
+            ],
+        };
+        stats.calculate_total_byte_size(&schema);
+        assert_eq!(stats.total_byte_size, Precision::Exact(1_200)); // (4+8)*100
+    }
+
+    #[test]
+    fn test_calculate_total_byte_size_variable_width_no_byte_size_keeps_prior() {
+        // Variable-width column with no byte_size: nothing to size it from, so the
+        // prior estimate is preserved (downgraded to inexact), not under-counted.
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Utf8, false),
+        ]);
+        let mut stats = Statistics {
+            num_rows: Precision::Exact(100),
+            total_byte_size: Precision::Exact(123_456),
+            column_statistics: vec![
+                ColumnStatistics::new_unknown().with_byte_size(Precision::Exact(400)),
+                ColumnStatistics::new_unknown(), // Utf8, byte_size Absent
+            ],
+        };
+        stats.calculate_total_byte_size(&schema);
+        assert_eq!(stats.total_byte_size, Precision::Inexact(123_456));
     }
 
     // Make a Statistics structure with the specified null counts for each column

@@ -729,8 +729,11 @@ impl ProjectionExprs {
             };
             column_statistics.push(col_stats);
         }
-        stats.calculate_total_byte_size(output_schema);
+        // Assign the projected per-column statistics first so
+        // `calculate_total_byte_size` sums the projected columns' own `byte_size`
+        // (aligned with `output_schema`)
         stats.column_statistics = column_statistics;
+        stats.calculate_total_byte_size(output_schema);
         Ok(stats)
     }
 }
@@ -2366,6 +2369,42 @@ pub(crate) mod tests {
         };
 
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_stats_projection_sums_per_column_byte_size() {
+        // Wide source: [c_id Int32, c_state Utf8 (narrow), c_data Utf8 (fat)].
+        let schema = Schema::new(vec![
+            Field::new("c_id", DataType::Int32, false),
+            Field::new("c_state", DataType::Utf8, false),
+            Field::new("c_data", DataType::Utf8, false),
+        ]);
+        let source = Statistics {
+            num_rows: Precision::Exact(1_000_000),
+            total_byte_size: Precision::Exact(744_000_000), // full row incl. c_data
+            column_statistics: vec![
+                ColumnStatistics::new_unknown().with_byte_size(Precision::Exact(4_000_000)),
+                ColumnStatistics::new_unknown().with_byte_size(Precision::Exact(6_000_000)),
+                ColumnStatistics::new_unknown()
+                    .with_byte_size(Precision::Exact(734_000_000)),
+            ],
+        };
+        // Project [c_id, c_state] (drop the fat c_data column).
+        let projection = ProjectionExprs::new(vec![
+            ProjectionExpr {
+                expr: Arc::new(Column::new("c_id", 0)),
+                alias: "c_id".to_string(),
+            },
+            ProjectionExpr {
+                expr: Arc::new(Column::new("c_state", 1)),
+                alias: "c_state".to_string(),
+            },
+        ]);
+        let result = projection
+            .project_statistics(source, &projection.project_schema(&schema).unwrap())
+            .unwrap();
+        // Sum of the two surviving columns' byte_size, not the 744MB full row.
+        assert_eq!(result.total_byte_size, Precision::Exact(10_000_000));
     }
 
     // Tests for Projection struct
