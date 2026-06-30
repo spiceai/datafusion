@@ -194,9 +194,8 @@ impl PhysicalOptimizerRule for EagerAggregation {
             }
         })?;
         if n_agg > 0 {
-            log::debug!(
-                target: "eager_aggregation",
-                "considered plan: AggregateExec={n_agg} (final={n_final} partial={n_partial} single={n_single}), HashJoinExec={n_join}, rewritten={}",
+            eprintln!(
+                "eager_aggregation: considered plan: AggregateExec={n_agg} (final={n_final} partial={n_partial} single={n_single}), HashJoinExec={n_join}, rewritten={}",
                 optimized.transformed
             );
         }
@@ -239,9 +238,8 @@ fn try_push_aggregate(
         return Ok(None);
     }
     let Some(top_partial) = top_final.input().downcast_ref::<AggregateExec>() else {
-        log::debug!(
-            target: "eager_aggregation",
-            "shape: final aggregate's input is {}, not a partial aggregate",
+        eprintln!(
+            "eager_aggregation: shape: final aggregate's input is {}, not a partial aggregate",
             top_final.input().name()
         );
         return Ok(None);
@@ -271,9 +269,8 @@ fn try_push_aggregate(
             // subquery aggregate, e.g. CH-benCHmark q13/q16) would need a separate
             // matcher. Both bail here for now. See the module "Deferred" section.
             let Some(proj) = node.downcast_ref::<ProjectionExec>() else {
-                log::info!(
-                    target: "eager_aggregation",
-                    "shape: aggregate input chain reaches {}, not a (projected) hash join",
+                eprintln!(
+                    "eager_aggregation: shape: aggregate input chain reaches {}, not a (projected) hash join",
                     node.name()
                 );
                 return Ok(None);
@@ -282,9 +279,8 @@ fn try_push_aggregate(
             let mut proj_map = Vec::with_capacity(proj.expr().len());
             for pe in proj.expr() {
                 let Some(c) = pe.expr.downcast_ref::<Column>() else {
-                    log::info!(
-                        target: "eager_aggregation",
-                        "shape: intervening projection has a computed expression (not a plain column)"
+                    eprintln!(
+                        "eager_aggregation: shape: intervening projection has a computed expression (not a plain column)"
                     );
                     return Ok(None);
                 };
@@ -313,7 +309,7 @@ fn try_push_aggregate(
     // debug — it fires for every aggregate node in every plan.)
     macro_rules! decline {
         ($($arg:tt)*) => {{
-            log::info!(target: "eager_aggregation", "decline: {}", format!($($arg)*));
+            eprintln!("eager_aggregation: decline: {}", format!($($arg)*));
             return Ok(None);
         }};
     }
@@ -516,9 +512,8 @@ fn try_push_aggregate(
             grouped,
             join_out,
         } => {
-            log::info!(
-                target: "eager_aggregation",
-                "accept: side={side:?} push_rows={push_rows} grouped={grouped} join_out={join_out}"
+            eprintln!(
+                "eager_aggregation: accept: side={side:?} push_rows={push_rows} grouped={grouped} join_out={join_out}"
             );
         }
         CostGate::Decline(reason) => decline!("cost gate: {reason}"),
@@ -777,9 +772,8 @@ fn try_push_aggregate(
         new_top_final
     };
 
-    log::info!(
-        target: "eager_aggregation",
-        "pushed aggregation into {side:?} side of join"
+    eprintln!(
+        "eager_aggregation: pushed aggregation into {side:?} side of join"
     );
     Ok(Some(result))
 }
