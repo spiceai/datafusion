@@ -166,11 +166,41 @@ impl PhysicalOptimizerRule for EagerAggregation {
         if !config.optimizer.enable_eager_aggregation {
             return Ok(plan);
         }
-        plan.transform_down(|plan| match try_push_aggregate(&plan, config)? {
-            Some(new_plan) => Ok(Transformed::yes(new_plan)),
-            None => Ok(Transformed::no(plan)),
-        })
-        .map(|t| t.data)
+        // Observability: this is a cost-based rule that silently no-ops when the
+        // plan shape or cost gate doesn't qualify (most per-node guards in
+        // `try_push_aggregate` bail at debug or silently). Summarize the
+        // aggregate/join landscape it considered so a plan that wasn't rewritten
+        // still explains itself. Debug-level + only when the plan has aggregates,
+        // so it's quiet unless `eager_aggregation=debug` is set.
+        let (mut n_agg, mut n_final, mut n_partial, mut n_single, mut n_join) =
+            (0u32, 0u32, 0u32, 0u32, 0u32);
+        let optimized = plan.transform_down(|plan| {
+            if let Some(agg) = plan.downcast_ref::<AggregateExec>() {
+                n_agg += 1;
+                match agg.mode() {
+                    AggregateMode::Final | AggregateMode::FinalPartitioned => {
+                        n_final += 1
+                    }
+                    AggregateMode::Partial => n_partial += 1,
+                    _ => n_single += 1,
+                }
+            }
+            if plan.downcast_ref::<HashJoinExec>().is_some() {
+                n_join += 1;
+            }
+            match try_push_aggregate(&plan, config)? {
+                Some(new_plan) => Ok(Transformed::yes(new_plan)),
+                None => Ok(Transformed::no(plan)),
+            }
+        })?;
+        if n_agg > 0 {
+            log::debug!(
+                target: "eager_aggregation",
+                "considered plan: AggregateExec={n_agg} (final={n_final} partial={n_partial} single={n_single}), HashJoinExec={n_join}, rewritten={}",
+                optimized.transformed
+            );
+        }
+        Ok(optimized.data)
     }
 }
 
