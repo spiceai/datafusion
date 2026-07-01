@@ -260,7 +260,11 @@ fn try_push_aggregate(
                     node.name()
                 );
             };
-            // Column-only projection: output index -> input column index.
+            // Column-only projection: output index -> input column index. We
+            // compose only the *indices*; the aggregate args, keys, and group
+            // exprs are later remapped into the rebuilt (raw-named) schemas *by
+            // name*, so a projection that *renames* a column (`x AS y`) would peel
+            // fine here but make that by-name lookup fail. Decline on any rename.
             let mut proj_map = Vec::with_capacity(proj.expr().len());
             for pe in proj.expr() {
                 let Some(c) = pe.expr.downcast_ref::<Column>() else {
@@ -268,6 +272,13 @@ fn try_push_aggregate(
                         "intervening projection has a computed expression (not a plain column)"
                     );
                 };
+                if c.name() != pe.alias {
+                    decline!(
+                        "intervening projection renames a column ({} as {})",
+                        c.name(),
+                        pe.alias
+                    );
+                }
                 proj_map.push(c.index());
             }
             for m in agg_to_raw.iter_mut() {
@@ -811,6 +822,13 @@ fn try_push_aggregate(
 /// SUM(x)+COUNT(x) and is recombined by division (see [`decompose`]).
 fn is_decomposable(agg: &AggregateFunctionExpr) -> bool {
     if agg.is_distinct() {
+        return false;
+    }
+    // An order-sensitive aggregate (`ORDER BY` inside the call) cannot be split
+    // into pushed partials and merged, since the pre-aggregation would collapse
+    // the rows the ordering depends on. None of the supported functions below are
+    // order-sensitive, but guard explicitly to honor the documented contract.
+    if !agg.order_bys().is_empty() {
         return false;
     }
     matches!(agg.fun().name(), "sum" | "min" | "max" | "count" | "avg")
@@ -1730,6 +1748,79 @@ mod tests {
         assert!(
             join_child_is_aggregate(&optimized),
             "expected push-down through a column-only projection chain"
+        );
+    }
+
+    // Decline path: an intervening projection that *renames* a column (`d_name AS
+    // d_label`). The peel composes indices only; the later by-name remap into the
+    // rebuilt (raw-named) join schema would fail to find `d_label`, so the rule
+    // must decline rather than turn the plan into a planning error.
+    #[test]
+    fn declines_on_renaming_projection() {
+        let beneficial = agg_over_join(100);
+        let final_agg = beneficial.downcast_ref::<AggregateExec>().unwrap();
+        let partial = final_agg.input().downcast_ref::<AggregateExec>().unwrap();
+        let join = Arc::clone(partial.input()); // [f_dim, f_amount, d_id, d_name]
+
+        // Renames d_name@3 -> d_label; f_amount/f_dim pass through unchanged.
+        let proj = Arc::new(
+            ProjectionExec::try_new(
+                vec![
+                    (
+                        Arc::new(Column::new("f_amount", 1)) as Arc<dyn PhysicalExpr>,
+                        "f_amount".to_string(),
+                    ),
+                    (Arc::new(Column::new("d_name", 3)), "d_label".to_string()),
+                    (Arc::new(Column::new("f_dim", 0)), "f_dim".to_string()),
+                ],
+                join,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let proj_schema = proj.schema();
+
+        let sum_expr = Arc::new(
+            AggregateExprBuilder::new(
+                sum_udaf(),
+                vec![Arc::new(Column::new("f_amount", 0))],
+            )
+            .schema(Arc::clone(&proj_schema))
+            .alias("sum(f_amount)")
+            .build()
+            .unwrap(),
+        );
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("d_label", 1)) as Arc<dyn PhysicalExpr>,
+            "d_label".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group,
+                vec![Arc::clone(&sum_expr)],
+                vec![None],
+                proj,
+                Arc::clone(&proj_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                vec![sum_expr],
+                vec![None],
+                partial,
+                proj_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let optimized = run_rule(plan);
+        assert!(
+            !join_child_is_aggregate(&optimized),
+            "expected NO push: a renaming projection must be declined, not mis-remapped"
         );
     }
 
