@@ -340,10 +340,34 @@ impl FilterExec {
             }
             (0.0, Precision::Exact(0), cs)
         } else if !check_support(predicate, schema) {
-            // Interval analysis is not applicable; fall back to the default
-            // selectivity but still pin NDV=1 for every `col = literal` column.
-            let selectivity = default_selectivity as f64 / 100.0;
+            // Interval analysis is not applicable (e.g. equality on a `Utf8`
+            // column). Estimate selectivity from the equality columns' distinct
+            // counts. For an AND of `col = literal` predicates the result is a
+            // subset of the rows matching any single one, so the true selectivity
+            // is at most `1/NDV` of the *most selective* column — i.e.
+            // `1 / max(NDV)` is a correlation-agnostic upper bound. It never
+            // under-estimates rows, unlike the independence product `∏ 1/NDV`
+            // (which collapses badly on correlated columns such as a composite
+            // key). `max` over the *known* NDVs stays a valid upper bound
+            // even when some columns' NDV is absent (an extra equality can only
+            // shrink the result), so fall back to the default only when NO column
+            // has a usable NDV. Then pin NDV=1 for every `col = literal` column
+            // (the equality leaves a single value).
             let mut cs = input_stats.to_inexact().column_statistics;
+            let mut max_ndv: Option<usize> = None;
+            for &idx in &eq_columns {
+                if idx < cs.len()
+                    && let Precision::Exact(n) | Precision::Inexact(n) =
+                        cs[idx].distinct_count
+                    && n > 0
+                {
+                    max_ndv = Some(max_ndv.map_or(n, |m| m.max(n)));
+                }
+            }
+            let selectivity = match max_ndv {
+                Some(n) => 1.0 / n as f64,
+                None => default_selectivity as f64 / 100.0,
+            };
             for &idx in &eq_columns {
                 if idx < cs.len() && cs[idx].distinct_count != Precision::Exact(0) {
                     cs[idx].distinct_count = Precision::Exact(1);
@@ -1253,6 +1277,89 @@ mod tests {
                 ..Default::default()
             }]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_utf8_equality_uses_ndv() -> Result<()> {
+        // `Utf8` equality is not interval-analyzable, so selectivity is estimated
+        // from the column's distinct count (`1/NDV`) rather than the flat default.
+        // A `name = 'CHINA'` filter on a 62-row / NDV-61 column keeps ~1 row (not
+        // `62 * default_selectivity`).
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, false)]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(62),
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![ColumnStatistics {
+                    distinct_count: Precision::Inexact(61),
+                    ..Default::default()
+                }],
+            },
+            schema.clone(),
+        ));
+
+        // name = 'CHINA'
+        let predicate: Arc<dyn PhysicalExpr> =
+            binary(col("name", &schema)?, Operator::Eq, lit("CHINA"), &schema)?;
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+
+        let statistics = filter.partition_statistics(None)?;
+        // 62 * (1/61) = 1.016, rounded up to 2 — i.e. ~1 row, NOT the ~13 the
+        // flat 20% default would give.
+        assert_eq!(statistics.num_rows, Precision::Inexact(2));
+        // The equality leaves a single distinct value.
+        assert_eq!(
+            statistics.column_statistics[0].distinct_count,
+            Precision::Exact(1)
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_multi_equality_uses_max_ndv() -> Result<()> {
+        // `a = 'x' AND b = 'y'` on Utf8 columns (interval analysis N/A). The
+        // combined selectivity is bounded by the *most selective* single equality
+        // — `1 / max(NDV)` — NOT the independence product `1/(NDV_a * NDV_b)`,
+        // which would collapse rows on correlated columns.
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("b", DataType::Utf8, false),
+        ]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(1000),
+                total_byte_size: Precision::Absent,
+                column_statistics: vec![
+                    ColumnStatistics {
+                        distinct_count: Precision::Inexact(100),
+                        ..Default::default()
+                    },
+                    ColumnStatistics {
+                        distinct_count: Precision::Inexact(50),
+                        ..Default::default()
+                    },
+                ],
+            },
+            schema.clone(),
+        ));
+
+        // a = 'x' AND b = 'y'
+        let predicate: Arc<dyn PhysicalExpr> = binary(
+            binary(col("a", &schema)?, Operator::Eq, lit("x"), &schema)?,
+            Operator::And,
+            binary(col("b", &schema)?, Operator::Eq, lit("y"), &schema)?,
+            &schema,
+        )?;
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+
+        let statistics = filter.partition_statistics(None)?;
+        // 1000 * (1/max(100,50)) = 10
+        assert_eq!(statistics.num_rows, Precision::Inexact(10));
 
         Ok(())
     }
