@@ -170,40 +170,12 @@ impl PhysicalOptimizerRule for EagerAggregation {
         if !config.optimizer.enable_eager_aggregation {
             return Ok(plan);
         }
-        // Observability: this is a cost-based rule that silently no-ops when the
-        // plan shape or cost gate doesn't qualify (most per-node guards in
-        // `try_push_aggregate` bail at debug or silently). Summarize the
-        // aggregate/join landscape it considered so a plan that wasn't rewritten
-        // still explains itself. Debug-level + only when the plan has aggregates,
-        // so it's quiet unless `eager_aggregation=debug` is set.
-        let (mut n_agg, mut n_final, mut n_partial, mut n_single, mut n_join) =
-            (0u32, 0u32, 0u32, 0u32, 0u32);
-        let optimized = plan.transform_down(|plan| {
-            if let Some(agg) = plan.downcast_ref::<AggregateExec>() {
-                n_agg += 1;
-                match agg.mode() {
-                    AggregateMode::Final | AggregateMode::FinalPartitioned => {
-                        n_final += 1
-                    }
-                    AggregateMode::Partial => n_partial += 1,
-                    _ => n_single += 1,
-                }
-            }
-            if plan.downcast_ref::<HashJoinExec>().is_some() {
-                n_join += 1;
-            }
-            match try_push_aggregate(&plan, config)? {
+        Ok(plan
+            .transform_down(|plan| match try_push_aggregate(&plan, config)? {
                 Some(new_plan) => Ok(Transformed::yes(new_plan)),
                 None => Ok(Transformed::no(plan)),
-            }
-        })?;
-        if n_agg > 0 {
-            eprintln!(
-                "eager_aggregation: considered plan: AggregateExec={n_agg} (final={n_final} partial={n_partial} single={n_single}), HashJoinExec={n_join}, rewritten={}",
-                optimized.transformed
-            );
-        }
-        Ok(optimized.data)
+            })?
+            .data)
     }
 }
 
@@ -242,14 +214,24 @@ fn try_push_aggregate(
         return Ok(None);
     }
     let Some(top_partial) = top_final.input().downcast_ref::<AggregateExec>() else {
-        eprintln!(
-            "eager_aggregation: shape: final aggregate's input is {}, not a partial aggregate",
-            top_final.input().name()
-        );
+        // High-frequency shape miss (fires for every non-two-phase aggregate);
+        // stay silent so the decline diagnostics below aren't drowned out.
         return Ok(None);
     };
     if *top_partial.mode() != AggregateMode::Partial {
         return Ok(None);
+    }
+
+    // The `Final <- Partial` shape matched, so from here any bail is informative:
+    // emit the reason to stderr (prefixed `eager_aggregation:`, so it can be
+    // grepped/filtered) — e.g. an unsupported shape, an unsupported aggregate, or
+    // a cost-gate decline. eprintln is deliberate: `log`-crate lines don't survive
+    // the log->tracing bridge in spiced, so they never reach a query-time log.
+    macro_rules! decline {
+        ($($arg:tt)*) => {{
+            eprintln!("eager_aggregation: decline: {}", format!($($arg)*));
+            return Ok(None);
+        }};
     }
 
     // Between the partial aggregate and the join the planner emits a *chain* of
@@ -273,20 +255,18 @@ fn try_push_aggregate(
             // subquery aggregate, e.g. CH-benCHmark q13/q16) would need a separate
             // matcher. Both bail here for now. See the module "Deferred" section.
             let Some(proj) = node.downcast_ref::<ProjectionExec>() else {
-                eprintln!(
-                    "eager_aggregation: shape: aggregate input chain reaches {}, not a (projected) hash join",
+                decline!(
+                    "aggregate input chain reaches {}, not a (projected) hash join",
                     node.name()
                 );
-                return Ok(None);
             };
             // Column-only projection: output index -> input column index.
             let mut proj_map = Vec::with_capacity(proj.expr().len());
             for pe in proj.expr() {
                 let Some(c) = pe.expr.downcast_ref::<Column>() else {
-                    eprintln!(
-                        "eager_aggregation: shape: intervening projection has a computed expression (not a plain column)"
+                    decline!(
+                        "intervening projection has a computed expression (not a plain column)"
                     );
-                    return Ok(None);
                 };
                 proj_map.push(c.index());
             }
@@ -297,25 +277,15 @@ fn try_push_aggregate(
         };
         node = next;
     }
-    let join = node.downcast_ref::<HashJoinExec>().unwrap();
+    // The peel loop only `break`s once `node` downcasts to a `HashJoinExec`.
+    let join = node
+        .downcast_ref::<HashJoinExec>()
+        .expect("peel loop exits only at a HashJoinExec");
     // Apply the join's own (folded) projection: node output index -> raw index.
     if let Some(p) = join.projection.as_ref() {
         for m in agg_to_raw.iter_mut() {
             *m = p[*m];
         }
-    }
-
-    // From here the shape matched (Final <- Partial <- [Projection] <- Join), so
-    // any decline is informative: log the reason (and the accept decision with
-    // push_rows/grouped/join_out) at INFO so it survives release builds, which
-    // compile out debug!. Filter the target `eager_aggregation` to isolate it.
-    // (The high-frequency "input is not a partial aggregate" shape miss stays at
-    // debug — it fires for every aggregate node in every plan.)
-    macro_rules! decline {
-        ($($arg:tt)*) => {{
-            eprintln!("eager_aggregation: decline: {}", format!($($arg)*));
-            return Ok(None);
-        }};
     }
 
     // Supported join types: inner, and the semi/anti joins produced by
@@ -485,6 +455,22 @@ fn try_push_aggregate(
     }
 
     let push_schema = push_plan.schema();
+    // We remap the aggregate arguments, join keys, and residual-filter columns
+    // into `push_schema` *by name* (via `reassign_expr_columns` / `index_of`),
+    // which resolves to the first field of a given name. If the push side carries
+    // duplicate column names a lookup could silently bind to the wrong column, so
+    // bail (mirrors the output-schema duplicate-name guard below).
+    {
+        let mut names: Vec<&str> = push_schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect();
+        names.sort_unstable();
+        if names.windows(2).any(|w| w[0] == w[1]) {
+            decline!("push side has duplicate column names (name-based remap unsafe)");
+        }
+    }
 
     // The join side the pre-aggregation replaces, in `JoinFilter` terms.
     let push_join_side = match side {
@@ -544,7 +530,13 @@ fn try_push_aggregate(
     // Cost gate: only push when the pre-aggregation produces fewer rows than the
     // join emits (otherwise the join is selective enough that pre-aggregating is
     // wasted work). Requires statistics; absent stats => do not fire.
-    match cost_gate(join, push_plan, &pushdown_group, retained_groups_bound, config)? {
+    match cost_gate(
+        join,
+        push_plan,
+        &pushdown_group,
+        retained_groups_bound,
+        config,
+    )? {
         CostGate::Allow {
             push_rows,
             grouped,
@@ -810,9 +802,6 @@ fn try_push_aggregate(
         new_top_final
     };
 
-    eprintln!(
-        "eager_aggregation: pushed aggregation into {side:?} side of join"
-    );
     Ok(Some(result))
 }
 
@@ -1009,13 +998,15 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::NullEquality;
+    use datafusion_common::ScalarValue;
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::stats::{ColumnStatistics, Statistics};
     use datafusion_execution::TaskContext;
+    use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::sum::sum_udaf;
     use datafusion_physical_expr::EquivalenceProperties;
-    use datafusion_physical_expr::expressions::lit;
+    use datafusion_physical_expr::expressions::{BinaryExpr, Literal, lit};
     use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion_physical_plan::joins::PartitionMode;
     use datafusion_physical_plan::memory::MemoryStream;
@@ -1499,8 +1490,6 @@ mod tests {
     // ProjectionExec divides them back into the AVG output (restoring the schema).
     #[test]
     fn fires_with_avg_on_inner_join() {
-        use datafusion_functions_aggregate::average::avg_udaf;
-
         let fact = stats_leaf(
             vec![
                 Field::new("f_dim", DataType::Int32, false),
@@ -1697,10 +1686,6 @@ mod tests {
     // the pushdown groups only by the join key.
     #[test]
     fn fires_with_computed_group_expr() {
-        use datafusion_common::ScalarValue;
-        use datafusion_expr::Operator;
-        use datafusion_physical_expr::expressions::{BinaryExpr, Literal};
-
         let fact = stats_leaf(
             vec![
                 Field::new("f_dim", DataType::Int32, false),
@@ -2065,10 +2050,7 @@ mod tests {
         let aggrs = vec![
             mk("count(f_amount)", count_udaf()),
             mk("sum(f_amount)", sum_udaf()),
-            mk(
-                "avg(f_amount)",
-                datafusion_functions_aggregate::average::avg_udaf(),
-            ),
+            mk("avg(f_amount)", avg_udaf()),
         ];
         let group = PhysicalGroupBy::new_single(vec![(
             Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
@@ -2120,6 +2102,136 @@ mod tests {
             sorted_rows(&on_rows),
             sorted_rows(&off_rows),
             "eager-on results must match eager-off"
+        );
+    }
+
+    // End-to-end value correctness with a *non-unique keep side* (join fan-out) —
+    // the classic eager-aggregation correctness trap. The dim (keep) side repeats
+    // join key 1, so each pushed pre-aggregated fact row for f_dim=1 is duplicated
+    // by the join before the top aggregate re-aggregates. SUM/COUNT are fan-out
+    // linear (Σ over fact⋈dim = Σ_key preSum(key)·fanout(key)), so the top
+    // re-aggregation must still match eager-off. Guards against a future change
+    // that (wrongly) assumes a unique keep side.
+    #[tokio::test]
+    async fn fan_out_keep_side_eager_push_preserves_values() {
+        // fact(f_dim, f_amount): tiny real rows, big fake stats (NDV 2) so it fires.
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("f_dim", DataType::Int32, false),
+            Field::new("f_amount", DataType::Float64, true),
+        ]));
+        let fact_batch = RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0])),
+            ],
+        )
+        .unwrap();
+        let fact = Arc::new(DataStatsExec::new(
+            vec![fact_batch],
+            stats_with(10_000_000, &[Some(2), None]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        // dim(d_id, d_name): key 1 repeats (both named "a") -> f_dim=1 fans out 2x.
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("d_id", DataType::Int32, false),
+            Field::new("d_name", DataType::Utf8, true),
+        ]));
+        let dim_batch = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2])),
+                Arc::new(StringArray::from(vec!["a", "a", "b"])),
+            ],
+        )
+        .unwrap();
+        let dim = Arc::new(DataStatsExec::new(
+            vec![dim_batch],
+            stats_with(3, &[Some(2), Some(2)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                fact,
+                dim,
+                vec![(
+                    Arc::new(Column::new("f_dim", 0)),
+                    Arc::new(Column::new("d_id", 0)),
+                )],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema(); // [f_dim, f_amount, d_id, d_name]
+
+        let mk = |alias: &str, udaf: Arc<AggregateUDF>| {
+            Arc::new(
+                AggregateExprBuilder::new(
+                    udaf,
+                    vec![Arc::new(Column::new("f_amount", 1))],
+                )
+                .schema(Arc::clone(&join_schema))
+                .alias(alias.to_string())
+                .build()
+                .unwrap(),
+            )
+        };
+        let aggrs = vec![
+            mk("count(f_amount)", count_udaf()),
+            mk("sum(f_amount)", sum_udaf()),
+        ];
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+            "d_name".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let eager_on = run_rule(Arc::clone(&plan));
+        assert!(
+            join_child_is_aggregate(&eager_on),
+            "eager aggregation should have fired"
+        );
+        let on = enforce_distribution(eager_on);
+        let off = enforce_distribution(plan);
+
+        let ctx = Arc::new(TaskContext::default());
+        let on_rows = collect(on, Arc::clone(&ctx)).await.unwrap();
+        let off_rows = collect(off, ctx).await.unwrap();
+
+        // Expected (fan-out): a -> {count 4, sum 60}; b -> {count 1, sum 30}.
+        let total: usize = off_rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "two groups expected");
+        assert_eq!(
+            sorted_rows(&on_rows),
+            sorted_rows(&off_rows),
+            "eager-on results must match eager-off across a fan-out keep side"
         );
     }
 
