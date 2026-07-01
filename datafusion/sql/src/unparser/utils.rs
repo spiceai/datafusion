@@ -330,17 +330,59 @@ pub(crate) fn unproject_sort_expr(
                         )?));
                     }
 
-                    // If SELECT and ORDER BY contain the same expression with a scalar function, the ORDER BY expression will
-                    // be replaced by a Column expression (e.g., "substr(customer.c_last_name, Int64(0), Int64(5))"), and we need
-                    // to transform it back to the actual expression.
+                    // If SELECT and ORDER BY contain the same expression (e.g., a scalar function
+                    // or any other non-trivial computed expression like BinaryExpr), the ORDER BY
+                    // expression will be replaced by a Column expression referencing the SELECT-list
+                    // alias. We need to transform it back to the actual expression so that it is
+                    // valid SQL in all positions inside ORDER BY (PostgreSQL only allows bare
+                    // output-column aliases as top-level sort keys, not inside larger expressions
+                    // such as CASE WHEN).
+                    //
+                    // We do NOT re-inline when the underlying expression (after stripping aliases)
+                    // is a plain Expr::Column (simple rename), an AggregateFunction, or a
+                    // WindowFunction — those cases either don't need inlining or are handled
+                    // separately by the aggregate/window unproject branches.
+                    //
+                    // When the inlined expression contains aggregate output column references
+                    // (e.g., `grouping(a) + grouping(b)` which in the projection is stored as
+                    // `col("grouping(a)") + col("grouping(b)")`), we also apply a best-effort
+                    // agg unprojection so those references resolve to their actual function-call
+                    // representations rather than emitting as quoted identifiers.
                     if let LogicalPlan::Projection(Projection { expr, schema, .. }) =
                         input
                         && let Ok(idx) = schema.index_of_column(&col)
-                        && let Some(Expr::ScalarFunction(scalar_fn)) = expr.get(idx)
+                        && let Some(proj_expr) = expr.get(idx)
                     {
-                        return Ok(Transformed::yes(Expr::ScalarFunction(
-                            scalar_fn.clone(),
-                        )));
+                        let unaliased = proj_expr.clone().unalias_nested().data;
+                        if !matches!(
+                            unaliased,
+                            Expr::Column(_)
+                                | Expr::AggregateFunction(_)
+                                | Expr::WindowFunction(_)
+                        ) {
+                            // If there is an aggregate in scope, resolve any aggregate output
+                            // column references inside the inlined expression. We use a
+                            // best-effort approach: columns not found in the aggregate schema
+                            // are left as-is rather than causing an error.
+                            let resolved = if let Some(agg) = agg {
+                                unaliased.transform(|e| {
+                                    if let Expr::Column(c) = &e {
+                                        if let Ok(Some(unprojected)) =
+                                            find_agg_expr(agg, c)
+                                        {
+                                            return Ok(Transformed::yes(
+                                                unprojected.clone(),
+                                            ));
+                                        }
+                                    }
+                                    Ok(Transformed::no(e))
+                                })?
+                                .data
+                            } else {
+                                unaliased
+                            };
+                            return Ok(Transformed::yes(resolved));
+                        }
                     }
 
                     Ok(Transformed::no(Expr::Column(col)))
