@@ -2159,6 +2159,95 @@ fn test_complex_order_by_with_grouping() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: a computed (`BinaryExpr`) SELECT-list alias referenced
+/// inside an `ORDER BY` *expression* (e.g. `CASE WHEN`) must be unparsed as the
+/// underlying expression, not left as a bare alias column.
+///
+/// `unproject_sort_expr` previously only re-inlined `ScalarFunction` projection
+/// expressions; any other computed expression (here `id + age`) fell through and
+/// the alias leaked into the `ORDER BY`. This produces SQL that is invalid under
+/// the SQL standard's name-resolution rules for `ORDER BY`: a bare output-column
+/// alias is accepted as a top-level sort key, but when the alias appears inside a
+/// larger expression, identifiers are resolved against the `FROM` relations only —
+/// where the alias does not exist.
+///
+/// So the buggy output
+/// `... ORDER BY CASE WHEN (computed = 0) THEN t1.id END`
+/// is rejected by every standard-conforming engine, e.g.:
+///   - PostgreSQL: `ERROR: column "computed" does not exist` (SQLSTATE 42703)
+///   - DuckDB:     `Binder Error: Referenced column "computed" not found`
+///   - MySQL:      `ERROR 1054 (42S22): Unknown column 'computed' in 'order clause'`
+///
+/// This was the root cause of the `column "lochierarchy" does not exist` failures
+/// observed in federated TPC-DS queries (q36 / q70 / q86), where `lochierarchy` is
+/// a `grouping(a) + grouping(b)` alias used inside an `ORDER BY CASE WHEN`.
+///
+/// ```text
+///   t1
+///  ┌─────┬─────┐    ```sql
+///  │ id  │ i32 │      SELECT id + age AS computed, id
+///  ├─────┼─────┤      FROM t1
+///  │ age │ i32 │      ORDER BY CASE WHEN computed = 0 THEN id END
+///  └─────┴─────┘    ```
+///
+///  ── logical plan ───────────────────────────────────────────────────────────
+///   Sort: CASE WHEN computed = 0 THEN id END ASC NULLS FIRST
+///     Projection: (id + age) AS computed, id
+///       TableScan: t1
+///
+///  ── unparsed SQL, before the fix (BROKEN) ──────────────────────────────────
+///   SELECT (t1.id + t1.age) AS computed, t1.id
+///   FROM t1
+///   ORDER BY CASE WHEN (computed = 0) THEN t1.id END
+///                      ▲
+///                      └─ `computed` is a SELECT alias, not a column of t1;
+///                         inside an expression the engine resolves it against
+///                         FROM only → PostgreSQL: ERROR: column "computed"
+///                         does not exist (SQLSTATE 42703)
+///
+///  ── Unparsed SQL, after the fix (VALID) ────────────────────────────────────
+///   SELECT (t1.id + t1.age) AS computed, t1.id
+///   FROM t1
+///   ORDER BY CASE WHEN ((t1.id + t1.age) = 0) THEN t1.id END
+///                       ▲
+///                       └─ underlying expression inlined; resolves against t1
+///                          → valid on every standard-conforming engine
+/// ```
+#[test]
+fn test_order_by_with_computed_alias_inside_expr() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    // Build plan:  Sort(CASE WHEN computed = 0 THEN id END)
+    //                Projection((id + age) AS computed, id)
+    //                  TableScan(t1)
+    //
+    // `computed` is a BinaryExpr alias in the Projection.  The sort expression
+    // references it via col("computed") inside a CASE.  Without the fix the
+    // unparser emits `CASE WHEN (computed = 0) THEN t1.id END` which is invalid
+    // SQL in PostgreSQL; with the fix it emits
+    // `CASE WHEN ((t1.id + t1.age) = 0) THEN t1.id END`.
+    let computed_alias = (col("id") + col("age")).alias("computed");
+    let case_expr = datafusion_expr::when(col("computed").eq(lit(0i32)), col("id"))
+        .end()
+        .unwrap();
+
+    let plan = table_scan(Some("t1"), &schema, None)?
+        .project(vec![computed_alias, col("id")])?
+        .sort(vec![case_expr.sort(true, true)])?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    // The CASE condition must reference the inlined expression, not the bare alias.
+    assert_snapshot!(
+        sql,
+        @"SELECT (t1.id + t1.age) AS computed, t1.id FROM t1 ORDER BY CASE WHEN ((t1.id + t1.age) = 0) THEN t1.id END ASC NULLS FIRST"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_aggregation_to_sql() {
     let sql = r#"SELECT id, first_name,
