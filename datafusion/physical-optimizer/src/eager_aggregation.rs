@@ -70,7 +70,11 @@
 //!
 //! It peels an intervening chain of column-only `ProjectionExec`s between the
 //! partial aggregate and the join (the shape the planner emits before
-//! `ProjectionPushdown`). Anything outside this leaves the plan unchanged.
+//! `ProjectionPushdown`), including ones that *rename* columns (`x AS y`): the
+//! aggregate arg/group expressions are normalized out of the (possibly aliased)
+//! post-projection space into the join's raw-named output space before any
+//! by-name remapping (see `remap_to_raw`). Anything outside this leaves the plan
+//! unchanged.
 //!
 //! # Cost-gated cascade
 //!
@@ -120,7 +124,7 @@ use datafusion_common::JoinSide;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_expr::{AggregateUDF, JoinType, Operator};
 use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_functions_aggregate::sum::sum_udaf;
@@ -133,7 +137,9 @@ use datafusion_physical_plan::aggregates::{
     AggregateExec, AggregateMode, PhysicalGroupBy,
 };
 use datafusion_physical_plan::joins::HashJoinExec;
-use datafusion_physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+use datafusion_physical_plan::joins::utils::{
+    ColumnIndex, JoinFilter, build_join_schema,
+};
 use datafusion_physical_plan::projection::ProjectionExec;
 
 /// Cost-based physical eager-aggregation rule. See the [module docs](self).
@@ -261,10 +267,11 @@ fn try_push_aggregate(
                 );
             };
             // Column-only projection: output index -> input column index. We
-            // compose only the *indices*; the aggregate args, keys, and group
-            // exprs are later remapped into the rebuilt (raw-named) schemas *by
-            // name*, so a projection that *renames* a column (`x AS y`) would peel
-            // fine here but make that by-name lookup fail. Decline on any rename.
+            // compose only the *indices*. A projection that *renames* a column
+            // (`x AS y`) is fine: the aggregate arg/group expressions are later
+            // normalized out of this (possibly-renamed) post-projection space into
+            // the join's raw-named output space via `agg_to_raw` (see
+            // `remap_to_raw`), so the downstream by-name remaps never see the alias.
             let mut proj_map = Vec::with_capacity(proj.expr().len());
             for pe in proj.expr() {
                 let Some(c) = pe.expr.downcast_ref::<Column>() else {
@@ -272,13 +279,6 @@ fn try_push_aggregate(
                         "intervening projection has a computed expression (not a plain column)"
                     );
                 };
-                if c.name() != pe.alias {
-                    decline!(
-                        "intervening projection renames a column ({} as {})",
-                        c.name(),
-                        pe.alias
-                    );
-                }
                 proj_map.push(c.index());
             }
             for m in agg_to_raw.iter_mut() {
@@ -323,6 +323,34 @@ fn try_push_aggregate(
 
     // Map an aggregate-input column index to the raw left ++ right join index.
     let raw_index = |agg_idx: usize| -> usize { agg_to_raw[agg_idx] };
+
+    // The join's *raw* (unprojected) output schema — left ++ right for an inner
+    // join, or the single surviving side for a semi/anti join. This is exactly the
+    // index space `agg_to_raw` now points into, so it carries the canonical
+    // (raw) column names.
+    let (raw_join_schema, _) =
+        build_join_schema(left.schema().as_ref(), right.schema().as_ref(), &join_type);
+
+    // Rewrite an aggregate arg/group expression out of the (possibly projection-
+    // *renamed*) aggregate-input space into the raw join-output space: each
+    // `Column` is re-pointed via `agg_to_raw` to its raw index and given the raw
+    // name at that index. Downstream by-name remaps (`reassign_expr_columns` into
+    // the push-side / rebuilt-join schemas) then never see a projection alias, so
+    // an intervening `x AS y` projection is handled rather than declined.
+    let remap_to_raw = |e: Arc<dyn PhysicalExpr>| -> Result<Arc<dyn PhysicalExpr>> {
+        e.transform_down(|node| {
+            if let Some(c) = node.downcast_ref::<Column>() {
+                let raw = agg_to_raw[c.index()];
+                let name = raw_join_schema.field(raw).name();
+                Ok(Transformed::yes(
+                    Arc::new(Column::new(name, raw)) as Arc<dyn PhysicalExpr>
+                ))
+            } else {
+                Ok(Transformed::no(node))
+            }
+        })
+        .data()
+    };
 
     // Equi-keys must be plain columns.
     let mut left_key_cols: Vec<Column> = Vec::with_capacity(join.on().len());
@@ -401,15 +429,22 @@ fn try_push_aggregate(
     };
 
     // Group-by may include computed expressions (e.g. `extract(year from ...)`),
-    // not just plain columns. Collect the columns each group expression
+    // not just plain columns. Normalize the group expressions into raw join-output
+    // space (rename-safe; see `remap_to_raw`) and collect the columns each one
     // references; the push-side ones are added to the pushdown grouping below.
     // Grouping the pre-aggregation by those underlying columns refines grouping
     // by the expression (the expression is constant within each pre-agg group),
     // so re-aggregating above the join reproduces the original groups. Keep-side
-    // group expressions simply pass through to the final grouping unchanged.
+    // group expressions simply pass through to the final grouping unchanged. The
+    // normalized exprs are reused to rebuild the final grouping over the new join.
     let group = top_partial.group_expr();
+    let raw_group_exprs: Vec<(Arc<dyn PhysicalExpr>, String)> = group
+        .expr()
+        .iter()
+        .map(|(e, name)| Ok((remap_to_raw(Arc::clone(e))?, name.clone())))
+        .collect::<Result<Vec<_>>>()?;
     let mut group_cols: Vec<Column> = Vec::new();
-    for (e, _) in group.expr() {
+    for (e, _) in &raw_group_exprs {
         collect_columns(e, &mut group_cols);
     }
 
@@ -449,7 +484,9 @@ fn try_push_aggregate(
     // guard below).
     let n_key_groups = pushdown_group.len();
     for c in &group_cols {
-        let raw = raw_index(c.index());
+        // `group_cols` are already in raw join-output space, so the index is the
+        // raw index and the name is the raw (un-aliased) column name.
+        let raw = c.index();
         let on_side = output_side.is_some()
             || (side == Side::Left && raw < left_len)
             || (side == Side::Right && raw >= left_len);
@@ -586,8 +623,10 @@ fn try_push_aggregate(
             .expressions()
             .into_iter()
             .map(|e| {
-                // Remap join-output indices to push-side indices, then fix by name.
-                reassign_expr_columns(e, push_schema.as_ref())
+                // Normalize out of the (possibly renamed) aggregate-input space
+                // into raw join-output space, then rebind by name onto the push
+                // side's schema.
+                reassign_expr_columns(remap_to_raw(e)?, push_schema.as_ref())
             })
             .collect::<Result<Vec<_>>>()?;
         let Decomp { partials, out } = decompose(agg);
@@ -727,11 +766,12 @@ fn try_push_aggregate(
         }
     }
 
-    // Rebuild the top aggregation to merge the partials. Group columns are
-    // remapped into the new join output (by name); each aggregate becomes
-    // merge(internal_col) aliased back to the original output name.
-    let new_group_exprs = group
-        .expr()
+    // Rebuild the top aggregation to merge the partials. Group columns are the
+    // raw-normalized group expressions remapped into the new join output (by name,
+    // now rename-safe); the output alias (`name`) is preserved so the final schema
+    // is unchanged. Each aggregate becomes merge(internal_col) aliased back to the
+    // original output name.
+    let new_group_exprs = raw_group_exprs
         .iter()
         .map(|(e, name)| -> Result<_> {
             Ok((
@@ -1751,46 +1791,43 @@ mod tests {
         );
     }
 
-    // Decline path: an intervening projection that *renames* a column (`d_name AS
-    // d_label`). The peel composes indices only; the later by-name remap into the
-    // rebuilt (raw-named) join schema would fail to find `d_label`, so the rule
-    // must decline rather than turn the plan into a planning error.
+    // A *renaming* (and reordering / pruning) column-only projection between the
+    // aggregate and the join: `d_name AS d_label`, `f_amount AS amt`. The aggregate
+    // references the renamed columns. The rule normalizes them back to the join's
+    // raw names (`remap_to_raw`) and still pushes — a rename no longer disables the
+    // optimization (it previously declined).
     #[test]
-    fn declines_on_renaming_projection() {
+    fn fires_through_renaming_projection() {
         let beneficial = agg_over_join(100);
         let final_agg = beneficial.downcast_ref::<AggregateExec>().unwrap();
         let partial = final_agg.input().downcast_ref::<AggregateExec>().unwrap();
         let join = Arc::clone(partial.input()); // [f_dim, f_amount, d_id, d_name]
 
-        // Renames d_name@3 -> d_label; f_amount/f_dim pass through unchanged.
+        // Rename + reorder + prune: [d_name@3 as d_label, f_amount@1 as amt].
         let proj = Arc::new(
             ProjectionExec::try_new(
                 vec![
                     (
-                        Arc::new(Column::new("f_amount", 1)) as Arc<dyn PhysicalExpr>,
-                        "f_amount".to_string(),
+                        Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+                        "d_label".to_string(),
                     ),
-                    (Arc::new(Column::new("d_name", 3)), "d_label".to_string()),
-                    (Arc::new(Column::new("f_dim", 0)), "f_dim".to_string()),
+                    (Arc::new(Column::new("f_amount", 1)), "amt".to_string()),
                 ],
                 join,
             )
             .unwrap(),
         ) as Arc<dyn ExecutionPlan>;
-        let proj_schema = proj.schema();
+        let proj_schema = proj.schema(); // [d_label, amt]
 
         let sum_expr = Arc::new(
-            AggregateExprBuilder::new(
-                sum_udaf(),
-                vec![Arc::new(Column::new("f_amount", 0))],
-            )
-            .schema(Arc::clone(&proj_schema))
-            .alias("sum(f_amount)")
-            .build()
-            .unwrap(),
+            AggregateExprBuilder::new(sum_udaf(), vec![Arc::new(Column::new("amt", 1))])
+                .schema(Arc::clone(&proj_schema))
+                .alias("sum(amt)")
+                .build()
+                .unwrap(),
         );
         let group = PhysicalGroupBy::new_single(vec![(
-            Arc::new(Column::new("d_label", 1)) as Arc<dyn PhysicalExpr>,
+            Arc::new(Column::new("d_label", 0)) as Arc<dyn PhysicalExpr>,
             "d_label".to_string(),
         )]);
         let partial = Arc::new(
@@ -1819,8 +1856,143 @@ mod tests {
 
         let optimized = run_rule(plan);
         assert!(
-            !join_child_is_aggregate(&optimized),
-            "expected NO push: a renaming projection must be declined, not mis-remapped"
+            join_child_is_aggregate(&optimized),
+            "expected push-down through a renaming projection"
+        );
+    }
+
+    // End-to-end value correctness through a renaming projection: `f_amount AS amt`
+    // (aggregate arg) and `d_name AS label` (group key) are both renamed by a
+    // projection between the aggregate and the join. Eager-ON must match eager-OFF,
+    // proving the raw-name normalization rebinds the pushed aggregate and the final
+    // grouping to the right underlying columns.
+    #[tokio::test]
+    async fn renaming_projection_eager_push_preserves_values() {
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("f_dim", DataType::Int32, false),
+            Field::new("f_amount", DataType::Float64, true),
+        ]));
+        let fact_batch = RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2, 2, 1])),
+                Arc::new(Float64Array::from(vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0])),
+            ],
+        )
+        .unwrap();
+        let fact = Arc::new(DataStatsExec::new(
+            vec![fact_batch],
+            stats_with(10_000_000, &[Some(2), None]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("d_id", DataType::Int32, false),
+            Field::new("d_name", DataType::Utf8, true),
+        ]));
+        let dim_batch = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let dim = Arc::new(DataStatsExec::new(
+            vec![dim_batch],
+            stats_with(2, &[Some(2), Some(2)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                fact,
+                dim,
+                vec![(
+                    Arc::new(Column::new("f_dim", 0)),
+                    Arc::new(Column::new("d_id", 0)),
+                )],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>; // [f_dim, f_amount, d_id, d_name]
+
+        // Renaming + reordering projection: [d_name@3 as label, f_amount@1 as amt].
+        let proj = Arc::new(
+            ProjectionExec::try_new(
+                vec![
+                    (
+                        Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+                        "label".to_string(),
+                    ),
+                    (Arc::new(Column::new("f_amount", 1)), "amt".to_string()),
+                ],
+                join,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let proj_schema = proj.schema(); // [label, amt]
+
+        let mk = |alias: &str, udaf: Arc<AggregateUDF>| {
+            Arc::new(
+                AggregateExprBuilder::new(udaf, vec![Arc::new(Column::new("amt", 1))])
+                    .schema(Arc::clone(&proj_schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let aggrs = vec![mk("count(amt)", count_udaf()), mk("sum(amt)", sum_udaf())];
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("label", 0)) as Arc<dyn PhysicalExpr>,
+            "label".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                proj,
+                Arc::clone(&proj_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                partial,
+                proj_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let eager_on = run_rule(Arc::clone(&plan));
+        assert!(
+            join_child_is_aggregate(&eager_on),
+            "eager aggregation should fire through the renaming projection"
+        );
+        let on = enforce_distribution(eager_on);
+        let off = enforce_distribution(plan);
+
+        let ctx = Arc::new(TaskContext::default());
+        let on_rows = collect(on, Arc::clone(&ctx)).await.unwrap();
+        let off_rows = collect(off, ctx).await.unwrap();
+
+        // Expected: a -> {count 3, sum 90}; b -> {count 3, sum 120}.
+        let total: usize = off_rows.iter().map(|b| b.num_rows()).sum();
+        assert_eq!(total, 2, "two groups expected");
+        assert_eq!(
+            sorted_rows(&on_rows),
+            sorted_rows(&off_rows),
+            "eager-on results must match eager-off across a renaming projection"
         );
     }
 
