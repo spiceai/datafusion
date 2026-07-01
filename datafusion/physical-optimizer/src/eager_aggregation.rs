@@ -30,9 +30,10 @@
 //! `Statistics` and fires only when the push-down is estimated to pay off:
 //!
 //! ```text
-//!     join_out > grouped                       (not behind a selective join)
-//!  && push_rows >= grouped * min_reduction      (a substantial, not token, reduction)
-//!  && grouped <= max_pushed_groups (if capped)  (bounded pre-aggregation memory)
+//!     join_out > grouped                          (not behind a selective join)
+//!  && push_rows >= grouped * min_reduction         (a substantial, not token, reduction)
+//!  && grouped <= max_pushed_groups (if capped)     (bounded pre-aggregation memory)
+//!  && grouped <= retained_groups_bound * 2 (if known)  (not over-producing groups the join drops)
 //! ```
 //!
 //! where `push_rows` is the push side's row count, `grouped` the estimated
@@ -41,7 +42,10 @@
 //! `datafusion.optimizer.eager_aggregation_min_reduction_factor` and
 //! `…_max_pushed_groups`. The factor guard matters because a push that barely
 //! reduces (e.g. 1.7x) yet materializes millions of groups costs more than it
-//! saves.
+//! saves. `retained_groups_bound` is the cap (when derivable) on how many
+//! pre-aggregated groups the join can keep — the over-production guard against a
+//! `join_out` over-estimate that would otherwise wave a wasteful push through;
+//! see [`cost_gate`].
 //!
 //! # Scope (first milestone)
 //!
@@ -457,6 +461,12 @@ fn try_push_aggregate(
             ));
         }
     }
+    // Group count when the pushdown grouping is *exactly* the push-side join
+    // keys (no extra group/filter columns added below). In that case the
+    // pre-aggregation collapses the push side to one row per join key, which
+    // lets us bound how many groups the join can retain (the over-production
+    // guard below).
+    let n_key_groups = pushdown_group.len();
     for c in &group_cols {
         let raw = raw_index(c.index());
         let on_side = output_side.is_some()
@@ -503,10 +513,38 @@ fn try_push_aggregate(
         }
     }
 
+    // Upper bound on how many pre-aggregated groups the join can *retain*, for
+    // the over-production guard in `cost_gate`. Derivable only when the grouping
+    // is exactly the push-side join keys (`group_is_just_keys`) on an inner join:
+    // the pre-aggregation then leaves one row per key, and such a group survives
+    // only if its key exists on the other side, so
+    //     retained groups <= distinct keys(other side) <= other side row count.
+    // The other side's row count is therefore a (loose) upper bound. Materializing
+    // far more groups than this is hash-aggregation the join immediately discards.
+    // The pre-push `join_out` estimate misses this collapse when the other side
+    // carries selective filters whose selectivity never propagated through the
+    // join chain (CH-benCHmark q3: 3.1M order_line groups pre-aggregated, but the
+    // selective customer/oorder side retains ~1.0M est / ~35K actual). A semi/anti
+    // join's other side merely filters the single output side, so it bounds
+    // nothing here — leave it unset (no guard).
+    let group_is_just_keys = pushdown_group.len() == n_key_groups;
+    let retained_groups_bound = if output_side.is_none() && group_is_just_keys {
+        let other_plan = match side {
+            Side::Left => right,
+            Side::Right => left,
+        };
+        match other_plan.partition_statistics(None)?.num_rows {
+            Precision::Exact(n) | Precision::Inexact(n) => Some(n),
+            Precision::Absent => None,
+        }
+    } else {
+        None
+    };
+
     // Cost gate: only push when the pre-aggregation produces fewer rows than the
     // join emits (otherwise the join is selective enough that pre-aggregating is
     // wasted work). Requires statistics; absent stats => do not fire.
-    match cost_gate(join, push_plan, &pushdown_group, config)? {
+    match cost_gate(join, push_plan, &pushdown_group, retained_groups_bound, config)? {
         CostGate::Allow {
             push_rows,
             grouped,
@@ -861,6 +899,7 @@ fn cost_gate(
     join: &HashJoinExec,
     push_plan: &Arc<dyn ExecutionPlan>,
     pushdown_group: &[(Arc<dyn PhysicalExpr>, String)],
+    retained_groups_bound: Option<usize>,
     config: &ConfigOptions,
 ) -> Result<CostGate> {
     let min_factor = config
@@ -904,6 +943,20 @@ fn cost_gate(
         grouped = grouped.saturating_mul(ndv.max(1));
     }
     let grouped = grouped.min(push_rows);
+
+    // Over-production guard: `retained_groups_bound` (when known) caps how many
+    // pre-aggregated groups the join can retain (see caller for the derivation).
+    // Allow up to 2x over-production to absorb estimate noise on a healthy
+    // key-to-key join (q18: grouped ~= bound), but decline a gross overshoot
+    // (q3: grouped ~3x the bound, so most pre-aggregation is discarded).
+    if let Some(bound) = retained_groups_bound
+        && grouped > bound.saturating_mul(2)
+    {
+        return Ok(CostGate::Decline(format!(
+            "over-produces vs join: grouped={grouped} retained_groups_bound={bound} \
+             (pre-agg groups the selective join discards)"
+        )));
+    }
 
     if push_is_beneficial(push_rows, grouped, join_out, min_factor, max_groups) {
         Ok(CostGate::Allow {
@@ -1000,6 +1053,18 @@ mod tests {
     /// ... GROUP BY d_name`, with the fact join key having `fact_key_ndv` distinct
     /// values (controls whether pre-aggregation reduces rows).
     fn agg_over_join(fact_key_ndv: usize) -> Arc<dyn ExecutionPlan> {
+        agg_over_join_dim(fact_key_ndv, 100, 100)
+    }
+
+    /// Like [`agg_over_join`] but with a configurable dim (the join's *other*
+    /// side): `dim_rows` rows and `dim_ndv` distinct join keys. The grouping is
+    /// exactly the fact (push-side) join key, so the over-production guard is in
+    /// play — `dim_rows` is the bound on surviving pre-aggregated groups.
+    fn agg_over_join_dim(
+        fact_key_ndv: usize,
+        dim_rows: usize,
+        dim_ndv: usize,
+    ) -> Arc<dyn ExecutionPlan> {
         let fact = stats_leaf(
             vec![
                 Field::new("f_dim", DataType::Int32, false),
@@ -1013,8 +1078,8 @@ mod tests {
                 Field::new("d_id", DataType::Int32, false),
                 Field::new("d_name", DataType::Utf8, true),
             ],
-            100,
-            &[Some(100), Some(100)],
+            dim_rows,
+            &[Some(dim_ndv), Some(dim_ndv)],
         );
         let join = Arc::new(
             HashJoinExec::try_new(
@@ -1098,6 +1163,35 @@ mod tests {
         assert!(
             join_child_is_aggregate(&optimized),
             "expected a pre-aggregation pushed below the join"
+        );
+    }
+
+    // Decline path (CH-benCHmark q3 shape): a large fact pre-aggregates to many
+    // groups (500k) but the join's other side is comparatively small (100k rows),
+    // so the inner join can retain at most ~100k of those groups — the rest of
+    // the pre-aggregation is wasted work the selective join discards. The naive
+    // `join_out > grouped` test would still fire here (the join-output estimate
+    // ignores that the push collapses the fan-out), so the over-production guard
+    // is what holds it back. Contrast `fires_on_beneficial_join`, where the dim
+    // is tiny (100) *and* the fact reduces to 100 groups (no over-production).
+    #[test]
+    fn declines_over_production_q3_shape() {
+        let optimized = run_rule(agg_over_join_dim(500_000, 100_000, 100_000));
+        assert!(
+            !join_child_is_aggregate(&optimized),
+            "expected NO push: pre-agg over-produces vs the selective join's other side"
+        );
+    }
+
+    // A healthy key-to-key join (q18 shape): the fact reduces to ~grouped groups
+    // and the other side is about the same size, so the join retains essentially
+    // all pre-aggregated groups -> the over-production guard allows it.
+    #[test]
+    fn fires_on_balanced_key_to_key_join() {
+        let optimized = run_rule(agg_over_join_dim(2_000_000, 2_000_000, 2_000_000));
+        assert!(
+            join_child_is_aggregate(&optimized),
+            "expected a push: grouped ~= other side rows (no over-production)"
         );
     }
 
