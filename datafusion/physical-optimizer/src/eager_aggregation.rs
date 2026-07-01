@@ -1013,8 +1013,9 @@ mod tests {
     use datafusion_physical_plan::test::exec::StatisticsExec;
     use datafusion_physical_plan::{
         DisplayAs, DisplayFormatType, Partitioning, PlanProperties,
-        SendableRecordBatchStream, collect,
+        SendableRecordBatchStream, collect, displayable,
     };
+    use insta::assert_snapshot;
 
     fn stats_leaf(
         fields: Vec<Field>,
@@ -1136,6 +1137,11 @@ mod tests {
         EagerAggregation::new().optimize(plan, &opts).unwrap()
     }
 
+    /// Render a plan tree as an indented string, for the snapshot tests below.
+    fn plan_str(plan: &Arc<dyn ExecutionPlan>) -> String {
+        displayable(plan.as_ref()).indent(true).to_string()
+    }
+
     /// True if any `HashJoinExec` in the tree has an `AggregateExec` child
     /// (i.e. a pre-aggregation was pushed below the join).
     fn join_child_is_aggregate(plan: &Arc<dyn ExecutionPlan>) -> bool {
@@ -1155,6 +1161,37 @@ mod tests {
             join_child_is_aggregate(&optimized),
             "expected a pre-aggregation pushed below the join"
         );
+    }
+
+    // Executable example (canonical SUM push). Input is the plan the planner emits
+    // for `SELECT d_name, SUM(f_amount) FROM fact JOIN dim ON f_dim = d_id GROUP BY
+    // d_name`: a two-phase aggregate directly over the join. The rule pushes a
+    // pre-aggregation over the fact's join key (`f_dim`) below the join, so the
+    // join probes ~100 pre-aggregated rows instead of 10M, and the original top
+    // aggregate merges the partial sums. The pushed aggregate is emitted as
+    // Partial -> FinalPartitioned; `EnforceDistribution` (which runs after this
+    // rule) inserts the hash repartition between the two halves.
+    #[test]
+    fn example_sum_push_plan() {
+        let input = agg_over_join(100);
+        assert_snapshot!(plan_str(&input), @"
+        AggregateExec: mode=FinalPartitioned, gby=[d_name@0 as d_name], aggr=[sum(f_amount)]
+          AggregateExec: mode=Partial, gby=[d_name@3 as d_name], aggr=[sum(f_amount)]
+            HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(f_dim@0, d_id@0)]
+              StatisticsExec: col_count=2, row_count=Inexact(10000000)
+              StatisticsExec: col_count=2, row_count=Inexact(100)
+        ");
+
+        let optimized = run_rule(input);
+        assert_snapshot!(plan_str(&optimized), @"
+        AggregateExec: mode=FinalPartitioned, gby=[d_name@0 as d_name], aggr=[sum(f_amount)]
+          AggregateExec: mode=Partial, gby=[d_name@3 as d_name], aggr=[sum(f_amount)]
+            HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(f_dim@0, d_id@0)]
+              AggregateExec: mode=FinalPartitioned, gby=[f_dim@0 as f_dim], aggr=[__eager_p0_0]
+                AggregateExec: mode=Partial, gby=[f_dim@0 as f_dim], aggr=[__eager_p0_0]
+                  StatisticsExec: col_count=2, row_count=Inexact(10000000)
+              StatisticsExec: col_count=2, row_count=Inexact(100)
+        ");
     }
 
     // Decline path (CH-benCHmark q3 shape): a large fact pre-aggregates to many
@@ -1590,6 +1627,21 @@ mod tests {
         );
         // Output schema (names, types, order) is preserved.
         assert_eq!(optimized.schema(), original_schema);
+
+        // Executable example of the AVG decomposition: the push side computes
+        // partial SUM(x) + COUNT(x); above the join both merge with SUM; and a top
+        // ProjectionExec divides the merged sum by the merged count (as Float64) to
+        // rebuild `avg(f_amount)`, restoring the original output schema.
+        assert_snapshot!(plan_str(&optimized), @"
+        ProjectionExec: expr=[d_name@0 as d_name, __eager_m0_0@1 / CAST(__eager_m0_1@2 AS Float64) as avg(f_amount)]
+          AggregateExec: mode=FinalPartitioned, gby=[d_name@0 as d_name], aggr=[__eager_m0_0, __eager_m0_1]
+            AggregateExec: mode=Partial, gby=[d_name@4 as d_name], aggr=[__eager_m0_0, __eager_m0_1]
+              HashJoinExec: mode=CollectLeft, join_type=Inner, accumulator=MinMaxLeftAccumulator, on=[(f_dim@0, d_id@0)]
+                AggregateExec: mode=FinalPartitioned, gby=[f_dim@0 as f_dim], aggr=[__eager_p0_0, __eager_p0_1]
+                  AggregateExec: mode=Partial, gby=[f_dim@0 as f_dim], aggr=[__eager_p0_0, __eager_p0_1]
+                    StatisticsExec: col_count=2, row_count=Inexact(10000000)
+                StatisticsExec: col_count=2, row_count=Inexact(100)
+        ");
     }
 
     // Fix #1: a chain of column-only projections between the partial aggregate
