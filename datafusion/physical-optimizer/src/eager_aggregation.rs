@@ -229,13 +229,12 @@ fn try_push_aggregate(
     }
 
     // The `Final <- Partial` shape matched, so from here any bail is informative:
-    // emit the reason to stderr (prefixed `eager_aggregation:`, so it can be
-    // grepped/filtered) — e.g. an unsupported shape, an unsupported aggregate, or
-    // a cost-gate decline. eprintln is deliberate: `log`-crate lines don't survive
-    // the log->tracing bridge in spiced, so they never reach a query-time log.
+    // emit the reason at debug level (target `datafusion::eager_aggregation`, so it
+    // can be filtered) — e.g. an unsupported shape, an unsupported aggregate, or a
+    // cost-gate decline.
     macro_rules! decline {
         ($($arg:tt)*) => {{
-            eprintln!("eager_aggregation: decline: {}", format!($($arg)*));
+            log::debug!(target: "datafusion::eager_aggregation", "decline: {}", format_args!($($arg)*));
             return Ok(None);
         }};
     }
@@ -590,8 +589,9 @@ fn try_push_aggregate(
             grouped,
             join_out,
         } => {
-            eprintln!(
-                "eager_aggregation: accept: side={side:?} push_rows={push_rows} grouped={grouped} join_out={join_out}"
+            log::debug!(
+                target: "datafusion::eager_aggregation",
+                "accept: side={side:?} push_rows={push_rows} grouped={grouped} join_out={join_out}"
             );
         }
         CostGate::Decline(reason) => decline!("cost gate: {reason}"),
