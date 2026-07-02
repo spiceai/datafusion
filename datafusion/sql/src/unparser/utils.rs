@@ -306,6 +306,7 @@ fn find_window_expr<'a>(
 pub(crate) fn unproject_sort_expr(
     mut sort_expr: SortExpr,
     agg: Option<&Aggregate>,
+    windows: Option<&[&Window]>,
     input: &LogicalPlan,
 ) -> Result<SortExpr> {
     sort_expr.expr = sort_expr
@@ -341,11 +342,10 @@ pub(crate) fn unproject_sort_expr(
                     // WindowFunction — those cases either don't need inlining or are handled
                     // separately by the aggregate/window unproject branches.
                     //
-                    // When the inlined expression contains aggregate output column references
-                    // (e.g., `grouping(a) + grouping(b)` which in the projection is stored as
-                    // `col("grouping(a)") + col("grouping(b)")`), we also apply a best-effort
-                    // agg unprojection so those references resolve to their actual function-call
-                    // representations rather than emitting as quoted identifiers.
+                    // When the inlined expression contains aggregate or window function output
+                    // column references (e.g., `sum(ws_ext_sales_price) * 100 / window_result`),
+                    // we apply best-effort unprojection so those references resolve to their
+                    // actual function-call representations rather than emitting as quoted identifiers.
                     if let LogicalPlan::Projection(Projection { expr, schema, .. }) =
                         input
                         && let Ok(idx) = schema.index_of_column(&col)
@@ -358,15 +358,23 @@ pub(crate) fn unproject_sort_expr(
                                 | Expr::AggregateFunction(_)
                                 | Expr::WindowFunction(_)
                         ) {
-                            // If there is an aggregate in scope, resolve any aggregate output
-                            // column references inside the inlined expression. We use a
-                            // best-effort approach: columns not found in the aggregate schema
-                            // are left as-is rather than causing an error.
-                            let resolved = if let Some(agg) = agg {
-                                unaliased.transform(|e| {
+                            // Resolve aggregate and window function output column references
+                            // inside the inlined expression. We use a best-effort approach:
+                            // columns not found in either schema are left as-is.
+                            let resolved = unaliased
+                                .transform(|e| {
                                     if let Expr::Column(c) = &e {
-                                        if let Ok(Some(unprojected)) =
-                                            find_agg_expr(agg, c)
+                                        if let Some(agg) = agg
+                                            && let Ok(Some(unprojected)) =
+                                                find_agg_expr(agg, c)
+                                        {
+                                            return Ok(Transformed::yes(
+                                                unprojected.clone(),
+                                            ));
+                                        }
+                                        if let Some(windows) = windows
+                                            && let Some(unprojected) =
+                                                find_window_expr(windows, &c.name)
                                         {
                                             return Ok(Transformed::yes(
                                                 unprojected.clone(),
@@ -375,10 +383,7 @@ pub(crate) fn unproject_sort_expr(
                                     }
                                     Ok(Transformed::no(e))
                                 })?
-                                .data
-                            } else {
-                                unaliased
-                            };
+                                .data;
                             return Ok(Transformed::yes(resolved));
                         }
                     }

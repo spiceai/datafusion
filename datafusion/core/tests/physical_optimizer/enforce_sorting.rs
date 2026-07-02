@@ -2963,7 +2963,8 @@ fn reorder_projection_physical_plan() -> Result<Arc<dyn ExecutionPlan>> {
 }
 
 #[tokio::test]
-async fn test_parallelize_sorts_remaps_index_through_reordering_projection() -> Result<()> {
+async fn test_parallelize_sorts_remaps_index_through_reordering_projection() -> Result<()>
+{
     let physical_plan = reorder_projection_physical_plan()?;
 
     // EnforceSorting with sort repartitioning enabled runs `parallelize_sorts`.

@@ -2248,6 +2248,93 @@ fn test_order_by_with_computed_alias_inside_expr() -> Result<()> {
     Ok(())
 }
 
+/// Regression test: a BinaryExpr SELECT-list alias that references a window function
+/// output column must be fully inlined in ORDER BY, resolving the window column to
+/// the actual window function expression rather than emitting DataFusion's internal
+/// column name as a quoted identifier.
+///
+/// Pattern from TPC-DS q12:
+///   SELECT ..., sum(ws) * 100 / sum(sum(ws)) OVER (PARTITION BY i_class ...) AS revenueratio
+///   FROM ...
+///   ORDER BY revenueratio
+///
+/// Without the fix, `revenueratio` inlines to:
+///   ((sum(ws) * 100) / "sum(sum(ws_ext_sales_price)) PARTITION BY [i_class] ...")
+/// where the window result becomes a quoted column name that PostgreSQL rejects.
+///
+/// With the fix, it inlines to the full window function expression.
+#[test]
+fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
+    // Mirrors the TPC-DS q12 pattern:
+    //   SELECT ..., sum(ws) * 100 / sum(sum(ws)) OVER (PARTITION BY class) AS revenueratio
+    //   FROM ...
+    //   GROUP BY class, ...
+    //   ORDER BY revenueratio
+    //
+    // After GROUP BY, sum(sales_price) becomes a column named "sum(t.sales_price)".
+    // The window function takes that aggregated column as its arg.
+    // The revenueratio BinaryExpr alias is then the direct sort key.
+    //
+    // Without the fix, the window output column is emitted as a quoted identifier
+    // (DataFusion's internal name), which PostgreSQL rejects with SQLSTATE 42703.
+    // With the fix, the window function expression is fully inlined.
+    let schema = Schema::new(vec![
+        Field::new("class", DataType::Utf8, false),
+        Field::new("sales_price", DataType::Float64, true),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("class")],
+            vec![sum(col("sales_price")).alias("itemrevenue")],
+        )?
+        .build()?;
+
+    // After aggregation, the sum output column is "itemrevenue".
+    // Build: sum(itemrevenue) OVER (PARTITION BY class)
+    let window_expr = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+        params: WindowFunctionParams {
+            args: vec![col("itemrevenue")],
+            partition_by: vec![col("class")],
+            order_by: vec![],
+            window_frame: WindowFrame::new(None),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }));
+    // Get the auto-generated window output column name from the schema
+    let plan = LogicalPlanBuilder::from(plan)
+        .window(vec![window_expr])?
+        .build()?;
+    let window_col_name = plan.schema().fields().last().unwrap().name().clone();
+
+    // revenueratio = itemrevenue * 100 / window_result
+    let revenueratio = ((col("itemrevenue") * lit(100i64))
+        / col(window_col_name.clone()))
+    .alias("revenueratio");
+
+    let plan = LogicalPlanBuilder::from(plan)
+        .project(vec![col("class"), col("itemrevenue"), revenueratio])?
+        .sort(vec![col("revenueratio").sort(true, true)])?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    let sql_str = sql.to_string();
+    // ORDER BY must not contain a quoted DataFusion internal window column name.
+    assert!(
+        !sql_str.contains(&format!("\"{window_col_name}\"")),
+        "ORDER BY should not contain quoted DataFusion internal window column name, got: {sql_str}"
+    );
+    // ORDER BY must contain the inlined window function expression.
+    assert!(
+        sql_str.to_uppercase().contains("OVER"),
+        "ORDER BY should contain an inlined OVER clause, got: {sql_str}"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_aggregation_to_sql() {
     let sql = r#"SELECT id, first_name,
@@ -4014,6 +4101,43 @@ fn snowflake_flatten_multiple_unnest_cross_join() -> Result<(), DataFusionError>
         parser_dialect: GenericDialect {},
         unparser_dialect: snowflake,
         expected: @r#"SELECT "a"."VALUE", "b"."VALUE" FROM "multi_array_table" CROSS JOIN LATERAL FLATTEN(INPUT => "multi_array_table"."column_a") AS "a" CROSS JOIN LATERAL FLATTEN(INPUT => "multi_array_table"."column_b") AS "b""#,
+    );
+    Ok(())
+}
+/// Regression test for chained `INTERSECT`/`EXCEPT` (e.g. TPC-DS q38).
+///
+/// When both intersect/except branches share identical column qualifiers, the
+/// planner requalifies the inputs as `left`/`right` subquery aliases and lowers
+/// the set operation to a `LeftSemi`/`LeftAnti` join. For a 3-way chain the
+/// build (right) side of the *outer* join is a complex plan
+/// (`Distinct(Projection(Join))`). Previously the unparser merged that plan's
+/// projection, joins, DISTINCT and WHERE into the shared outer SELECT while the
+/// generated `EXISTS` captured only the base relation. That produced a spurious
+/// join on the outer FROM and correlated references to tables not in scope
+/// (Postgres: `missing FROM-clause entry for table "left"`).
+///
+/// The build side must now be emitted as a self-contained subquery: each
+/// `EXISTS` carries its own `FROM ... JOIN ...` so every column reference
+/// resolves.
+#[test]
+fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
+    let branch = "SELECT DISTINCT p.first_name, o.order_id \
+                  FROM person p JOIN orders o ON p.id = o.customer_id";
+    let query = format!("{branch} INTERSECT {branch} INTERSECT {branch}");
+
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(&query)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let sql = unparser.plan_to_sql(&plan)?;
+    assert_snapshot!(
+        sql,
+        @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" = "right"."first_name") AND ("left"."order_id" = "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" = "p"."first_name") AND ("left"."order_id" = "o"."order_id"))"#
     );
     Ok(())
 }
