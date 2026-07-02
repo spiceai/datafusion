@@ -2383,10 +2383,8 @@ pub(crate) mod tests {
             num_rows: Precision::Exact(1_000_000),
             total_byte_size: Precision::Exact(744_000_000), // full row incl. c_data
             column_statistics: vec![
-                ColumnStatistics::new_unknown()
-                    .with_byte_size(Precision::Exact(4_000_000)),
-                ColumnStatistics::new_unknown()
-                    .with_byte_size(Precision::Exact(6_000_000)),
+                ColumnStatistics::new_unknown().with_byte_size(Precision::Exact(4_000_000)),
+                ColumnStatistics::new_unknown().with_byte_size(Precision::Exact(6_000_000)),
                 ColumnStatistics::new_unknown()
                     .with_byte_size(Precision::Exact(734_000_000)),
             ],

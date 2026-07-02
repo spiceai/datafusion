@@ -2311,9 +2311,9 @@ fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
     let window_col_name = plan.schema().fields().last().unwrap().name().clone();
 
     // revenueratio = itemrevenue * 100 / window_result
-    let revenueratio = ((col("itemrevenue") * lit(100i64))
-        / col(window_col_name.clone()))
-    .alias("revenueratio");
+    let revenueratio =
+        ((col("itemrevenue") * lit(100i64)) / col(window_col_name.clone()))
+            .alias("revenueratio");
 
     let plan = LogicalPlanBuilder::from(plan)
         .project(vec![col("class"), col("itemrevenue"), revenueratio])?
