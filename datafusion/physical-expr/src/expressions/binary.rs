@@ -754,10 +754,11 @@ impl BinaryExpr {
             max_depth = max_depth.max(depth);
 
             if let Some(binary) = expr.downcast_ref::<BinaryExpr>()
-                && binary.op == target_op {
-                    stack.push((&binary.left, depth + 1));
-                    stack.push((&binary.right, depth + 1));
-                }
+                && binary.op == target_op
+            {
+                stack.push((&binary.left, depth + 1));
+                stack.push((&binary.right, depth + 1));
+            }
         }
 
         max_depth
@@ -777,12 +778,13 @@ impl BinaryExpr {
 
         while let Some(expr) = stack.pop() {
             if let Some(binary) = expr.downcast_ref::<BinaryExpr>()
-                && binary.op == target_op {
-                    // Push right first so left is processed first (preserves order)
-                    stack.push(Arc::clone(&binary.right));
-                    stack.push(Arc::clone(&binary.left));
-                    continue;
-                }
+                && binary.op == target_op
+            {
+                // Push right first so left is processed first (preserves order)
+                stack.push(Arc::clone(&binary.right));
+                stack.push(Arc::clone(&binary.left));
+                continue;
+            }
             // Not a matching BinaryExpr, so it's a leaf operand
             operands.push(expr);
         }
@@ -844,7 +846,9 @@ impl BinaryExpr {
 
             // After combining, check if we can short-circuit based on result
             if let Some(ref res) = result {
-                if let ShortCircuitStrategy::ReturnLeft = check_short_circuit(res, &self.op) {
+                if let ShortCircuitStrategy::ReturnLeft =
+                    check_short_circuit(res, &self.op)
+                {
                     return Ok(result.unwrap());
                 }
             }

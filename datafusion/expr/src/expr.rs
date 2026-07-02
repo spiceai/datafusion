@@ -2309,9 +2309,10 @@ impl Expr {
                         }
                     }
                     if let Some(else_expr) = else_expr
-                        && let Some(expr_type) = &expr_type {
-                            rewrite_placeholder_type(else_expr.as_mut(), expr_type)?;
-                        }
+                        && let Some(expr_type) = &expr_type
+                    {
+                        rewrite_placeholder_type(else_expr.as_mut(), expr_type)?;
+                    }
                 }
                 // These expressions constrain any immediate placeholders to Boolean.
                 Expr::Not(expr)
@@ -3046,9 +3047,10 @@ impl HashNode for Expr {
 
 fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
     if let Expr::Placeholder(Placeholder { id: _, field }) = expr
-        && field.is_none() {
-            *field = Some(Field::new("", dt.clone(), true).into());
-        };
+        && field.is_none()
+    {
+        *field = Some(Field::new("", dt.clone(), true).into());
+    };
     Ok(())
 }
 
@@ -4729,14 +4731,15 @@ mod test {
 
             // ELSE expression should infer Utf8 (to match THEN expressions)
             if let Some(else_expr) = else_expr
-                && let Expr::Placeholder(placeholder) = else_expr.as_ref() {
-                    assert_eq!(
-                        placeholder.field.as_ref().unwrap().data_type(),
-                        &DataType::Utf8,
-                        "ELSE placeholder {} should infer Utf8",
-                        placeholder.id
-                    );
-                }
+                && let Expr::Placeholder(placeholder) = else_expr.as_ref()
+            {
+                assert_eq!(
+                    placeholder.field.as_ref().unwrap().data_type(),
+                    &DataType::Utf8,
+                    "ELSE placeholder {} should infer Utf8",
+                    placeholder.id
+                );
+            }
         } else {
             panic!("Expected Case expression");
         }
@@ -4805,25 +4808,27 @@ mod test {
 
             // Check first WHEN condition: $1 > 100
             if let Expr::BinaryExpr(binary_expr) = &when_then_expr[0].0.as_ref()
-                && let Expr::Placeholder(placeholder) = binary_expr.left.as_ref() {
-                    assert_eq!(
-                        placeholder.field.as_ref().unwrap().data_type(),
-                        &DataType::Int32,
-                        "Placeholder {} should infer Int32",
-                        placeholder.id
-                    );
-                }
+                && let Expr::Placeholder(placeholder) = binary_expr.left.as_ref()
+            {
+                assert_eq!(
+                    placeholder.field.as_ref().unwrap().data_type(),
+                    &DataType::Int32,
+                    "Placeholder {} should infer Int32",
+                    placeholder.id
+                );
+            }
 
             // Check second WHEN condition: name = $3
             if let Expr::BinaryExpr(binary_expr) = &when_then_expr[1].0.as_ref()
-                && let Expr::Placeholder(placeholder) = binary_expr.right.as_ref() {
-                    assert_eq!(
-                        placeholder.field.as_ref().unwrap().data_type(),
-                        &DataType::Utf8,
-                        "Placeholder {} should infer Utf8",
-                        placeholder.id
-                    );
-                }
+                && let Expr::Placeholder(placeholder) = binary_expr.right.as_ref()
+            {
+                assert_eq!(
+                    placeholder.field.as_ref().unwrap().data_type(),
+                    &DataType::Utf8,
+                    "Placeholder {} should infer Utf8",
+                    placeholder.id
+                );
+            }
 
             // Check THEN expressions - should all infer Utf8
             for (_, then_expr) in &when_then_expr {
@@ -4839,14 +4844,15 @@ mod test {
 
             // Check ELSE expression - should infer Utf8
             if let Some(else_expr) = else_expr
-                && let Expr::Placeholder(placeholder) = else_expr.as_ref() {
-                    assert_eq!(
-                        placeholder.field.as_ref().unwrap().data_type(),
-                        &DataType::Utf8,
-                        "ELSE placeholder {} should infer Utf8",
-                        placeholder.id
-                    );
-                }
+                && let Expr::Placeholder(placeholder) = else_expr.as_ref()
+            {
+                assert_eq!(
+                    placeholder.field.as_ref().unwrap().data_type(),
+                    &DataType::Utf8,
+                    "ELSE placeholder {} should infer Utf8",
+                    placeholder.id
+                );
+            }
         } else {
             panic!("Expected Case expression");
         }
@@ -4894,14 +4900,15 @@ mod test {
         {
             // Base expression placeholder should infer Utf8 (from WHEN value)
             if let Some(base_expr) = expr
-                && let Expr::Placeholder(placeholder) = base_expr.as_ref() {
-                    assert_eq!(
-                        placeholder.field.as_ref().unwrap().data_type(),
-                        &DataType::Utf8,
-                        "Base expression placeholder {} should infer Utf8",
-                        placeholder.id
-                    );
-                }
+                && let Expr::Placeholder(placeholder) = base_expr.as_ref()
+            {
+                assert_eq!(
+                    placeholder.field.as_ref().unwrap().data_type(),
+                    &DataType::Utf8,
+                    "Base expression placeholder {} should infer Utf8",
+                    placeholder.id
+                );
+            }
 
             // THEN and ELSE expressions should have consistent types
             // Since we don't have a concrete type hint, they should get inferred from context
@@ -4913,9 +4920,10 @@ mod test {
             }
 
             if let Some(else_expr) = else_expr
-                && let Expr::Placeholder(placeholder) = else_expr.as_ref() {
-                    assert!(placeholder.field.is_some());
-                }
+                && let Expr::Placeholder(placeholder) = else_expr.as_ref()
+            {
+                assert!(placeholder.field.is_some());
+            }
         } else {
             panic!("Expected Case expression");
         }

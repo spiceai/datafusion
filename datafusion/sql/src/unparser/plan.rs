@@ -48,7 +48,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
-    Aggregate, BinaryExpr, Distinct, Expr, JoinConstraint, JoinType, LogicalPlan,
+    Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan, Unnest,
     UserDefinedLogicalNode, Window, expr::Alias,
 };
@@ -251,23 +251,26 @@ impl Unparser<'_> {
 
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
-        projection
-            .iter_mut()
-            .for_each(|select_item| if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) = select_item {
+        projection.iter_mut().for_each(|select_item| {
+            if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) =
+                select_item
+            {
                 remove_dangling_identifiers(idents, &all_idents);
-            });
+            }
+        });
 
         // Check the order by as well
         if let Some(query) = query.as_mut()
-            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by() {
-                order_by.iter_mut().for_each(|sort_item| {
-                    if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                        remove_dangling_identifiers(idents, &all_idents);
-                    }
-                });
+            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
+        {
+            order_by.iter_mut().for_each(|sort_item| {
+                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
+                    remove_dangling_identifiers(idents, &all_idents);
+                }
+            });
 
-                query.order_by(OrderByKind::Expressions(order_by));
-            }
+            query.order_by(OrderByKind::Expressions(order_by));
+        }
 
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
@@ -840,12 +843,25 @@ impl Unparser<'_> {
                 };
 
                 let agg = find_agg_node_within_select(plan, select.already_projected());
+                let window_nodes = find_window_nodes_within_select(
+                    plan,
+                    None,
+                    select.already_projected(),
+                );
+                let windows: Option<Vec<&Window>> = window_nodes
+                    .as_deref()
+                    .map(|ws| ws.iter().copied().collect());
                 // unproject sort expressions
                 let sort_exprs: Vec<SortExpr> = sort
                     .expr
                     .iter()
                     .map(|sort_expr| {
-                        unproject_sort_expr(sort_expr.clone(), agg, sort.input.as_ref())
+                        unproject_sort_expr(
+                            sort_expr.clone(),
+                            agg,
+                            windows.as_deref(),
+                            sort.input.as_ref(),
+                        )
                     })
                     .collect::<Result<Vec<_>>>()?;
 
@@ -979,29 +995,58 @@ impl Unparser<'_> {
                     None
                 };
 
-                let right_plan =
-                    match try_transform_to_simple_table_scan_with_filters(right_plan)? {
-                        Some((plan, filters)) => {
-                            table_scan_filters.extend(filters);
-                            Arc::new(plan)
-                        }
-                        None => Arc::clone(right_plan),
-                    };
-
-                let mut right_relation = RelationBuilder::default();
-
-                self.select_to_sql_recursively(
-                    right_plan.as_ref(),
-                    query,
-                    select,
-                    &mut right_relation,
-                )?;
-
-                let (join_filters, where_filters) = Self::split_join_on_and_where_filters(
+                let is_exists_join = matches!(
                     join.join_type,
-                    &join.filter,
-                    table_scan_filters,
+                    JoinType::LeftSemi
+                        | JoinType::LeftAnti
+                        | JoinType::LeftMark
+                        | JoinType::RightSemi
+                        | JoinType::RightAnti
+                        | JoinType::RightMark
                 );
+
+                // The build (right) side of an EXISTS-style join is emitted as
+                // a self-contained subquery (see `build_exists_subquery`), so
+                // it must not be unparsed into the shared `select` here. Doing
+                // so would leak its projection, joins, DISTINCT and WHERE
+                // clauses into the outer query. Regular joins unparse it into
+                // the shared `select` as usual.
+                let mut right_relation = RelationBuilder::default();
+                let right_plan: Arc<LogicalPlan> = if is_exists_join {
+                    Arc::clone(right_plan)
+                } else {
+                    let right_plan =
+                        match try_transform_to_simple_table_scan_with_filters(right_plan)?
+                        {
+                            Some((plan, filters)) => {
+                                table_scan_filters.extend(filters);
+                                Arc::new(plan)
+                            }
+                            None => Arc::clone(right_plan),
+                        };
+
+                    self.select_to_sql_recursively(
+                        right_plan.as_ref(),
+                        query,
+                        select,
+                        &mut right_relation,
+                    )?;
+                    right_plan
+                };
+
+                // Table-scan filters extracted from the inputs must land in the
+                // outer query. EXISTS-style joins have no outer `ON` clause, so
+                // all such filters go to the outer `WHERE`; regular joins split
+                // them between `ON` and `WHERE`.
+                let (join_filters, where_filters) = if is_exists_join {
+                    (join.filter.clone(), table_scan_filters)
+                } else {
+                    Self::split_join_on_and_where_filters(
+                        join.join_type,
+                        &join.filter,
+                        table_scan_filters,
+                    )
+                };
                 for filter in where_filters {
                     let filter_expr = self.expr_to_sql(&filter)?;
                     select.selection(Some(filter_expr));
@@ -1013,12 +1058,12 @@ impl Unparser<'_> {
                     join_filters.as_ref(),
                 )?;
 
-                let right_projection: Option<Vec<ast::SelectItem>> = if !already_projected
-                {
-                    Some(select.pop_projections())
-                } else {
-                    None
-                };
+                let right_projection: Option<Vec<ast::SelectItem>> =
+                    if !already_projected && !is_exists_join {
+                        Some(select.pop_projections())
+                    } else {
+                        None
+                    };
 
                 match join.join_type {
                     JoinType::LeftSemi
@@ -1027,25 +1072,8 @@ impl Unparser<'_> {
                     | JoinType::RightSemi
                     | JoinType::RightAnti
                     | JoinType::RightMark => {
-                        let mut query_builder = QueryBuilder::default();
-                        let mut from = TableWithJoinsBuilder::default();
-                        let mut exists_select: SelectBuilder = SelectBuilder::default();
-                        from.relation(right_relation);
-                        exists_select.push_from(from);
-                        if let Some(filter) = &join.filter {
-                            exists_select.selection(Some(self.expr_to_sql(filter)?));
-                        }
-                        for (left, right) in &join.on {
-                            exists_select.selection(Some(
-                                self.expr_to_sql(&left.clone().eq(right.clone()))?,
-                            ));
-                        }
-                        exists_select.projection(vec![ast::SelectItem::UnnamedExpr(
-                            ast::Expr::value(ast::Value::Number("1".to_string(), false)),
-                        )]);
-                        query_builder.body(Box::new(SetExpr::Select(Box::new(
-                            exists_select.build()?,
-                        ))));
+                        let subquery =
+                            self.build_exists_subquery(right_plan.as_ref(), join)?;
 
                         let negated = match join.join_type {
                             JoinType::LeftSemi
@@ -1056,7 +1084,7 @@ impl Unparser<'_> {
                             _ => unreachable!(),
                         };
                         let exists_expr = ast::Expr::Exists {
-                            subquery: Box::new(query_builder.build()?),
+                            subquery: Box::new(subquery),
                             negated,
                         };
 
@@ -1704,14 +1732,34 @@ impl Unparser<'_> {
     /// Plans like Aggregate or Window build their own SELECT clauses (GROUP BY,
     /// window functions).
     fn requires_derived_subquery(plan: &LogicalPlan) -> bool {
-        matches!(
-            plan,
+        match plan {
             LogicalPlan::Aggregate(_)
-                | LogicalPlan::Window(_)
-                | LogicalPlan::Sort(_)
-                | LogicalPlan::Limit(_)
-                | LogicalPlan::Union(_)
-        )
+            | LogicalPlan::Window(_)
+            | LogicalPlan::Sort(_)
+            | LogicalPlan::Limit(_)
+            | LogicalPlan::Union(_) => true,
+            // Semi/anti joins generate correlated EXISTS subqueries whose WHERE conditions
+            // reference the join's left-branch alias via `select.selection()`. When a
+            // SubqueryAlias later calls `relation.alias(outer_name)` it overwrites that
+            // alias, causing the EXISTS correlation to reference a table name that no
+            // longer appears in FROM. Wrapping as a derived subquery isolates the EXISTS
+            // conditions inside their own SELECT scope, so the alias overwrite only
+            // affects the outer wrapper and the correlation remains valid.
+            LogicalPlan::Join(join) => matches!(
+                join.join_type,
+                JoinType::LeftSemi
+                    | JoinType::LeftAnti
+                    | JoinType::RightSemi
+                    | JoinType::RightAnti
+                    | JoinType::LeftMark
+                    | JoinType::RightMark
+            ),
+            // Peek through Distinct: INTERSECT produces Distinct(LeftSemiJoin(...))
+            LogicalPlan::Distinct(distinct) => {
+                Self::requires_derived_subquery(distinct.input())
+            }
+            _ => false,
+        }
     }
 
     /// Try to unparse a table scan with pushdown operations into a new subquery plan.
@@ -2115,6 +2163,82 @@ impl Unparser<'_> {
         } else {
             vec![Expr::Literal(ScalarValue::Int64(Some(1)), None)]
         }
+    }
+
+    /// Builds the body of an `EXISTS` subquery for a semi/anti/mark join.
+    ///
+    /// The build (right) side is unparsed as a complete, self-contained
+    /// subquery so that any SELECT-level clauses it needs (projection, joins,
+    /// DISTINCT, WHERE) stay inside the subquery instead of leaking into the
+    /// outer SELECT. Its projection is replaced with `SELECT 1` and the join
+    /// predicates (`ON` equalities plus any residual join filter) are
+    /// AND-combined into its WHERE clause, becoming correlated references to
+    /// the outer query.
+    fn build_exists_subquery(
+        &self,
+        right_plan: &LogicalPlan,
+        join: &Join,
+    ) -> Result<ast::Query> {
+        let mut query_builder = Some(QueryBuilder::default());
+        let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
+        let mut query_builder = query_builder.unwrap();
+
+        // Correlated predicates: the join `ON` equalities plus any residual
+        // (non-equi) join filter.
+        let mut predicates = Vec::new();
+        if let Some(filter) = &join.filter {
+            predicates.push(self.expr_to_sql(filter)?);
+        }
+        for (left, right) in &join.on {
+            predicates.push(self.expr_to_sql(&left.clone().eq(right.clone()))?);
+        }
+
+        let select_one = || {
+            vec![ast::SelectItem::UnnamedExpr(ast::Expr::value(
+                ast::Value::Number("1".to_string(), false),
+            ))]
+        };
+
+        let body = match body {
+            SetExpr::Select(mut select) => {
+                for predicate in predicates {
+                    select.selection = Some(match select.selection.take() {
+                        Some(existing) => ast::Expr::BinaryOp {
+                            left: Box::new(existing),
+                            op: ast::BinaryOperator::And,
+                            right: Box::new(predicate),
+                        },
+                        None => predicate,
+                    });
+                }
+                // `SELECT 1` is all `EXISTS` needs; DISTINCT would be redundant.
+                select.projection = select_one();
+                select.distinct = None;
+                SetExpr::Select(select)
+            }
+            // A non-SELECT body (e.g. a set operation) can't have `SELECT 1`
+            // and correlated predicates spliced directly into it. Wrap it in a
+            // derived table and build a fresh `EXISTS` body around it.
+            other => {
+                let mut derived = DerivedRelationBuilder::default();
+                derived.lateral(false).alias(None).subquery(Box::new(
+                    QueryBuilder::default().body(Box::new(other)).build()?,
+                ));
+                let mut relation = RelationBuilder::default();
+                relation.derived(derived);
+                let mut from = TableWithJoinsBuilder::default();
+                from.relation(relation);
+                let mut exists_select = SelectBuilder::default();
+                exists_select.push_from(from);
+                for predicate in predicates {
+                    exists_select.selection(Some(predicate));
+                }
+                exists_select.projection(select_one());
+                SetExpr::Select(Box::new(exists_select.build()?))
+            }
+        };
+
+        Ok(query_builder.body(Box::new(body)).build()?)
     }
 
     /// Decides where extracted table-scan filters belong in the unparsed SQL:
