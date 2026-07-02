@@ -361,29 +361,23 @@ pub(crate) fn unproject_sort_expr(
                             // Resolve aggregate and window function output column references
                             // inside the inlined expression. We use a best-effort approach:
                             // columns not found in either schema are left as-is.
-                            let resolved = unaliased
-                                .transform(|e| {
-                                    if let Expr::Column(c) = &e {
-                                        if let Some(agg) = agg
-                                            && let Ok(Some(unprojected)) =
-                                                find_agg_expr(agg, c)
-                                        {
-                                            return Ok(Transformed::yes(
-                                                unprojected.clone(),
-                                            ));
-                                        }
-                                        if let Some(windows) = windows
-                                            && let Some(unprojected) =
-                                                find_window_expr(windows, &c.name)
-                                        {
-                                            return Ok(Transformed::yes(
-                                                unprojected.clone(),
-                                            ));
-                                        }
+                            let resolved = unaliased.transform(|e| {
+                                if let Expr::Column(c) = &e {
+                                    if let Some(agg) = agg
+                                        && let Ok(Some(unprojected)) = find_agg_expr(agg, c)
+                                    {
+                                        return Ok(Transformed::yes(unprojected.clone()));
                                     }
-                                    Ok(Transformed::no(e))
-                                })?
-                                .data;
+                                    if let Some(windows) = windows
+                                        && let Some(unprojected) =
+                                            find_window_expr(windows, &c.name)
+                                    {
+                                        return Ok(Transformed::yes(unprojected.clone()));
+                                    }
+                                }
+                                Ok(Transformed::no(e))
+                            })?
+                            .data;
                             return Ok(Transformed::yes(resolved));
                         }
                     }
