@@ -234,7 +234,7 @@ fn try_push_aggregate(
     // cost-gate decline.
     macro_rules! decline {
         ($($arg:tt)*) => {{
-            log::debug!(target: "datafusion::eager_aggregation", "decline: {}", format!($($arg)*));
+            log::debug!(target: "datafusion::eager_aggregation", "decline: {}", format_args!($($arg)*));
             return Ok(None);
         }};
     }
