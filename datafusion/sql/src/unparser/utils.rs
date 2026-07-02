@@ -358,26 +358,24 @@ pub(crate) fn unproject_sort_expr(
                                 | Expr::AggregateFunction(_)
                                 | Expr::WindowFunction(_)
                         ) {
-                            // Resolve aggregate and window function output column references
-                            // inside the inlined expression. We use a best-effort approach:
-                            // columns not found in either schema are left as-is.
-                            let resolved = unaliased.transform(|e| {
-                                if let Expr::Column(c) = &e {
-                                    if let Some(agg) = agg
-                                        && let Ok(Some(unprojected)) = find_agg_expr(agg, c)
-                                    {
-                                        return Ok(Transformed::yes(unprojected.clone()));
-                                    }
-                                    if let Some(windows) = windows
-                                        && let Some(unprojected) =
-                                            find_window_expr(windows, &c.name)
-                                    {
-                                        return Ok(Transformed::yes(unprojected.clone()));
-                                    }
+                            // Resolve aggregate and window function output column
+                            // references inside the inlined expression. Delegate to the
+                            // same helpers the SELECT projection uses so nested
+                            // references are fully unprojected — in particular a window
+                            // whose argument is itself an aggregate output, e.g.
+                            // `sum(sum(x)) OVER (...)`, where `unproject_agg_exprs`
+                            // recurses into the substituted window expression. The
+                            // previous inline transform did not, leaving the inner
+                            // `sum(x)` as a dangling quoted identifier.
+                            let resolved = match (agg, windows) {
+                                (Some(agg), windows) => {
+                                    unproject_agg_exprs(unaliased, agg, windows)?
                                 }
-                                Ok(Transformed::no(e))
-                            })?
-                            .data;
+                                (None, Some(windows)) => {
+                                    unproject_window_exprs(unaliased, windows)?
+                                }
+                                (None, None) => unaliased,
+                            };
                             return Ok(Transformed::yes(resolved));
                         }
                     }

@@ -2283,19 +2283,19 @@ fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
         Field::new("sales_price", DataType::Float64, true),
     ]);
 
+    // GROUP BY class, sum(sales_price) — left unaliased so the window's argument
+    // is the raw aggregate-output column (as in q12), which the ORDER BY
+    // unprojection must resolve back to the aggregate function call.
     let plan = table_scan(Some("t"), &schema, None)?
-        .aggregate(
-            vec![col("class")],
-            vec![sum(col("sales_price")).alias("itemrevenue")],
-        )?
+        .aggregate(vec![col("class")], vec![sum(col("sales_price"))])?
         .build()?;
+    let agg_col = plan.schema().fields().last().unwrap().name().clone();
 
-    // After aggregation, the sum output column is "itemrevenue".
-    // Build: sum(itemrevenue) OVER (PARTITION BY class)
+    // Build: sum(<agg output>) OVER (PARTITION BY class)
     let window_expr = Expr::WindowFunction(Box::new(WindowFunction {
         fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
         params: WindowFunctionParams {
-            args: vec![col("itemrevenue")],
+            args: vec![col(agg_col.clone())],
             partition_by: vec![col("class")],
             order_by: vec![],
             window_frame: WindowFrame::new(None),
@@ -2310,22 +2310,27 @@ fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
         .build()?;
     let window_col_name = plan.schema().fields().last().unwrap().name().clone();
 
-    // revenueratio = itemrevenue * 100 / window_result
+    // revenueratio = sum(sales_price) * 100 / (sum(sum(sales_price)) OVER (...))
     let revenueratio =
-        ((col("itemrevenue") * lit(100i64)) / col(window_col_name.clone()))
+        ((col(agg_col.clone()) * lit(100i64)) / col(window_col_name.clone()))
             .alias("revenueratio");
 
     let plan = LogicalPlanBuilder::from(plan)
-        .project(vec![col("class"), col("itemrevenue"), revenueratio])?
+        .project(vec![col("class"), revenueratio])?
         .sort(vec![col("revenueratio").sort(true, true)])?
         .build()?;
 
-    let sql = plan_to_sql(&plan)?;
-    let sql_str = sql.to_string();
-    // ORDER BY must not contain a quoted DataFusion internal window column name.
+    let sql_str = plan_to_sql(&plan)?.to_string();
+    // ORDER BY must inline the window expression, leaving neither the window
+    // output column nor its nested aggregate argument as a quoted DataFusion
+    // internal identifier (both would be rejected by PostgreSQL as 42703).
     assert!(
         !sql_str.contains(&format!("\"{window_col_name}\"")),
-        "ORDER BY should not contain quoted DataFusion internal window column name, got: {sql_str}"
+        "ORDER BY leaked the window output identifier, got: {sql_str}"
+    );
+    assert!(
+        !sql_str.contains(&format!("\"{agg_col}\"")),
+        "ORDER BY leaked the nested aggregate identifier, got: {sql_str}"
     );
     // ORDER BY must contain the inlined window function expression.
     assert!(
@@ -4141,3 +4146,4 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
     );
     Ok(())
 }
+
