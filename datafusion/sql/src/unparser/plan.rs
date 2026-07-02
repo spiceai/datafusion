@@ -2175,62 +2175,67 @@ impl Unparser<'_> {
         let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
         let mut query_builder = query_builder.unwrap();
 
-        // Correlated predicates: the join `ON` equalities plus any residual
-        // (non-equi) join filter.
-        let mut predicates = Vec::new();
-        if let Some(filter) = &join.filter {
-            predicates.push(self.expr_to_sql(filter)?);
-        }
-        for (left, right) in &join.on {
-            predicates.push(self.expr_to_sql(&left.clone().eq(right.clone()))?);
-        }
-
-        let select_one = || {
-            vec![ast::SelectItem::UnnamedExpr(ast::Expr::value(
-                ast::Value::Number("1".to_string(), false),
-            ))]
+        // Reduce the build side to a single SELECT to use as the EXISTS body.
+        // A non-SELECT body (e.g. a set operation) is wrapped as a derived table.
+        let mut select = match body {
+            SetExpr::Select(select) => select,
+            other => Box::new(Self::wrap_setexpr_as_derived_select(other)?),
         };
 
-        let body = match body {
-            SetExpr::Select(mut select) => {
-                for predicate in predicates {
-                    select.selection = Some(match select.selection.take() {
-                        Some(existing) => ast::Expr::BinaryOp {
-                            left: Box::new(existing),
-                            op: ast::BinaryOperator::And,
-                            right: Box::new(predicate),
-                        },
-                        None => predicate,
-                    });
-                }
-                // `SELECT 1` is all `EXISTS` needs; DISTINCT would be redundant.
-                select.projection = select_one();
-                select.distinct = None;
-                SetExpr::Select(select)
-            }
-            // A non-SELECT body (e.g. a set operation) can't have `SELECT 1`
-            // and correlated predicates spliced directly into it. Wrap it in a
-            // derived table and build a fresh `EXISTS` body around it.
-            other => {
-                let mut derived = DerivedRelationBuilder::default();
-                derived.lateral(false).alias(None).subquery(Box::new(
-                    QueryBuilder::default().body(Box::new(other)).build()?,
-                ));
-                let mut relation = RelationBuilder::default();
-                relation.derived(derived);
-                let mut from = TableWithJoinsBuilder::default();
-                from.relation(relation);
-                let mut exists_select = SelectBuilder::default();
-                exists_select.push_from(from);
-                for predicate in predicates {
-                    exists_select.selection(Some(predicate));
-                }
-                exists_select.projection(select_one());
-                SetExpr::Select(Box::new(exists_select.build()?))
-            }
-        };
+        // `EXISTS` only needs `SELECT 1`; DISTINCT would be redundant.
+        select.projection = vec![ast::SelectItem::UnnamedExpr(ast::Expr::value(
+            ast::Value::Number("1".to_string(), false),
+        ))];
+        select.distinct = None;
 
-        Ok(query_builder.body(Box::new(body)).build()?)
+        // AND the correlated join predicates — the `ON` equalities plus any
+        // residual (non-equi) join filter — into the WHERE clause.
+        let predicates = join
+            .filter
+            .iter()
+            .cloned()
+            .chain(join.on.iter().map(|(l, r)| l.clone().eq(r.clone())));
+        for predicate in predicates {
+            let predicate = self.expr_to_sql(&predicate)?;
+            select.selection = Some(match select.selection.take() {
+                Some(existing) => ast::Expr::BinaryOp {
+                    left: Box::new(existing),
+                    op: ast::BinaryOperator::And,
+                    right: Box::new(predicate),
+                },
+                None => predicate,
+            });
+        }
+
+        query_builder.body(Box::new(SetExpr::Select(select)));
+        Ok(query_builder.build()?)
+    }
+
+    /// Wraps a non-SELECT set expression (e.g. a `UNION`) as an unaliased
+    /// derived table inside a bare `SELECT`, so it can serve as an `EXISTS`
+    /// body that [`build_exists_subquery`] then adds `SELECT 1` and correlated
+    /// predicates to.
+    ///
+    /// [`build_exists_subquery`]: Self::build_exists_subquery
+    fn wrap_setexpr_as_derived_select(body: SetExpr) -> Result<ast::Select> {
+        let mut subquery = QueryBuilder::default();
+        subquery.body(Box::new(body));
+
+        let mut derived = DerivedRelationBuilder::default();
+        derived
+            .lateral(false)
+            .alias(None)
+            .subquery(Box::new(subquery.build()?));
+
+        let mut relation = RelationBuilder::default();
+        relation.derived(derived);
+
+        let mut from = TableWithJoinsBuilder::default();
+        from.relation(relation);
+
+        let mut select = SelectBuilder::default();
+        select.push_from(from);
+        Ok(select.build()?)
     }
 
     /// Decides where extracted table-scan filters belong in the unparsed SQL:
