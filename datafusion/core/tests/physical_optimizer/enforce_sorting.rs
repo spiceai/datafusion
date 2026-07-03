@@ -1594,6 +1594,69 @@ async fn test_multilayer_coalesce_partitions() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_parallelize_sorts_preserves_collect_left_coalesce() -> Result<()> {
+    use datafusion_common::NullEquality;
+    use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode};
+
+    let schema = create_test_schema()?;
+    // Build side: its `CoalescePartitionsExec` satisfies the CollectLeft
+    // join's SinglePartition requirement and must not be removed.
+    let left =
+        coalesce_partitions_exec(repartition_exec(parquet_exec(schema.clone())));
+    // Probe side: contains a `CoalescePartitionsExec` reachable through
+    // operators that don't require a single partition, so the coalesce link
+    // propagates through the join to the coalesce at the top of the plan.
+    let right = filter_exec(
+        Arc::new(NotExpr::new(col("non_nullable_col", schema.as_ref())?)),
+        coalesce_partitions_exec(repartition_exec(parquet_exec(schema.clone()))),
+    );
+    let join = Arc::new(HashJoinExec::try_new(
+        left,
+        right,
+        vec![(
+            col("nullable_col", &schema)?,
+            col("nullable_col", &schema)?,
+        )],
+        None,
+        &JoinType::LeftAnti,
+        None,
+        PartitionMode::CollectLeft,
+        NullEquality::NullEqualsNothing,
+        false,
+    )?);
+    let physical_plan = coalesce_partitions_exec(join);
+
+    // `parallelize_sorts` may remove the probe-side coalesce, but the
+    // build-side coalesce satisfies the join's SinglePartition requirement
+    // and must survive.
+    let test = EnforceSortingTest::new(physical_plan).with_repartition_sorts(true);
+    assert_snapshot!(test.run(), @r"
+    Input Plan:
+    CoalescePartitionsExec
+      HashJoinExec: mode=CollectLeft, join_type=LeftAnti, accumulator=MinMaxLeftAccumulator, on=[(nullable_col@0, nullable_col@0)]
+        CoalescePartitionsExec
+          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+            DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
+        FilterExec: NOT non_nullable_col@1
+          CoalescePartitionsExec
+            RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+              DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
+
+    Optimized Plan:
+    CoalescePartitionsExec
+      HashJoinExec: mode=CollectLeft, join_type=LeftAnti, accumulator=MinMaxLeftAccumulator, on=[(nullable_col@0, nullable_col@0)]
+        CoalescePartitionsExec
+          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+            DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
+        FilterExec: NOT non_nullable_col@1
+          RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1
+            DataSourceExec: file_groups={1 group: [[x]]}, projection=[nullable_col, non_nullable_col], file_type=parquet
+    ");
+
+    Ok(())
+}
+
 fn create_lost_ordering_plan(source_unbounded: bool) -> Result<Arc<dyn ExecutionPlan>> {
     let schema = create_test_schema3()?;
     let sort_exprs = [sort_expr("a", &schema)];
