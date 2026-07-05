@@ -293,6 +293,22 @@ impl Unparser<'_> {
     ) -> Result<()> {
         let mut exprs = p.expr.clone();
 
+        // A projection with no output expressions (e.g. `count(*)` over a view
+        // that prunes every column, producing `Projection: <empty> -> TableScan`)
+        // must not be unparsed as an empty `SELECT` list: dialects such as DuckDB
+        // reject `SELECT FROM t` with a parser error. Mirror the bare `TableScan`
+        // handling and fall back to a dummy `SELECT 1` for dialects that do not
+        // support an empty select list.
+        if exprs.is_empty() {
+            let items = self
+                .empty_projection_fallback()
+                .iter()
+                .map(|e| self.select_item_to_sql(e))
+                .collect::<Result<Vec<_>>>()?;
+            select.projection(items);
+            return Ok(());
+        }
+
         // If an Unnest node is found within the select, find and unproject the unnest column
         let flatten_alias = select.current_flatten_alias();
         if let Some(unnest) = find_unnest_node_within_select(plan) {
