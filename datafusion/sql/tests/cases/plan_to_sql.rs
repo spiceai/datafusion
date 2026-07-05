@@ -1337,6 +1337,61 @@ fn table_scan_with_empty_projection_and_none_projection_helper(
         .unwrap()
 }
 
+// An empty `Projection` node (0 output expressions) arises when, for example,
+// `count(*)` is planned over a view/subquery whose columns are all pruned,
+// yielding `Projection: <empty> -> TableScan`. It must not be unparsed as an
+// empty `SELECT` list for dialects that reject `SELECT FROM t` (e.g. DuckDB):
+// fall back to `SELECT 1` just like the bare empty-projection `TableScan`.
+fn empty_projection_over_table_helper(table_name: &str, table_schema: Schema) -> LogicalPlan {
+    project(
+        table_scan(Some(table_name), &table_schema, None)
+            .unwrap()
+            .build()
+            .unwrap(),
+        Vec::<Expr>::new(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_empty_projection_node_in_plan_to_sql_default_dialect() {
+    let plan = empty_projection_over_table_helper("table", test_schema());
+    let unparser = Unparser::new(&UnparserDefaultDialect {});
+    let sql = unparser.plan_to_sql(&plan).unwrap();
+    assert_snapshot!(
+        sql,
+        @r#"SELECT 1 FROM "table""#
+    );
+}
+
+#[test]
+fn test_empty_projection_node_in_plan_to_sql_postgres() {
+    let plan = empty_projection_over_table_helper("table", test_schema());
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let sql = unparser.plan_to_sql(&plan).unwrap();
+    assert_snapshot!(
+        sql,
+        @r#"SELECT FROM "table""#
+    );
+}
+
+#[test]
+fn test_empty_projection_under_subquery_alias_default_dialect() {
+    let plan = subquery_alias(
+        empty_projection_over_table_helper("table", test_schema()),
+        "v",
+    )
+    .unwrap();
+    let unparser = Unparser::new(&UnparserDefaultDialect {});
+    let sql = unparser.plan_to_sql(&plan).unwrap();
+    // The inner empty projection (the view body) is what previously unparsed to
+    // the invalid `SELECT FROM "table"`; it now renders as `SELECT 1 FROM "table"`.
+    assert_snapshot!(
+        sql,
+        @r#"SELECT * FROM (SELECT 1 FROM "table") AS v"#
+    );
+}
+
 #[test]
 fn test_pretty_roundtrip() -> Result<()> {
     let schema = Schema::new(vec![
