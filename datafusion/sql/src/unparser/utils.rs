@@ -322,12 +322,10 @@ pub(crate) fn unproject_sort_expr(
     // PostgreSQL and similar dialects reject output-column aliases inside
     // expressions. That path is handled by the recursive `transform` below,
     // which is only reached when `sort_expr.expr` is not a bare column.
-    if let Expr::Column(col) = &sort_expr.expr
-        && col.relation.is_none()
+    if let Expr::Column(Column{relation: None, name, .. }) = &sort_expr.expr
         && let LogicalPlan::Projection(Projection { expr, schema, .. }) = input
-        && let Ok(idx) = schema.index_of_column(col)
-        && let Some(proj_expr) = expr.get(idx)
-        && matches!(proj_expr, Expr::Alias(_))
+        && let Some(idx) = schema.index_of_column_by_name(None, name)
+        && let Some(Expr::Alias(_)) = expr.get(idx)
     {
         return Ok(sort_expr);
     }
