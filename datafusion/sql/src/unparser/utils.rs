@@ -309,6 +309,29 @@ pub(crate) fn unproject_sort_expr(
     windows: Option<&[&Window]>,
     input: &LogicalPlan,
 ) -> Result<SortExpr> {
+    // When the *entire* sort key is a bare unqualified column reference that
+    // maps to an explicitly aliased projection expression, the column name IS
+    // the output-column alias — a valid top-level ORDER BY key in all dialects.
+    // Return it as-is; inlining the full aliased expression (which may be a
+    // complex window or arithmetic formula) is both unnecessary and harmful:
+    // remote engines that re-unparse the SQL can produce dangling quoted
+    // identifiers for inner aggregate/window references.
+    //
+    // Inlining IS still needed when the same alias appears *nested* inside a
+    // larger sort expression (e.g. `CASE WHEN alias = 0 THEN ...`), because
+    // PostgreSQL and similar dialects reject output-column aliases inside
+    // expressions. That path is handled by the recursive `transform` below,
+    // which is only reached when `sort_expr.expr` is not a bare column.
+    if let Expr::Column(col) = &sort_expr.expr
+        && col.relation.is_none()
+        && let LogicalPlan::Projection(Projection { expr, schema, .. }) = input
+        && let Ok(idx) = schema.index_of_column(col)
+        && let Some(proj_expr) = expr.get(idx)
+        && matches!(proj_expr, Expr::Alias(_))
+    {
+        return Ok(sort_expr);
+    }
+
     sort_expr.expr = sort_expr
         .expr
         .transform(|sub_expr| {

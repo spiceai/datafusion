@@ -2207,7 +2207,7 @@ fn test_complex_order_by_with_grouping() -> Result<()> {
     }, {
         assert_snapshot!(
             sql,
-            @"SELECT j1.j1_id, j1.j1_string, lochierarchy FROM (SELECT j1.j1_id, j1.j1_string, (grouping(j1.j1_id) + grouping(j1.j1_string)) AS lochierarchy, grouping(j1.j1_string), grouping(j1.j1_id) FROM j1 GROUP BY ROLLUP (j1.j1_id, j1.j1_string) ORDER BY lochierarchy DESC NULLS FIRST, CASE WHEN ((grouping(j1.j1_id) + grouping(j1.j1_string)) = 0) THEN j1.j1_id END ASC NULLS LAST) LIMIT 100"
+            @"SELECT j1.j1_id, j1.j1_string, (grouping(j1.j1_id) + grouping(j1.j1_string)) AS lochierarchy FROM j1 GROUP BY ROLLUP (j1.j1_id, j1.j1_string) ORDER BY lochierarchy DESC NULLS FIRST, CASE WHEN ((grouping(j1.j1_id) + grouping(j1.j1_string)) = 0) THEN j1.j1_id END ASC NULLS LAST LIMIT 100"
         );
     });
 
@@ -2303,36 +2303,23 @@ fn test_order_by_with_computed_alias_inside_expr() -> Result<()> {
     Ok(())
 }
 
-/// Regression test: a BinaryExpr SELECT-list alias that references a window function
-/// output column must be fully inlined in ORDER BY, resolving the window column to
-/// the actual window function expression rather than emitting DataFusion's internal
-/// column name as a quoted identifier.
+/// Regression test: a sort key that is exactly a SELECT-list alias (here for a
+/// BinaryExpr referencing a window function output) must be emitted as the bare
+/// alias, not inlined.
 ///
-/// Pattern from TPC-DS q12:
+/// Pattern from TPC-DS q12/q20/q98:
 ///   SELECT ..., sum(ws) * 100 / sum(sum(ws)) OVER (PARTITION BY i_class ...) AS revenueratio
 ///   FROM ...
 ///   ORDER BY revenueratio
 ///
-/// Without the fix, `revenueratio` inlines to:
+/// A bare output-column alias is a valid top-level ORDER BY key in every
+/// dialect, and inlining the aliased expression is harmful: engines that
+/// re-plan and re-unparse the received SQL (e.g. a federated remote) can leak
+/// the window's internal schema name as a quoted identifier, e.g.
 ///   ((sum(ws) * 100) / "sum(sum(ws_ext_sales_price)) PARTITION BY [i_class] ...")
-/// where the window result becomes a quoted column name that PostgreSQL rejects.
-///
-/// With the fix, it inlines to the full window function expression.
+/// which the downstream engine rejects (PostgreSQL 42703 / DuckDB Binder Error).
 #[test]
 fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
-    // Mirrors the TPC-DS q12 pattern:
-    //   SELECT ..., sum(ws) * 100 / sum(sum(ws)) OVER (PARTITION BY class) AS revenueratio
-    //   FROM ...
-    //   GROUP BY class, ...
-    //   ORDER BY revenueratio
-    //
-    // After GROUP BY, sum(sales_price) becomes a column named "sum(t.sales_price)".
-    // The window function takes that aggregated column as its arg.
-    // The revenueratio BinaryExpr alias is then the direct sort key.
-    //
-    // Without the fix, the window output column is emitted as a quoted identifier
-    // (DataFusion's internal name), which PostgreSQL rejects with SQLSTATE 42703.
-    // With the fix, the window function expression is fully inlined.
     let schema = Schema::new(vec![
         Field::new("class", DataType::Utf8, false),
         Field::new("sales_price", DataType::Float64, true),
@@ -2366,9 +2353,9 @@ fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
     let window_col_name = plan.schema().fields().last().unwrap().name().clone();
 
     // revenueratio = sum(sales_price) * 100 / (sum(sum(sales_price)) OVER (...))
-    let revenueratio =
-        ((col(agg_col.clone()) * lit(100i64)) / col(window_col_name.clone()))
-            .alias("revenueratio");
+    let revenueratio = ((col(agg_col.clone()) * lit(100i64))
+        / col(window_col_name.clone()))
+    .alias("revenueratio");
 
     let plan = LogicalPlanBuilder::from(plan)
         .project(vec![col("class"), revenueratio])?
@@ -2376,9 +2363,91 @@ fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
         .build()?;
 
     let sql_str = plan_to_sql(&plan)?.to_string();
-    // ORDER BY must inline the window expression, leaving neither the window
-    // output column nor its nested aggregate argument as a quoted DataFusion
-    // internal identifier (both would be rejected by PostgreSQL as 42703).
+    // The sort key is exactly the projection alias, so ORDER BY must keep the
+    // bare alias rather than inlining the window/aggregate expression.
+    assert!(
+        sql_str.ends_with("ORDER BY revenueratio ASC NULLS FIRST"),
+        "ORDER BY should be the bare output-column alias, got: {sql_str}"
+    );
+    // Neither the window output column nor its nested aggregate argument may
+    // appear anywhere as a quoted DataFusion internal identifier (both would
+    // be rejected by PostgreSQL as 42703).
+    assert!(
+        !sql_str.contains(&format!("\"{window_col_name}\"")),
+        "leaked the window output identifier, got: {sql_str}"
+    );
+    assert!(
+        !sql_str.contains(&format!("\"{agg_col}\"")),
+        "leaked the nested aggregate identifier, got: {sql_str}"
+    );
+    Ok(())
+}
+
+/// Companion to [`test_order_by_with_binary_expr_referencing_window_output`]:
+/// when the same window-referencing alias appears *nested* inside a larger
+/// ORDER BY expression, keeping the bare alias is not an option (engines
+/// resolve identifiers inside expressions against the FROM relations only), so
+/// the unparser must inline the aliased expression — resolving the window
+/// output column to its full OVER expression and the aggregate-output column
+/// nested in the window's argument to the aggregate function call, leaving
+/// neither as a quoted DataFusion internal identifier.
+#[test]
+fn test_order_by_window_output_alias_nested_inside_expr() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("class", DataType::Utf8, false),
+        Field::new("sales_price", DataType::Float64, true),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("class")], vec![sum(col("sales_price"))])?
+        .build()?;
+    let agg_col = plan.schema().fields().last().unwrap().name().clone();
+
+    // Build: sum(<agg output>) OVER (PARTITION BY class)
+    let window_expr = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+        params: WindowFunctionParams {
+            args: vec![col(agg_col.clone())],
+            partition_by: vec![col("class")],
+            order_by: vec![],
+            window_frame: WindowFrame::new(None),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }));
+    let plan = LogicalPlanBuilder::from(plan)
+        .window(vec![window_expr])?
+        .build()?;
+    let window_col_name = plan.schema().fields().last().unwrap().name().clone();
+
+    let revenueratio = ((col(agg_col.clone()) * lit(100i64))
+        / col(window_col_name.clone()))
+    .alias("revenueratio");
+
+    // Sort key: CASE WHEN revenueratio = 0 THEN class END — the alias is
+    // nested inside a larger expression, so it must be inlined.
+    let case_expr =
+        datafusion_expr::when(col("revenueratio").eq(lit(0i64)), col("class"))
+            .end()
+            .unwrap();
+
+    let plan = LogicalPlanBuilder::from(plan)
+        .project(vec![col("class"), revenueratio])?
+        .sort(vec![case_expr.sort(true, true)])?
+        .build()?;
+
+    let sql_str = plan_to_sql(&plan)?.to_string();
+    // The inlined expression must contain the window function...
+    assert!(
+        sql_str.to_uppercase().contains("OVER"),
+        "ORDER BY should contain an inlined OVER clause, got: {sql_str}"
+    );
+    // ...and must not leak the alias or internal identifiers.
+    assert!(
+        !sql_str.contains("ORDER BY CASE WHEN (revenueratio"),
+        "ORDER BY leaked the bare alias inside an expression, got: {sql_str}"
+    );
     assert!(
         !sql_str.contains(&format!("\"{window_col_name}\"")),
         "ORDER BY leaked the window output identifier, got: {sql_str}"
@@ -2386,11 +2455,6 @@ fn test_order_by_with_binary_expr_referencing_window_output() -> Result<()> {
     assert!(
         !sql_str.contains(&format!("\"{agg_col}\"")),
         "ORDER BY leaked the nested aggregate identifier, got: {sql_str}"
-    );
-    // ORDER BY must contain the inlined window function expression.
-    assert!(
-        sql_str.to_uppercase().contains("OVER"),
-        "ORDER BY should contain an inlined OVER clause, got: {sql_str}"
     );
     Ok(())
 }
@@ -4201,4 +4265,3 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
     );
     Ok(())
 }
-
