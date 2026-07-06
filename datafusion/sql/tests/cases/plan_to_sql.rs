@@ -2438,23 +2438,32 @@ fn test_order_by_window_output_alias_nested_inside_expr() -> Result<()> {
         .build()?;
 
     let sql_str = plan_to_sql(&plan)?.to_string();
-    // The inlined expression must contain the window function...
+    // Scope the ORDER BY assertions to the clause itself: the SELECT list also
+    // inlines the window expression, so whole-string checks for OVER / the
+    // alias would pass regardless of what the ORDER BY contains.
+    let order_by = sql_str
+        .split_once("ORDER BY")
+        .expect("SQL should contain ORDER BY")
+        .1;
+    // The sort key must inline the window function expression...
     assert!(
-        sql_str.to_uppercase().contains("OVER"),
+        order_by.to_uppercase().contains("OVER"),
         "ORDER BY should contain an inlined OVER clause, got: {sql_str}"
     );
-    // ...and must not leak the alias or internal identifiers.
+    // ...with no reference to the SELECT-list alias (engines resolve
+    // identifiers inside ORDER BY expressions against FROM relations only)...
     assert!(
-        !sql_str.contains("ORDER BY CASE WHEN (revenueratio"),
+        !order_by.contains("revenueratio"),
         "ORDER BY leaked the bare alias inside an expression, got: {sql_str}"
     );
+    // ...and no internal identifiers anywhere.
     assert!(
         !sql_str.contains(&format!("\"{window_col_name}\"")),
-        "ORDER BY leaked the window output identifier, got: {sql_str}"
+        "leaked the window output identifier, got: {sql_str}"
     );
     assert!(
         !sql_str.contains(&format!("\"{agg_col}\"")),
-        "ORDER BY leaked the nested aggregate identifier, got: {sql_str}"
+        "leaked the nested aggregate identifier, got: {sql_str}"
     );
     Ok(())
 }
