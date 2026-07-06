@@ -119,7 +119,7 @@ use std::sync::Arc;
 
 use crate::PhysicalOptimizerRule;
 
-use arrow::datatypes::DataType;
+use arrow::datatypes::{DataType, FieldRef};
 use datafusion_common::JoinSide;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
@@ -606,8 +606,8 @@ fn try_push_aggregate(
     /// Per-input-aggregate plan: how to merge each pushed partial and how to
     /// recombine the merged columns into the aggregate's output value.
     struct AggPlan {
-        /// `(merge udaf, pushed partial alias, merged column alias)` per partial.
-        merges: Vec<(Arc<AggregateUDF>, String, String)>,
+        /// `(merge udaf, pushed partial alias, merged column alias, return field)` per partial.
+        merges: Vec<(Arc<AggregateUDF>, String, String, Option<FieldRef>)>,
         out: OutKind,
         out_name: String,
     }
@@ -631,7 +631,12 @@ fn try_push_aggregate(
             .collect::<Result<Vec<_>>>()?;
         let Decomp { partials, out } = decompose(agg);
         let mut merges = Vec::with_capacity(partials.len());
-        for (p, (partial_udaf, merge)) in partials.into_iter().enumerate() {
+        for (p, partial) in partials.into_iter().enumerate() {
+            let PartialAgg {
+                partial_udaf,
+                merge_udaf,
+                merge_return_field,
+            } = partial;
             let pushed_alias = format!("__eager_p{i}_{p}");
             let built = AggregateExprBuilder::new(partial_udaf, args.clone())
                 .schema(Arc::clone(&push_schema))
@@ -646,7 +651,7 @@ fn try_push_aggregate(
             } else {
                 agg.name().to_string()
             };
-            merges.push((merge, pushed_alias, merged_alias));
+            merges.push((merge_udaf, pushed_alias, merged_alias, merge_return_field));
         }
         agg_plans.push(AggPlan {
             merges,
@@ -785,13 +790,16 @@ fn try_push_aggregate(
     let mut merge_aggrs: Vec<Arc<AggregateFunctionExpr>> =
         Vec::with_capacity(agg_plans.len());
     for plan in &agg_plans {
-        for (merge, pushed_alias, merged_alias) in &plan.merges {
+        for (merge, pushed_alias, merged_alias, return_field) in &plan.merges {
             let idx = new_join_schema.index_of(pushed_alias)?;
             let arg = Arc::new(Column::new(pushed_alias, idx)) as Arc<dyn PhysicalExpr>;
-            let built = AggregateExprBuilder::new(Arc::clone(merge), vec![arg])
+            let mut builder = AggregateExprBuilder::new(Arc::clone(merge), vec![arg])
                 .schema(Arc::clone(&new_join_schema))
-                .alias(merged_alias.clone())
-                .build()?;
+                .alias(merged_alias.clone());
+            if let Some(return_field) = return_field {
+                builder = builder.return_field(Arc::clone(return_field));
+            }
+            let built = builder.build()?;
             merge_aggrs.push(Arc::new(built));
         }
     }
@@ -877,11 +885,22 @@ fn is_decomposable(agg: &AggregateFunctionExpr) -> bool {
 /// The partial aggregate(s) to push below the join for `agg`, and how its final
 /// output value is recombined above the join.
 struct Decomp {
-    /// `(udaf, merge_udaf)` for each pushed partial: the partial computes `udaf`
-    /// on the push side, and `merge_udaf` merges it above the join.
-    partials: Vec<(Arc<AggregateUDF>, Arc<AggregateUDF>)>,
+    /// Pushed partial aggregate(s) and how to merge each one above the join.
+    partials: Vec<PartialAgg>,
     /// How to turn the merged column(s) into `agg`'s output value.
     out: OutKind,
+}
+
+/// A pushed partial aggregate and its top-level merge aggregate.
+struct PartialAgg {
+    /// UDAF to compute on the push side.
+    partial_udaf: Arc<AggregateUDF>,
+    /// UDAF to merge the pushed partials above the join.
+    merge_udaf: Arc<AggregateUDF>,
+    /// Optional return field for the merge aggregate when the rewrite must
+    /// preserve the original SQL-visible aggregate field instead of inferring a
+    /// new field from the pushed partial column.
+    merge_return_field: Option<FieldRef>,
 }
 
 /// How an aggregate's merged partial column(s) recombine into its output.
@@ -898,19 +917,45 @@ fn decompose(agg: &AggregateFunctionExpr) -> Decomp {
     match agg.fun().name() {
         // COUNT's per-group partial counts must be summed, not re-counted.
         "count" => Decomp {
-            partials: vec![(Arc::new(agg.fun().clone()), sum_udaf())],
+            partials: vec![PartialAgg {
+                partial_udaf: Arc::new(agg.fun().clone()),
+                merge_udaf: sum_udaf(),
+                merge_return_field: None,
+            }],
             out: OutKind::Passthrough,
         },
         // AVG(x) = SUM(x) / COUNT(x); both partials merge with SUM.
         "avg" => Decomp {
-            partials: vec![(sum_udaf(), sum_udaf()), (count_udaf(), sum_udaf())],
+            partials: vec![
+                PartialAgg {
+                    partial_udaf: sum_udaf(),
+                    merge_udaf: sum_udaf(),
+                    merge_return_field: None,
+                },
+                PartialAgg {
+                    partial_udaf: count_udaf(),
+                    merge_udaf: sum_udaf(),
+                    merge_return_field: None,
+                },
+            ],
             out: OutKind::AvgDiv,
         },
-        // SUM/MIN/MAX are self-merging.
-        _ => Decomp {
-            partials: vec![(Arc::new(agg.fun().clone()), Arc::new(agg.fun().clone()))],
+        // SUM/MIN/MAX are self-merging. Preserve the original aggregate field for
+        // the merge output instead of inferring it from the pushed partial column.
+        // This matters for decimal SUM: the pushed partial already has the
+        // SQL-visible widened type, so inferring SUM(partial_sum) would widen it a
+        // second time.
+        "sum" | "min" | "max" => Decomp {
+            partials: vec![PartialAgg {
+                partial_udaf: Arc::new(agg.fun().clone()),
+                merge_udaf: Arc::new(agg.fun().clone()),
+                merge_return_field: Some(agg.field()),
+            }],
             out: OutKind::Passthrough,
         },
+        other => unreachable!(
+            "aggregate {other} was accepted by is_decomposable but has no eager-aggregation decomposition"
+        ),
     }
 }
 
@@ -1052,7 +1097,7 @@ mod tests {
     use crate::PhysicalOptimizerRule;
 
     use crate::enforce_distribution::EnforceDistribution;
-    use arrow::array::{Float64Array, Int32Array, StringArray};
+    use arrow::array::{Decimal128Array, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::NullEquality;
@@ -2417,6 +2462,148 @@ mod tests {
             sorted_rows(&on_rows),
             sorted_rows(&off_rows),
             "eager-on results must match eager-off"
+        );
+    }
+
+    // Decimal SUM widens its input precision by +10. Eager aggregation rewrites
+    // SUM(x) into a pushed SUM(x) plus a top SUM(partial_sum); the top merge must
+    // preserve the original SUM field instead of widening the already-widened
+    // partial again (Decimal(16,2) -> Decimal(26,2)).
+    #[tokio::test]
+    async fn decimal_sum_eager_push_preserves_output_schema() {
+        let fact_schema = Arc::new(Schema::new(vec![
+            Field::new("f_dim", DataType::Int32, false),
+            Field::new("f_amount", DataType::Decimal128(6, 2), true),
+        ]));
+        let amount = Decimal128Array::from(vec![
+            Some(1000),
+            Some(2000),
+            Some(3000),
+            Some(4000),
+            Some(5000),
+            Some(6000),
+        ])
+        .with_precision_and_scale(6, 2)
+        .unwrap();
+        let fact_batch = RecordBatch::try_new(
+            Arc::clone(&fact_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 1, 2, 2, 2, 1])),
+                Arc::new(amount),
+            ],
+        )
+        .unwrap();
+        let fact = Arc::new(DataStatsExec::new(
+            vec![fact_batch],
+            stats_with(10_000_000, &[Some(2), None]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let dim_schema = Arc::new(Schema::new(vec![
+            Field::new("d_id", DataType::Int32, false),
+            Field::new("d_name", DataType::Utf8, true),
+        ]));
+        let dim_batch = RecordBatch::try_new(
+            Arc::clone(&dim_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1, 2])),
+                Arc::new(StringArray::from(vec!["a", "b"])),
+            ],
+        )
+        .unwrap();
+        let dim = Arc::new(DataStatsExec::new(
+            vec![dim_batch],
+            stats_with(2, &[Some(2), Some(2)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                fact,
+                dim,
+                vec![(
+                    Arc::new(Column::new("f_dim", 0)),
+                    Arc::new(Column::new("d_id", 0)),
+                )],
+                None,
+                &JoinType::Inner,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema();
+
+        let sum_expr = Arc::new(
+            AggregateExprBuilder::new(
+                sum_udaf(),
+                vec![Arc::new(Column::new("f_amount", 1))],
+            )
+            .schema(Arc::clone(&join_schema))
+            .alias("amount_sum")
+            .build()
+            .unwrap(),
+        );
+        let group = PhysicalGroupBy::new_single(vec![(
+            Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+            "d_name".to_string(),
+        )]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group.clone(),
+                vec![Arc::clone(&sum_expr)],
+                vec![None],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::FinalPartitioned,
+                final_group,
+                vec![sum_expr],
+                vec![None],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let original_schema = plan.schema();
+        assert_eq!(
+            original_schema.field(1).data_type(),
+            &DataType::Decimal128(16, 2)
+        );
+
+        let eager_on = run_rule(Arc::clone(&plan));
+        assert!(
+            join_child_is_aggregate(&eager_on),
+            "eager aggregation should have fired"
+        );
+        assert_eq!(
+            eager_on.schema(),
+            original_schema,
+            "eager aggregation must not change the public output schema"
+        );
+
+        let on = enforce_distribution(eager_on);
+        let off = enforce_distribution(plan);
+        assert_eq!(on.schema(), original_schema);
+
+        let ctx = Arc::new(TaskContext::default());
+        let on_rows = collect(on, Arc::clone(&ctx)).await.unwrap();
+        let off_rows = collect(off, ctx).await.unwrap();
+        assert!(
+            on_rows
+                .iter()
+                .all(|batch| batch.schema() == original_schema)
+        );
+        assert_eq!(
+            sorted_rows(&on_rows),
+            sorted_rows(&off_rows),
+            "eager-on decimal SUM results must match eager-off"
         );
     }
 

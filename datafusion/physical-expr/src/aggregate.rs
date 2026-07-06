@@ -124,6 +124,8 @@ pub struct AggregateExprBuilder {
     args: Vec<Arc<dyn PhysicalExpr>>,
     alias: Option<String>,
     output_metadata: Option<FieldMetadata>,
+    /// Optional override for the aggregate return field inferred from the UDAF.
+    return_field: Option<FieldRef>,
     /// A human readable name
     human_display: Option<String>,
     /// Optional visible output alias for `human_display`.
@@ -147,6 +149,7 @@ impl AggregateExprBuilder {
             args,
             alias: None,
             output_metadata: None,
+            return_field: None,
             human_display: None,
             human_display_alias: None,
             schema: Arc::new(Schema::empty()),
@@ -253,6 +256,7 @@ impl AggregateExprBuilder {
             args,
             alias,
             output_metadata,
+            return_field,
             human_display,
             human_display_alias,
             schema,
@@ -281,7 +285,8 @@ impl AggregateExprBuilder {
             &fun.signature().type_signature,
         )?;
 
-        let mut return_field = fun.return_field(&input_exprs_fields)?;
+        let inferred_return_field = fun.return_field(&input_exprs_fields)?;
+        let mut return_field = return_field.unwrap_or(inferred_return_field);
         if let Some(output_metadata) = output_metadata {
             return_field = output_metadata.add_to_field_ref(return_field);
         }
@@ -328,6 +333,16 @@ impl AggregateExprBuilder {
 
     fn output_metadata(mut self, metadata: Option<FieldMetadata>) -> Self {
         self.output_metadata = metadata;
+        self
+    }
+
+    /// Override the aggregate return field inferred from the UDAF.
+    ///
+    /// This is intended for physical optimizer rewrites that replace an
+    /// aggregate's input with already-aggregated values while preserving the
+    /// original SQL-visible output field.
+    pub fn return_field(mut self, return_field: FieldRef) -> Self {
+        self.return_field = Some(return_field);
         self
     }
 
