@@ -1394,6 +1394,7 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
                             filter,
                             on_right,
                             repartition_random_state,
+                            self.null_aware,
                         ))
                     })))
                 })
