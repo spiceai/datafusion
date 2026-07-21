@@ -45,7 +45,7 @@ use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, split_conjunction};
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
-use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
+use datafusion_physical_expr_common::physical_expr::{PhysicalExpr, is_volatile};
 use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::coop::cooperative;
@@ -160,6 +160,12 @@ pub struct FileScanConfig {
     /// DataFusion may attempt to read each partition of files
     /// concurrently, however files *within* a partition will be read
     /// sequentially, one after the next.
+    ///
+    /// Note that when `datafusion.execution.enable_file_stream_work_stealing`
+    /// is enabled (the default), files may be reassigned to a different
+    /// partition at runtime unless `preserve_order` or
+    /// `partitioned_by_file_group` is set, so a file is not guaranteed to be
+    /// read by the partition it is grouped under here.
     pub file_groups: Vec<FileGroup>,
     /// Table constraints
     pub constraints: Constraints,
@@ -635,6 +641,51 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
     }
 }
 
+/// Returns `true` if merging `outer` into `inner` would duplicate a volatile
+/// expression; the caller should then decline the merge.
+///
+/// `inner` is the scan's current projection and `outer` the projection being
+/// pushed into it; merging substitutes each `inner` expression into every
+/// `outer` reference to it. If a volatile `inner` expression (e.g. `random()`,
+/// `uuid()`) is referenced more than once, that single value gets inlined at
+/// each site and re-evaluated independently, so references meant to share a
+/// "locked-in" value diverge. This is the volatility guard the physical
+/// `ProjectionPushdown` and `FilterPushdown` rules already apply (see
+/// `datafusion_physical_expr_common::physical_expr::is_volatile`).
+///
+/// References are counted with multiplicity by walking each `outer` expression
+/// (as `try_collapse_projection_chain` does), so a self-duplicating expression
+/// such as `r + r` counts as two references. A volatile expression referenced
+/// exactly once has nothing to duplicate and is left to merge.
+fn would_duplicate_volatile_exprs(
+    inner: &ProjectionExprs,
+    outer: &ProjectionExprs,
+) -> bool {
+    use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+
+    let inner_exprs = inner.as_ref();
+
+    let mut ref_counts = vec![0usize; inner_exprs.len()];
+    for proj_expr in outer.as_ref() {
+        proj_expr
+            .expr
+            .apply(|e| {
+                if let Some(col) = e.as_ref().downcast_ref::<Column>()
+                    && let Some(count) = ref_counts.get_mut(col.index())
+                {
+                    *count += 1;
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("infallible closure should not fail");
+    }
+
+    ref_counts
+        .iter()
+        .enumerate()
+        .any(|(idx, &count)| count > 1 && is_volatile(&inner_exprs[idx].expr))
+}
+
 impl DataSource for FileScanConfig {
     fn open(
         &self,
@@ -917,6 +968,15 @@ impl DataSource for FileScanConfig {
         &self,
         projection: &ProjectionExprs,
     ) -> Result<Option<Arc<dyn DataSource>>> {
+        // Don't merge a projection into the scan if it would inline a volatile
+        // expression that the outer projection references, which would turn a
+        // single "locked-in" value (e.g. `random()` aliased in a subquery) into
+        // multiple independent evaluations. See #23220.
+        if let Some(inner) = self.file_source.projection()
+            && would_duplicate_volatile_exprs(inner, projection)
+        {
+            return Ok(None);
+        }
         match self.file_source.try_pushdown_projection(projection)? {
             Some(new_source) => {
                 let mut new_file_scan_config = self.clone();
@@ -1102,10 +1162,18 @@ impl DataSource for FileScanConfig {
     /// during one execution.
     ///
     /// This returns `None` when sibling streams must not share work, such as
-    /// when file order must be preserved or the file groups define the output
-    /// partitioning needed for the rest of the plan
-    fn create_sibling_state(&self) -> Option<Arc<dyn Any + Send + Sync>> {
-        if self.preserve_order || self.partitioned_by_file_group {
+    /// when file order must be preserved, the file groups define the output
+    /// partitioning needed for the rest of the plan, or work stealing is
+    /// disabled via
+    /// `datafusion.execution.enable_file_stream_work_stealing`.
+    fn create_sibling_state(
+        &self,
+        config: &ConfigOptions,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        if self.preserve_order
+            || self.partitioned_by_file_group
+            || !config.execution.enable_file_stream_work_stealing
+        {
             return None;
         }
 
@@ -3704,5 +3772,180 @@ mod tests {
             "Expected Exact (no NULLs), got {result:?}"
         );
         Ok(())
+    }
+
+    /// Helper: build a `ProjectionExprs` from `(expr, alias)` pairs.
+    fn make_projection(pairs: Vec<(Arc<dyn PhysicalExpr>, &str)>) -> ProjectionExprs {
+        ProjectionExprs::new(
+            pairs
+                .into_iter()
+                .map(|(expr, alias)| ProjectionExpr::new(expr, alias)),
+        )
+    }
+
+    /// Helper: create a volatile (non-deterministic) function expression,
+    /// e.g. `random()`.
+    fn make_volatile_expr() -> Arc<dyn PhysicalExpr> {
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_expr::ScalarUDF;
+        use datafusion_functions::math::random::RandomFunc;
+        use datafusion_physical_expr::ScalarFunctionExpr;
+
+        Arc::new(ScalarFunctionExpr::new(
+            "random",
+            Arc::new(ScalarUDF::from(RandomFunc::new())),
+            vec![],
+            Arc::new(Field::new("random", DataType::Float64, false)),
+            Arc::new(ConfigOptions::default()),
+        ))
+    }
+
+    /// Column-only inner projections always merge safely, even when
+    /// the outer projection references them multiple times.
+    #[test]
+    fn test_would_duplicate_allows_column_only_inner() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+
+        let inner =
+            make_projection(vec![(Arc::clone(&col_a), "a"), (Arc::clone(&col_b), "b")]);
+
+        // Outer references col 0 twice
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("a", 0)), "x"),
+            (Arc::new(Column::new("a", 0)), "y"),
+        ]);
+
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    /// Deterministic computed expressions (arithmetic) referenced multiple
+    /// times are allowed to merge — only volatile expressions are protected.
+    #[test]
+    fn test_would_duplicate_allows_deterministic_computed_multi_ref() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
+        // Inner: [a + b, b]  (index 0 is deterministic computed)
+        let inner = make_projection(vec![
+            (
+                Arc::new(BinaryExpr::new(
+                    Arc::clone(&col_a),
+                    Operator::Plus,
+                    Arc::clone(&col_b),
+                )),
+                "sum",
+            ),
+            (Arc::clone(&col_b), "b"),
+        ]);
+
+        // Outer references index 0 twice
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("sum", 0)), "x"),
+            (Arc::new(Column::new("sum", 0)), "y"),
+        ]);
+
+        // Deterministic arithmetic → allow merge even though duplicated
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    /// A volatile expression the outer projection does not reference is
+    /// safe to merge (it is projected away, not duplicated).
+    #[test]
+    fn test_would_duplicate_allows_unreferenced_volatile() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        // Inner: [random(), a]
+        let inner =
+            make_projection(vec![(make_volatile_expr(), "r"), (Arc::clone(&col_a), "a")]);
+
+        // Outer references only index 1 (the column), not the volatile expr
+        let outer = make_projection(vec![(Arc::new(Column::new("a", 1)), "a")]);
+
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    /// A volatile expression referenced multiple times must block merge:
+    /// this is the #23220 regression (`random()` aliased then referenced as
+    /// `x` and `y`).
+    #[test]
+    fn test_would_duplicate_blocks_multi_ref_volatile() {
+        // Inner: [random()]
+        let inner = make_projection(vec![(make_volatile_expr(), "r")]);
+
+        // Outer references index 0 twice
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("r", 0)), "x"),
+            (Arc::new(Column::new("r", 0)), "y"),
+        ]);
+
+        assert!(would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    /// A volatile expression referenced exactly once has nothing to duplicate,
+    /// so the merge is allowed.
+    #[test]
+    fn test_would_duplicate_allows_single_ref_volatile() {
+        let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
+        // Inner: [random(), a]
+        let inner =
+            make_projection(vec![(make_volatile_expr(), "r"), (Arc::clone(&col_a), "a")]);
+
+        // Outer references the volatile expression exactly once
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("r", 0)), "x"),
+            (Arc::new(Column::new("a", 1)), "a"),
+        ]);
+
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    /// References are counted with multiplicity, so a single outer expression
+    /// that duplicates the value (e.g. `r + r`) still blocks the merge.
+    #[test]
+    fn test_would_duplicate_blocks_single_expr_self_ref_volatile() {
+        // Inner: [random()]
+        let inner = make_projection(vec![(make_volatile_expr(), "r")]);
+
+        // Outer: [r + r] — one expression referencing `random()` twice
+        let outer = make_projection(vec![(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("r", 0)),
+                Operator::Plus,
+                Arc::new(Column::new("r", 0)),
+            )),
+            "x",
+        )]);
+
+        assert!(would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    /// A volatile expression buried inside a larger expression (e.g.
+    /// `random() + 1`) is still detected and blocks merge.
+    #[test]
+    fn test_would_duplicate_blocks_volatile_nested_in_arithmetic() {
+        // Inner: [random() + 1]
+        let inner = make_projection(vec![(
+            Arc::new(BinaryExpr::new(
+                make_volatile_expr(),
+                Operator::Plus,
+                Arc::new(Literal::new(ScalarValue::Float64(Some(1.0)))),
+            )),
+            "expr",
+        )]);
+
+        // Outer references index 0 twice
+        let outer = make_projection(vec![
+            (Arc::new(Column::new("expr", 0)), "x"),
+            (Arc::new(Column::new("expr", 0)), "y"),
+        ]);
+
+        assert!(would_duplicate_volatile_exprs(&inner, &outer));
+    }
+
+    /// Empty projections should not block merging.
+    #[test]
+    fn test_would_duplicate_empty_projections() {
+        let inner = make_projection(vec![]);
+        let outer = make_projection(vec![]);
+        assert!(!would_duplicate_volatile_exprs(&inner, &outer));
     }
 }
