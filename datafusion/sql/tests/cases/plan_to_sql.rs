@@ -1342,7 +1342,10 @@ fn table_scan_with_empty_projection_and_none_projection_helper(
 // yielding `Projection: <empty> -> TableScan`. It must not be unparsed as an
 // empty `SELECT` list for dialects that reject `SELECT FROM t` (e.g. DuckDB):
 // fall back to `SELECT 1` just like the bare empty-projection `TableScan`.
-fn empty_projection_over_table_helper(table_name: &str, table_schema: Schema) -> LogicalPlan {
+fn empty_projection_over_table_helper(
+    table_name: &str,
+    table_schema: Schema,
+) -> LogicalPlan {
     project(
         table_scan(Some(table_name), &table_schema, None)
             .unwrap()
@@ -4272,5 +4275,61 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
         sql,
         @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" = "right"."first_name") AND ("left"."order_id" = "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" = "p"."first_name") AND ("left"."order_id" = "o"."order_id"))"#
     );
+    Ok(())
+}
+
+/// A `Sort` that has to be emitted below the SELECT list must not end up inside a
+/// derived table: SQL does not require an enclosing query to honour the ORDER BY of
+/// a derived table, so the rows come back in an arbitrary order.
+#[test]
+fn order_by_over_non_projected_field_stays_top_level() -> Result<()> {
+    // Sort key is an expression over a column the SELECT list does not project.
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT id FROM person ORDER BY age + 1 DESC",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT person.id FROM person ORDER BY (person.age + 1) DESC NULLS FIRST",
+    );
+
+    // Same, with the sort key an expression over an aggregate that is not selected.
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT id, first_name FROM person GROUP BY id, first_name ORDER BY max(age) + 1 DESC",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT person.id, person.first_name FROM person GROUP BY person.id, person.first_name ORDER BY (max(person.age) + 1) DESC NULLS FIRST",
+    );
+
+    // A plain non-projected column already worked; keep it covered so the
+    // generalisation above cannot regress it.
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT id FROM person ORDER BY age DESC",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT person.id FROM person ORDER BY person.age DESC NULLS FIRST",
+    );
+
+    Ok(())
+}
+
+/// The inner `Projection` may define an alias that only the `Sort` uses. Hoisting the
+/// `Sort` drops that alias, so every reference to it -- including one nested inside a
+/// larger sort expression -- has to be replaced by the expression it named.
+#[test]
+fn order_by_nested_reference_to_dropped_alias() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("age", DataType::Int64, false),
+    ]);
+    let plan = table_scan(Some("person"), &schema, None)?
+        .project(vec![col("id"), (col("age") * lit(2)).alias("doubled")])?
+        .sort(vec![(col("doubled") + lit(1)).sort(false, true)])?
+        .project(vec![col("id")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT person.id FROM person ORDER BY ((person.age * 2) + 1) DESC NULLS FIRST"
+    );
+
     Ok(())
 }
