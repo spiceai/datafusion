@@ -464,3 +464,40 @@ async fn test_tpch_unparser_roundtrip() {
     set_stack_allocation_size(8 * 1024 * 1024);
     run_roundtrip_tests("TPC-H", tpch_queries(), tpch_test_context).await;
 }
+
+/// The suites above unparse the plan as it comes out of the SQL planner. A consumer that
+/// pushes a query down to a remote engine unparses the *optimized* plan, where
+/// `single_distinct_to_groupby` has rewritten `count(DISTINCT c)` into an outer
+/// `count(alias1)` over an inner `GROUP BY c AS alias1`. Both aggregates have to reach the
+/// emitted SQL: with the inner one dropped, `count(alias1)` is left referencing the base
+/// table, which fails to bind — and where a column of that name does exist, counts every
+/// row instead of the distinct values.
+#[tokio::test]
+async fn test_optimized_plan_roundtrip_count_distinct() -> Result<()> {
+    let ctx = clickbench_test_context().await?;
+    let unparser = Unparser::new(&DefaultDialect {});
+
+    for sql in [
+        r#"SELECT COUNT(DISTINCT "UserID") AS c FROM hits"#,
+        r#"SELECT "RegionID", COUNT(DISTINCT "UserID") AS c FROM hits GROUP BY "RegionID""#,
+    ] {
+        let optimized = ctx.sql(sql).await?.into_optimized_plan()?;
+        let unparsed = format!("{:#}", unparser.plan_to_sql(&optimized)?);
+
+        let expected = sort_batches(&ctx, ctx.sql(sql).await?.collect().await?).await?;
+        let actual_df = ctx.sql(&unparsed).await.map_err(|e| {
+            datafusion_common::DataFusionError::Context(
+                format!("unparsed SQL failed to plan: {unparsed}"),
+                Box::new(e),
+            )
+        })?;
+        let actual = sort_batches(&ctx, actual_df.collect().await?).await?;
+
+        assert_eq!(
+            expected, actual,
+            "unparsed optimized plan returned different rows.\nOriginal SQL:\n{sql}\n\nUnparsed SQL:\n{unparsed}"
+        );
+    }
+
+    Ok(())
+}

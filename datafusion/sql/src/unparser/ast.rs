@@ -170,6 +170,12 @@ pub struct SelectBuilder {
     /// Table aliases that correspond to LATERAL FLATTEN relations.
     /// Column references into these aliases must use `VALUE` as the column name.
     flatten_table_aliases: Vec<String>,
+    /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
+    /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so
+    /// a second aggregate below it belongs in a derived table.
+    ///
+    /// Set with `mark_aggregated()` and read with `already_aggregated()`.
+    aggregated: bool,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -196,6 +202,16 @@ impl SelectBuilder {
     /// Returns true if the given table alias refers to a FLATTEN relation.
     pub fn is_flatten_table_alias(&self, alias: &str) -> bool {
         self.flatten_table_aliases.iter().any(|a| a == alias)
+    }
+
+    /// Record that an aggregate node is now expressed by this SELECT.
+    pub fn mark_aggregated(&mut self) {
+        self.aggregated = true;
+    }
+
+    /// Returns true if an aggregate node has already been folded into this SELECT.
+    pub fn already_aggregated(&self) -> bool {
+        self.aggregated
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -425,6 +441,7 @@ impl SelectBuilder {
             flavor: Some(SelectFlavor::Standard),
             flatten_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
+            aggregated: false,
         }
     }
 }

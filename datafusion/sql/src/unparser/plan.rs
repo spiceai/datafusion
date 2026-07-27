@@ -884,6 +884,24 @@ impl Unparser<'_> {
                 )
             }
             LogicalPlan::Aggregate(agg) => {
+                // A SELECT expresses a single grouping, so an aggregate stacked below the
+                // one this SELECT already carries has to become a derived table. Stacked
+                // aggregates are what `single_distinct_to_groupby` produces for
+                // `count(DISTINCT c)`: an outer `count(alias1)` over an inner
+                // `GROUP BY c AS alias1`. Folding both into one SELECT would emit
+                // `count(alias1)` against the base table — `alias1` does not exist there,
+                // and where it happens to, the DISTINCT is silently gone.
+                if select.already_aggregated() {
+                    return self.derive_with_dialect_alias(
+                        "derived_aggregate",
+                        plan,
+                        relation,
+                        false,
+                        vec![],
+                    );
+                }
+                select.mark_aggregated();
+
                 // Aggregation can be already handled in the projection case
                 if !select.already_projected() {
                     // The query returns aggregate and group expressions. If that weren't the case,

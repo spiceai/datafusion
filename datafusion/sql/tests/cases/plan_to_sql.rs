@@ -4274,3 +4274,72 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
     );
     Ok(())
 }
+
+/// Builds `count(<col>)` with the aggregate-function stub used across these tests.
+fn count_col(name: &str) -> Expr {
+    use datafusion_expr::expr::{AggregateFunction, AggregateFunctionParams};
+    Expr::AggregateFunction(AggregateFunction {
+        func: count_udaf(),
+        params: AggregateFunctionParams {
+            args: vec![col(name)],
+            distinct: false,
+            filter: None,
+            order_by: vec![],
+            null_treatment: None,
+        },
+    })
+}
+
+/// A SELECT carries a single grouping, so an aggregate stacked directly on top of
+/// another has to be unparsed as a derived table. This is the plan
+/// `single_distinct_to_groupby` produces for `count(DISTINCT b)`: an outer
+/// `count(alias1)` over an inner `GROUP BY b AS alias1`. Folding both into one SELECT
+/// emits `count(alias1)` against the base table, where `alias1` does not exist — and
+/// where a column of that name happens to exist, the DISTINCT is silently dropped.
+#[test]
+fn stacked_aggregate_is_unparsed_as_a_derived_table() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+
+    // count(DISTINCT b) — the outer aggregate groups by nothing.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(vec![col("test.b").alias("alias1")], Vec::<Expr>::new())?
+        .aggregate(Vec::<Expr>::new(), vec![count_col("alias1")])?
+        .project(vec![col("COUNT(alias1)").alias("count(DISTINCT test.b)")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.b AS alias1 FROM test GROUP BY test.b)"#
+    );
+
+    // a, count(DISTINCT b) ... GROUP BY a — the outer aggregate keeps its own grouping,
+    // which must not absorb the inner one.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .project(vec![
+            col("test.a"),
+            col("COUNT(alias1)").alias("count(DISTINCT test.b)"),
+        ])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) GROUP BY test.a"#
+    );
+
+    // A lone aggregate is still folded into the SELECT it belongs to.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(vec![col("test.a")], vec![count_col("test.b")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(test.b), test.a FROM test GROUP BY test.a"
+    );
+
+    Ok(())
+}
