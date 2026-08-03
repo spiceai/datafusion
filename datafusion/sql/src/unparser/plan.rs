@@ -994,12 +994,35 @@ impl Unparser<'_> {
                         None => Arc::clone(left_plan),
                     };
 
+                // A join that null-extends its left input must not let a
+                // predicate from that subtree reach the SELECT-global `WHERE`:
+                // `WHERE` is evaluated after this join and would discard the
+                // very rows this join preserves. Set the accumulated predicate
+                // aside, see what the left subtree adds, and fold that into
+                // this join's `ON` instead (where, for the non-preserved side,
+                // it means the same thing).
+                let left_is_null_extended =
+                    matches!(join.join_type, JoinType::Right | JoinType::Full);
+                let outer_selection = if left_is_null_extended {
+                    select.take_selection()
+                } else {
+                    None
+                };
+
                 self.select_to_sql_recursively(
                     left_plan.as_ref(),
                     query,
                     select,
                     relation,
                 )?;
+
+                let hoisted_from_left = if left_is_null_extended {
+                    let contributed = select.take_selection();
+                    select.selection(outer_selection);
+                    contributed
+                } else {
+                    None
+                };
 
                 let left_projection: Option<Vec<ast::SelectItem>> = if !already_projected
                 {
@@ -1071,6 +1094,12 @@ impl Unparser<'_> {
                     &join.on,
                     join_filters.as_ref(),
                 )?;
+                let (join_constraint, unhoistable) =
+                    Self::and_into_join_constraint(join_constraint, hoisted_from_left);
+                // `USING`/`NATURAL` cannot carry an extra predicate. Nothing is
+                // gained by mangling the join, so the predicate goes back where
+                // it was.
+                select.selection(unhoistable);
 
                 let right_projection: Option<Vec<ast::SelectItem>> =
                     if !already_projected && !is_exists_join {
@@ -2258,6 +2287,33 @@ impl Unparser<'_> {
         let mut select = SelectBuilder::default();
         select.push_from(from);
         Ok(select.build()?)
+    }
+
+    /// AND-folds `predicate` into a join's `ON` clause.
+    ///
+    /// Returns the constraint together with the predicate it could not take:
+    /// `USING` and `NATURAL` joins have nowhere to put one.
+    fn and_into_join_constraint(
+        constraint: ast::JoinConstraint,
+        predicate: Option<ast::Expr>,
+    ) -> (ast::JoinConstraint, Option<ast::Expr>) {
+        let Some(predicate) = predicate else {
+            return (constraint, None);
+        };
+
+        match constraint {
+            ast::JoinConstraint::On(existing) => (
+                ast::JoinConstraint::On(ast::Expr::BinaryOp {
+                    left: Box::new(existing),
+                    op: ast::BinaryOperator::And,
+                    right: Box::new(predicate),
+                }),
+                None,
+            ),
+            ast::JoinConstraint::None => (ast::JoinConstraint::On(predicate), None),
+            constraint @ (ast::JoinConstraint::Using(_)
+            | ast::JoinConstraint::Natural) => (constraint, Some(predicate)),
+        }
     }
 
     /// Decides where the table-scan filters extracted from a join's two inputs
