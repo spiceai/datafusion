@@ -2059,6 +2059,122 @@ fn test_join_with_table_scan_filters() -> Result<()> {
 }
 
 #[test]
+fn test_outer_join_with_table_scan_filters() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let schema_right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let left_with_filter = || {
+        table_scan_with_filters(
+            Some("left_table"),
+            &schema_left,
+            Some(vec![0, 1]),
+            vec![col("left_table.id").eq(lit("a"))],
+        )?
+        .build()
+    };
+    let right_with_filter = || {
+        table_scan_with_filters(
+            Some("right_table"),
+            &schema_right,
+            Some(vec![0, 1]),
+            vec![col("right_table.age").gt(lit(10))],
+        )?
+        .build()
+    };
+    let plain_left =
+        || table_scan(Some("left_table"), &schema_left, Some(vec![0, 1]))?.build();
+    let plain_right =
+        || table_scan(Some("right_table"), &schema_right, Some(vec![0, 1]))?.build();
+
+    // LEFT JOIN, filter on the preserved (left) side: it must land in WHERE.
+    // Folding it into `ON` would not remove a single row, because a LEFT JOIN
+    // preserves every left row regardless of the `ON` predicate.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            plain_right()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table LEFT OUTER JOIN right_table ON left_table.id = right_table.id WHERE (left_table.id = 'a')"#
+    );
+
+    // LEFT JOIN, filter on the non-preserved (right) side: it must stay in
+    // `ON`. Moving it to WHERE would discard the null-extended rows and turn
+    // the LEFT JOIN into an INNER JOIN.
+    let plan = LogicalPlanBuilder::from(plain_left()?)
+        .join(
+            right_with_filter()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table LEFT OUTER JOIN right_table ON left_table.id = right_table.id AND (right_table.age > 10)"#
+    );
+
+    // LEFT JOIN with a filter on each side: the two are routed to different
+    // clauses, and neither is dropped.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            right_with_filter()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table LEFT OUTER JOIN right_table ON left_table.id = right_table.id AND (right_table.age > 10) WHERE (left_table.id = 'a')"#
+    );
+
+    // RIGHT JOIN is the mirror image: the right side is preserved.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            right_with_filter()?,
+            datafusion_expr::JoinType::Right,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table RIGHT OUTER JOIN right_table ON left_table.id = right_table.id AND (left_table.id = 'a') WHERE (right_table.age > 10)"#
+    );
+
+    // FULL OUTER JOIN preserves both sides, so neither `ON` nor `WHERE`
+    // expresses either side's filter; a derived table would be needed. The
+    // existing `ON` placement is kept unchanged — this case is still wrong and
+    // is tracked separately.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            plain_right()?,
+            datafusion_expr::JoinType::Full,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table FULL JOIN right_table ON left_table.id = right_table.id AND (left_table.id = 'a')"#
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_interval_lhs_eq() {
     let statement = generate_round_trip_statement(
         GenericDialect {},
