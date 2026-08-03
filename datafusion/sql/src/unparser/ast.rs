@@ -330,6 +330,13 @@ impl SelectBuilder {
 
         self
     }
+
+    /// Removes the `WHERE` predicate accumulated so far and returns it, so a
+    /// caller can tell what a sub-plan contributed and re-place it elsewhere.
+    pub fn take_selection(&mut self) -> Option<ast::Expr> {
+        self.selection.take()
+    }
+
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {
         self.group_by = Some(value);
         self
