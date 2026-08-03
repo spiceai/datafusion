@@ -2171,6 +2171,29 @@ fn test_outer_join_with_table_scan_filters() -> Result<()> {
         @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table FULL JOIN right_table ON left_table.id = right_table.id AND (left_table.id = 'a')"#
     );
 
+    // The aliased form: the filter is rewritten to the alias on its way out of
+    // the scan, and must still land in WHERE.
+    let aliased_left = table_scan_with_filters(
+        Some("left_table"),
+        &schema_left,
+        Some(vec![0, 1]),
+        vec![col("left_table.id").eq(lit("a"))],
+    )?
+    .alias("l")?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(aliased_left)
+        .join(
+            plain_right()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["l.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT l.id, l."name", right_table.id, right_table.age FROM left_table AS l LEFT OUTER JOIN right_table ON l.id = right_table.id WHERE (l.id = 'a')"#
+    );
+
     Ok(())
 }
 
@@ -4388,5 +4411,54 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
         sql,
         @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" = "right"."first_name") AND ("left"."order_id" = "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" = "p"."first_name") AND ("left"."order_id" = "o"."order_id"))"#
     );
+    Ok(())
+}
+
+#[test]
+fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
+    // A predicate extracted from a nested join's input must not reach the
+    // SELECT-global `WHERE` when an enclosing join null-extends that input:
+    // `WHERE` runs after every join and would discard the rows the enclosing
+    // join is there to preserve. It belongs in the enclosing join's `ON`.
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let a = table_scan_with_filters(
+        Some("a"),
+        &schema,
+        Some(vec![0]),
+        vec![col("a.id").eq(lit("x"))],
+    )?
+    .build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+
+    let nested_under_right = |inner_join_type| -> Result<String> {
+        let inner = LogicalPlanBuilder::from(a.clone())
+            .join(
+                b.clone(),
+                inner_join_type,
+                (vec!["a.id"], vec!["b.id"]),
+                None,
+            )?
+            .build()?;
+        let outer = LogicalPlanBuilder::from(inner)
+            .join(
+                c.clone(),
+                datafusion_expr::JoinType::Right,
+                (vec!["a.id"], vec!["c.id"]),
+                None,
+            )?
+            .build()?;
+        Ok(plan_to_sql(&outer)?.to_string())
+    };
+
+    assert_snapshot!(
+        nested_under_right(datafusion_expr::JoinType::Inner)?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
+    );
+    assert_snapshot!(
+        nested_under_right(datafusion_expr::JoinType::Left)?,
+        @"SELECT a.id, b.id, c.id FROM a LEFT OUTER JOIN b ON a.id = b.id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
+    );
+
     Ok(())
 }
