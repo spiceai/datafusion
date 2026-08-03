@@ -2344,7 +2344,13 @@ impl Unparser<'_> {
         // * Full — both sides are preserved, so neither clause preserves either
         //   side's filter; only a derived table would. Left in ON as before.
         let (on_scan_filters, where_scan_filters) = match join_type {
-            JoinType::Inner => (vec![], [left_scan_filters, right_scan_filters].concat()),
+            JoinType::Inner => (
+                vec![],
+                left_scan_filters
+                    .into_iter()
+                    .chain(right_scan_filters)
+                    .collect(),
+            ),
             JoinType::Left => (right_scan_filters, left_scan_filters),
             JoinType::Right => (left_scan_filters, right_scan_filters),
             // Semi/anti/mark joins do not reach this function: their filters
@@ -2355,9 +2361,13 @@ impl Unparser<'_> {
             | JoinType::LeftAnti
             | JoinType::RightAnti
             | JoinType::LeftMark
-            | JoinType::RightMark => {
-                ([left_scan_filters, right_scan_filters].concat(), vec![])
-            }
+            | JoinType::RightMark => (
+                left_scan_filters
+                    .into_iter()
+                    .chain(right_scan_filters)
+                    .collect(),
+                vec![],
+            ),
         };
 
         if on_scan_filters.is_empty() {
