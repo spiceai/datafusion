@@ -969,7 +969,11 @@ impl Unparser<'_> {
                 self.select_to_sql_recursively(input, query, select, relation)
             }
             LogicalPlan::Join(join) => {
-                let mut table_scan_filters = vec![];
+                // Kept apart by input: where a filter may be re-emitted depends
+                // on which side of the join it came from (see
+                // `split_join_on_and_where_filters`).
+                let mut left_scan_filters = vec![];
+                let mut right_scan_filters = vec![];
                 let (left_plan, right_plan) = match join.join_type {
                     JoinType::RightSemi | JoinType::RightAnti => {
                         (&join.right, &join.left)
@@ -984,7 +988,7 @@ impl Unparser<'_> {
                 let left_plan =
                     match try_transform_to_simple_table_scan_with_filters(left_plan)? {
                         Some((plan, filters)) => {
-                            table_scan_filters.extend(filters);
+                            left_scan_filters.extend(filters);
                             Arc::new(plan)
                         }
                         None => Arc::clone(left_plan),
@@ -1027,7 +1031,7 @@ impl Unparser<'_> {
                     let right_plan =
                         match try_transform_to_simple_table_scan_with_filters(right_plan)? {
                             Some((plan, filters)) => {
-                                table_scan_filters.extend(filters);
+                                right_scan_filters.extend(filters);
                                 Arc::new(plan)
                             }
                             None => Arc::clone(right_plan),
@@ -1044,15 +1048,17 @@ impl Unparser<'_> {
 
                 // Table-scan filters extracted from the inputs must land in the
                 // outer query. EXISTS-style joins have no outer `ON` clause, so
-                // all such filters go to the outer `WHERE`; regular joins split
-                // them between `ON` and `WHERE`.
+                // all such filters go to the outer `WHERE` (only the preserved
+                // side is transformed above, so `right_scan_filters` is empty);
+                // regular joins split them between `ON` and `WHERE`.
                 let (join_filters, where_filters) = if is_exists_join {
-                    (join.filter.clone(), table_scan_filters)
+                    (join.filter.clone(), left_scan_filters)
                 } else {
                     Self::split_join_on_and_where_filters(
                         join.join_type,
                         &join.filter,
-                        table_scan_filters,
+                        left_scan_filters,
+                        right_scan_filters,
                     )
                 };
                 for filter in where_filters {
@@ -2254,31 +2260,55 @@ impl Unparser<'_> {
         Ok(select.build()?)
     }
 
-    /// Decides where extracted table-scan filters belong in the unparsed SQL:
-    /// in the `JOIN ON` clause or in `WHERE`.
+    /// Decides where the table-scan filters extracted from a join's two inputs
+    /// belong in the unparsed SQL: in the `JOIN ON` clause or in `WHERE`.
     ///
-    /// For inner joins the two are semantically equivalent, so filters go to
-    /// `WHERE` (some dialects reject subqueries inside `JOIN ON`).
-    /// For outer joins the filters are AND-folded into `ON` to preserve correctness.
+    /// The answer depends on the join type *and* on which input the filter came
+    /// from — a filter on a preserved side means something different in `ON`
+    /// than in `WHERE`. Filters routed to `ON` are AND-folded onto the join's
+    /// own filter.
     ///
     /// Returns `(on_filter, where_filters)`.
     fn split_join_on_and_where_filters(
         join_type: JoinType,
         join_filter: &Option<Expr>,
-        table_scan_filters: Vec<Expr>,
+        left_scan_filters: Vec<Expr>,
+        right_scan_filters: Vec<Expr>,
     ) -> (Option<Expr>, Vec<Expr>) {
-        if table_scan_filters.is_empty() {
-            return (join_filter.clone(), vec![]);
+        // Which clause preserves a filter's meaning depends on the side it came
+        // from:
+        //
+        // * Inner — ON and WHERE are equivalent, so both sides go to WHERE
+        //   (some dialects reject subqueries inside JOIN ON).
+        // * Left/Right — the preserved side keeps every row whatever ON says,
+        //   so folding its filter into ON would filter nothing at all; it has
+        //   to go to WHERE. The non-preserved side is the mirror image: WHERE
+        //   would discard the null-extended rows and silently turn the outer
+        //   join into an inner join, so its filter has to stay in ON.
+        // * Full — both sides are preserved, so neither clause preserves either
+        //   side's filter; only a derived table would. Left in ON as before.
+        let (on_scan_filters, where_scan_filters) = match join_type {
+            JoinType::Inner => (vec![], [left_scan_filters, right_scan_filters].concat()),
+            JoinType::Left => (right_scan_filters, left_scan_filters),
+            JoinType::Right => (left_scan_filters, right_scan_filters),
+            // Semi/anti/mark joins do not reach this function: their filters
+            // are routed by the EXISTS branch of `select_to_sql_recursively`.
+            JoinType::Full
+            | JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+            | JoinType::LeftMark
+            | JoinType::RightMark => {
+                ([left_scan_filters, right_scan_filters].concat(), vec![])
+            }
+        };
+
+        if on_scan_filters.is_empty() {
+            return (join_filter.clone(), where_scan_filters);
         }
 
-        if join_type == JoinType::Inner {
-            // ON and WHERE are equivalent for inner joins; prefer WHERE
-            // because some dialects reject subqueries inside JOIN ON.
-            return (join_filter.clone(), table_scan_filters);
-        }
-
-        // Outer joins: fold table-scan filters into ON to preserve semantics.
-        let combined = table_scan_filters.into_iter().reduce(|acc, filter| {
+        let combined = on_scan_filters.into_iter().reduce(|acc, filter| {
             Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(acc),
                 op: Operator::And,
@@ -2297,7 +2327,7 @@ impl Unparser<'_> {
             (None, None) => None,
         };
 
-        (on_filter, vec![])
+        (on_filter, where_scan_filters)
     }
 }
 
