@@ -4416,10 +4416,11 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
 
 #[test]
 fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
-    // A predicate extracted from a nested join's input must not reach the
-    // SELECT-global `WHERE` when an enclosing join null-extends that input:
-    // `WHERE` runs after every join and would discard the rows the enclosing
-    // join is there to preserve. It belongs in the enclosing join's `ON`.
+    // When an enclosing RIGHT JOIN null-extends a nested left input, a predicate
+    // from that input must not reach the SELECT-global `WHERE`: `WHERE` runs
+    // after every join and would discard the preserved right-side rows. It
+    // belongs in the enclosing join's `ON` because the left input is not
+    // preserved. FULL JOIN differs because it preserves both inputs.
     let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
     let a = table_scan_with_filters(
         Some("a"),
@@ -4431,7 +4432,7 @@ fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
     let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
     let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
 
-    let nested_under_right = |inner_join_type| -> Result<String> {
+    let nested_under_outer = |inner_join_type, outer_join_type| -> Result<String> {
         let inner = LogicalPlanBuilder::from(a.clone())
             .join(
                 b.clone(),
@@ -4443,7 +4444,7 @@ fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
         let outer = LogicalPlanBuilder::from(inner)
             .join(
                 c.clone(),
-                datafusion_expr::JoinType::Right,
+                outer_join_type,
                 (vec!["a.id"], vec!["c.id"]),
                 None,
             )?
@@ -4452,12 +4453,30 @@ fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
     };
 
     assert_snapshot!(
-        nested_under_right(datafusion_expr::JoinType::Inner)?,
+        nested_under_outer(
+            datafusion_expr::JoinType::Inner,
+            datafusion_expr::JoinType::Right,
+        )?,
         @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
     );
     assert_snapshot!(
-        nested_under_right(datafusion_expr::JoinType::Left)?,
+        nested_under_outer(
+            datafusion_expr::JoinType::Left,
+            datafusion_expr::JoinType::Right,
+        )?,
         @"SELECT a.id, b.id, c.id FROM a LEFT OUTER JOIN b ON a.id = b.id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
+    );
+
+    // A FULL JOIN also null-extends its left input, but unlike a RIGHT JOIN it
+    // preserves that input. Hoisting the predicate into ON would therefore
+    // make filtered-out left rows reappear as unmatched rows. Keep the prior
+    // WHERE placement until FULL JOIN inputs can be emitted as derived tables.
+    assert_snapshot!(
+        nested_under_outer(
+            datafusion_expr::JoinType::Inner,
+            datafusion_expr::JoinType::Full,
+        )?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE (a.id = 'x')"
     );
 
     Ok(())

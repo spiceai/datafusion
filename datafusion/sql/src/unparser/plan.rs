@@ -1001,8 +1001,11 @@ impl Unparser<'_> {
                 // aside, see what the left subtree adds, and fold that into
                 // this join's `ON` instead (where, for the non-preserved side,
                 // it means the same thing).
-                let left_is_null_extended =
-                    matches!(join.join_type, JoinType::Right | JoinType::Full);
+                // This relocation is only valid when the left input is not
+                // preserved. A FULL JOIN also null-extends its left input, but
+                // preserves left rows, so moving the predicate into ON would
+                // make filtered-out left rows reappear as unmatched rows.
+                let left_is_null_extended = matches!(join.join_type, JoinType::Right);
                 let outer_selection = if left_is_null_extended {
                     select.take_selection()
                 } else {
