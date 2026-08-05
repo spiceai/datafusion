@@ -2155,9 +2155,9 @@ fn test_outer_join_with_table_scan_filters() -> Result<()> {
     );
 
     // FULL OUTER JOIN preserves both sides, so neither `ON` nor `WHERE`
-    // expresses either side's filter; a derived table would be needed. The
-    // existing `ON` placement is kept unchanged — this case is still wrong and
-    // is tracked separately.
+    // expresses an input filter correctly. Isolate the filtered input in a
+    // derived table so rows rejected by the filter cannot reappear as unmatched
+    // rows from the FULL JOIN.
     let plan = LogicalPlanBuilder::from(left_with_filter()?)
         .join(
             plain_right()?,
@@ -2168,7 +2168,7 @@ fn test_outer_join_with_table_scan_filters() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table FULL JOIN right_table ON left_table.id = right_table.id AND (left_table.id = 'a')"#
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM (SELECT left_table.id, left_table."name" FROM left_table WHERE (left_table.id = 'a')) AS left_table FULL JOIN right_table ON left_table.id = right_table.id"#
     );
 
     // The aliased form: the filter is rewritten to the alias on its way out of
@@ -4477,6 +4477,48 @@ fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
             datafusion_expr::JoinType::Full,
         )?,
         @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE (a.id = 'x')"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_join_filter_nested_under_right_join_using() -> Result<()> {
+    // USING cannot carry the predicate contributed by the non-preserved left
+    // input. It must be downgraded to an equivalent ON constraint before the
+    // predicate is appended; returning the predicate to the SELECT-global
+    // WHERE would discard unmatched rows from the preserved right input.
+    let id_schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let b_schema = Schema::new(vec![Field::new("b_id", DataType::Utf8, false)]);
+    let a = table_scan_with_filters(
+        Some("a"),
+        &id_schema,
+        Some(vec![0]),
+        vec![col("a.id").eq(lit("x"))],
+    )?
+    .build()?;
+    let b = table_scan(Some("b"), &b_schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &id_schema, Some(vec![0]))?.build()?;
+
+    let inner = LogicalPlanBuilder::from(a)
+        .join(
+            b,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["b.b_id"]),
+            None,
+        )?
+        .build()?;
+    let outer = LogicalPlanBuilder::from(inner)
+        .join_using(
+            c,
+            datafusion_expr::JoinType::Right,
+            vec![Column::new_unqualified("id")],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&outer)?,
+        @"SELECT a.id, b.b_id, c.id FROM a INNER JOIN b ON a.id = b.b_id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
     );
 
     Ok(())
