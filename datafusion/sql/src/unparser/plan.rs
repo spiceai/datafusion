@@ -451,19 +451,32 @@ impl Unparser<'_> {
     /// Whether the subtree carrying a row limit needs a `SELECT` of its own.
     ///
     /// The walk is top-down, so any predicate already on `select` came from a
-    /// node *above* the one being unparsed. `WHERE`, `HAVING` and `QUALIFY`
-    /// are all evaluated before `LIMIT`/`OFFSET`, while the plan says the
-    /// opposite: the limit runs first and the predicate filters what it
-    /// produced. Keeping both in one `SELECT` therefore states the reverse of
-    /// the plan, and can return rows the plan excludes.
+    /// node visited earlier. `WHERE`, `HAVING` and `QUALIFY` are all evaluated
+    /// before `LIMIT`/`OFFSET`, while a plan that puts a filter above a limit
+    /// says the opposite: the limit runs first and the predicate filters what
+    /// it produced. Keeping both in one `SELECT` therefore states the reverse
+    /// of the plan, and can return rows the plan excludes.
     ///
-    /// A `WHERE` can be left behind in an enclosing query while the limited
-    /// subtree moves into a derived table. `HAVING` and `QUALIFY` cannot: they
-    /// reference an aggregate or window expression that only the `SELECT`
-    /// computing it can name. Refuse those rather than emit either the
-    /// reversed form or a predicate with nothing to bind to.
-    fn row_limit_needs_own_scope(select: &SelectBuilder) -> Result<bool> {
-        if select.has_grouped_predicate() {
+    /// A `WHERE` can stay in the enclosing query while the limited subtree
+    /// moves into a derived table. `HAVING` and `QUALIFY` cannot: they name an
+    /// aggregate or window expression that only the `SELECT` computing it can
+    /// name. Refuse those rather than emit the reversed form — but only when
+    /// the grouping they filter is in fact below this limit. Join inputs are
+    /// walked with one shared `SelectBuilder`, so a predicate on it may have
+    /// come from a sibling input rather than from an ancestor of this node.
+    fn row_limit_needs_own_scope(
+        plan: &LogicalPlan,
+        select: &SelectBuilder,
+    ) -> Result<bool> {
+        if select.has_grouped_predicate()
+            && (find_agg_node_within_select(plan, select.already_projected()).is_some()
+                || find_window_nodes_within_select(
+                    plan,
+                    None,
+                    select.already_projected(),
+                )
+                .is_some())
+        {
             return not_impl_err!(
                 "Unparsing a HAVING or QUALIFY predicate that is applied after a row limit is not supported"
             );
@@ -471,36 +484,59 @@ impl Unparser<'_> {
         Ok(select.has_selection())
     }
 
-    /// Unparses `plan` — a `Limit`, or a `Sort` carrying a `fetch` — as a
-    /// derived table, so the predicate already on the enclosing `SELECT`
-    /// applies to the limited rows rather than to the rows feeding the limit.
+    /// Unparses a `Limit` as a derived table, so the `WHERE` already on the
+    /// enclosing `SELECT` applies to the limited rows rather than to the rows
+    /// feeding the limit.
     ///
-    /// The derived table takes the name of the relation the subtree reads,
-    /// because the predicate staying outside is still qualified by it. A
-    /// subtree reading more than one relation has no such name to take: every
-    /// qualifier the predicate could carry would be gone from scope, so the
-    /// query is refused rather than rendered unbindable.
+    /// The derived table takes the name of the relation it reads, because the
+    /// predicate staying outside is still qualified by that name, and its
+    /// columns are listed explicitly: a wildcard would expand to every
+    /// relation in the enclosing `FROM`, not to this one's contribution.
+    ///
+    /// Both of those need the derived table's output columns to be exactly the
+    /// relation's own columns, under their own names — which is why only a
+    /// scan, and the clauses that can wrap one without renaming anything, are
+    /// accepted here. A projection may emit a column the derived query never
+    /// names (an unaliased expression) or two columns that differ only by a
+    /// qualifier SQL cannot carry across the boundary; a join, union or
+    /// aggregate has no single name for the alias to take. Those are refused,
+    /// which costs the pushdown but never the rows.
     fn derive_row_limited_scope(
         &self,
         plan: &LogicalPlan,
         select: &mut SelectBuilder,
         relation: &mut RelationBuilder,
     ) -> Result<()> {
-        let Some(table_ref) = Self::sole_relation_of(plan) else {
+        let Some(table_ref) = Self::scanned_relation_of(plan) else {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is not supported when the limited input reads more than one relation"
+                "Unparsing a filter applied after a row limit is only supported when the limited input is a single table scan"
             );
         };
 
+        // Only the last component survives as an alias, so a predicate spelled
+        // with the full path would be left pointing at a name that is gone.
+        if self.dialect.full_qualified_col() && table_ref.to_vec().len() > 1 {
+            return not_impl_err!(
+                "Unparsing a filter applied after a row limit is not supported for a qualified table name on a dialect that spells columns in full"
+            );
+        }
+
+        // A scan can project no columns at all, which every other empty
+        // projection in this unparser renders as `SELECT 1`. There is no
+        // column list to name a derived table's output with here, so refuse.
+        // (Two columns of one name cannot arrive: `DFSchema` rejects a scan
+        // with a duplicate qualified field.)
+        let fields = plan.schema().fields();
+        if fields.is_empty() {
+            return not_impl_err!(
+                "Unparsing a filter applied after a row limit is not supported for an input projecting no columns"
+            );
+        }
+
         // The subtree moves into a statement of its own, so this `SELECT` no
-        // longer receives a projection from the nodes below. Name the derived
-        // table's columns explicitly, as the scan underneath would have: a
-        // wildcard here would expand to every relation in the enclosing `FROM`
-        // — every column of a join, not this side's contribution to it.
+        // longer receives a projection from the nodes below it.
         if !select.already_projected() {
-            let items = plan
-                .schema()
-                .fields()
+            let items = fields
                 .iter()
                 .map(|field| {
                     self.select_item_to_sql(&Expr::Column(Column::new(
@@ -520,22 +556,24 @@ impl Unparser<'_> {
         )
     }
 
-    /// The single relation a subtree reads from, if it reads exactly one.
+    /// The relation a subtree scans, when the subtree is one scan under
+    /// clauses that neither rename nor add columns and neither reorder nor
+    /// combine rows from elsewhere.
     ///
-    /// Only the shapes that can sit between a limit and its source are walked
-    /// through; anything else (a join, a union, a set operation) has no single
-    /// name to answer with, and neither does a subtree reading two tables.
-    fn sole_relation_of(plan: &LogicalPlan) -> Option<TableReference> {
+    /// A `Sort` is deliberately not walked through. It is the one such clause
+    /// whose effect does not survive being wrapped: SQL does not carry a
+    /// derived table's row order into the query selecting from it.
+    fn scanned_relation_of(plan: &LogicalPlan) -> Option<TableReference> {
         match plan {
             LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
-            LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
-            LogicalPlan::Limit(limit) => Self::sole_relation_of(limit.input.as_ref()),
-            LogicalPlan::Filter(filter) => Self::sole_relation_of(filter.input.as_ref()),
-            LogicalPlan::Sort(sort) => Self::sole_relation_of(sort.input.as_ref()),
-            LogicalPlan::Projection(projection) => {
-                Self::sole_relation_of(projection.input.as_ref())
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::scanned_relation_of(alias.input.as_ref())
+                    .map(|_| alias.alias.clone())
             }
-            LogicalPlan::Distinct(distinct) => Self::sole_relation_of(distinct.input()),
+            LogicalPlan::Limit(limit) => Self::scanned_relation_of(limit.input.as_ref()),
+            LogicalPlan::Filter(filter) => {
+                Self::scanned_relation_of(filter.input.as_ref())
+            }
             _ => None,
         }
     }
@@ -894,7 +932,7 @@ impl Unparser<'_> {
                     );
                 }
                 if (limit.fetch.is_some() || limit.skip.is_some())
-                    && Self::row_limit_needs_own_scope(select)?
+                    && Self::row_limit_needs_own_scope(plan, select)?
                 {
                     return self.derive_row_limited_scope(plan, select, relation);
                 }
@@ -940,10 +978,16 @@ impl Unparser<'_> {
                 }
                 // A `Sort` carrying a `fetch` renders that fetch as this
                 // query's `LIMIT`, so it reorders against a predicate above it
-                // exactly as a `Limit` node does. A sort without one does not:
-                // `ORDER BY` is evaluated after `WHERE` either way.
-                if sort.fetch.is_some() && Self::row_limit_needs_own_scope(select)? {
-                    return self.derive_row_limited_scope(plan, select, relation);
+                // exactly as a `Limit` node does — but it cannot be moved into
+                // a derived table the way a `Limit` can, because SQL does not
+                // carry a derived table's row order out to the query selecting
+                // from it. (A sort without a fetch reorders nothing: `ORDER BY`
+                // is evaluated after `WHERE` either way.)
+                if sort.fetch.is_some() && Self::row_limit_needs_own_scope(plan, select)?
+                {
+                    return not_impl_err!(
+                        "Unparsing a filter applied after a sort's fetch is not supported"
+                    );
                 }
 
                 let Some(query_ref) = query else {

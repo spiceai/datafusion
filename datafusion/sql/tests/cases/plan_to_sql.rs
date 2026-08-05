@@ -4307,16 +4307,28 @@ fn test_filter_above_limit_gets_its_own_scope() -> Result<()> {
         @r#"SELECT t.id, t."name" FROM (SELECT * FROM t OFFSET 3) AS t WHERE (t.id = 'a')"#
     );
 
-    // A `Sort` carrying a `fetch` renders that fetch as the query's `LIMIT`,
-    // so it needs the same treatment as a `Limit` node.
+    Ok(())
+}
+
+/// A `Sort` carrying a `fetch` renders that fetch as the query's `LIMIT`, so a
+/// predicate above it reorders in the same way. It cannot take the same fix: a
+/// derived table's row order is not carried out to the query selecting from
+/// it, so moving the sort inside one would repair the row set and lose the
+/// ordering the plan promises.
+#[test]
+fn test_filter_above_a_sort_fetch_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
     let plan = table_scan(Some("t"), &schema, None)?
         .sort_with_limit(vec![col("id").sort(true, false)], Some(5))?
         .filter(col("id").eq(lit("a")))?
         .build()?;
-    assert_snapshot!(
-        plan_to_sql(&plan)?,
-        @r#"SELECT t.id, t."name" FROM (SELECT * FROM t ORDER BY t.id ASC NULLS LAST LIMIT 5) AS t WHERE (t.id = 'a')"#
-    );
+    let error =
+        plan_to_sql(&plan).expect_err("a filter above a sort fetch cannot be unparsed");
+    assert_contains!(error.to_string(), "after a sort\'s fetch");
 
     Ok(())
 }
@@ -4494,7 +4506,7 @@ fn test_filter_above_limit_over_a_join_is_refused() -> Result<()> {
         .build()?;
     let error = plan_to_sql(&plan)
         .expect_err("a filter above a limit over a join cannot be unparsed");
-    assert_contains!(error.to_string(), "reads more than one relation");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
 
     Ok(())
 }
@@ -4552,6 +4564,143 @@ fn test_filter_above_a_limited_join_input_keeps_the_join_schema() -> Result<()> 
         plan_to_sql(&plan)?,
         @r#"SELECT a.id, a."name", b.id, b.age FROM (SELECT a.id, a."name" FROM a LIMIT 5) AS a INNER JOIN b ON a.id = b.id WHERE (a."name" = 'x')"#
     );
+
+    Ok(())
+}
+
+/// The derived table's columns are named by the enclosing query, which only
+/// works if the derived query names them the same way. A projection breaks
+/// that: an unaliased expression is a column the derived query never names,
+/// and two aliases differing only by a qualifier collapse onto one SQL name.
+#[test]
+fn test_filter_above_limit_over_a_projection_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("a").add(col("b"))])?
+        .limit(0, Some(5))?
+        .filter(col("t.a + t.b").gt(lit(1i32)))?
+        .build()?;
+    let error = plan_to_sql(&plan)
+        .expect_err("a filter above a limited projection cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+
+    Ok(())
+}
+
+/// A sort below the limit orders what the plan returns just as surely as one
+/// above it, and a derived table does not carry its row order out. It is the
+/// one clause that may wrap a scan and still not be safe to move inside.
+#[test]
+fn test_filter_above_a_limited_sort_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .sort(vec![col("id").sort(true, false)])?
+        .limit(0, Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("a filter above a limited sort cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+
+    Ok(())
+}
+
+/// A dialect that spells columns in full leaves the outer predicate qualified
+/// by every part of the table's path, while a derived table can only be
+/// aliased by one identifier. The predicate would be left naming a path that
+/// is no longer in scope.
+#[test]
+fn test_filter_above_limit_is_refused_for_a_fully_qualified_column() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .with_identifier_quote_style('"')
+        .build();
+
+    let plan = table_scan(Some("catalog.schema.t"), &schema, None)?
+        .limit(0, Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    let error = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("a fully qualified predicate cannot survive the alias");
+    assert_contains!(error.to_string(), "dialect that spells columns in full");
+
+    // A bare table name has nothing to lose, so the same dialect renders it.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .limit(0, Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @r#"SELECT "t"."id", "t"."name" FROM (SELECT * FROM "t" LIMIT 5) AS "t" WHERE ("t"."id" = 'a')"#
+    );
+
+    Ok(())
+}
+
+/// Join inputs are walked with one shared `SelectBuilder`, so a predicate on
+/// it need not be an ancestor of the node being unparsed. A `HAVING` from one
+/// input must not make the other input's limit unrenderable.
+#[test]
+fn test_a_sibling_having_does_not_refuse_the_other_inputs_limit() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let grouped_left = table_scan(Some("a"), &left, None)?
+        .aggregate(vec![col("id")], vec![count(col("name"))])?
+        .filter(col("COUNT(a.name)").gt(lit(1i64)))?
+        .build()?;
+    let limited_right = table_scan(Some("b"), &right, Some(vec![0, 1]))?
+        .limit(0, Some(5))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(grouped_left)
+        .join(
+            limited_right,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["b.id"]),
+            None,
+        )?
+        .build()?;
+
+    plan_to_sql(&plan).expect("a sibling's HAVING is not this limit's predicate");
+
+    Ok(())
+}
+
+/// A scan can project no columns, and then there is no column list to name
+/// the derived table's output with.
+#[test]
+fn test_filter_above_limit_over_an_empty_projection_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, Some(vec![]))?
+        .limit(0, Some(5))?
+        .filter(lit(true))?
+        .build()?;
+    let error = plan_to_sql(&plan)
+        .expect_err("a limited scan with no columns cannot be unparsed");
+    assert_contains!(error.to_string(), "projecting no columns");
 
     Ok(())
 }
