@@ -448,6 +448,40 @@ impl Unparser<'_> {
         }
     }
 
+    /// Isolates a `FULL JOIN` input's table-scan filters in a derived table:
+    /// `(SELECT ... FROM t WHERE ...) AS t`. A `FULL JOIN` preserves both
+    /// sides, so a filter on just one input cannot be expressed by folding it
+    /// into `ON` (filtered-out rows would reappear as unmatched) or by moving
+    /// it to `WHERE` (the other side's unmatched rows would be discarded);
+    /// pre-filtering that side in its own subquery is the only clause that
+    /// preserves the original meaning.
+    ///
+    /// `clean_plan` is the `TableScan`/`SubqueryAlias` produced by
+    /// `try_transform_to_simple_table_scan_with_filters`, and `scan_filters`
+    /// are the filters it extracted. `relation` already holds the plain
+    /// table reference built for this side; it is overwritten with the
+    /// derived subquery.
+    fn derive_full_join_side(
+        &self,
+        clean_plan: &LogicalPlan,
+        scan_filters: Vec<Expr>,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        let Some(combined) = scan_filters.into_iter().reduce(Expr::and) else {
+            return Ok(());
+        };
+        let filtered_plan = LogicalPlanBuilder::from(clean_plan.clone())
+            .filter(combined)?
+            .build()?;
+        let alias = match clean_plan {
+            LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
+            LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
+            _ => None,
+        }
+        .map(|table_ref| self.new_table_alias(table_ref.table().to_string(), vec![]));
+        self.derive(&filtered_plan, relation, alias, false)
+    }
+
     /// Projection unparsing when [`super::dialect::Dialect::unnest_as_lateral_flatten`] is enabled:
     /// Snowflake-style `LATERAL FLATTEN` for unnest (not other dialect spellings).
     ///
@@ -1019,6 +1053,20 @@ impl Unparser<'_> {
                     relation,
                 )?;
 
+                // A FULL JOIN preserves both sides, so neither `ON` nor
+                // `WHERE` can express a filter that came from just one
+                // side's `TableScan` (see `split_join_on_and_where_filters`).
+                // Isolate that side in a derived table instead, and drop the
+                // filters from `left_scan_filters` so they are not also
+                // routed to `ON`/`WHERE` below.
+                if join.join_type == JoinType::Full && !left_scan_filters.is_empty() {
+                    self.derive_full_join_side(
+                        left_plan.as_ref(),
+                        std::mem::take(&mut left_scan_filters),
+                        relation,
+                    )?;
+                }
+
                 let hoisted_from_left = if left_is_null_extended {
                     let contributed = select.take_selection();
                     select.selection(outer_selection);
@@ -1069,6 +1117,14 @@ impl Unparser<'_> {
                         select,
                         &mut right_relation,
                     )?;
+                    if join.join_type == JoinType::Full && !right_scan_filters.is_empty()
+                    {
+                        self.derive_full_join_side(
+                            right_plan.as_ref(),
+                            std::mem::take(&mut right_scan_filters),
+                            &mut right_relation,
+                        )?;
+                    }
                     right_plan
                 };
 
@@ -2358,7 +2414,9 @@ impl Unparser<'_> {
         //   would discard the null-extended rows and silently turn the outer
         //   join into an inner join, so its filter has to stay in ON.
         // * Full — both sides are preserved, so neither clause preserves either
-        //   side's filter; only a derived table would. Left in ON as before.
+        //   side's filter; only a derived table does. The caller isolates a
+        //   `FULL JOIN`'s filtered side in one before reaching this function,
+        //   so `left_scan_filters`/`right_scan_filters` are always empty here.
         let (on_scan_filters, where_scan_filters) = match join_type {
             JoinType::Inner => (
                 vec![],
