@@ -416,8 +416,13 @@ pub(crate) struct SimpleTableScan {
     /// The `TableScan` (optionally under a `SubqueryAlias`) with the filters and the
     /// `fetch` removed.
     pub plan: LogicalPlan,
-    /// The filters collected from the `Filter` nodes and from the scan itself.
+    /// Every filter collected, from the `Filter` nodes and from the scan itself, in the
+    /// order they were found.
     pub filters: Vec<Expr>,
+    /// The subset of `filters` that came from the scan itself. The scan applies these
+    /// *before* its `fetch`, while a `Filter` node above it applies afterwards — a
+    /// distinction that only matters when there is a `fetch` to sit between them.
+    pub scan_filters: Vec<Expr>,
     /// The scan's row limit.
     pub fetch: Option<usize>,
 }
@@ -494,6 +499,7 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                     })
                     .collect::<Result<Vec<_>, DataFusionError>>()?;
 
+                let scan_filters = table_scan_filters.clone();
                 for table_scan_filter in table_scan_filters {
                     if !filters.contains(&table_scan_filter) {
                         filters.insert(table_scan_filter);
@@ -516,6 +522,7 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                 return Ok(Some(SimpleTableScan {
                     plan,
                     filters,
+                    scan_filters,
                     fetch: table_scan.fetch,
                 }));
             }

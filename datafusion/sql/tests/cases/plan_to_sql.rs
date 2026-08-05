@@ -4782,3 +4782,45 @@ fn test_join_input_fetch_survives_replanning() -> Result<()> {
 
     Ok(())
 }
+
+/// The scan applies its own filters before its `fetch`; a `Filter` node above
+/// the scan applies afterwards. Both end up in the derived table, but they
+/// cannot share one `SELECT` — `WHERE` is evaluated before `LIMIT`, so a
+/// single scope would silently filter first.
+#[test]
+fn test_join_input_filter_above_pushed_down_fetch() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let schema_right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let left = table_scan_with_filter_and_fetch(
+        Some("left_table"),
+        &schema_left,
+        Some(vec![0, 1]),
+        vec![col("left_table.v").gt(lit(1))],
+        Some(5),
+    )?
+    .filter(col("left_table.id").eq(lit("a")))?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            table_scan(Some("right_table"), &schema_right, Some(vec![0, 1]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table.v, right_table.id, right_table.age FROM (SELECT * FROM (SELECT left_table.id, left_table.v FROM left_table WHERE (left_table.v > 1) LIMIT 5) AS left_table WHERE (left_table.id = 'a')) AS left_table INNER JOIN right_table ON left_table.id = right_table.id"#
+    );
+
+    Ok(())
+}

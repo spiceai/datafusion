@@ -462,40 +462,62 @@ impl Unparser<'_> {
     ///   output, not one input's contribution to it.
     ///
     /// Pre-filtering that side in its own subquery is the only clause that
-    /// preserves the original meaning. Note that whenever a `fetch` is
-    /// isolated the filters must come with it: filtering after the limit
-    /// returns fewer rows than the plan asked for.
+    /// preserves the original meaning.
+    ///
+    /// The filters go on the side of the limit they came from. The scan's own
+    /// filters run before its `fetch`; a `Filter` node above the scan runs
+    /// after it, and needs a second scope of its own — the same `SELECT`
+    /// cannot express it, because `WHERE` is evaluated before `LIMIT`.
     ///
     /// `clean_plan` is the `TableScan`/`SubqueryAlias` produced by
-    /// `try_transform_to_simple_table_scan_with_filters`, and `scan_filters`
-    /// and `fetch` are what it extracted. `relation` already holds the plain
-    /// table reference built for this side; it is overwritten with the
-    /// derived subquery.
+    /// `try_transform_to_simple_table_scan_with_filters`; `filters` is
+    /// everything it extracted and `scan_filters` the subset belonging to the
+    /// scan. `relation` already holds the plain table reference built for this
+    /// side; it is overwritten with the derived subquery.
     fn derive_join_side(
         &self,
         clean_plan: &LogicalPlan,
-        scan_filters: Vec<Expr>,
+        filters: Vec<Expr>,
+        scan_filters: &[Expr],
         fetch: Option<usize>,
         relation: &mut RelationBuilder,
     ) -> Result<()> {
-        let combined = scan_filters.into_iter().reduce(Expr::and);
-        if combined.is_none() && fetch.is_none() {
+        if filters.is_empty() && fetch.is_none() {
             return Ok(());
         }
+        let table_ref = match clean_plan {
+            LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
+            LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
+            _ => None,
+        };
+        let (below_fetch, above_fetch): (Vec<Expr>, Vec<Expr>) = if fetch.is_some() {
+            filters
+                .into_iter()
+                .partition(|filter| scan_filters.contains(filter))
+        } else {
+            // Without a limit between them the two sets commute, so keep them
+            // in one `WHERE` in the order they were collected.
+            (filters, vec![])
+        };
+
         let mut builder = LogicalPlanBuilder::from(clean_plan.clone());
-        if let Some(combined) = combined {
+        if let Some(combined) = below_fetch.into_iter().reduce(Expr::and) {
             builder = builder.filter(combined)?;
         }
         if let Some(fetch) = fetch {
             builder = builder.limit(0, Some(fetch))?;
         }
-        let derived_plan = builder.build()?;
-        let alias = match clean_plan {
-            LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
-            LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
-            _ => None,
+        if let Some(combined) = above_fetch.into_iter().reduce(Expr::and) {
+            // The alias both scopes the limit in its own `SELECT` and keeps the
+            // predicate's column references resolvable against it.
+            if let Some(table_ref) = table_ref.clone() {
+                builder = builder.alias(table_ref)?;
+            }
+            builder = builder.filter(combined)?;
         }
-        .map(|table_ref| self.new_table_alias(table_ref.table().to_string(), vec![]));
+        let derived_plan = builder.build()?;
+        let alias = table_ref
+            .map(|table_ref| self.new_table_alias(table_ref.table().to_string(), vec![]));
         self.derive(&derived_plan, relation, alias, false)
     }
 
@@ -1037,10 +1059,12 @@ impl Unparser<'_> {
                 let already_projected = select.already_projected();
 
                 let mut left_scan_fetch = None;
+                let mut left_scan_only_filters = vec![];
                 let left_plan =
                     match try_transform_to_simple_table_scan_with_filters(left_plan)? {
                         Some(scan) => {
                             left_scan_filters.extend(scan.filters);
+                            left_scan_only_filters = scan.scan_filters;
                             left_scan_fetch = scan.fetch;
                             Arc::new(scan.plan)
                         }
@@ -1085,6 +1109,7 @@ impl Unparser<'_> {
                     self.derive_join_side(
                         left_plan.as_ref(),
                         std::mem::take(&mut left_scan_filters),
+                        &left_scan_only_filters,
                         left_scan_fetch,
                         relation,
                     )?;
@@ -1126,11 +1151,13 @@ impl Unparser<'_> {
                     Arc::clone(right_plan)
                 } else {
                     let mut right_scan_fetch = None;
+                    let mut right_scan_only_filters = vec![];
                     let right_plan =
                         match try_transform_to_simple_table_scan_with_filters(right_plan)?
                         {
                             Some(scan) => {
                                 right_scan_filters.extend(scan.filters);
+                                right_scan_only_filters = scan.scan_filters;
                                 right_scan_fetch = scan.fetch;
                                 Arc::new(scan.plan)
                             }
@@ -1150,6 +1177,7 @@ impl Unparser<'_> {
                         self.derive_join_side(
                             right_plan.as_ref(),
                             std::mem::take(&mut right_scan_filters),
+                            &right_scan_only_filters,
                             right_scan_fetch,
                             &mut right_relation,
                         )?;
