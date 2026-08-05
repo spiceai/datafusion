@@ -448,38 +448,55 @@ impl Unparser<'_> {
         }
     }
 
-    /// Isolates a `FULL JOIN` input's table-scan filters in a derived table:
-    /// `(SELECT ... FROM t WHERE ...) AS t`. A `FULL JOIN` preserves both
-    /// sides, so a filter on just one input cannot be expressed by folding it
-    /// into `ON` (filtered-out rows would reappear as unmatched) or by moving
-    /// it to `WHERE` (the other side's unmatched rows would be discarded);
-    /// pre-filtering that side in its own subquery is the only clause that
-    /// preserves the original meaning.
+    /// Isolates what a join input's `TableScan` did in a derived table:
+    /// `(SELECT ... FROM t WHERE ... LIMIT ...) AS t`.
+    ///
+    /// Two things a scan can carry have no faithful home in the enclosing
+    /// query:
+    ///
+    /// * A `FULL JOIN` input's filters. A `FULL JOIN` preserves both sides, so
+    ///   a filter on just one input cannot be expressed by folding it into `ON`
+    ///   (filtered-out rows would reappear as unmatched) or by moving it to
+    ///   `WHERE` (the other side's unmatched rows would be discarded).
+    /// * A `fetch`, for any join type. The join's own `LIMIT` bounds its
+    ///   output, not one input's contribution to it.
+    ///
+    /// Pre-filtering that side in its own subquery is the only clause that
+    /// preserves the original meaning. Note that whenever a `fetch` is
+    /// isolated the filters must come with it: filtering after the limit
+    /// returns fewer rows than the plan asked for.
     ///
     /// `clean_plan` is the `TableScan`/`SubqueryAlias` produced by
     /// `try_transform_to_simple_table_scan_with_filters`, and `scan_filters`
-    /// are the filters it extracted. `relation` already holds the plain
+    /// and `fetch` are what it extracted. `relation` already holds the plain
     /// table reference built for this side; it is overwritten with the
     /// derived subquery.
-    fn derive_full_join_side(
+    fn derive_join_side(
         &self,
         clean_plan: &LogicalPlan,
         scan_filters: Vec<Expr>,
+        fetch: Option<usize>,
         relation: &mut RelationBuilder,
     ) -> Result<()> {
-        let Some(combined) = scan_filters.into_iter().reduce(Expr::and) else {
+        let combined = scan_filters.into_iter().reduce(Expr::and);
+        if combined.is_none() && fetch.is_none() {
             return Ok(());
-        };
-        let filtered_plan = LogicalPlanBuilder::from(clean_plan.clone())
-            .filter(combined)?
-            .build()?;
+        }
+        let mut builder = LogicalPlanBuilder::from(clean_plan.clone());
+        if let Some(combined) = combined {
+            builder = builder.filter(combined)?;
+        }
+        if let Some(fetch) = fetch {
+            builder = builder.limit(0, Some(fetch))?;
+        }
+        let derived_plan = builder.build()?;
         let alias = match clean_plan {
             LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
             LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
             _ => None,
         }
         .map(|table_ref| self.new_table_alias(table_ref.table().to_string(), vec![]));
-        self.derive(&filtered_plan, relation, alias, false)
+        self.derive(&derived_plan, relation, alias, false)
     }
 
     /// Projection unparsing when [`super::dialect::Dialect::unnest_as_lateral_flatten`] is enabled:
@@ -1019,11 +1036,13 @@ impl Unparser<'_> {
                 // The outer projection plan will handle projecting the correct columns.
                 let already_projected = select.already_projected();
 
+                let mut left_scan_fetch = None;
                 let left_plan =
                     match try_transform_to_simple_table_scan_with_filters(left_plan)? {
-                        Some((plan, filters)) => {
-                            left_scan_filters.extend(filters);
-                            Arc::new(plan)
+                        Some(scan) => {
+                            left_scan_filters.extend(scan.filters);
+                            left_scan_fetch = scan.fetch;
+                            Arc::new(scan.plan)
                         }
                         None => Arc::clone(left_plan),
                     };
@@ -1055,14 +1074,18 @@ impl Unparser<'_> {
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
-                // side's `TableScan` (see `split_join_on_and_where_filters`).
-                // Isolate that side in a derived table instead, and drop the
-                // filters from `left_scan_filters` so they are not also
-                // routed to `ON`/`WHERE` below.
-                if join.join_type == JoinType::Full && !left_scan_filters.is_empty() {
-                    self.derive_full_join_side(
+                // side's `TableScan` (see `split_join_on_and_where_filters`),
+                // and no clause of the enclosing query can express one input's
+                // `fetch`. Isolate that side in a derived table instead, and
+                // drop the filters from `left_scan_filters` so they are not
+                // also routed to `ON`/`WHERE` below.
+                if left_scan_fetch.is_some()
+                    || (join.join_type == JoinType::Full && !left_scan_filters.is_empty())
+                {
+                    self.derive_join_side(
                         left_plan.as_ref(),
                         std::mem::take(&mut left_scan_filters),
+                        left_scan_fetch,
                         relation,
                     )?;
                 }
@@ -1102,11 +1125,14 @@ impl Unparser<'_> {
                 let right_plan: Arc<LogicalPlan> = if is_exists_join {
                     Arc::clone(right_plan)
                 } else {
+                    let mut right_scan_fetch = None;
                     let right_plan =
-                        match try_transform_to_simple_table_scan_with_filters(right_plan)? {
-                            Some((plan, filters)) => {
-                                right_scan_filters.extend(filters);
-                                Arc::new(plan)
+                        match try_transform_to_simple_table_scan_with_filters(right_plan)?
+                        {
+                            Some(scan) => {
+                                right_scan_filters.extend(scan.filters);
+                                right_scan_fetch = scan.fetch;
+                                Arc::new(scan.plan)
                             }
                             None => Arc::clone(right_plan),
                         };
@@ -1117,11 +1143,14 @@ impl Unparser<'_> {
                         select,
                         &mut right_relation,
                     )?;
-                    if join.join_type == JoinType::Full && !right_scan_filters.is_empty()
+                    if right_scan_fetch.is_some()
+                        || (join.join_type == JoinType::Full
+                            && !right_scan_filters.is_empty())
                     {
-                        self.derive_full_join_side(
+                        self.derive_join_side(
                             right_plan.as_ref(),
                             std::mem::take(&mut right_scan_filters),
+                            right_scan_fetch,
                             &mut right_relation,
                         )?;
                     }

@@ -411,25 +411,40 @@ pub(crate) fn unproject_sort_expr(
     Ok(sort_expr)
 }
 
+/// What [`try_transform_to_simple_table_scan_with_filters`] peeled off a join input.
+pub(crate) struct SimpleTableScan {
+    /// The `TableScan` (optionally under a `SubqueryAlias`) with the filters and the
+    /// `fetch` removed.
+    pub plan: LogicalPlan,
+    /// The filters collected from the `Filter` nodes and from the scan itself.
+    pub filters: Vec<Expr>,
+    /// The scan's row limit.
+    pub fetch: Option<usize>,
+}
+
 /// Iterates through the children of a [LogicalPlan] to find a TableScan node before encountering
 /// a Projection or any unexpected node that indicates the presence of a Projection (SELECT) in the plan.
-/// If a TableScan node is found, returns the TableScan node without filters, along with the collected filters separately.
+/// If a TableScan node is found, returns the TableScan node without filters, along with the collected
+/// filters and the scan's `fetch` separately.
 /// If the plan contains a Projection, returns None.
+///
+/// The returned plan carries neither the filters nor the `fetch`: both are the caller's to re-emit,
+/// and a caller that ignores either one silently widens the scan.
 ///
 /// Note: If a table alias is present, TableScan filters are rewritten to reference the alias.
 ///
 /// LogicalPlan example:
 ///   Filter: ta.j1_id < 5
 ///     Alias:  ta
-///       TableScan: j1, j1_id > 10
+///       TableScan: j1, j1_id > 10, fetch=5
 ///
 /// Will return LogicalPlan below:
 ///     Alias:  ta
 ///       TableScan: j1
-/// And filters: [ta.j1_id < 5, ta.j1_id > 10]
+/// And filters: [ta.j1_id < 5, ta.j1_id > 10], fetch: Some(5)
 pub(crate) fn try_transform_to_simple_table_scan_with_filters(
     plan: &LogicalPlan,
-) -> Result<Option<(LogicalPlan, Vec<Expr>)>> {
+) -> Result<Option<SimpleTableScan>> {
     let mut filters: IndexSet<Expr> = IndexSet::new();
     let mut plan_stack = vec![plan];
     let mut table_alias = None;
@@ -498,7 +513,11 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                 let plan = builder.build()?;
                 let filters = filters.into_iter().collect();
 
-                return Ok(Some((plan, filters)));
+                return Ok(Some(SimpleTableScan {
+                    plan,
+                    filters,
+                    fetch: table_scan.fetch,
+                }));
             }
             _ => {
                 return Ok(None);
