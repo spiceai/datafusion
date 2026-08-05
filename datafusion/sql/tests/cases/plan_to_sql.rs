@@ -4824,3 +4824,40 @@ fn test_join_input_filter_above_pushed_down_fetch() -> Result<()> {
 
     Ok(())
 }
+
+/// A scan filter may name a column the projection prunes. Rebuilding the input
+/// keeps the original projection and lets the filter reference the wider source
+/// schema, which is what SQL allows too.
+#[test]
+fn test_join_input_fetch_with_pruned_filter_column() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let schema_right = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+
+    let left = table_scan_with_filter_and_fetch(
+        Some("left_table"),
+        &schema_left,
+        Some(vec![0]),
+        vec![col("left_table.name").eq(lit("x"))],
+        Some(5),
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            table_scan(Some("right_table"), &schema_right, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, right_table.id FROM (SELECT left_table.id FROM left_table WHERE (left_table."name" = 'x') LIMIT 5) AS left_table INNER JOIN right_table ON left_table.id = right_table.id"#
+    );
+
+    Ok(())
+}
