@@ -3879,4 +3879,70 @@ mod tests {
         let sql = expr_to_sql(&expr).unwrap().to_string();
         assert_eq!(sql, "(c1 IS NOT DISTINCT FROM true)");
     }
+
+    #[test]
+    fn duckdb_utc_equivalent_offset_unparses_to_plain_cast() -> Result<()> {
+        // DuckDB resolves AT TIME ZONE through ICU, which only knows named IANA zones.
+        // Arrow's zero-offset spellings (Iceberg emits `+00:00`) otherwise produce
+        // `Not implemented Error: Unknown TimeZone '+00:00'!` and fail the query.
+        // They denote UTC, so the instant-preserving cast is an exact substitute.
+        let dialect = DuckDBDialect::new();
+        let unparser = Unparser::new(&dialect);
+
+        for tz in ["+00:00", "-00:00", "+0000", "-0000", "+00", "-00"] {
+            let expr = Expr::Cast(Cast::new(
+                Box::new(col("a")),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+            ));
+            let sql = format!("{}", unparser.expr_to_sql(&expr)?);
+            assert_eq!(
+                sql, "CAST(\"a\" AS TIMESTAMP WITH TIME ZONE)",
+                "zero offset {tz} must unparse to the instant-preserving cast"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duckdb_non_zero_offset_is_left_for_the_engine_to_reject() -> Result<()> {
+        // A non-zero fixed offset has no ICU-resolvable equivalent. Dropping it would
+        // trade a clear engine error for a possibly wrong instant, so it is preserved
+        // verbatim and DuckDB rejects it.
+        let dialect = DuckDBDialect::new();
+        let unparser = Unparser::new(&dialect);
+
+        for tz in ["-05:00", "+05:30", "-0530", "+01"] {
+            let expr = Expr::Cast(Cast::new(
+                Box::new(col("a")),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+            ));
+            let sql = format!("{}", unparser.expr_to_sql(&expr)?);
+            assert_eq!(
+                sql,
+                format!("\"a\" AT TIME ZONE '{tz}'"),
+                "non-zero offset {tz} must not be silently reinterpreted"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duckdb_named_timezone_still_unparses_to_at_time_zone() -> Result<()> {
+        // Named zones must keep the faithful rendering: dropping them would silently
+        // change the meaning of a genuine zone conversion.
+        let dialect = DuckDBDialect::new();
+        let unparser = Unparser::new(&dialect);
+
+        for tz in ["UTC", "Etc/UTC", "America/Los_Angeles"] {
+            let expr = Expr::Cast(Cast::new(
+                Box::new(col("a")),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+            ));
+            let sql = format!("{}", unparser.expr_to_sql(&expr)?);
+            assert_eq!(sql, format!("\"a\" AT TIME ZONE '{tz}'"));
+        }
+        Ok(())
+    }
+
+
 }
