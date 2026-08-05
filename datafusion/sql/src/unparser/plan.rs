@@ -448,6 +448,98 @@ impl Unparser<'_> {
         }
     }
 
+    /// Whether the subtree carrying a row limit needs a `SELECT` of its own.
+    ///
+    /// The walk is top-down, so any predicate already on `select` came from a
+    /// node *above* the one being unparsed. `WHERE`, `HAVING` and `QUALIFY`
+    /// are all evaluated before `LIMIT`/`OFFSET`, while the plan says the
+    /// opposite: the limit runs first and the predicate filters what it
+    /// produced. Keeping both in one `SELECT` therefore states the reverse of
+    /// the plan, and can return rows the plan excludes.
+    ///
+    /// A `WHERE` can be left behind in an enclosing query while the limited
+    /// subtree moves into a derived table. `HAVING` and `QUALIFY` cannot: they
+    /// reference an aggregate or window expression that only the `SELECT`
+    /// computing it can name. Refuse those rather than emit either the
+    /// reversed form or a predicate with nothing to bind to.
+    fn row_limit_needs_own_scope(select: &SelectBuilder) -> Result<bool> {
+        if select.has_grouped_predicate() {
+            return not_impl_err!(
+                "Unparsing a HAVING or QUALIFY predicate that is applied after a row limit is not supported"
+            );
+        }
+        Ok(select.has_selection())
+    }
+
+    /// Unparses `plan` — a `Limit`, or a `Sort` carrying a `fetch` — as a
+    /// derived table, so the predicate already on the enclosing `SELECT`
+    /// applies to the limited rows rather than to the rows feeding the limit.
+    ///
+    /// The derived table takes the name of the relation the subtree reads,
+    /// because the predicate staying outside is still qualified by it. A
+    /// subtree reading more than one relation has no such name to take: every
+    /// qualifier the predicate could carry would be gone from scope, so the
+    /// query is refused rather than rendered unbindable.
+    fn derive_row_limited_scope(
+        &self,
+        plan: &LogicalPlan,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        let Some(table_ref) = Self::sole_relation_of(plan) else {
+            return not_impl_err!(
+                "Unparsing a filter applied after a row limit is not supported when the limited input reads more than one relation"
+            );
+        };
+
+        // The subtree moves into a statement of its own, so this `SELECT` no
+        // longer receives a projection from the nodes below. Name the derived
+        // table's columns explicitly, as the scan underneath would have: a
+        // wildcard here would expand to every relation in the enclosing `FROM`
+        // — every column of a join, not this side's contribution to it.
+        if !select.already_projected() {
+            let items = plan
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| {
+                    self.select_item_to_sql(&Expr::Column(Column::new(
+                        Some(table_ref.clone()),
+                        field.name(),
+                    )))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            select.projection(items);
+        }
+
+        self.derive(
+            plan,
+            relation,
+            Some(self.new_table_alias(table_ref.table().to_string(), vec![])),
+            false,
+        )
+    }
+
+    /// The single relation a subtree reads from, if it reads exactly one.
+    ///
+    /// Only the shapes that can sit between a limit and its source are walked
+    /// through; anything else (a join, a union, a set operation) has no single
+    /// name to answer with, and neither does a subtree reading two tables.
+    fn sole_relation_of(plan: &LogicalPlan) -> Option<TableReference> {
+        match plan {
+            LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
+            LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
+            LogicalPlan::Limit(limit) => Self::sole_relation_of(limit.input.as_ref()),
+            LogicalPlan::Filter(filter) => Self::sole_relation_of(filter.input.as_ref()),
+            LogicalPlan::Sort(sort) => Self::sole_relation_of(sort.input.as_ref()),
+            LogicalPlan::Projection(projection) => {
+                Self::sole_relation_of(projection.input.as_ref())
+            }
+            LogicalPlan::Distinct(distinct) => Self::sole_relation_of(distinct.input()),
+            _ => None,
+        }
+    }
+
     /// Projection unparsing when [`super::dialect::Dialect::unnest_as_lateral_flatten`] is enabled:
     /// Snowflake-style `LATERAL FLATTEN` for unnest (not other dialect spellings).
     ///
@@ -801,6 +893,11 @@ impl Unparser<'_> {
                         vec![],
                     );
                 }
+                if (limit.fetch.is_some() || limit.skip.is_some())
+                    && Self::row_limit_needs_own_scope(select)?
+                {
+                    return self.derive_row_limited_scope(plan, select, relation);
+                }
                 if let Some(fetch) = &limit.fetch {
                     let Some(query) = query.as_mut() else {
                         return internal_err!(
@@ -840,6 +937,13 @@ impl Unparser<'_> {
                         false,
                         vec![],
                     );
+                }
+                // A `Sort` carrying a `fetch` renders that fetch as this
+                // query's `LIMIT`, so it reorders against a predicate above it
+                // exactly as a `Limit` node does. A sort without one does not:
+                // `ORDER BY` is evaluated after `WHERE` either way.
+                if sort.fetch.is_some() && Self::row_limit_needs_own_scope(select)? {
+                    return self.derive_row_limited_scope(plan, select, relation);
                 }
 
                 let Some(query_ref) = query else {
@@ -1025,7 +1129,8 @@ impl Unparser<'_> {
                     Arc::clone(right_plan)
                 } else {
                     let right_plan =
-                        match try_transform_to_simple_table_scan_with_filters(right_plan)? {
+                        match try_transform_to_simple_table_scan_with_filters(right_plan)?
+                        {
                             Some((plan, filters)) => {
                                 table_scan_filters.extend(filters);
                                 Arc::new(plan)

@@ -330,6 +330,24 @@ impl SelectBuilder {
 
         self
     }
+
+    /// Whether this `SELECT` already carries a `WHERE` predicate.
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
+
+    /// Whether this `SELECT` already carries a predicate that can only be
+    /// stated alongside the grouping or windowing it filters — `HAVING` or
+    /// `QUALIFY`.
+    ///
+    /// Both are evaluated before `LIMIT`/`OFFSET`, like `WHERE`, but unlike
+    /// `WHERE` they cannot simply be lifted into an enclosing query: the
+    /// aggregate or window expression they reference is only nameable in the
+    /// `SELECT` that computes it.
+    pub fn has_grouped_predicate(&self) -> bool {
+        self.having.is_some() || self.qualify.is_some()
+    }
+
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {
         self.group_by = Some(value);
         self

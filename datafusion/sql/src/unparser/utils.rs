@@ -322,7 +322,11 @@ pub(crate) fn unproject_sort_expr(
     // PostgreSQL and similar dialects reject output-column aliases inside
     // expressions. That path is handled by the recursive `transform` below,
     // which is only reached when `sort_expr.expr` is not a bare column.
-    if let Expr::Column(Column{relation: None, name, .. }) = &sort_expr.expr
+    if let Expr::Column(Column {
+        relation: None,
+        name,
+        ..
+    }) = &sort_expr.expr
         && let LogicalPlan::Projection(Projection { expr, schema, .. }) = input
         && let Some(idx) = schema.index_of_column_by_name(None, name)
         && let Some(Expr::Alias(_)) = expr.get(idx)
@@ -339,20 +343,21 @@ pub(crate) fn unproject_sort_expr(
                 // Qualified columns reference FROM relations directly; only
                 // unqualified columns can name aggregate/projection outputs
                 // that need unprojecting below.
-                Expr::Column(Column { relation: Some(_), .. }) => {
-                    Ok(Transformed::no(sub_expr))
-                }
+                Expr::Column(Column {
+                    relation: Some(_), ..
+                }) => Ok(Transformed::no(sub_expr)),
                 // In case of aggregation there could be columns containing aggregation functions we need to unproject
-                Expr::Column(col) if let Some(agg) = agg
-                    && agg.schema.is_column_from_schema(&col) => {
-                        return Ok(Transformed::yes(unproject_agg_exprs(
-                            Expr::Column(col),
-                            agg,
-                            None,
-                        )?));
-                    }
+                Expr::Column(col)
+                    if let Some(agg) = agg
+                        && agg.schema.is_column_from_schema(&col) =>
+                {
+                    return Ok(Transformed::yes(unproject_agg_exprs(
+                        Expr::Column(col),
+                        agg,
+                        None,
+                    )?));
+                }
                 Expr::Column(col) => {
-
                     // When an expression in the `ORDER BY` contains an alias from the `SELECT`
                     // we need to transform it back to the actual expression so that it is
                     // valid SQL in all positions inside ORDER BY (PostgreSQL only allows bare
