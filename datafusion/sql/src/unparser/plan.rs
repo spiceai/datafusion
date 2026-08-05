@@ -1092,16 +1092,29 @@ impl Unparser<'_> {
                     select.selection(Some(filter_expr));
                 }
 
-                let join_constraint = self.join_constraint_to_sql(
+                let mut join_constraint = self.join_constraint_to_sql(
                     join.join_constraint,
                     &join.on,
                     join_filters.as_ref(),
                 )?;
+                // `USING`/`NATURAL` cannot carry an extra predicate. Normally
+                // the predicate goes back where it was, since nothing is
+                // gained by mangling the join — but a predicate hoisted from
+                // the non-preserved side of a null-extending join has nowhere
+                // else to go: returning it to the SELECT-global `WHERE` would
+                // discard unmatched rows from the preserved side. Downgrade
+                // to an equivalent `ON` constraint so it can be appended.
+                if hoisted_from_left.is_some()
+                    && matches!(
+                        join_constraint,
+                        ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural
+                    )
+                {
+                    join_constraint =
+                        self.join_conditions_to_sql_on(&join.on, join_filters.as_ref())?;
+                }
                 let (join_constraint, unhoistable) =
                     Self::and_into_join_constraint(join_constraint, hoisted_from_left);
-                // `USING`/`NATURAL` cannot carry an extra predicate. Nothing is
-                // gained by mangling the join, so the predicate goes back where
-                // it was.
                 select.selection(unhoistable);
 
                 let right_projection: Option<Vec<ast::SelectItem>> =
