@@ -4328,7 +4328,7 @@ fn test_filter_above_a_sort_fetch_is_refused() -> Result<()> {
         .build()?;
     let error =
         plan_to_sql(&plan).expect_err("a filter above a sort fetch cannot be unparsed");
-    assert_contains!(error.to_string(), "after a sort\'s fetch");
+    assert_contains!(error.to_string(), "after a sort's fetch");
 
     Ok(())
 }
