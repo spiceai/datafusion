@@ -578,6 +578,40 @@ impl Unparser<'_> {
         }
     }
 
+    /// Isolates a `FULL JOIN` input's table-scan filters in a derived table:
+    /// `(SELECT ... FROM t WHERE ...) AS t`. A `FULL JOIN` preserves both
+    /// sides, so a filter on just one input cannot be expressed by folding it
+    /// into `ON` (filtered-out rows would reappear as unmatched) or by moving
+    /// it to `WHERE` (the other side's unmatched rows would be discarded);
+    /// pre-filtering that side in its own subquery is the only clause that
+    /// preserves the original meaning.
+    ///
+    /// `clean_plan` is the `TableScan`/`SubqueryAlias` produced by
+    /// `try_transform_to_simple_table_scan_with_filters`, and `scan_filters`
+    /// are the filters it extracted. `relation` already holds the plain
+    /// table reference built for this side; it is overwritten with the
+    /// derived subquery.
+    fn derive_full_join_side(
+        &self,
+        clean_plan: &LogicalPlan,
+        scan_filters: Vec<Expr>,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        let Some(combined) = scan_filters.into_iter().reduce(Expr::and) else {
+            return Ok(());
+        };
+        let filtered_plan = LogicalPlanBuilder::from(clean_plan.clone())
+            .filter(combined)?
+            .build()?;
+        let alias = match clean_plan {
+            LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
+            LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
+            _ => None,
+        }
+        .map(|table_ref| self.new_table_alias(table_ref.table().to_string(), vec![]));
+        self.derive(&filtered_plan, relation, alias, false)
+    }
+
     /// Projection unparsing when [`super::dialect::Dialect::unnest_as_lateral_flatten`] is enabled:
     /// Snowflake-style `LATERAL FLATTEN` for unnest (not other dialect spellings).
     ///
@@ -1117,7 +1151,11 @@ impl Unparser<'_> {
                 self.select_to_sql_recursively(input, query, select, relation)
             }
             LogicalPlan::Join(join) => {
-                let mut table_scan_filters = vec![];
+                // Kept apart by input: where a filter may be re-emitted depends
+                // on which side of the join it came from (see
+                // `split_join_on_and_where_filters`).
+                let mut left_scan_filters = vec![];
+                let mut right_scan_filters = vec![];
                 let (left_plan, right_plan) = match join.join_type {
                     JoinType::RightSemi | JoinType::RightAnti => {
                         (&join.right, &join.left)
@@ -1132,11 +1170,29 @@ impl Unparser<'_> {
                 let left_plan =
                     match try_transform_to_simple_table_scan_with_filters(left_plan)? {
                         Some((plan, filters)) => {
-                            table_scan_filters.extend(filters);
+                            left_scan_filters.extend(filters);
                             Arc::new(plan)
                         }
                         None => Arc::clone(left_plan),
                     };
+
+                // A join that null-extends its left input must not let a
+                // predicate from that subtree reach the SELECT-global `WHERE`:
+                // `WHERE` is evaluated after this join and would discard the
+                // very rows this join preserves. Set the accumulated predicate
+                // aside, see what the left subtree adds, and fold that into
+                // this join's `ON` instead (where, for the non-preserved side,
+                // it means the same thing).
+                // This relocation is only valid when the left input is not
+                // preserved. A FULL JOIN also null-extends its left input, but
+                // preserves left rows, so moving the predicate into ON would
+                // make filtered-out left rows reappear as unmatched rows.
+                let left_is_null_extended = matches!(join.join_type, JoinType::Right);
+                let outer_selection = if left_is_null_extended {
+                    select.take_selection()
+                } else {
+                    None
+                };
 
                 self.select_to_sql_recursively(
                     left_plan.as_ref(),
@@ -1144,6 +1200,28 @@ impl Unparser<'_> {
                     select,
                     relation,
                 )?;
+
+                // A FULL JOIN preserves both sides, so neither `ON` nor
+                // `WHERE` can express a filter that came from just one
+                // side's `TableScan` (see `split_join_on_and_where_filters`).
+                // Isolate that side in a derived table instead, and drop the
+                // filters from `left_scan_filters` so they are not also
+                // routed to `ON`/`WHERE` below.
+                if join.join_type == JoinType::Full && !left_scan_filters.is_empty() {
+                    self.derive_full_join_side(
+                        left_plan.as_ref(),
+                        std::mem::take(&mut left_scan_filters),
+                        relation,
+                    )?;
+                }
+
+                let hoisted_from_left = if left_is_null_extended {
+                    let contributed = select.take_selection();
+                    select.selection(outer_selection);
+                    contributed
+                } else {
+                    None
+                };
 
                 let left_projection: Option<Vec<ast::SelectItem>> = if !already_projected
                 {
@@ -1176,7 +1254,7 @@ impl Unparser<'_> {
                         match try_transform_to_simple_table_scan_with_filters(right_plan)?
                         {
                             Some((plan, filters)) => {
-                                table_scan_filters.extend(filters);
+                                right_scan_filters.extend(filters);
                                 Arc::new(plan)
                             }
                             None => Arc::clone(right_plan),
@@ -1188,20 +1266,30 @@ impl Unparser<'_> {
                         select,
                         &mut right_relation,
                     )?;
+                    if join.join_type == JoinType::Full && !right_scan_filters.is_empty()
+                    {
+                        self.derive_full_join_side(
+                            right_plan.as_ref(),
+                            std::mem::take(&mut right_scan_filters),
+                            &mut right_relation,
+                        )?;
+                    }
                     right_plan
                 };
 
                 // Table-scan filters extracted from the inputs must land in the
                 // outer query. EXISTS-style joins have no outer `ON` clause, so
-                // all such filters go to the outer `WHERE`; regular joins split
-                // them between `ON` and `WHERE`.
+                // all such filters go to the outer `WHERE` (only the preserved
+                // side is transformed above, so `right_scan_filters` is empty);
+                // regular joins split them between `ON` and `WHERE`.
                 let (join_filters, where_filters) = if is_exists_join {
-                    (join.filter.clone(), table_scan_filters)
+                    (join.filter.clone(), left_scan_filters)
                 } else {
                     Self::split_join_on_and_where_filters(
                         join.join_type,
                         &join.filter,
-                        table_scan_filters,
+                        left_scan_filters,
+                        right_scan_filters,
                     )
                 };
                 for filter in where_filters {
@@ -1209,11 +1297,30 @@ impl Unparser<'_> {
                     select.selection(Some(filter_expr));
                 }
 
-                let join_constraint = self.join_constraint_to_sql(
+                let mut join_constraint = self.join_constraint_to_sql(
                     join.join_constraint,
                     &join.on,
                     join_filters.as_ref(),
                 )?;
+                // `USING`/`NATURAL` cannot carry an extra predicate. Normally
+                // the predicate goes back where it was, since nothing is
+                // gained by mangling the join — but a predicate hoisted from
+                // the non-preserved side of a null-extending join has nowhere
+                // else to go: returning it to the SELECT-global `WHERE` would
+                // discard unmatched rows from the preserved side. Downgrade
+                // to an equivalent `ON` constraint so it can be appended.
+                if hoisted_from_left.is_some()
+                    && matches!(
+                        join_constraint,
+                        ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural
+                    )
+                {
+                    join_constraint =
+                        self.join_conditions_to_sql_on(&join.on, join_filters.as_ref())?;
+                }
+                let (join_constraint, unhoistable) =
+                    Self::and_into_join_constraint(join_constraint, hoisted_from_left);
+                select.selection(unhoistable);
 
                 let right_projection: Option<Vec<ast::SelectItem>> =
                     if !already_projected && !is_exists_join {
@@ -2403,31 +2510,94 @@ impl Unparser<'_> {
         Ok(select.build()?)
     }
 
-    /// Decides where extracted table-scan filters belong in the unparsed SQL:
-    /// in the `JOIN ON` clause or in `WHERE`.
+    /// AND-folds `predicate` into a join's `ON` clause.
     ///
-    /// For inner joins the two are semantically equivalent, so filters go to
-    /// `WHERE` (some dialects reject subqueries inside `JOIN ON`).
-    /// For outer joins the filters are AND-folded into `ON` to preserve correctness.
+    /// Returns the constraint together with the predicate it could not take:
+    /// `USING` and `NATURAL` joins have nowhere to put one.
+    fn and_into_join_constraint(
+        constraint: ast::JoinConstraint,
+        predicate: Option<ast::Expr>,
+    ) -> (ast::JoinConstraint, Option<ast::Expr>) {
+        let Some(predicate) = predicate else {
+            return (constraint, None);
+        };
+
+        match constraint {
+            ast::JoinConstraint::On(existing) => (
+                ast::JoinConstraint::On(ast::Expr::BinaryOp {
+                    left: Box::new(existing),
+                    op: ast::BinaryOperator::And,
+                    right: Box::new(predicate),
+                }),
+                None,
+            ),
+            ast::JoinConstraint::None => (ast::JoinConstraint::On(predicate), None),
+            constraint @ (ast::JoinConstraint::Using(_)
+            | ast::JoinConstraint::Natural) => (constraint, Some(predicate)),
+        }
+    }
+
+    /// Decides where the table-scan filters extracted from a join's two inputs
+    /// belong in the unparsed SQL: in the `JOIN ON` clause or in `WHERE`.
+    ///
+    /// The answer depends on the join type *and* on which input the filter came
+    /// from — a filter on a preserved side means something different in `ON`
+    /// than in `WHERE`. Filters routed to `ON` are AND-folded onto the join's
+    /// own filter.
     ///
     /// Returns `(on_filter, where_filters)`.
     fn split_join_on_and_where_filters(
         join_type: JoinType,
         join_filter: &Option<Expr>,
-        table_scan_filters: Vec<Expr>,
+        left_scan_filters: Vec<Expr>,
+        right_scan_filters: Vec<Expr>,
     ) -> (Option<Expr>, Vec<Expr>) {
-        if table_scan_filters.is_empty() {
-            return (join_filter.clone(), vec![]);
+        // Which clause preserves a filter's meaning depends on the side it came
+        // from:
+        //
+        // * Inner — ON and WHERE are equivalent, so both sides go to WHERE
+        //   (some dialects reject subqueries inside JOIN ON).
+        // * Left/Right — the preserved side keeps every row whatever ON says,
+        //   so folding its filter into ON would filter nothing at all; it has
+        //   to go to WHERE. The non-preserved side is the mirror image: WHERE
+        //   would discard the null-extended rows and silently turn the outer
+        //   join into an inner join, so its filter has to stay in ON.
+        // * Full — both sides are preserved, so neither clause preserves either
+        //   side's filter; only a derived table does. The caller isolates a
+        //   `FULL JOIN`'s filtered side in one before reaching this function,
+        //   so `left_scan_filters`/`right_scan_filters` are always empty here.
+        let (on_scan_filters, where_scan_filters) = match join_type {
+            JoinType::Inner => (
+                vec![],
+                left_scan_filters
+                    .into_iter()
+                    .chain(right_scan_filters)
+                    .collect(),
+            ),
+            JoinType::Left => (right_scan_filters, left_scan_filters),
+            JoinType::Right => (left_scan_filters, right_scan_filters),
+            // Semi/anti/mark joins do not reach this function: their filters
+            // are routed by the EXISTS branch of `select_to_sql_recursively`.
+            JoinType::Full
+            | JoinType::LeftSemi
+            | JoinType::RightSemi
+            | JoinType::LeftAnti
+            | JoinType::RightAnti
+            | JoinType::LeftMark
+            | JoinType::RightMark => (
+                left_scan_filters
+                    .into_iter()
+                    .chain(right_scan_filters)
+                    .collect(),
+                vec![],
+            ),
+        };
+
+        if on_scan_filters.is_empty() {
+            return (join_filter.clone(), where_scan_filters);
         }
 
-        if join_type == JoinType::Inner {
-            // ON and WHERE are equivalent for inner joins; prefer WHERE
-            // because some dialects reject subqueries inside JOIN ON.
-            return (join_filter.clone(), table_scan_filters);
-        }
-
-        // Outer joins: fold table-scan filters into ON to preserve semantics.
-        let combined = table_scan_filters.into_iter().reduce(|acc, filter| {
+        let combined = on_scan_filters.into_iter().reduce(|acc, filter| {
             Expr::BinaryExpr(BinaryExpr {
                 left: Box::new(acc),
                 op: Operator::And,
@@ -2446,7 +2616,7 @@ impl Unparser<'_> {
             (None, None) => None,
         };
 
-        (on_filter, vec![])
+        (on_filter, where_scan_filters)
     }
 }
 

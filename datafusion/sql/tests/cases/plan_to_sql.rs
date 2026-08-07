@@ -2059,6 +2059,145 @@ fn test_join_with_table_scan_filters() -> Result<()> {
 }
 
 #[test]
+fn test_outer_join_with_table_scan_filters() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let schema_right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let left_with_filter = || {
+        table_scan_with_filters(
+            Some("left_table"),
+            &schema_left,
+            Some(vec![0, 1]),
+            vec![col("left_table.id").eq(lit("a"))],
+        )?
+        .build()
+    };
+    let right_with_filter = || {
+        table_scan_with_filters(
+            Some("right_table"),
+            &schema_right,
+            Some(vec![0, 1]),
+            vec![col("right_table.age").gt(lit(10))],
+        )?
+        .build()
+    };
+    let plain_left =
+        || table_scan(Some("left_table"), &schema_left, Some(vec![0, 1]))?.build();
+    let plain_right =
+        || table_scan(Some("right_table"), &schema_right, Some(vec![0, 1]))?.build();
+
+    // LEFT JOIN, filter on the preserved (left) side: it must land in WHERE.
+    // Folding it into `ON` would not remove a single row, because a LEFT JOIN
+    // preserves every left row regardless of the `ON` predicate.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            plain_right()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table LEFT OUTER JOIN right_table ON left_table.id = right_table.id WHERE (left_table.id = 'a')"#
+    );
+
+    // LEFT JOIN, filter on the non-preserved (right) side: it must stay in
+    // `ON`. Moving it to WHERE would discard the null-extended rows and turn
+    // the LEFT JOIN into an INNER JOIN.
+    let plan = LogicalPlanBuilder::from(plain_left()?)
+        .join(
+            right_with_filter()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table LEFT OUTER JOIN right_table ON left_table.id = right_table.id AND (right_table.age > 10)"#
+    );
+
+    // LEFT JOIN with a filter on each side: the two are routed to different
+    // clauses, and neither is dropped.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            right_with_filter()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table LEFT OUTER JOIN right_table ON left_table.id = right_table.id AND (right_table.age > 10) WHERE (left_table.id = 'a')"#
+    );
+
+    // RIGHT JOIN is the mirror image: the right side is preserved.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            right_with_filter()?,
+            datafusion_expr::JoinType::Right,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table RIGHT OUTER JOIN right_table ON left_table.id = right_table.id AND (left_table.id = 'a') WHERE (right_table.age > 10)"#
+    );
+
+    // FULL OUTER JOIN preserves both sides, so neither `ON` nor `WHERE`
+    // expresses an input filter correctly. Isolate the filtered input in a
+    // derived table so rows rejected by the filter cannot reappear as unmatched
+    // rows from the FULL JOIN.
+    let plan = LogicalPlanBuilder::from(left_with_filter()?)
+        .join(
+            plain_right()?,
+            datafusion_expr::JoinType::Full,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM (SELECT left_table.id, left_table."name" FROM left_table WHERE (left_table.id = 'a')) AS left_table FULL JOIN right_table ON left_table.id = right_table.id"#
+    );
+
+    // The aliased form: the filter is rewritten to the alias on its way out of
+    // the scan, and must still land in WHERE.
+    let aliased_left = table_scan_with_filters(
+        Some("left_table"),
+        &schema_left,
+        Some(vec![0, 1]),
+        vec![col("left_table.id").eq(lit("a"))],
+    )?
+    .alias("l")?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(aliased_left)
+        .join(
+            plain_right()?,
+            datafusion_expr::JoinType::Left,
+            (vec!["l.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT l.id, l."name", right_table.id, right_table.age FROM left_table AS l LEFT OUTER JOIN right_table ON l.id = right_table.id WHERE (l.id = 'a')"#
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_interval_lhs_eq() {
     let statement = generate_round_trip_statement(
         GenericDialect {},
@@ -4701,6 +4840,116 @@ fn test_filter_above_limit_over_an_empty_projection_is_refused() -> Result<()> {
     let error = plan_to_sql(&plan)
         .expect_err("a limited scan with no columns cannot be unparsed");
     assert_contains!(error.to_string(), "projecting no columns");
+
+    Ok(())
+}
+
+#[test]
+fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
+    // When an enclosing RIGHT JOIN null-extends a nested left input, a predicate
+    // from that input must not reach the SELECT-global `WHERE`: `WHERE` runs
+    // after every join and would discard the preserved right-side rows. It
+    // belongs in the enclosing join's `ON` because the left input is not
+    // preserved. FULL JOIN differs because it preserves both inputs.
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let a = table_scan_with_filters(
+        Some("a"),
+        &schema,
+        Some(vec![0]),
+        vec![col("a.id").eq(lit("x"))],
+    )?
+    .build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+
+    let nested_under_outer = |inner_join_type, outer_join_type| -> Result<String> {
+        let inner = LogicalPlanBuilder::from(a.clone())
+            .join(
+                b.clone(),
+                inner_join_type,
+                (vec!["a.id"], vec!["b.id"]),
+                None,
+            )?
+            .build()?;
+        let outer = LogicalPlanBuilder::from(inner)
+            .join(
+                c.clone(),
+                outer_join_type,
+                (vec!["a.id"], vec!["c.id"]),
+                None,
+            )?
+            .build()?;
+        Ok(plan_to_sql(&outer)?.to_string())
+    };
+
+    assert_snapshot!(
+        nested_under_outer(
+            datafusion_expr::JoinType::Inner,
+            datafusion_expr::JoinType::Right,
+        )?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
+    );
+    assert_snapshot!(
+        nested_under_outer(
+            datafusion_expr::JoinType::Left,
+            datafusion_expr::JoinType::Right,
+        )?,
+        @"SELECT a.id, b.id, c.id FROM a LEFT OUTER JOIN b ON a.id = b.id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
+    );
+
+    // A FULL JOIN also null-extends its left input, but unlike a RIGHT JOIN it
+    // preserves that input. Hoisting the predicate into ON would therefore
+    // make filtered-out left rows reappear as unmatched rows. Keep the prior
+    // WHERE placement until FULL JOIN inputs can be emitted as derived tables.
+    assert_snapshot!(
+        nested_under_outer(
+            datafusion_expr::JoinType::Inner,
+            datafusion_expr::JoinType::Full,
+        )?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE (a.id = 'x')"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_join_filter_nested_under_right_join_using() -> Result<()> {
+    // USING cannot carry the predicate contributed by the non-preserved left
+    // input. It must be downgraded to an equivalent ON constraint before the
+    // predicate is appended; returning the predicate to the SELECT-global
+    // WHERE would discard unmatched rows from the preserved right input.
+    let id_schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let b_schema = Schema::new(vec![Field::new("b_id", DataType::Utf8, false)]);
+    let a = table_scan_with_filters(
+        Some("a"),
+        &id_schema,
+        Some(vec![0]),
+        vec![col("a.id").eq(lit("x"))],
+    )?
+    .build()?;
+    let b = table_scan(Some("b"), &b_schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &id_schema, Some(vec![0]))?.build()?;
+
+    let inner = LogicalPlanBuilder::from(a)
+        .join(
+            b,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["b.b_id"]),
+            None,
+        )?
+        .build()?;
+    let outer = LogicalPlanBuilder::from(inner)
+        .join_using(
+            c,
+            datafusion_expr::JoinType::Right,
+            vec![Column::new_unqualified("id")],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&outer)?,
+        @"SELECT a.id, b.b_id, c.id FROM a INNER JOIN b ON a.id = b.b_id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
+    );
 
     Ok(())
 }
