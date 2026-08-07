@@ -376,6 +376,23 @@ pub enum TimezoneCastStyle {
     Cast,
 }
 
+/// Whether `tz` is a fixed UTC offset of **zero** — `+00:00`, `-00:00`, `+0000`,
+/// `-0000`, `+00` or `-00` — i.e. a spelling of UTC.
+///
+/// Arrow carries a fixed UTC offset as the timezone rather than an IANA name (Iceberg
+/// maps every `timestamptz` column to `+00:00`). Only the zero-offset spellings are
+/// recognised here: they denote UTC exactly, so an engine that cannot resolve the
+/// spelling loses nothing by falling back. A *non-zero* offset is deliberately not
+/// matched — silently reinterpreting one risks returning the wrong instant, so it is
+/// better to let the engine reject a zone name it does not understand.
+pub(crate) fn is_utc_equivalent_fixed_offset(tz: &str) -> bool {
+    let Some(digits) = tz.strip_prefix(['+', '-']) else {
+        return false;
+    };
+    // Accept HH, HHMM and HH:MM, and only when every field is zero.
+    matches!(digits, "00" | "0000" | "00:00")
+}
+
 /// Build the AST for `input AT TIME ZONE 'tz'`.
 pub(crate) fn at_time_zone_to_ast(input: ast::Expr, tz: &str) -> ast::Expr {
     ast::Expr::AtTimeZone {
@@ -630,6 +647,37 @@ impl Dialect for DuckDBDialect {
         }
 
         Ok(None)
+    }
+
+    /// DuckDB resolves `AT TIME ZONE` through its ICU extension, which performs a zone
+    /// *name* lookup and knows only named IANA zones. Arrow carries a fixed UTC offset
+    /// as the timezone — Iceberg maps every `timestamptz` column to `+00:00` — and every
+    /// offset spelling (`+00:00`, `+0000`, `+00`, and the negative forms) makes DuckDB
+    /// raise `Not implemented Error: Unknown TimeZone '...'`, failing the query outright.
+    ///
+    /// For the zero-offset spellings, fall back to the plain cast. Those denote UTC, and
+    /// an Arrow timestamp is a UTC instant whose timezone is display metadata, so for a
+    /// timezone-aware operand `CAST(x AS TIMESTAMP WITH TIME ZONE)` is a no-op that
+    /// preserves the instant and compares correctly whatever the session timezone. That
+    /// is the shape this actually has in practice: the cast is generated when filtering a
+    /// timezone-aware column. Note the cast is *not* session-independent for a naive
+    /// `TIMESTAMP` operand — DuckDB resolves that one using the session timezone — so it
+    /// is not a general-purpose replacement for an explicit zone conversion.
+    ///
+    /// A *non-zero* fixed offset is deliberately left alone and still raises the DuckDB
+    /// error. ICU has no equivalent spelling to map it onto — `GMT+05:00` is rejected too,
+    /// and `Etc/GMT±N` covers only whole hours with an inverted sign — so the only
+    /// alternatives are to reject it, as now, or to drop the offset and risk silently
+    /// returning a different instant. Failing loudly is the correct trade.
+    fn timestamp_at_time_zone_to_sql(
+        &self,
+        input: ast::Expr,
+        tz: &str,
+    ) -> Option<ast::Expr> {
+        if is_utc_equivalent_fixed_offset(tz) {
+            return None;
+        }
+        Some(at_time_zone_to_ast(input, tz))
     }
 }
 
