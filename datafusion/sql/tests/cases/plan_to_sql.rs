@@ -4616,7 +4616,8 @@ fn stacked_aggregate_under_a_join_leaves_the_other_side_qualified() -> Result<()
     //
     // The join's `ON` still reads `test.a`: it is built as part of the join and attached
     // after this SELECT's clauses, so it is not among the clauses that are swept. That is
-    // unchanged by the requalification and is tracked as its own gap.
+    // unchanged by the requalification and is tracked as spiceai/spiceai#12695; pinning it
+    // here keeps the gap visible rather than silent.
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT COUNT(derived_aggregate.a), "other".a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
