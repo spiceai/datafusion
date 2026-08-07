@@ -132,7 +132,15 @@ pub enum DataFusionError {
     Execution(String),
     /// [`JoinError`] during execution of the query.
     ///
-    /// This error can't occur for unjoined tasks, such as execution shutdown.
+    /// Only a task that is actually joined can report a [`JoinError`], so a task
+    /// that is spawned and never awaited never reaches this variant. A joined
+    /// task that was **cancelled** does: it was aborted, or the runtime it was
+    /// spawned on shut down while it was still queued. The `JoinError` stays
+    /// reachable as the error's source so a caller can still ask
+    /// [`JoinError::is_cancelled`].
+    ///
+    /// Construct this with [`DataFusionError::from_join_error`], which reports a
+    /// **panicking** task by resuming its panic rather than returning it here.
     ExecutionJoin(Box<JoinError>),
     /// Error when resources (such as memory of scratch disk space) are exhausted.
     ///
