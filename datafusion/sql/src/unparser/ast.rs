@@ -185,6 +185,8 @@ pub struct SelectBuilder {
     flavor: Option<SelectFlavor>,
     /// Counter for generating unique LATERAL FLATTEN aliases within this SELECT.
     flatten_alias_counter: usize,
+    /// Counter for generating unique derived-aggregate aliases within this SELECT.
+    derived_aggregate_alias_counter: usize,
     /// Table aliases that correspond to LATERAL FLATTEN relations.
     /// Column references into these aliases must use `VALUE` as the column name.
     flatten_table_aliases: Vec<String>,
@@ -199,12 +201,30 @@ pub struct SelectBuilder {
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
 const FLATTEN_ALIAS_PREFIX: &str = "_unnest";
 
+/// Prefix used for the auto-generated alias of a derived table that carries an
+/// aggregate stacked below the one its enclosing SELECT already expresses.
+const DERIVED_AGGREGATE_ALIAS_PREFIX: &str = "derived_aggregate";
+
 impl SelectBuilder {
     /// Generate a unique alias for a LATERAL FLATTEN relation
     /// (`_unnest_1`, `_unnest_2`, …). Each call returns a fresh name.
     pub fn next_flatten_alias(&mut self) -> String {
         self.flatten_alias_counter += 1;
         format!("{FLATTEN_ALIAS_PREFIX}_{}", self.flatten_alias_counter)
+    }
+
+    /// Generate a unique alias for a derived table holding a stacked aggregate
+    /// (`derived_aggregate_1`, `derived_aggregate_2`, …). Each call returns a fresh
+    /// name. A join walks both of its sides with one builder, so both sides can
+    /// derive an aggregate into the same FROM clause; the number is what keeps the
+    /// two apart, both as table names and as the qualifier each side's own column
+    /// references are rewritten onto.
+    pub fn next_derived_aggregate_alias(&mut self) -> String {
+        self.derived_aggregate_alias_counter += 1;
+        format!(
+            "{DERIVED_AGGREGATE_ALIAS_PREFIX}_{}",
+            self.derived_aggregate_alias_counter
+        )
     }
 
     /// Register a table alias as pointing to a LATERAL FLATTEN relation.
@@ -519,6 +539,7 @@ impl SelectBuilder {
             value_table_mode: Default::default(),
             flavor: Some(SelectFlavor::Standard),
             flatten_alias_counter: 0,
+            derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             aggregated: false,
         }

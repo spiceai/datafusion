@@ -56,10 +56,6 @@ use datafusion_expr::{
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
 use std::{collections::HashSet, sync::Arc, vec};
 
-/// Alias given to the derived table that carries an aggregate stacked below the one its
-/// enclosing SELECT already expresses.
-const DERIVED_AGGREGATE_ALIAS: &str = "derived_aggregate";
-
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
 /// This function is the opposite of [`SqlToRel::sql_statement_to_plan`] and can
@@ -935,15 +931,19 @@ impl Unparser<'_> {
                     // would not require one, so this SELECT has a name to address its
                     // columns through. A bare column name would do only where the derived
                     // table is the SELECT's sole relation, which is not true under a join.
-                    let alias = self
-                        .new_ident_quoted_if_needs(DERIVED_AGGREGATE_ALIAS.to_string());
+                    //
+                    // The alias is numbered per SELECT because a join walks both of
+                    // its sides with this one builder, so both sides can derive an
+                    // aggregate into the same FROM clause. A fixed name would repeat
+                    // there, and since each side requalifies its own references onto
+                    // its own alias, the two sides' distinct columns would collapse
+                    // onto a single qualifier.
+                    let alias_name = select.next_derived_aggregate_alias();
+                    let alias = self.new_ident_quoted_if_needs(alias_name.clone());
                     self.derive(
                         plan,
                         relation,
-                        Some(self.new_table_alias(
-                            DERIVED_AGGREGATE_ALIAS.to_string(),
-                            vec![],
-                        )),
+                        Some(self.new_table_alias(alias_name, vec![])),
                         false,
                     )?;
 
