@@ -537,6 +537,46 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
     }
 }
 
+/// Re-points a column reference at the derived table that replaced the relation it names.
+///
+/// When a sub-plan is unparsed as a derived table, the SELECT above it stops reading from
+/// the relation its expressions are qualified by and reads from that derived table instead.
+/// A qualifier naming the original relation then binds to nothing, so a strict remote binder
+/// rejects the query even though DataFusion re-plans it.
+///
+/// `derived_columns` are the derived table's output column names; a reference to anything
+/// else is left alone, since the derived table cannot supply it. That test is on the column
+/// name only and so does not distinguish a correlated reference to an enclosing query — a
+/// caller must not offer one, which is why
+/// [`SelectBuilder::visit_expressions_in_clauses_mut`] skips any expression holding a
+/// subquery.
+///
+/// `alias` is the derived table's alias when it has one — the reference is qualified by it,
+/// and otherwise reduced to the bare column name, which is unambiguous because a derived
+/// table is the SELECT's only relation.
+///
+/// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
+pub fn requalify_column_onto_derived_table(
+    idents: &mut Vec<Ident>,
+    derived_columns: &HashSet<String>,
+    alias: Option<&Ident>,
+) {
+    if idents.len() < 2 {
+        return;
+    }
+    let Some(last) = idents.last() else {
+        unreachable!("CompoundIdentifier must have a last element");
+    };
+    if !derived_columns.contains(&last.value) {
+        return;
+    }
+    let last = last.clone();
+    *idents = match alias {
+        Some(alias) => vec![alias.clone(), last],
+        None => vec![last],
+    };
+}
+
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
 /// Removes any table identifiers that are not present in the list of available identifiers, retains original column names.
 pub fn remove_dangling_identifiers(

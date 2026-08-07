@@ -20,7 +20,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    self, LimitClause, OrderByKind, SelectFlavor, visit_expressions_mut,
+    self, LimitClause, OrderByKind, SelectFlavor, visit_expressions,
+    visit_expressions_mut,
 };
 
 #[derive(Clone)]
@@ -136,6 +137,23 @@ impl Default for QueryBuilder {
     fn default() -> Self {
         Self::create_empty()
     }
+}
+
+/// Returns true if `expr` holds a subquery anywhere within it.
+fn contains_subquery(expr: &ast::Expr) -> bool {
+    visit_expressions(expr, |expr| {
+        if matches!(
+            expr,
+            ast::Expr::Subquery(_)
+                | ast::Expr::InSubquery { .. }
+                | ast::Expr::Exists { .. }
+        ) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
 }
 
 #[derive(Clone)]
@@ -351,6 +369,60 @@ impl SelectBuilder {
     /// caller can tell what a sub-plan contributed and re-place it elsewhere.
     pub fn take_selection(&mut self) -> Option<ast::Expr> {
         self.selection.take()
+    }
+
+    /// Applies `f` to every expression this SELECT carries: the projection, `WHERE`,
+    /// `GROUP BY`, `HAVING`, `QUALIFY` and the builder's own sort. `f` sees nested
+    /// expressions too, so a rewrite reaches a column reference wherever it sits.
+    ///
+    /// This exists so a caller that replaces the SELECT's relation — unparsing a sub-plan
+    /// as a derived table — can re-point the column references that addressed the old one,
+    /// without the builder having to expose each clause for reading.
+    ///
+    /// An expression containing a subquery is skipped whole. A correlated subquery
+    /// references an enclosing query's relation, which stays in scope and is
+    /// indistinguishable by name from a reference to this SELECT's own relation, so
+    /// rewriting inside one would silently change which column the subquery reads. That
+    /// leaves such an expression untouched rather than risk rewriting it wrongly.
+    pub fn visit_expressions_in_clauses_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut ast::Expr),
+    {
+        let mut visit = |expr: &mut ast::Expr| {
+            if contains_subquery(expr) {
+                return;
+            }
+            let _ = visit_expressions_mut(expr, |expr| {
+                f(expr);
+                ControlFlow::<()>::Continue(())
+            });
+        };
+
+        for item in self.projection.iter_mut().flatten() {
+            match item {
+                ast::SelectItem::UnnamedExpr(expr)
+                | ast::SelectItem::ExprWithAlias { expr, .. }
+                | ast::SelectItem::ExprWithAliases { expr, .. } => visit(expr),
+                ast::SelectItem::QualifiedWildcard(..) | ast::SelectItem::Wildcard(_) => {
+                }
+            }
+        }
+        for expr in self
+            .selection
+            .iter_mut()
+            .chain(self.having.iter_mut())
+            .chain(self.qualify.iter_mut())
+        {
+            visit(expr);
+        }
+        if let Some(ast::GroupByExpr::Expressions(exprs, _)) = self.group_by.as_mut() {
+            for expr in exprs {
+                visit(expr);
+            }
+        }
+        for sort in &mut self.sort_by {
+            visit(&mut sort.expr);
+        }
     }
 
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {

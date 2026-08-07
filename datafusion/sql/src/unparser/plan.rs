@@ -23,7 +23,8 @@ use super::{
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
+        remove_dangling_identifiers, requalify_column_onto_derived_table,
+        rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
     utils::{
@@ -53,7 +54,7 @@ use datafusion_expr::{
     UserDefinedLogicalNode, Window, expr::Alias,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::{sync::Arc, vec};
+use std::{collections::HashSet, sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -926,13 +927,40 @@ impl Unparser<'_> {
                 // `count(alias1)` against the base table — `alias1` does not exist there,
                 // and where it happens to, the DISTINCT is silently gone.
                 if select.already_aggregated() {
-                    return self.derive_with_dialect_alias(
+                    self.derive_with_dialect_alias(
                         "derived_aggregate",
                         plan,
                         relation,
                         false,
                         vec![],
-                    );
+                    )?;
+
+                    // This SELECT now reads from that derived table, and the relation its
+                    // expressions are qualified by is no longer in scope. Every column it
+                    // addresses is one the derived table projects, so re-point the
+                    // qualified references at the derived table; leaving them addressing
+                    // the base relation emits SQL that DataFusion re-plans but a stricter
+                    // remote binder rejects.
+                    let derived_columns: HashSet<String> = plan
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().clone())
+                        .collect();
+                    let alias = relation
+                        .get_alias()
+                        .map(|alias| self.new_ident_quoted_if_needs(alias));
+                    select.visit_expressions_in_clauses_mut(|expr| {
+                        if let ast::Expr::CompoundIdentifier(idents) = expr {
+                            requalify_column_onto_derived_table(
+                                idents,
+                                &derived_columns,
+                                alias.as_ref(),
+                            );
+                        }
+                    });
+
+                    return Ok(());
                 }
                 select.mark_aggregated();
 
