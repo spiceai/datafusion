@@ -1342,7 +1342,10 @@ fn table_scan_with_empty_projection_and_none_projection_helper(
 // yielding `Projection: <empty> -> TableScan`. It must not be unparsed as an
 // empty `SELECT` list for dialects that reject `SELECT FROM t` (e.g. DuckDB):
 // fall back to `SELECT 1` just like the bare empty-projection `TableScan`.
-fn empty_projection_over_table_helper(table_name: &str, table_schema: Schema) -> LogicalPlan {
+fn empty_projection_over_table_helper(
+    table_name: &str,
+    table_schema: Schema,
+) -> LogicalPlan {
     project(
         table_scan(Some(table_name), &table_schema, None)
             .unwrap()
@@ -4521,5 +4524,114 @@ fn test_join_filter_nested_under_right_join_using() -> Result<()> {
         @"SELECT a.id, b.b_id, c.id FROM a INNER JOIN b ON a.id = b.b_id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_unnamed_projection_output_binds() -> Result<()> {
+    // A `Filter` whose predicate references a `Projection` output that the
+    // projection does not name. The projected expression carries the logical
+    // name `t.a + t.b`, which is not an identifier any relation exposes, so
+    // emitting it as one produces SQL no engine can bind.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(col("t.a + t.b").gt(lit(1)))?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    assert_snapshot!(sql, @r#"SELECT (t.a + t.b) FROM t WHERE ((t.a + t.b) > 1)"#);
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_named_projection_output_is_unchanged() -> Result<()> {
+    // An alias gives the output a name the emitted `SELECT` carries, and a bare
+    // column keeps the name it already had. Neither needs repairing, so neither
+    // is inlined.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")).alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&aliased)?,
+        @r#"SELECT (t.a + t.b) AS s FROM t WHERE (s > 1)"#
+    );
+
+    let bare_column = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a")])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&bare_column)?,
+        @r#"SELECT t.a FROM t WHERE (t.a > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_unnamed_projection_output_used_twice() -> Result<()> {
+    // Every reference to the output is inlined, not just the first.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(
+            col("t.a + t.b")
+                .gt(lit(1))
+                .and(col("t.a + t.b").lt(lit(10))),
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.a + t.b) FROM t WHERE (((t.a + t.b) > 1) AND ((t.a + t.b) < 10))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
+    // Stacked filters collapse into one `WHERE`, so the projection is still the
+    // one this predicate refers to and both predicates are repaired.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(col("t.a + t.b").gt(lit(1)))?
+        .filter(col("t.a + t.b").lt(lit(10)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.a + t.b) FROM t WHERE ((t.a + t.b) < 10) AND ((t.a + t.b) > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_unnamed_volatile_projection_output_is_not_inlined() -> Result<()> {
+    // Inlining a volatile expression would evaluate it a second time, in a
+    // clause that can see a different value than the `SELECT` list did, turning
+    // an unbindable reference into silently wrong rows. The unbindable
+    // reference is the safer of the two, so it is left in place.
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![datafusion_functions::math::random().call(vec![])])?
+        .filter(col("random()").gt(lit(0.5)))?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    assert_snapshot!(sql, @r#"SELECT random() FROM t WHERE ("random()" > 0.5)"#);
     Ok(())
 }
