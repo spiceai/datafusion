@@ -1547,8 +1547,9 @@ mod test {
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build a current-thread runtime");
+        let task = rt.spawn(async { panic!("task payload") });
         let err = rt
-            .block_on(async { tokio::spawn(async { panic!("task payload") }).await })
+            .block_on(task)
             .expect_err("a panicking task cannot succeed");
         assert!(err.is_panic(), "precondition: the task panicked");
 

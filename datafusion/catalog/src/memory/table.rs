@@ -453,7 +453,7 @@ impl TableProvider for MemTable {
                     let column_name = field.name();
                     let original_column =
                         batch.column_by_name(column_name).ok_or_else(|| {
-                            datafusion_common::DataFusionError::Internal(format!(
+                            DataFusionError::Internal(format!(
                                 "Column '{column_name}' not found in batch"
                             ))
                         })?;
@@ -517,7 +517,7 @@ fn evaluate_filters_to_mask(
             .as_any()
             .downcast_ref::<BooleanArray>()
             .ok_or_else(|| {
-                datafusion_common::DataFusionError::Internal(
+                DataFusionError::Internal(
                     "Filter did not evaluate to boolean".to_string(),
                 )
             })?
