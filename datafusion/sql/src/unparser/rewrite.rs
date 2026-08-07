@@ -321,10 +321,17 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                     .clone()
                     .transform_down(|e| {
                         Ok(match &e {
-                            Expr::Column(col) => match dropped_aliases.get(col.name()) {
-                                Some(underlying) => Transformed::yes(underlying.clone()),
-                                None => Transformed::no(e),
-                            },
+                            // Only an unqualified column can name a projection
+                            // alias: `t.x` refers to `t`'s own column even when a
+                            // dropped alias happens to share the name.
+                            Expr::Column(col) if col.relation.is_none() => {
+                                match dropped_aliases.get(col.name()) {
+                                    Some(underlying) => {
+                                        Transformed::yes(underlying.clone())
+                                    }
+                                    None => Transformed::no(e),
+                                }
+                            }
                             _ => Transformed::no(e),
                         })
                     })
