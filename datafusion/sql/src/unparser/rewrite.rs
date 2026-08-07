@@ -544,37 +544,40 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// A qualifier naming the original relation then binds to nothing, so a strict remote binder
 /// rejects the query even though DataFusion re-plans it.
 ///
-/// `derived_columns` are the derived table's output column names; a reference to anything
-/// else is left alone, since the derived table cannot supply it. That test is on the column
-/// name only and so does not distinguish a correlated reference to an enclosing query — a
-/// caller must not offer one, which is why
-/// [`SelectBuilder::visit_expressions_in_clauses_mut`] skips any expression holding a
-/// subquery.
+/// A reference is rewritten only when its qualifier names one of the relations the derived
+/// table encloses (`derived_qualifiers`), so a reference to a relation the SELECT still
+/// reads directly — the other side of a join, say — keeps the qualifier it needs. The
+/// column is then addressed through `alias`, which the derived table always carries, rather
+/// than reduced to a bare name: bare would be ambiguous wherever the derived table is not
+/// the SELECT's only relation.
 ///
-/// `alias` is the derived table's alias when it has one — the reference is qualified by it,
-/// and otherwise reduced to the bare column name, which is unambiguous because a derived
-/// table is the SELECT's only relation.
+/// Both tests are on names alone, so neither distinguishes a correlated reference to an
+/// enclosing query — that qualifier can name the very same relation. A caller must not
+/// offer one, which is why [`SelectBuilder::visit_expressions_in_clauses_mut`] skips any
+/// expression holding a subquery.
 ///
 /// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
 pub fn requalify_column_onto_derived_table(
     idents: &mut Vec<Ident>,
-    derived_columns: &HashSet<String>,
-    alias: Option<&Ident>,
+    derived_qualifiers: &HashSet<String>,
+    alias: &Ident,
 ) {
     if idents.len() < 2 {
+        return;
+    }
+    let qualifier = idents
+        .iter()
+        .take(idents.len() - 1)
+        .map(|ident| ident.value.clone())
+        .collect::<Vec<String>>()
+        .join(".");
+    if !derived_qualifiers.contains(&qualifier) {
         return;
     }
     let Some(last) = idents.last() else {
         unreachable!("CompoundIdentifier must have a last element");
     };
-    if !derived_columns.contains(&last.value) {
-        return;
-    }
-    let last = last.clone();
-    *idents = match alias {
-        Some(alias) => vec![alias.clone(), last],
-        None => vec![last],
-    };
+    *idents = vec![alias.clone(), last.clone()];
 }
 
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.

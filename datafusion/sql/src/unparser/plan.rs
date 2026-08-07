@@ -56,6 +56,10 @@ use datafusion_expr::{
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
 use std::{collections::HashSet, sync::Arc, vec};
 
+/// Alias given to the derived table that carries an aggregate stacked below the one its
+/// enclosing SELECT already expresses.
+const DERIVED_AGGREGATE_ALIAS: &str = "derived_aggregate";
+
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
 /// This function is the opposite of [`SqlToRel::sql_statement_to_plan`] and can
@@ -927,35 +931,40 @@ impl Unparser<'_> {
                 // `count(alias1)` against the base table — `alias1` does not exist there,
                 // and where it happens to, the DISTINCT is silently gone.
                 if select.already_aggregated() {
-                    self.derive_with_dialect_alias(
-                        "derived_aggregate",
+                    // The derived table always carries an alias, even for a dialect that
+                    // would not require one, so this SELECT has a name to address its
+                    // columns through. A bare column name would do only where the derived
+                    // table is the SELECT's sole relation, which is not true under a join.
+                    let alias = self
+                        .new_ident_quoted_if_needs(DERIVED_AGGREGATE_ALIAS.to_string());
+                    self.derive(
                         plan,
                         relation,
+                        Some(self.new_table_alias(
+                            DERIVED_AGGREGATE_ALIAS.to_string(),
+                            vec![],
+                        )),
                         false,
-                        vec![],
                     )?;
 
-                    // This SELECT now reads from that derived table, and the relation its
-                    // expressions are qualified by is no longer in scope. Every column it
-                    // addresses is one the derived table projects, so re-point the
-                    // qualified references at the derived table; leaving them addressing
-                    // the base relation emits SQL that DataFusion re-plans but a stricter
-                    // remote binder rejects.
-                    let derived_columns: HashSet<String> = plan
+                    // This SELECT now reads those columns from the derived table, so a
+                    // reference still qualified by a relation the derived table encloses
+                    // binds to nothing. DataFusion re-plans such SQL, but a stricter remote
+                    // binder rejects it, which is what breaks a federated pushdown.
+                    let derived_qualifiers: HashSet<String> = plan
                         .schema()
-                        .fields()
                         .iter()
-                        .map(|field| field.name().clone())
+                        .filter_map(|(qualifier, _)| qualifier)
+                        .flat_map(|qualifier| {
+                            [qualifier.to_string(), qualifier.table().to_string()]
+                        })
                         .collect();
-                    let alias = relation
-                        .get_alias()
-                        .map(|alias| self.new_ident_quoted_if_needs(alias));
                     select.visit_expressions_in_clauses_mut(|expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
                             requalify_column_onto_derived_table(
                                 idents,
-                                &derived_columns,
-                                alias.as_ref(),
+                                &derived_qualifiers,
+                                &alias,
                             );
                         }
                     });

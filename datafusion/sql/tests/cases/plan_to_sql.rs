@@ -4453,7 +4453,7 @@ fn stacked_aggregate_is_unparsed_as_a_derived_table() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.b AS alias1 FROM test GROUP BY test.b)"#
+        @r#"SELECT COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.b AS alias1 FROM test GROUP BY test.b) AS derived_aggregate"#
     );
 
     // a, count(DISTINCT b) ... GROUP BY a — the outer aggregate keeps its own grouping,
@@ -4471,7 +4471,7 @@ fn stacked_aggregate_is_unparsed_as_a_derived_table() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT a, COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) GROUP BY a"#
+        @r#"SELECT derived_aggregate.a, COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate GROUP BY derived_aggregate.a"#
     );
 
     // A lone aggregate is still folded into the SELECT it belongs to.
@@ -4509,7 +4509,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) GROUP BY a"
+        @"SELECT COUNT(alias1), derived_aggregate.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate GROUP BY derived_aggregate.a"
     );
 
     // A qualifier nested inside a grouping expression is reached too — the projection and
@@ -4519,7 +4519,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), (a + 1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) GROUP BY (a + 1)"
+        @"SELECT COUNT(alias1), (derived_aggregate.a + 1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate GROUP BY (derived_aggregate.a + 1)"
     );
 
     // HAVING is built from a Filter above the aggregate and was never swept.
@@ -4529,24 +4529,26 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) GROUP BY a HAVING (a > 1)"
+        @"SELECT COUNT(alias1), derived_aggregate.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate GROUP BY derived_aggregate.a HAVING (derived_aggregate.a > 1)"
     );
 
-    // ORDER BY was already handled by the dangling-identifier sweep; it must stay that way.
+    // A query-level ORDER BY is reached by the existing dangling-identifier sweep, which
+    // runs later and strips the qualifier rather than repointing it. It binds either way;
+    // this pins that the two mechanisms do not fight over the same clause.
     let plan = stacked()?
         .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
         .sort(vec![col("test.a").sort(true, false)])?
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) GROUP BY a ORDER BY a ASC NULLS LAST"
+        @"SELECT COUNT(alias1), derived_aggregate.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate GROUP BY derived_aggregate.a ORDER BY a ASC NULLS LAST"
     );
 
     Ok(())
 }
 
-/// A dialect that requires an alias on a derived table gets the references pointed at that
-/// alias rather than stripped bare, so the emitted SQL binds under both shapes.
+/// The derived table is aliased for every dialect, so a dialect that also *requires* the
+/// alias must not end up with a second one, and its references resolve the same way.
 #[test]
 fn stacked_aggregate_requalifies_onto_a_required_derived_table_alias() -> Result<()> {
     struct AliasedDerivedTableDialect {}
@@ -4576,6 +4578,48 @@ fn stacked_aggregate_requalifies_onto_a_required_derived_table_alias() -> Result
     assert_snapshot!(
         unparser.plan_to_sql(&plan)?,
         @"SELECT COUNT(alias1), derived_aggregate.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate GROUP BY derived_aggregate.a HAVING (derived_aggregate.a > 1)"
+    );
+
+    Ok(())
+}
+
+/// A join shares one `SelectBuilder` across both sides, and the join is recorded on it only
+/// after the left side has been walked — so at the point the derived table is built, this
+/// SELECT reads from more than one relation even though nothing on the builder says so yet.
+/// A reference qualified by the *other* side must keep its qualifier, and one pointed at the
+/// derived table must name it rather than go bare, since `a` here is ambiguous between the
+/// two relations.
+#[test]
+fn stacked_aggregate_under_a_join_leaves_the_other_side_qualified() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    // `other` deliberately repeats the column name `a`.
+    let right = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+
+    let inner_aggregate = table_scan(Some("test"), &left, None)?
+        .aggregate(vec![col("test.a")], Vec::<Expr>::new())?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(inner_aggregate)
+        .join_on(
+            table_scan(Some("other"), &right, None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("test.a").eq(col("other.a"))],
+        )?
+        .aggregate(vec![col("other.a")], vec![count_col("test.a")])?
+        .build()?;
+
+    // `COUNT(derived_aggregate.a)` and `GROUP BY "other".a` stay distinguishable. Reducing
+    // either to a bare `a` would make the query ambiguous, and group by the wrong column.
+    //
+    // The join's `ON` still reads `test.a`: it is built as part of the join and attached
+    // after this SELECT's clauses, so it is not among the clauses that are swept. That is
+    // unchanged by the requalification and is tracked as its own gap.
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(derived_aggregate.a), "other".a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
     );
 
     Ok(())
@@ -4622,7 +4666,7 @@ fn stacked_aggregate_leaves_a_correlated_outer_reference_alone() -> Result<()> {
     // clauses that hold no subquery.
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(alias1), a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) GROUP BY a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
+        @r#"SELECT COUNT(alias1), derived_aggregate.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate GROUP BY derived_aggregate.a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
     );
 
     Ok(())
