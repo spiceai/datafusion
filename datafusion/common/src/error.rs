@@ -418,6 +418,31 @@ impl DataFusionError {
     /// The separator between the error message and the backtrace
     pub const BACK_TRACE_SEP: &'static str = "\n\nbacktrace: ";
 
+    /// Convert a [`JoinError`] observed while joining a task into a
+    /// `DataFusionError`.
+    ///
+    /// A [`JoinError`] reports one of exactly two outcomes, and they are not
+    /// interchangeable:
+    ///
+    /// * The task **panicked**. The panic is resumed on the calling thread, so it
+    ///   surfaces where the caller can see it instead of being downgraded to an
+    ///   ordinary error. This function does not return in that case.
+    /// * The task was **cancelled** — it was aborted, or the runtime it was spawned
+    ///   on shut down while it was still queued. That is returned as
+    ///   [`DataFusionError::ExecutionJoin`], which keeps the `JoinError` as the
+    ///   error's source so a caller can still ask [`JoinError::is_cancelled`].
+    ///
+    /// Draining a `JoinSet` is the usual caller: every task the set yields an
+    /// `Err` for is one of these two cases.
+    pub fn from_join_error(e: JoinError) -> Self {
+        if e.is_panic() {
+            // Resume on this thread so the panic is not turned into an error that
+            // loses the payload and the original backtrace.
+            std::panic::resume_unwind(e.into_panic());
+        }
+        Self::ExecutionJoin(Box::new(e))
+    }
+
     /// Get deepest underlying [`DataFusionError`]
     ///
     /// [`DataFusionError`]s sometimes form a chain, such as `DataFusionError::ArrowError()` in order to conform
@@ -1135,6 +1160,7 @@ mod test {
     use super::*;
 
     use std::mem::size_of;
+    use std::panic::AssertUnwindSafe;
     use std::sync::Arc;
 
     use arrow::error::ArrowError;
@@ -1481,5 +1507,60 @@ mod test {
         assert_eq!(errs[0].strip_backtrace(), "Error during planning: a");
         assert_eq!(errs[1].strip_backtrace(), "Error during planning: b");
         assert_eq!(errs[2].strip_backtrace(), "Error during planning: c");
+    }
+
+    /// A `JoinError` for a task that was aborted rather than left to panic.
+    fn cancelled_join_error() -> JoinError {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build a current-thread runtime");
+        // The runtime is never driven before `abort`, so the task cannot have run.
+        let task = rt.spawn(std::future::pending::<()>());
+        task.abort();
+        rt.block_on(task)
+            .expect_err("an aborted task cannot succeed")
+    }
+
+    #[test]
+    fn from_join_error_reports_a_cancelled_task_as_execution_join() {
+        let err = cancelled_join_error();
+        assert!(err.is_cancelled(), "precondition: the task was cancelled");
+
+        let err = DataFusionError::from_join_error(err);
+
+        // The variant carries the `JoinError`, so a caller can still tell a
+        // cancellation apart from any other execution failure.
+        match &err {
+            DataFusionError::ExecutionJoin(join_error) => {
+                assert!(join_error.is_cancelled());
+            }
+            other => panic!("expected ExecutionJoin, got {other:?}"),
+        }
+        assert!(
+            Error::source(&err).is_some(),
+            "the JoinError must remain reachable as the error's source"
+        );
+    }
+
+    #[test]
+    fn from_join_error_resumes_a_panicking_task_instead_of_returning() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build a current-thread runtime");
+        let err = rt
+            .block_on(async { tokio::spawn(async { panic!("task payload") }).await })
+            .expect_err("a panicking task cannot succeed");
+        assert!(err.is_panic(), "precondition: the task panicked");
+
+        let resumed = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            DataFusionError::from_join_error(err)
+        }));
+
+        let payload = resumed.expect_err("the panic must not be downgraded to an error");
+        assert_eq!(
+            payload.downcast_ref::<&str>().copied(),
+            Some("task payload"),
+            "the original panic payload must be carried through"
+        );
     }
 }

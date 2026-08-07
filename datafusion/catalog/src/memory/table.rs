@@ -31,7 +31,9 @@ use arrow::compute::{and, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::error::Result;
-use datafusion_common::{Constraints, DFSchema, SchemaExt, not_impl_err, plan_err};
+use datafusion_common::{
+    Constraints, DFSchema, DataFusionError, SchemaExt, not_impl_err, plan_err,
+};
 use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::memory::{MemSink, MemorySourceConfig};
 use datafusion_datasource::sink::DataSinkExec;
@@ -166,13 +168,7 @@ impl MemTable {
         while let Some(result) = join_set.join_next().await {
             match result {
                 Ok(res) => data.push(res?),
-                Err(e) => {
-                    if e.is_panic() {
-                        std::panic::resume_unwind(e.into_panic());
-                    } else {
-                        unreachable!();
-                    }
-                }
+                Err(e) => return Err(DataFusionError::from_join_error(e)),
             }
         }
 
