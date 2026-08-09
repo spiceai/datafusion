@@ -88,6 +88,19 @@ impl QueryBuilder {
     pub fn is_distinct_union(&self) -> bool {
         self.distinct_union
     }
+    /// Whether the query bounds *which* rows it returns rather than only
+    /// filtering them: `LIMIT`, `OFFSET`, `FETCH` or `LIMIT BY`.
+    ///
+    /// SQL evaluates all of these after the body's `WHERE`, so a predicate
+    /// added to that `WHERE` decides which rows the bound then keeps. A caller
+    /// that needs its predicate applied to the bounded result has to put the
+    /// bounded query in a scope of its own instead.
+    pub fn bounds_rows(&self) -> bool {
+        self.limit.is_some()
+            || self.offset.is_some()
+            || self.fetch.is_some()
+            || !self.limit_by.is_empty()
+    }
     pub fn build(&self) -> Result<ast::Query, BuilderError> {
         let order_by = self
             .order_by_kind

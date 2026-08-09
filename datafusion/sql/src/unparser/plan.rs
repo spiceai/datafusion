@@ -2305,6 +2305,30 @@ impl Unparser<'_> {
             other => Box::new(Self::wrap_setexpr_as_derived_select(other)?),
         };
 
+        // A row bound on the build side (`LIMIT`/`OFFSET`/`FETCH`/`LIMIT BY`)
+        // is applied after that side's own `WHERE`, so a correlated predicate
+        // added there would decide which rows the bound keeps: the subquery
+        // would search the whole relation and report a match among rows the
+        // plan never read. A semi or mark join then reports a match it does
+        // not have and an anti join drops a row it should return — wrong rows
+        // rather than too many. Give the bounded body a scope of its own and
+        // correlate outside it.
+        //
+        // The rewrites below then belong to the outer select: inside the bound,
+        // both the projection and `DISTINCT` still decide which rows survive
+        // it, so neither is redundant there.
+        if let Some(scope_name) = Self::exists_scope_name(join)
+            && query_builder.bounds_rows()
+        {
+            query_builder.body(Box::new(SetExpr::Select(select)));
+            let bounded = query_builder.build()?;
+            let alias = self.new_table_alias(scope_name, vec![]);
+            select = Box::new(Self::wrap_query_as_derived_select(bounded, Some(alias))?);
+            // The bound now lives on the derived table; a second copy out here
+            // would re-apply it to the correlated result.
+            query_builder = QueryBuilder::default();
+        }
+
         // `EXISTS` only needs `SELECT 1`; DISTINCT would be redundant.
         select.projection = vec![ast::SelectItem::UnnamedExpr(ast::Expr::value(
             ast::Value::Number("1".to_string(), false),
@@ -2343,12 +2367,28 @@ impl Unparser<'_> {
     fn wrap_setexpr_as_derived_select(body: SetExpr) -> Result<ast::Select> {
         let mut subquery = QueryBuilder::default();
         subquery.body(Box::new(body));
+        let mut select = Self::wrap_query_as_derived_select(subquery.build()?, None)?;
+        // An unset projection renders as `SELECT FROM`. A caller that goes on
+        // to ask for `SELECT 1` overwrites this; one that wraps this select in
+        // a further scope needs it to expose the body's columns to that scope.
+        select.projection = vec![ast::SelectItem::Wildcard(
+            ast::WildcardAdditionalOptions::default(),
+        )];
+        Ok(select)
+    }
 
+    /// Wraps a complete query as a derived table inside a bare `SELECT`, so
+    /// clauses added to that `SELECT` are evaluated on the query's result
+    /// rather than alongside its own.
+    fn wrap_query_as_derived_select(
+        query: ast::Query,
+        alias: Option<ast::TableAlias>,
+    ) -> Result<ast::Select> {
         let mut derived = DerivedRelationBuilder::default();
         derived
             .lateral(false)
-            .alias(None)
-            .subquery(Box::new(subquery.build()?));
+            .alias(alias)
+            .subquery(Box::new(query));
 
         let mut relation = RelationBuilder::default();
         relation.derived(derived);
@@ -2359,6 +2399,67 @@ impl Unparser<'_> {
         let mut select = SelectBuilder::default();
         select.push_from(from);
         Ok(select.build()?)
+    }
+
+    /// The name a scope around the `EXISTS` build side has to answer to, so the
+    /// correlated predicates still resolve against it.
+    ///
+    /// The name has to come from the predicates rather than from the build
+    /// side's schema: a set operation's output carries no qualifier while the
+    /// join keys naming it still do, so the schema would have this scope
+    /// answer to a name nothing references.
+    ///
+    /// * One relation — the scope takes its name and every reference resolves.
+    /// * None — the correlation is by unqualified columns, which resolve
+    ///   against the only relation in scope whatever it is called. It still
+    ///   needs *a* name, since most dialects reject an unaliased derived table.
+    /// * Several — the build side is itself a join and the correlation names
+    ///   more than one of its inputs. A single scope can expose only one of
+    ///   those names, so `None` is returned and the caller leaves the plan
+    ///   alone rather than emitting references that cannot bind.
+    fn exists_scope_name(join: &Join) -> Option<String> {
+        // Match on the probe side's *qualifiers* rather than its columns: a
+        // correlated reference can name a probe-side column the probe's own
+        // projection dropped, and testing for the column would then read that
+        // reference as a build-side name.
+        let probe_relations: Vec<&TableReference> = join
+            .left
+            .schema()
+            .iter()
+            .filter_map(|(relation, _)| relation)
+            .collect();
+        let mut relations: Vec<TableReference> = Vec::new();
+        let mut names_a_probe_relation = false;
+        let mut collect = |expr: &Expr| {
+            for column in expr.column_refs() {
+                let Some(relation) = &column.relation else {
+                    continue;
+                };
+                if probe_relations.contains(&relation) {
+                    names_a_probe_relation = true;
+                } else if !relations.contains(relation) {
+                    relations.push(relation.clone());
+                }
+            }
+        };
+        for (_, right) in &join.on {
+            collect(right);
+        }
+        if let Some(filter) = &join.filter {
+            collect(filter);
+        }
+
+        match relations.as_slice() {
+            // Nothing to preserve, so any name will do — but only once the
+            // correlation has been shown to name nothing. A qualifier the probe
+            // side also answers to can be a build-side reference on a self-join,
+            // and renaming its scope would rebind it to the probe instead,
+            // turning the correlation into a comparison of the outer row with
+            // itself.
+            [] if !names_a_probe_relation => Some("derived_limit".to_string()),
+            [relation] => Some(relation.table().to_string()),
+            _ => None,
+        }
     }
 
     /// AND-folds `predicate` into a join's `ON` clause.
