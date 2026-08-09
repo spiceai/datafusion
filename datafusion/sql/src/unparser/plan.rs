@@ -2453,9 +2453,10 @@ impl Unparser<'_> {
             // Nothing to preserve, so any name will do — but only once the
             // correlation has been shown to name nothing. A qualifier the probe
             // side also answers to can be a build-side reference on a self-join,
-            // and renaming its scope would rebind it to the probe instead,
-            // turning the correlation into a comparison of the outer row with
-            // itself.
+            // where renaming the scope rebinds it to the probe. That shape is
+            // already mis-emitted for an unrelated reason (the body's own
+            // relation shadows the outer one), so declining does not repair it;
+            // it only avoids trading that wrong answer for a different one.
             [] if !names_a_probe_relation => Some("derived_limit".to_string()),
             [relation] => Some(relation.table().to_string()),
             _ => None,

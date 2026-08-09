@@ -3187,8 +3187,13 @@ fn test_unparse_left_semi_join_scopes_bounded_set_operation_build_side() -> Resu
 /// A correlation naming more than one of the build side's own inputs cannot be
 /// scoped: one derived table can answer to only one of those names, so the
 /// alternative to leaving the bound where it is would be emitting `t2`/`t3`
-/// references that no longer bind. Pins the documented decline — the `LIMIT`
-/// stays beside the correlation, which is what #12595 tracks for this shape.
+/// references that no longer bind.
+///
+/// The snapshot below is therefore **known-incorrect output**, recorded so the
+/// decline is visible rather than silent: the `LIMIT` still sits beside the
+/// correlation and still does nothing. Repairing it needs the correlation's
+/// qualifiers rewritten to the new scope, tracked by spiceai/spiceai#12840.
+/// Whoever implements that should expect this snapshot to change.
 #[test]
 fn test_unparse_left_semi_join_declines_multi_relation_build_side() -> Result<()> {
     let schema = exists_fetch_schema();
@@ -3222,10 +3227,16 @@ fn test_unparse_left_semi_join_declines_multi_relation_build_side() -> Result<()
 /// A correlation whose only qualifier is one the probe side also answers to
 /// cannot be scoped under an invented name: renaming the scope would rebind
 /// those references to the probe, turning the correlation into a comparison of
-/// the outer row with itself — which is true for every row and makes `EXISTS`
-/// report a match whenever the bounded side is non-empty. Declining leaves the
-/// bound where it was, which is wrong in the way #12595 describes but does not
-/// also silently drop the correlation.
+/// the outer row with itself.
+///
+/// The snapshot below is **known-incorrect output** and declining does not
+/// repair it — the subquery's own `FROM "t"` already shadows the outer `"t"`,
+/// so both sides of the predicate bind to the inner relation and the
+/// correlation is lost whatever the bound does. That shadowing is independent
+/// of this change and is tracked, with the rewrite that fixes it, by
+/// spiceai/spiceai#12840. What declining buys is only that the scope is not
+/// *also* renamed out from under the reference, which would swap one wrong
+/// answer for a different one.
 #[test]
 fn test_unparse_left_semi_join_declines_probe_qualified_correlation() -> Result<()> {
     let schema = exists_fetch_schema();
