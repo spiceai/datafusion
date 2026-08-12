@@ -1315,13 +1315,7 @@ pub async fn collect_partitioned(
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok((idx, res)) => batches.push((idx, res?)),
-            Err(e) => {
-                if e.is_panic() {
-                    std::panic::resume_unwind(e.into_panic());
-                } else {
-                    unreachable!();
-                }
-            }
+            Err(e) => return Err(DataFusionError::from_join_error(e)),
         }
     }
 
@@ -1557,6 +1551,9 @@ mod tests {
 
     use super::*;
     use crate::{DisplayAs, DisplayFormatType, ExecutionPlan};
+
+    use std::future::Future;
+    use std::task::{Context as TaskPollContext, Waker};
 
     use arrow::array::{DictionaryArray, Int32Array, NullArray, RunArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -1887,5 +1884,54 @@ mod tests {
             "Execution error: Invalid batch column at '0' has null but schema specifies non-nullable",
         );
         Ok(())
+    }
+
+    /// A `JoinError` reports either a panic or a cancellation, so the non-panic arm
+    /// of the drain loop is reachable and must yield an error rather than panicking.
+    ///
+    /// The cancellation is produced the way it arises in practice: the per-partition
+    /// tasks are spawned on one runtime while the collecting future is driven by
+    /// another, so shutting the first down cancels the tasks that the drain loop is
+    /// still awaiting. Separate runtimes for serving and for query execution are a
+    /// normal deployment shape, which is why this is not a hypothetical arm.
+    #[test]
+    fn collect_partitioned_reports_a_cancelled_task_as_an_error() {
+        // Never driven, so every task spawned onto it stays queued until it is
+        // dropped and they are cancelled.
+        let task_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build the task runtime");
+        let driver_rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build the driver runtime");
+
+        let plan = crate::test::scan_partitioned(2);
+        let mut collect =
+            Box::pin(collect_partitioned(plan, Arc::new(TaskContext::default())));
+
+        // The first poll is what spawns the tasks, so it has to happen inside the
+        // task runtime's context.
+        {
+            let _guard = task_rt.enter();
+            let mut cx = TaskPollContext::from_waker(Waker::noop());
+            assert!(
+                collect.as_mut().poll(&mut cx).is_pending(),
+                "tasks on a runtime that is never driven cannot have completed"
+            );
+        }
+        drop(task_rt);
+
+        let err = driver_rt
+            .block_on(collect)
+            .expect_err("a cancelled task must not be reported as a successful collect");
+        match err {
+            DataFusionError::ExecutionJoin(join_error) => {
+                assert!(
+                    join_error.is_cancelled(),
+                    "expected a cancellation, got {join_error:?}"
+                );
+            }
+            other => panic!("expected ExecutionJoin, got {other:?}"),
+        }
     }
 }
