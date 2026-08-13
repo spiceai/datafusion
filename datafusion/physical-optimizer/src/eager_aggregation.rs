@@ -112,6 +112,14 @@
 //!   could ride a heuristic side choice but is declined for now.
 //! * **Decimal `AVG`.** Only Float64 `AVG` is recombined; a decimal result would
 //!   need its exact output scale reproduced in the division projection.
+//! * **`GROUPING SETS`/`ROLLUP`/`CUBE`** (TPC-DS q36). The rebuilt top grouping
+//!   goes through `PhysicalGroupBy::new_single`, which cannot express
+//!   `null_expr`/`groups`/`has_grouping_set`, so the grouping-set rows and the
+//!   `__grouping_id` column would be dropped. Supporting it means preserving the
+//!   partial grouping's full shape — remapping `null_expr` alongside `expr` into
+//!   the rebuilt join's schema and keeping `__grouping_id` at its original output
+//!   index, since parent projections and window `PARTITION BY`/`ORDER BY` bind
+//!   `GROUPING(...)` results positionally.
 //! * **`schema_check` is disabled** (COUNT→SUM widens non-null→nullable). A
 //!   `coalesce(_, 0)` in a top projection would let it stay enabled.
 
@@ -237,6 +245,23 @@ fn try_push_aggregate(
             log::debug!(target: "datafusion::eager_aggregation", "decline: {}", format_args!($($arg)*));
             return Ok(None);
         }};
+    }
+
+    // `GROUPING SETS`/`ROLLUP`/`CUBE` are not supported. The rewrite rebuilds the
+    // top grouping with `PhysicalGroupBy::new_single`, which carries neither
+    // `null_expr`/`groups` nor `has_grouping_set` — so a grouping-set aggregate
+    // would come back as a plain grouping, dropping both the extra grouping-set
+    // rows and the `__grouping_id` column that `group_fields` appends for them.
+    // Because `schema_check` is opted out of (see above), the framework does not
+    // catch the narrowed schema: the parent projection/window keeps binding
+    // aggregate outputs at their original indices and hits
+    // `col.name() == matching_name` in `ProjectionMapping` (TPC-DS q36).
+    //
+    // Guard on the *partial* grouping: `as_final` always clears
+    // `has_grouping_set` (folding `__grouping_id` into its expression list), so
+    // `top_final`'s grouping cannot report it.
+    if top_partial.group_expr().has_grouping_set() {
+        decline!("grouping sets (ROLLUP/CUBE/GROUPING SETS) are not supported");
     }
 
     // Between the partial aggregate and the join the planner emits a *chain* of
@@ -1160,6 +1185,26 @@ mod tests {
         dim_rows: usize,
         dim_ndv: usize,
     ) -> Arc<dyn ExecutionPlan> {
+        agg_over_join_grouped(
+            fact_key_ndv,
+            dim_rows,
+            dim_ndv,
+            PhysicalGroupBy::new_single(vec![(
+                Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+                "d_name".to_string(),
+            )]),
+        )
+    }
+
+    /// Like [`agg_over_join_dim`], but with the partial aggregate's grouping
+    /// supplied by the caller, so a test can vary only the `PhysicalGroupBy`
+    /// (e.g. a grouping set) while holding the plan shape and statistics fixed.
+    fn agg_over_join_grouped(
+        fact_key_ndv: usize,
+        dim_rows: usize,
+        dim_ndv: usize,
+        group: PhysicalGroupBy,
+    ) -> Arc<dyn ExecutionPlan> {
         let fact = stats_leaf(
             vec![
                 Field::new("f_dim", DataType::Int32, false),
@@ -1205,14 +1250,10 @@ mod tests {
             .build()
             .unwrap(),
         );
-        let group = PhysicalGroupBy::new_single(vec![(
-            Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
-            "d_name".to_string(),
-        )]);
         let partial = Arc::new(
             AggregateExec::try_new(
                 AggregateMode::Partial,
-                group.clone(),
+                group,
                 vec![Arc::clone(&sum_expr)],
                 vec![None],
                 join,
@@ -1232,6 +1273,31 @@ mod tests {
             )
             .unwrap(),
         ) as Arc<dyn ExecutionPlan>
+    }
+
+    /// [`agg_over_join`]'s plan, but grouped by `ROLLUP(d_name)` instead of a plain
+    /// `GROUP BY d_name`. Statistics, join shape and aggregate are identical, so the
+    /// cost gate reaches the same verdict as in [`fires_on_beneficial_join`] and the
+    /// grouping set is the only difference.
+    ///
+    /// The partial grouping carries `has_grouping_set`, so both aggregates output
+    /// `[d_name, __grouping_id, sum(f_amount)]`.
+    fn rollup_agg_over_join() -> Arc<dyn ExecutionPlan> {
+        // `ROLLUP(d_name)`: the plain group, plus the all-NULL super-aggregate row.
+        let group = PhysicalGroupBy::new(
+            vec![(
+                Arc::new(Column::new("d_name", 3)) as Arc<dyn PhysicalExpr>,
+                "d_name".to_string(),
+            )],
+            vec![(
+                Arc::new(Literal::new(ScalarValue::Utf8(None))) as Arc<dyn PhysicalExpr>,
+                "d_name".to_string(),
+            )],
+            vec![vec![false], vec![true]],
+            true,
+        );
+        assert!(group.has_grouping_set());
+        agg_over_join_grouped(100, 100, 100, group)
     }
 
     fn run_rule(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
@@ -1263,6 +1329,45 @@ mod tests {
         assert!(
             join_child_is_aggregate(&optimized),
             "expected a pre-aggregation pushed below the join"
+        );
+    }
+
+    // Decline path: the same beneficial join shape, but grouped by `ROLLUP(d_name)`.
+    // The rewrite cannot express a grouping set, so the rule must leave the plan
+    // alone rather than silently degrade it to a plain `GROUP BY`.
+    #[test]
+    fn declines_grouping_set_aggregate() {
+        let optimized = run_rule(rollup_agg_over_join());
+        assert!(
+            !join_child_is_aggregate(&optimized),
+            "expected no pre-aggregation below the join for a grouping-set aggregate, got:\n{}",
+            plan_str(&optimized)
+        );
+    }
+
+    // The defect this guards against: rebuilding the top grouping with
+    // `PhysicalGroupBy::new_single` drops `__grouping_id`, narrowing the aggregate
+    // output schema. `schema_check` is disabled for this rule, so nothing else
+    // catches it — a parent projection keeps binding by the original index and
+    // fails with `Input field name ... does not match with the projection
+    // expression ...` (TPC-DS q36).
+    #[test]
+    fn grouping_set_aggregate_preserves_output_schema() {
+        let plan = rollup_agg_over_join();
+        let before = plan.schema();
+        assert_eq!(
+            before
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec!["d_name", "__grouping_id", "sum(f_amount)"],
+            "fixture should carry the grouping-set `__grouping_id` column"
+        );
+        assert_eq!(
+            run_rule(plan).schema(),
+            before,
+            "eager aggregation must not change the aggregate output schema"
         );
     }
 

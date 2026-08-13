@@ -27,9 +27,10 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters,
-        unproject_sort_expr, unproject_unnest_expr,
+        find_agg_node_within_select, find_projection_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
+        unproject_unnamed_projection_exprs, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
     },
 };
@@ -852,7 +853,20 @@ impl Unparser<'_> {
                     let filter_expr = self.expr_to_sql(&unprojected)?;
                     select.having(Some(filter_expr));
                 } else {
-                    let filter_expr = self.expr_to_sql(&filter.predicate)?;
+                    // A predicate can reference a projection output that the
+                    // projection does not name, whose logical name is not an
+                    // identifier the emitted statement carries.
+                    let predicate = match find_projection_node_within_select(
+                        plan,
+                        select.already_projected(),
+                    ) {
+                        Some(projection) => unproject_unnamed_projection_exprs(
+                            filter.predicate.clone(),
+                            projection,
+                        )?,
+                        None => filter.predicate.clone(),
+                    };
+                    let filter_expr = self.expr_to_sql(&predicate)?;
                     select.selection(Some(filter_expr));
                 }
 
