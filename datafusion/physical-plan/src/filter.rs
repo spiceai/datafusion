@@ -1220,6 +1220,42 @@ mod tests {
     use crate::test;
     use crate::test::exec::StatisticsExec;
     use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
+    use datafusion_expr::ScalarUDF;
+    use datafusion_functions::math::random::RandomFunc;
+    use datafusion_physical_expr::ScalarFunctionExpr;
+
+    fn volatile_call(schema: &Schema) -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(ScalarUDF::from(RandomFunc::new())),
+                vec![],
+                schema,
+                Arc::new(ConfigOptions::default()),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn dedup_deterministic_exprs_removes_repeated_deterministic_expr() -> Result<()> {
+        let schema = test::aggr_test_schema();
+        let predicate = binary(col("c2", &schema)?, Operator::Eq, lit(4u32), &schema)?;
+        let deduped = dedup_deterministic_exprs(vec![Arc::clone(&predicate), predicate]);
+        assert_eq!(deduped.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dedup_deterministic_exprs_keeps_repeated_volatile_expr() {
+        let schema = test::aggr_test_schema();
+        // Two structurally-identical calls to a volatile function must both
+        // survive: each represents a distinct evaluation.
+        let deduped = dedup_deterministic_exprs(vec![
+            volatile_call(&schema),
+            volatile_call(&schema),
+        ]);
+        assert_eq!(deduped.len(), 2);
+    }
 
     #[tokio::test]
     async fn collect_columns_predicates() -> Result<()> {
