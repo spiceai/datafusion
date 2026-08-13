@@ -253,23 +253,26 @@ impl Unparser<'_> {
 
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
-        projection
-            .iter_mut()
-            .for_each(|select_item| if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) = select_item {
+        projection.iter_mut().for_each(|select_item| {
+            if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) =
+                select_item
+            {
                 remove_dangling_identifiers(idents, &all_idents);
-            });
+            }
+        });
 
         // Check the order by as well
         if let Some(query) = query.as_mut()
-            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by() {
-                order_by.iter_mut().for_each(|sort_item| {
-                    if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                        remove_dangling_identifiers(idents, &all_idents);
-                    }
-                });
+            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
+        {
+            order_by.iter_mut().for_each(|sort_item| {
+                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
+                    remove_dangling_identifiers(idents, &all_idents);
+                }
+            });
 
-                query.order_by(OrderByKind::Expressions(order_by));
-            }
+            query.order_by(OrderByKind::Expressions(order_by));
+        }
 
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
@@ -622,6 +625,24 @@ impl Unparser<'_> {
             LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
             _ => None,
         };
+
+        // A derived table's alias is a single identifier, so only the last
+        // component of a qualified name survives it. Where the dialect spells
+        // columns in full, the enclosing query's `ON` and `WHERE` still name
+        // every component, leaving them qualified by a relation that is no
+        // longer in scope. Refuse rather than emit that, which costs the
+        // pushdown but never the rows — the same trade
+        // `derive_row_limited_scope` makes for the limit it scopes.
+        if self.dialect.full_qualified_col()
+            && table_ref
+                .as_ref()
+                .is_some_and(|table_ref| table_ref.to_vec().len() > 1)
+        {
+            return not_impl_err!(
+                "Unparsing a join input's fetch or FULL JOIN filters is not supported for a qualified table name on a dialect that spells columns in full"
+            );
+        }
+
         let (below_fetch, above_fetch): (Vec<Expr>, Vec<Expr>) = if fetch.is_some() {
             filters
                 .into_iter()
@@ -1092,10 +1113,14 @@ impl Unparser<'_> {
                 };
 
                 let agg = find_agg_node_within_select(plan, select.already_projected());
-                let window_nodes =
-                    find_window_nodes_within_select(plan, None, select.already_projected());
-                let windows: Option<Vec<&Window>> =
-                    window_nodes.as_deref().map(|ws| ws.iter().copied().collect());
+                let window_nodes = find_window_nodes_within_select(
+                    plan,
+                    None,
+                    select.already_projected(),
+                );
+                let windows: Option<Vec<&Window>> = window_nodes
+                    .as_deref()
+                    .map(|ws| ws.iter().copied().collect());
                 // unproject sort expressions
                 let sort_exprs: Vec<SortExpr> = sort
                     .expr

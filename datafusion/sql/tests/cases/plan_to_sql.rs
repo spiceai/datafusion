@@ -5755,3 +5755,56 @@ fn test_filter_on_unnamed_volatile_projection_output_is_not_inlined() -> Result<
     assert_snapshot!(sql, @r#"SELECT random() FROM t WHERE ("random()" > 0.5)"#);
     Ok(())
 }
+
+#[test]
+fn test_qualified_join_input_fetch_refused_on_full_qualified_col_dialect() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ]);
+    let other = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+
+    let join_with_fetched_input = |name: &str| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(
+            table_scan_with_filter_and_fetch(
+                Some(name),
+                &schema,
+                Some(vec![0, 1]),
+                vec![],
+                Some(5),
+            )?
+            .build()?,
+        )
+        .join(
+            table_scan(Some("other"), &other, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec![format!("{name}.id")], vec!["other.id".to_string()]),
+            None,
+        )?
+        .build()
+    };
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let unparser = Unparser::new(&dialect);
+
+    // The derived table can only be aliased `table`, while this dialect spells
+    // the join condition `catalog.schema.table.id` — a relation the derived
+    // table no longer brings into scope.
+    let err = unparser
+        .plan_to_sql(&join_with_fetched_input("catalog.schema.table")?)
+        .expect_err("a qualified name must not unparse to an unresolvable alias");
+    assert_contains!(
+        err.to_string(),
+        "not supported for a qualified table name on a dialect that spells columns in full"
+    );
+
+    // A single-component name loses nothing to the alias, so the guard must
+    // not fire on it even on this dialect.
+    assert_snapshot!(
+        unparser.plan_to_sql(&join_with_fetched_input("t")?)?,
+        @"SELECT t.id, t.value, other.id FROM (SELECT t.id, t.value FROM t LIMIT 5) AS t INNER JOIN other ON t.id = other.id"
+    );
+    Ok(())
+}
