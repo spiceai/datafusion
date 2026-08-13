@@ -265,6 +265,84 @@ pub(crate) fn unproject_window_exprs(expr: Expr, windows: &[&Window]) -> Result<
     .map(|e| e.data)
 }
 
+/// Recursively searches children of [LogicalPlan] for the [Projection] that will be
+/// flattened into the same `SELECT` as `plan`, if there is one.
+///
+/// Stops at a node that opens a scope of its own: the columns of a relation, a
+/// subquery, or a derived table are addressable by name from outside, so a
+/// reference to one of them already binds.
+pub(crate) fn find_projection_node_within_select(
+    plan: &LogicalPlan,
+    already_projected: bool,
+) -> Option<&Projection> {
+    // A projection reached once the `SELECT` list is taken becomes a derived
+    // table rather than part of this statement, so it is not what a predicate
+    // here would be referring to.
+    if already_projected {
+        return None;
+    }
+    let input = plan.inputs();
+    if input.len() > 1 {
+        return None;
+    }
+    let input = input.first()?;
+    match input {
+        LogicalPlan::Projection(projection) => Some(projection),
+        // Stacked filters collapse into one `WHERE`, so keep looking through them.
+        LogicalPlan::Filter(_) => {
+            find_projection_node_within_select(input, already_projected)
+        }
+        _ => None,
+    }
+}
+
+/// Replaces a reference to a [Projection] output that the projection does not name
+/// with the expression that produces it.
+///
+/// The unparser names such an output by its logical name — `t.a + t.b` for
+/// `Projection: t.a + t.b` — which is a description of the expression, not an
+/// identifier the emitted statement carries. Emitting it as one yields SQL that
+/// no engine can bind, so the expression is inlined at the point of use instead,
+/// which needs no name at all.
+pub(crate) fn unproject_unnamed_projection_exprs(
+    expr: Expr,
+    projection: &Projection,
+) -> Result<Expr> {
+    expr.transform(|sub_expr| {
+        if let Expr::Column(c) = &sub_expr
+            && let Some(unprojected) = find_unnamed_projection_expr(projection, c)
+        {
+            return Ok(Transformed::yes(unprojected.clone()));
+        }
+        Ok(Transformed::no(sub_expr))
+    })
+    .map(|e| e.data)
+}
+
+/// The expression behind `column`, but only when the projection leaves it unnamed.
+///
+/// An alias names the output explicitly and a bare column carries the name it
+/// already had, so in both cases the emitted `SELECT` carries a name matching the
+/// reference and there is nothing to repair.
+///
+/// A volatile expression is left alone as well. Inlining evaluates it a second
+/// time, in a clause that may see a different value than the `SELECT` list did,
+/// which would answer the query with silently wrong rows. The unbindable
+/// reference this repairs is at least a loud failure, so it is the safer of the
+/// two to leave in place.
+fn find_unnamed_projection_expr<'a>(
+    projection: &'a Projection,
+    column: &Column,
+) -> Option<&'a Expr> {
+    let index = projection.schema.index_of_column(column).ok()?;
+    let expr = projection.expr.get(index)?;
+    if matches!(expr, Expr::Alias(_) | Expr::Column(_)) || expr.is_volatile() {
+        None
+    } else {
+        Some(expr)
+    }
+}
+
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {
     if let Ok(index) = agg.schema.index_of_column(column) {
         if matches!(agg.group_expr.as_slice(), [Expr::GroupingSet(_)]) {
@@ -322,7 +400,11 @@ pub(crate) fn unproject_sort_expr(
     // PostgreSQL and similar dialects reject output-column aliases inside
     // expressions. That path is handled by the recursive `transform` below,
     // which is only reached when `sort_expr.expr` is not a bare column.
-    if let Expr::Column(Column{relation: None, name, .. }) = &sort_expr.expr
+    if let Expr::Column(Column {
+        relation: None,
+        name,
+        ..
+    }) = &sort_expr.expr
         && let LogicalPlan::Projection(Projection { expr, schema, .. }) = input
         && let Some(idx) = schema.index_of_column_by_name(None, name)
         && let Some(Expr::Alias(_)) = expr.get(idx)
@@ -339,20 +421,21 @@ pub(crate) fn unproject_sort_expr(
                 // Qualified columns reference FROM relations directly; only
                 // unqualified columns can name aggregate/projection outputs
                 // that need unprojecting below.
-                Expr::Column(Column { relation: Some(_), .. }) => {
-                    Ok(Transformed::no(sub_expr))
-                }
+                Expr::Column(Column {
+                    relation: Some(_), ..
+                }) => Ok(Transformed::no(sub_expr)),
                 // In case of aggregation there could be columns containing aggregation functions we need to unproject
-                Expr::Column(col) if let Some(agg) = agg
-                    && agg.schema.is_column_from_schema(&col) => {
-                        return Ok(Transformed::yes(unproject_agg_exprs(
-                            Expr::Column(col),
-                            agg,
-                            None,
-                        )?));
-                    }
+                Expr::Column(col)
+                    if let Some(agg) = agg
+                        && agg.schema.is_column_from_schema(&col) =>
+                {
+                    return Ok(Transformed::yes(unproject_agg_exprs(
+                        Expr::Column(col),
+                        agg,
+                        None,
+                    )?));
+                }
                 Expr::Column(col) => {
-
                     // When an expression in the `ORDER BY` contains an alias from the `SELECT`
                     // we need to transform it back to the actual expression so that it is
                     // valid SQL in all positions inside ORDER BY (PostgreSQL only allows bare
@@ -411,25 +494,45 @@ pub(crate) fn unproject_sort_expr(
     Ok(sort_expr)
 }
 
+/// What [`try_transform_to_simple_table_scan_with_filters`] peeled off a join input.
+pub(crate) struct SimpleTableScan {
+    /// The `TableScan` (optionally under a `SubqueryAlias`) with the filters and the
+    /// `fetch` removed.
+    pub plan: LogicalPlan,
+    /// Every filter collected, from the `Filter` nodes and from the scan itself, in the
+    /// order they were found.
+    pub filters: Vec<Expr>,
+    /// The subset of `filters` that came from the scan itself. The scan applies these
+    /// *before* its `fetch`, while a `Filter` node above it applies afterwards — a
+    /// distinction that only matters when there is a `fetch` to sit between them.
+    pub scan_filters: Vec<Expr>,
+    /// The scan's row limit.
+    pub fetch: Option<usize>,
+}
+
 /// Iterates through the children of a [LogicalPlan] to find a TableScan node before encountering
 /// a Projection or any unexpected node that indicates the presence of a Projection (SELECT) in the plan.
-/// If a TableScan node is found, returns the TableScan node without filters, along with the collected filters separately.
+/// If a TableScan node is found, returns the TableScan node without filters, along with the collected
+/// filters and the scan's `fetch` separately.
 /// If the plan contains a Projection, returns None.
+///
+/// The returned plan carries neither the filters nor the `fetch`: both are the caller's to re-emit,
+/// and a caller that ignores either one silently widens the scan.
 ///
 /// Note: If a table alias is present, TableScan filters are rewritten to reference the alias.
 ///
 /// LogicalPlan example:
 ///   Filter: ta.j1_id < 5
 ///     Alias:  ta
-///       TableScan: j1, j1_id > 10
+///       TableScan: j1, j1_id > 10, fetch=5
 ///
 /// Will return LogicalPlan below:
 ///     Alias:  ta
 ///       TableScan: j1
-/// And filters: [ta.j1_id < 5, ta.j1_id > 10]
+/// And filters: [ta.j1_id < 5, ta.j1_id > 10], fetch: Some(5)
 pub(crate) fn try_transform_to_simple_table_scan_with_filters(
     plan: &LogicalPlan,
-) -> Result<Option<(LogicalPlan, Vec<Expr>)>> {
+) -> Result<Option<SimpleTableScan>> {
     let mut filters: IndexSet<Expr> = IndexSet::new();
     let mut plan_stack = vec![plan];
     let mut table_alias = None;
@@ -479,6 +582,7 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                     })
                     .collect::<Result<Vec<_>, DataFusionError>>()?;
 
+                let scan_filters = table_scan_filters.clone();
                 for table_scan_filter in table_scan_filters {
                     if !filters.contains(&table_scan_filter) {
                         filters.insert(table_scan_filter);
@@ -498,7 +602,12 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
                 let plan = builder.build()?;
                 let filters = filters.into_iter().collect();
 
-                return Ok(Some((plan, filters)));
+                return Ok(Some(SimpleTableScan {
+                    plan,
+                    filters,
+                    scan_filters,
+                    fetch: table_scan.fetch,
+                }));
             }
             _ => {
                 return Ok(None);

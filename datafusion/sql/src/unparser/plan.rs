@@ -23,13 +23,15 @@ use super::{
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
+        remove_dangling_identifiers, requalify_column_onto_derived_table,
+        rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, try_transform_to_simple_table_scan_with_filters,
-        unproject_sort_expr, unproject_unnest_expr,
+        find_agg_node_within_select, find_projection_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
+        unproject_unnamed_projection_exprs, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
     },
 };
@@ -53,7 +55,7 @@ use datafusion_expr::{
     UserDefinedLogicalNode, Window, expr::Alias,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::{sync::Arc, vec};
+use std::{collections::HashSet, sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -251,23 +253,26 @@ impl Unparser<'_> {
 
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
-        projection
-            .iter_mut()
-            .for_each(|select_item| if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) = select_item {
+        projection.iter_mut().for_each(|select_item| {
+            if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) =
+                select_item
+            {
                 remove_dangling_identifiers(idents, &all_idents);
-            });
+            }
+        });
 
         // Check the order by as well
         if let Some(query) = query.as_mut()
-            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by() {
-                order_by.iter_mut().for_each(|sort_item| {
-                    if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                        remove_dangling_identifiers(idents, &all_idents);
-                    }
-                });
+            && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
+        {
+            order_by.iter_mut().for_each(|sort_item| {
+                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
+                    remove_dangling_identifiers(idents, &all_idents);
+                }
+            });
 
-                query.order_by(OrderByKind::Expressions(order_by));
-            }
+            query.order_by(OrderByKind::Expressions(order_by));
+        }
 
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
@@ -448,38 +453,225 @@ impl Unparser<'_> {
         }
     }
 
-    /// Isolates a `FULL JOIN` input's table-scan filters in a derived table:
-    /// `(SELECT ... FROM t WHERE ...) AS t`. A `FULL JOIN` preserves both
-    /// sides, so a filter on just one input cannot be expressed by folding it
-    /// into `ON` (filtered-out rows would reappear as unmatched) or by moving
-    /// it to `WHERE` (the other side's unmatched rows would be discarded);
-    /// pre-filtering that side in its own subquery is the only clause that
-    /// preserves the original meaning.
+    /// Whether the subtree carrying a row limit needs a `SELECT` of its own.
     ///
-    /// `clean_plan` is the `TableScan`/`SubqueryAlias` produced by
-    /// `try_transform_to_simple_table_scan_with_filters`, and `scan_filters`
-    /// are the filters it extracted. `relation` already holds the plain
-    /// table reference built for this side; it is overwritten with the
-    /// derived subquery.
-    fn derive_full_join_side(
+    /// The walk is top-down, so any predicate already on `select` came from a
+    /// node visited earlier. `WHERE`, `HAVING` and `QUALIFY` are all evaluated
+    /// before `LIMIT`/`OFFSET`, while a plan that puts a filter above a limit
+    /// says the opposite: the limit runs first and the predicate filters what
+    /// it produced. Keeping both in one `SELECT` therefore states the reverse
+    /// of the plan, and can return rows the plan excludes.
+    ///
+    /// A `WHERE` can stay in the enclosing query while the limited subtree
+    /// moves into a derived table. `HAVING` and `QUALIFY` cannot: they name an
+    /// aggregate or window expression that only the `SELECT` computing it can
+    /// name. Refuse those rather than emit the reversed form — but only when
+    /// the grouping they filter is in fact below this limit. Join inputs are
+    /// walked with one shared `SelectBuilder`, so a predicate on it may have
+    /// come from a sibling input rather than from an ancestor of this node.
+    fn row_limit_needs_own_scope(
+        plan: &LogicalPlan,
+        select: &SelectBuilder,
+    ) -> Result<bool> {
+        if select.has_grouped_predicate()
+            && (find_agg_node_within_select(plan, select.already_projected()).is_some()
+                || find_window_nodes_within_select(
+                    plan,
+                    None,
+                    select.already_projected(),
+                )
+                .is_some())
+        {
+            return not_impl_err!(
+                "Unparsing a HAVING or QUALIFY predicate that is applied after a row limit is not supported"
+            );
+        }
+        Ok(select.has_selection())
+    }
+
+    /// Unparses a `Limit` as a derived table, so the `WHERE` already on the
+    /// enclosing `SELECT` applies to the limited rows rather than to the rows
+    /// feeding the limit.
+    ///
+    /// The derived table takes the name of the relation it reads, because the
+    /// predicate staying outside is still qualified by that name, and its
+    /// columns are listed explicitly: a wildcard would expand to every
+    /// relation in the enclosing `FROM`, not to this one's contribution.
+    ///
+    /// Both of those need the derived table's output columns to be exactly the
+    /// relation's own columns, under their own names — which is why only a
+    /// scan, and the clauses that can wrap one without renaming anything, are
+    /// accepted here. A projection may emit a column the derived query never
+    /// names (an unaliased expression) or two columns that differ only by a
+    /// qualifier SQL cannot carry across the boundary; a join, union or
+    /// aggregate has no single name for the alias to take. Those are refused,
+    /// which costs the pushdown but never the rows.
+    fn derive_row_limited_scope(
         &self,
-        clean_plan: &LogicalPlan,
-        scan_filters: Vec<Expr>,
+        plan: &LogicalPlan,
+        select: &mut SelectBuilder,
         relation: &mut RelationBuilder,
     ) -> Result<()> {
-        let Some(combined) = scan_filters.into_iter().reduce(Expr::and) else {
-            return Ok(());
+        let Some(table_ref) = Self::scanned_relation_of(plan) else {
+            return not_impl_err!(
+                "Unparsing a filter applied after a row limit is only supported when the limited input is a single table scan"
+            );
         };
-        let filtered_plan = LogicalPlanBuilder::from(clean_plan.clone())
-            .filter(combined)?
-            .build()?;
-        let alias = match clean_plan {
+
+        // Only the last component survives as an alias, so a predicate spelled
+        // with the full path would be left pointing at a name that is gone.
+        if self.dialect.full_qualified_col() && table_ref.to_vec().len() > 1 {
+            return not_impl_err!(
+                "Unparsing a filter applied after a row limit is not supported for a qualified table name on a dialect that spells columns in full"
+            );
+        }
+
+        // A scan can project no columns at all, which every other empty
+        // projection in this unparser renders as `SELECT 1`. There is no
+        // column list to name a derived table's output with here, so refuse.
+        // (Two columns of one name cannot arrive: `DFSchema` rejects a scan
+        // with a duplicate qualified field.)
+        let fields = plan.schema().fields();
+        if fields.is_empty() {
+            return not_impl_err!(
+                "Unparsing a filter applied after a row limit is not supported for an input projecting no columns"
+            );
+        }
+
+        // The subtree moves into a statement of its own, so this `SELECT` no
+        // longer receives a projection from the nodes below it.
+        if !select.already_projected() {
+            let items = fields
+                .iter()
+                .map(|field| {
+                    self.select_item_to_sql(&Expr::Column(Column::new(
+                        Some(table_ref.clone()),
+                        field.name(),
+                    )))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            select.projection(items);
+        }
+
+        self.derive(
+            plan,
+            relation,
+            Some(self.new_table_alias(table_ref.table().to_string(), vec![])),
+            false,
+        )
+    }
+
+    /// The relation a subtree scans, when the subtree is one scan under
+    /// clauses that neither rename nor add columns and neither reorder nor
+    /// combine rows from elsewhere.
+    ///
+    /// A `Sort` is deliberately not walked through. It is the one such clause
+    /// whose effect does not survive being wrapped: SQL does not carry a
+    /// derived table's row order into the query selecting from it.
+    fn scanned_relation_of(plan: &LogicalPlan) -> Option<TableReference> {
+        match plan {
+            LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::scanned_relation_of(alias.input.as_ref())
+                    .map(|_| alias.alias.clone())
+            }
+            LogicalPlan::Limit(limit) => Self::scanned_relation_of(limit.input.as_ref()),
+            LogicalPlan::Filter(filter) => {
+                Self::scanned_relation_of(filter.input.as_ref())
+            }
+            _ => None,
+        }
+    }
+
+    /// Isolates what a join input's `TableScan` did in a derived table:
+    /// `(SELECT ... FROM t WHERE ... LIMIT ...) AS t`.
+    ///
+    /// Two things a scan can carry have no faithful home in the enclosing
+    /// query:
+    ///
+    /// * A `FULL JOIN` input's filters. A `FULL JOIN` preserves both sides, so
+    ///   a filter on just one input cannot be expressed by folding it into `ON`
+    ///   (filtered-out rows would reappear as unmatched) or by moving it to
+    ///   `WHERE` (the other side's unmatched rows would be discarded).
+    /// * A `fetch`, for any join type. The join's own `LIMIT` bounds its
+    ///   output, not one input's contribution to it.
+    ///
+    /// Pre-filtering that side in its own subquery is the only clause that
+    /// preserves the original meaning.
+    ///
+    /// The filters go on the side of the limit they came from. The scan's own
+    /// filters run before its `fetch`; a `Filter` node above the scan runs
+    /// after it, and needs a second scope of its own — the same `SELECT`
+    /// cannot express it, because `WHERE` is evaluated before `LIMIT`.
+    ///
+    /// `clean_plan` is the `TableScan`/`SubqueryAlias` produced by
+    /// `try_transform_to_simple_table_scan_with_filters`; `filters` is
+    /// everything it extracted and `scan_filters` the subset belonging to the
+    /// scan. `relation` already holds the plain table reference built for this
+    /// side; it is overwritten with the derived subquery.
+    fn derive_join_side(
+        &self,
+        clean_plan: &LogicalPlan,
+        filters: Vec<Expr>,
+        scan_filters: &[Expr],
+        fetch: Option<usize>,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        if filters.is_empty() && fetch.is_none() {
+            return Ok(());
+        }
+        let table_ref = match clean_plan {
             LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
             LogicalPlan::SubqueryAlias(alias) => Some(alias.alias.clone()),
             _ => None,
+        };
+
+        // A derived table's alias is a single identifier, so only the last
+        // component of a qualified name survives it. Where the dialect spells
+        // columns in full, the enclosing query's `ON` and `WHERE` still name
+        // every component, leaving them qualified by a relation that is no
+        // longer in scope. Refuse rather than emit that, which costs the
+        // pushdown but never the rows — the same trade
+        // `derive_row_limited_scope` makes for the limit it scopes.
+        if self.dialect.full_qualified_col()
+            && table_ref
+                .as_ref()
+                .is_some_and(|table_ref| table_ref.to_vec().len() > 1)
+        {
+            return not_impl_err!(
+                "Unparsing a join input's fetch or FULL JOIN filters is not supported for a qualified table name on a dialect that spells columns in full"
+            );
         }
-        .map(|table_ref| self.new_table_alias(table_ref.table().to_string(), vec![]));
-        self.derive(&filtered_plan, relation, alias, false)
+
+        let (below_fetch, above_fetch): (Vec<Expr>, Vec<Expr>) = if fetch.is_some() {
+            filters
+                .into_iter()
+                .partition(|filter| scan_filters.contains(filter))
+        } else {
+            // Without a limit between them the two sets commute, so keep them
+            // in one `WHERE` in the order they were collected.
+            (filters, vec![])
+        };
+
+        let mut builder = LogicalPlanBuilder::from(clean_plan.clone());
+        if let Some(combined) = below_fetch.into_iter().reduce(Expr::and) {
+            builder = builder.filter(combined)?;
+        }
+        if let Some(fetch) = fetch {
+            builder = builder.limit(0, Some(fetch))?;
+        }
+        if let Some(combined) = above_fetch.into_iter().reduce(Expr::and) {
+            // The alias both scopes the limit in its own `SELECT` and keeps the
+            // predicate's column references resolvable against it.
+            if let Some(table_ref) = table_ref.clone() {
+                builder = builder.alias(table_ref)?;
+            }
+            builder = builder.filter(combined)?;
+        }
+        let derived_plan = builder.build()?;
+        let alias = table_ref
+            .map(|table_ref| self.new_table_alias(table_ref.table().to_string(), vec![]));
+        self.derive(&derived_plan, relation, alias, false)
     }
 
     /// Projection unparsing when [`super::dialect::Dialect::unnest_as_lateral_flatten`] is enabled:
@@ -813,7 +1005,20 @@ impl Unparser<'_> {
                     let filter_expr = self.expr_to_sql(&unprojected)?;
                     select.having(Some(filter_expr));
                 } else {
-                    let filter_expr = self.expr_to_sql(&filter.predicate)?;
+                    // A predicate can reference a projection output that the
+                    // projection does not name, whose logical name is not an
+                    // identifier the emitted statement carries.
+                    let predicate = match find_projection_node_within_select(
+                        plan,
+                        select.already_projected(),
+                    ) {
+                        Some(projection) => unproject_unnamed_projection_exprs(
+                            filter.predicate.clone(),
+                            projection,
+                        )?,
+                        None => filter.predicate.clone(),
+                    };
+                    let filter_expr = self.expr_to_sql(&predicate)?;
                     select.selection(Some(filter_expr));
                 }
 
@@ -834,6 +1039,11 @@ impl Unparser<'_> {
                         false,
                         vec![],
                     );
+                }
+                if (limit.fetch.is_some() || limit.skip.is_some())
+                    && Self::row_limit_needs_own_scope(plan, select)?
+                {
+                    return self.derive_row_limited_scope(plan, select, relation);
                 }
                 if let Some(fetch) = &limit.fetch {
                     let Some(query) = query.as_mut() else {
@@ -875,6 +1085,19 @@ impl Unparser<'_> {
                         vec![],
                     );
                 }
+                // A `Sort` carrying a `fetch` renders that fetch as this
+                // query's `LIMIT`, so it reorders against a predicate above it
+                // exactly as a `Limit` node does — but it cannot be moved into
+                // a derived table the way a `Limit` can, because SQL does not
+                // carry a derived table's row order out to the query selecting
+                // from it. (A sort without a fetch reorders nothing: `ORDER BY`
+                // is evaluated after `WHERE` either way.)
+                if sort.fetch.is_some() && Self::row_limit_needs_own_scope(plan, select)?
+                {
+                    return not_impl_err!(
+                        "Unparsing a filter applied after a sort's fetch is not supported"
+                    );
+                }
 
                 let Some(query_ref) = query else {
                     return internal_err!(
@@ -890,10 +1113,14 @@ impl Unparser<'_> {
                 };
 
                 let agg = find_agg_node_within_select(plan, select.already_projected());
-                let window_nodes =
-                    find_window_nodes_within_select(plan, None, select.already_projected());
-                let windows: Option<Vec<&Window>> =
-                    window_nodes.as_deref().map(|ws| ws.iter().copied().collect());
+                let window_nodes = find_window_nodes_within_select(
+                    plan,
+                    None,
+                    select.already_projected(),
+                );
+                let windows: Option<Vec<&Window>> = window_nodes
+                    .as_deref()
+                    .map(|ws| ws.iter().copied().collect());
                 // unproject sort expressions
                 let sort_exprs: Vec<SortExpr> = sort
                     .expr
@@ -918,6 +1145,60 @@ impl Unparser<'_> {
                 )
             }
             LogicalPlan::Aggregate(agg) => {
+                // A SELECT expresses a single grouping, so an aggregate stacked below the
+                // one this SELECT already carries has to become a derived table. Stacked
+                // aggregates are what `single_distinct_to_groupby` produces for
+                // `count(DISTINCT c)`: an outer `count(alias1)` over an inner
+                // `GROUP BY c AS alias1`. Folding both into one SELECT would emit
+                // `count(alias1)` against the base table — `alias1` does not exist there,
+                // and where it happens to, the DISTINCT is silently gone.
+                if select.already_aggregated() {
+                    // The derived table always carries an alias, even for a dialect that
+                    // would not require one, so this SELECT has a name to address its
+                    // columns through. A bare column name would do only where the derived
+                    // table is the SELECT's sole relation, which is not true under a join.
+                    //
+                    // The alias is numbered per SELECT because a join walks both of
+                    // its sides with this one builder, so both sides can derive an
+                    // aggregate into the same FROM clause. A fixed name would repeat
+                    // there, and since each side requalifies its own references onto
+                    // its own alias, the two sides' distinct columns would collapse
+                    // onto a single qualifier.
+                    let alias_name = select.next_derived_aggregate_alias();
+                    let alias = self.new_ident_quoted_if_needs(alias_name.clone());
+                    self.derive(
+                        plan,
+                        relation,
+                        Some(self.new_table_alias(alias_name, vec![])),
+                        false,
+                    )?;
+
+                    // This SELECT now reads those columns from the derived table, so a
+                    // reference still qualified by a relation the derived table encloses
+                    // binds to nothing. DataFusion re-plans such SQL, but a stricter remote
+                    // binder rejects it, which is what breaks a federated pushdown.
+                    let derived_qualifiers: HashSet<String> = plan
+                        .schema()
+                        .iter()
+                        .filter_map(|(qualifier, _)| qualifier)
+                        .flat_map(|qualifier| {
+                            [qualifier.to_string(), qualifier.table().to_string()]
+                        })
+                        .collect();
+                    select.visit_expressions_in_clauses_mut(|expr| {
+                        if let ast::Expr::CompoundIdentifier(idents) = expr {
+                            requalify_column_onto_derived_table(
+                                idents,
+                                &derived_qualifiers,
+                                &alias,
+                            );
+                        }
+                    });
+
+                    return Ok(());
+                }
+                select.mark_aggregated();
+
                 // Aggregation can be already handled in the projection case
                 if !select.already_projected() {
                     // The query returns aggregate and group expressions. If that weren't the case,
@@ -1019,11 +1300,15 @@ impl Unparser<'_> {
                 // The outer projection plan will handle projecting the correct columns.
                 let already_projected = select.already_projected();
 
+                let mut left_scan_fetch = None;
+                let mut left_scan_only_filters = vec![];
                 let left_plan =
                     match try_transform_to_simple_table_scan_with_filters(left_plan)? {
-                        Some((plan, filters)) => {
-                            left_scan_filters.extend(filters);
-                            Arc::new(plan)
+                        Some(scan) => {
+                            left_scan_filters.extend(scan.filters);
+                            left_scan_only_filters = scan.scan_filters;
+                            left_scan_fetch = scan.fetch;
+                            Arc::new(scan.plan)
                         }
                         None => Arc::clone(left_plan),
                     };
@@ -1055,14 +1340,19 @@ impl Unparser<'_> {
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
-                // side's `TableScan` (see `split_join_on_and_where_filters`).
-                // Isolate that side in a derived table instead, and drop the
-                // filters from `left_scan_filters` so they are not also
-                // routed to `ON`/`WHERE` below.
-                if join.join_type == JoinType::Full && !left_scan_filters.is_empty() {
-                    self.derive_full_join_side(
+                // side's `TableScan` (see `split_join_on_and_where_filters`),
+                // and no clause of the enclosing query can express one input's
+                // `fetch`. Isolate that side in a derived table instead, and
+                // drop the filters from `left_scan_filters` so they are not
+                // also routed to `ON`/`WHERE` below.
+                if left_scan_fetch.is_some()
+                    || (join.join_type == JoinType::Full && !left_scan_filters.is_empty())
+                {
+                    self.derive_join_side(
                         left_plan.as_ref(),
                         std::mem::take(&mut left_scan_filters),
+                        &left_scan_only_filters,
+                        left_scan_fetch,
                         relation,
                     )?;
                 }
@@ -1102,11 +1392,16 @@ impl Unparser<'_> {
                 let right_plan: Arc<LogicalPlan> = if is_exists_join {
                     Arc::clone(right_plan)
                 } else {
+                    let mut right_scan_fetch = None;
+                    let mut right_scan_only_filters = vec![];
                     let right_plan =
-                        match try_transform_to_simple_table_scan_with_filters(right_plan)? {
-                            Some((plan, filters)) => {
-                                right_scan_filters.extend(filters);
-                                Arc::new(plan)
+                        match try_transform_to_simple_table_scan_with_filters(right_plan)?
+                        {
+                            Some(scan) => {
+                                right_scan_filters.extend(scan.filters);
+                                right_scan_only_filters = scan.scan_filters;
+                                right_scan_fetch = scan.fetch;
+                                Arc::new(scan.plan)
                             }
                             None => Arc::clone(right_plan),
                         };
@@ -1117,11 +1412,15 @@ impl Unparser<'_> {
                         select,
                         &mut right_relation,
                     )?;
-                    if join.join_type == JoinType::Full && !right_scan_filters.is_empty()
+                    if right_scan_fetch.is_some()
+                        || (join.join_type == JoinType::Full
+                            && !right_scan_filters.is_empty())
                     {
-                        self.derive_full_join_side(
+                        self.derive_join_side(
                             right_plan.as_ref(),
                             std::mem::take(&mut right_scan_filters),
+                            &right_scan_only_filters,
+                            right_scan_fetch,
                             &mut right_relation,
                         )?;
                     }

@@ -74,13 +74,7 @@ pub async fn plan_to_parquet(
     while let Some(result) = join_set.join_next().await {
         match result {
             Ok(res) => res?,
-            Err(e) => {
-                if e.is_panic() {
-                    std::panic::resume_unwind(e.into_panic());
-                } else {
-                    unreachable!();
-                }
-            }
+            Err(e) => return Err(DataFusionError::from_join_error(e)),
         }
     }
 

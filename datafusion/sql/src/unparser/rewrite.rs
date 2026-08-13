@@ -184,6 +184,20 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
 ///       TableScan: j2
 ///
 /// This prevents the original plan generate query with derived table but missing alias.
+///
+/// It also keeps the ORDER BY at the top level of the emitted statement. Left as
+/// `Projection -> Sort`, the `Sort` is unparsed as a derived table:
+///
+/// ```sql
+/// SELECT id FROM (SELECT person.id, person.age FROM person ORDER BY person.age)
+/// ```
+///
+/// SQL does not require the enclosing query to preserve the ordering of a derived
+/// table, so the rows come back in an arbitrary order.
+///
+/// A sort key does not have to *be* one of the inner Projection's outputs for the
+/// hoist to be valid -- it only has to be computable from them, as `age + 1` is from
+/// `age`.
 pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     p: &Projection,
 ) -> Option<LogicalPlan> {
@@ -221,6 +235,15 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         })
         .collect::<Vec<_>>();
 
+    // Compare outer collects Expr::to_string with inner collected transformed values
+    // alias -> alias column
+    // column -> remain
+    // others, extract schema field name
+    let inner_collects = inner_exprs
+        .iter()
+        .map(Expr::to_string)
+        .collect::<HashSet<_>>();
+
     let mut collects = p.expr.clone();
     for sort in &sort.expr {
         // Strip aliases from sort expressions so the comparison matches
@@ -231,18 +254,21 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         while let Expr::Alias(alias) = expr {
             expr = *alias.expr;
         }
-        collects.push(expr);
+        if inner_collects.contains(&expr.to_string()) {
+            collects.push(expr);
+            continue;
+        }
+        // The sort key is not itself one of the inner Projection's outputs, but
+        // it may be an expression *over* them (`ORDER BY age + 1` while the
+        // inner Projection exposes `age`). Account for the columns it reads so
+        // an inner Projection that exists only to expose them still matches.
+        // Without this the rewrite bails out and the Sort is emitted as a
+        // derived table, where SQL does not guarantee the ORDER BY is honoured
+        // by the enclosing query -- the rows come back in an arbitrary order.
+        collects.extend(expr.column_refs().into_iter().cloned().map(Expr::Column));
     }
 
-    // Compare outer collects Expr::to_string with inner collected transformed values
-    // alias -> alias column
-    // column -> remain
-    // others, extract schema field name
     let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
-    let inner_collects = inner_exprs
-        .iter()
-        .map(Expr::to_string)
-        .collect::<HashSet<_>>();
 
     if outer_collects == inner_collects {
         let mut sort = sort.clone();
@@ -288,11 +314,28 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 while let Expr::Alias(alias) = expr {
                     expr = *alias.expr;
                 }
-                if let Expr::Column(ref col) = expr
-                    && let Some(underlying) = dropped_aliases.get(col.name())
-                {
-                    sort_expr.expr = underlying.clone();
-                }
+                // Substitute nested references too, not just a whole-expression
+                // one: `ORDER BY x + 1` over a dropped `expr AS x` has to become
+                // `ORDER BY expr + 1`.
+                sort_expr.expr = expr
+                    .clone()
+                    .transform_down(|e| {
+                        Ok(match &e {
+                            // Only an unqualified column can name a projection
+                            // alias: `t.x` refers to `t`'s own column even when a
+                            // dropped alias happens to share the name.
+                            Expr::Column(col) if col.relation.is_none() => {
+                                match dropped_aliases.get(col.name()) {
+                                    Some(underlying) => {
+                                        Transformed::yes(underlying.clone())
+                                    }
+                                    None => Transformed::no(e),
+                                }
+                            }
+                            _ => Transformed::no(e),
+                        })
+                    })
+                    .map_or(expr, |transformed| transformed.data);
             }
         }
 
@@ -535,6 +578,49 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
             _ => Ok(Transformed::no(expr)),
         }
     }
+}
+
+/// Re-points a column reference at the derived table that replaced the relation it names.
+///
+/// When a sub-plan is unparsed as a derived table, the SELECT above it stops reading from
+/// the relation its expressions are qualified by and reads from that derived table instead.
+/// A qualifier naming the original relation then binds to nothing, so a strict remote binder
+/// rejects the query even though DataFusion re-plans it.
+///
+/// A reference is rewritten only when its qualifier names one of the relations the derived
+/// table encloses (`derived_qualifiers`), so a reference to a relation the SELECT still
+/// reads directly — the other side of a join, say — keeps the qualifier it needs. The
+/// column is then addressed through `alias`, which the derived table always carries, rather
+/// than reduced to a bare name: bare would be ambiguous wherever the derived table is not
+/// the SELECT's only relation.
+///
+/// Both tests are on names alone, so neither distinguishes a correlated reference to an
+/// enclosing query — that qualifier can name the very same relation. A caller must not
+/// offer one, which is why [`SelectBuilder::visit_expressions_in_clauses_mut`] skips any
+/// expression holding a subquery.
+///
+/// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
+pub fn requalify_column_onto_derived_table(
+    idents: &mut Vec<Ident>,
+    derived_qualifiers: &HashSet<String>,
+    alias: &Ident,
+) {
+    if idents.len() < 2 {
+        return;
+    }
+    let qualifier = idents
+        .iter()
+        .take(idents.len() - 1)
+        .map(|ident| ident.value.clone())
+        .collect::<Vec<String>>()
+        .join(".");
+    if !derived_qualifiers.contains(&qualifier) {
+        return;
+    }
+    let Some(last) = idents.last() else {
+        unreachable!("CompoundIdentifier must have a last element");
+    };
+    *idents = vec![alias.clone(), last.clone()];
 }
 
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.

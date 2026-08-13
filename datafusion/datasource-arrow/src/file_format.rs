@@ -323,13 +323,7 @@ impl FileSink for ArrowFileSink {
                 Ok(r) => {
                     row_count += r?;
                 }
-                Err(e) => {
-                    if e.is_panic() {
-                        std::panic::resume_unwind(e.into_panic());
-                    } else {
-                        unreachable!();
-                    }
-                }
+                Err(e) => return Err(DataFusionError::from_join_error(e)),
             }
         }
 
