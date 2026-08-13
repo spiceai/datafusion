@@ -4716,6 +4716,39 @@ fn stacked_aggregate_leaves_a_correlated_outer_reference_alone() -> Result<()> {
     Ok(())
 }
 
+/// A `Sort` that has to be emitted below the SELECT list must not end up inside a
+/// derived table: SQL does not require an enclosing query to honour the ORDER BY of
+/// a derived table, so the rows come back in an arbitrary order.
+#[test]
+fn order_by_over_non_projected_field_stays_top_level() -> Result<()> {
+    // Sort key is an expression over a column the SELECT list does not project.
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT id FROM person ORDER BY age + 1 DESC",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT person.id FROM person ORDER BY (person.age + 1) DESC NULLS FIRST",
+    );
+
+    // Same, with the sort key an expression over an aggregate that is not selected.
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT id, first_name FROM person GROUP BY id, first_name ORDER BY max(age) + 1 DESC",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT person.id, person.first_name FROM person GROUP BY person.id, person.first_name ORDER BY (max(person.age) + 1) DESC NULLS FIRST",
+    );
+
+    // A plain non-projected column already worked; keep it covered so the
+    // generalisation above cannot regress it.
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT id FROM person ORDER BY age DESC",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT person.id FROM person ORDER BY person.age DESC NULLS FIRST",
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
     // When an enclosing RIGHT JOIN null-extends a nested left input, a predicate
@@ -4784,6 +4817,29 @@ fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
     Ok(())
 }
 
+/// The inner `Projection` may define an alias that only the `Sort` uses. Hoisting the
+/// `Sort` drops that alias, so every reference to it -- including one nested inside a
+/// larger sort expression -- has to be replaced by the expression it named.
+#[test]
+fn order_by_nested_reference_to_dropped_alias() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("age", DataType::Int64, false),
+    ]);
+    let plan = table_scan(Some("person"), &schema, None)?
+        .project(vec![col("id"), (col("age") * lit(2)).alias("doubled")])?
+        .sort(vec![(col("doubled") + lit(1)).sort(false, true)])?
+        .project(vec![col("id")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT person.id FROM person ORDER BY ((person.age * 2) + 1) DESC NULLS FIRST"
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_join_filter_nested_under_right_join_using() -> Result<()> {
     // USING cannot carry the predicate contributed by the non-preserved left
@@ -4823,5 +4879,114 @@ fn test_join_filter_nested_under_right_join_using() -> Result<()> {
         @"SELECT a.id, b.b_id, c.id FROM a INNER JOIN b ON a.id = b.b_id RIGHT OUTER JOIN c ON a.id = c.id AND (a.id = 'x')"
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_unnamed_projection_output_binds() -> Result<()> {
+    // A `Filter` whose predicate references a `Projection` output that the
+    // projection does not name. The projected expression carries the logical
+    // name `t.a + t.b`, which is not an identifier any relation exposes, so
+    // emitting it as one produces SQL no engine can bind.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(col("t.a + t.b").gt(lit(1)))?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    assert_snapshot!(sql, @r#"SELECT (t.a + t.b) FROM t WHERE ((t.a + t.b) > 1)"#);
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_named_projection_output_is_unchanged() -> Result<()> {
+    // An alias gives the output a name the emitted `SELECT` carries, and a bare
+    // column keeps the name it already had. Neither needs repairing, so neither
+    // is inlined.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")).alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&aliased)?,
+        @r#"SELECT (t.a + t.b) AS s FROM t WHERE (s > 1)"#
+    );
+
+    let bare_column = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a")])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&bare_column)?,
+        @r#"SELECT t.a FROM t WHERE (t.a > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_unnamed_projection_output_used_twice() -> Result<()> {
+    // Every reference to the output is inlined, not just the first.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(
+            col("t.a + t.b")
+                .gt(lit(1))
+                .and(col("t.a + t.b").lt(lit(10))),
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.a + t.b) FROM t WHERE (((t.a + t.b) > 1) AND ((t.a + t.b) < 10))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
+    // Stacked filters collapse into one `WHERE`, so the projection is still the
+    // one this predicate refers to and both predicates are repaired.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(col("t.a + t.b").gt(lit(1)))?
+        .filter(col("t.a + t.b").lt(lit(10)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.a + t.b) FROM t WHERE ((t.a + t.b) < 10) AND ((t.a + t.b) > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_unnamed_volatile_projection_output_is_not_inlined() -> Result<()> {
+    // Inlining a volatile expression would evaluate it a second time, in a
+    // clause that can see a different value than the `SELECT` list did, turning
+    // an unbindable reference into silently wrong rows. The unbindable
+    // reference is the safer of the two, so it is left in place.
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![datafusion_functions::math::random().call(vec![])])?
+        .filter(col("random()").gt(lit(0.5)))?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    assert_snapshot!(sql, @r#"SELECT random() FROM t WHERE ("random()" > 0.5)"#);
     Ok(())
 }

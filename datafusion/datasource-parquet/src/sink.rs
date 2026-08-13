@@ -375,13 +375,7 @@ impl FileSink for ParquetSink {
                         .map_err(|e| internal_datafusion_err!("duplicate entry detected for partitioned file {path}: {e}"))?;
                     drop(written_files);
                 }
-                Err(e) => {
-                    if e.is_panic() {
-                        std::panic::resume_unwind(e.into_panic());
-                    } else {
-                        unreachable!();
-                    }
-                }
+                Err(e) => return Err(DataFusionError::from_join_error(e)),
             }
         }
 
