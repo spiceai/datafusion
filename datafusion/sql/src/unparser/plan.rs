@@ -1008,11 +1008,10 @@ impl Unparser<'_> {
                 // `split_join_on_and_where_filters`).
                 let mut left_scan_filters = vec![];
                 let mut right_scan_filters = vec![];
-                let (left_plan, right_plan) = match join.join_type {
-                    JoinType::RightSemi | JoinType::RightAnti => {
-                        (&join.right, &join.left)
-                    }
-                    _ => (&join.left, &join.right),
+                let (left_plan, right_plan) = if Self::swaps_join_inputs(join.join_type) {
+                    (&join.right, &join.left)
+                } else {
+                    (&join.left, &join.right)
                 };
                 // If there's an outer projection plan, it will already set up the projection.
                 // In that case, we don't need to worry about setting up the projection here.
@@ -2317,8 +2316,12 @@ impl Unparser<'_> {
         // The rewrites below then belong to the outer select: inside the bound,
         // both the projection and `DISTINCT` still decide which rows survive
         // it, so neither is redundant there.
-        if let Some(scope_name) = Self::exists_scope_name(join)
-            && query_builder.bounds_rows()
+        //
+        // `bounds_rows()` is tested first so the scope name is only demanded
+        // when a bound actually has to be moved: naming it can refuse the plan
+        // outright, and an unbounded build side has nothing to get wrong.
+        if query_builder.bounds_rows()
+            && let Some(scope_name) = self.exists_scope_name(join)?
         {
             query_builder.body(Box::new(SetExpr::Select(select)));
             let bounded = query_builder.build()?;
@@ -2401,6 +2404,18 @@ impl Unparser<'_> {
         Ok(select.build()?)
     }
 
+    /// Whether a join presents its inputs to the unparser the other way round
+    /// from the way the plan holds them: `RightSemi` and `RightAnti` correlate
+    /// `join.right` and build the `EXISTS` body from `join.left`.
+    ///
+    /// Read from here rather than restated, so that everything deciding which
+    /// side is which agrees — the join arm swaps the plans, and anything
+    /// reading `join.on` has to take the key from the matching side of each
+    /// pair or it will name the relation the correlation does not.
+    const fn swaps_join_inputs(join_type: JoinType) -> bool {
+        matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+    }
+
     /// The name a scope around the `EXISTS` build side has to answer to, so the
     /// correlated predicates still resolve against it.
     ///
@@ -2417,13 +2432,25 @@ impl Unparser<'_> {
     ///   more than one of its inputs. A single scope can expose only one of
     ///   those names, so `None` is returned and the caller leaves the plan
     ///   alone rather than emitting references that cannot bind.
-    fn exists_scope_name(join: &Join) -> Option<String> {
+    ///
+    /// One shape is refused outright instead: a qualified name on a dialect
+    /// that spells columns in full. The scope cannot carry that name, and
+    /// unlike the `None` cases the unscoped form there *does* bind — so it
+    /// would run and quietly return the wrong rows rather than fail. Refusing
+    /// costs the pushdown, which is the trade `derive_row_limited_scope` makes
+    /// for the same reason.
+    fn exists_scope_name(&self, join: &Join) -> Result<Option<String>> {
+        // Which input is correlated against, and therefore which half of each
+        // `on` pair names the side being scoped, follows the same swap the join
+        // arm applies before it builds this subquery.
+        let swapped = Self::swaps_join_inputs(join.join_type);
+        let probe_plan = if swapped { &join.right } else { &join.left };
+
         // Match on the probe side's *qualifiers* rather than its columns: a
         // correlated reference can name a probe-side column the probe's own
         // projection dropped, and testing for the column would then read that
         // reference as a build-side name.
-        let probe_relations: Vec<&TableReference> = join
-            .left
+        let probe_relations: Vec<&TableReference> = probe_plan
             .schema()
             .iter()
             .filter_map(|(relation, _)| relation)
@@ -2442,8 +2469,8 @@ impl Unparser<'_> {
                 }
             }
         };
-        for (_, right) in &join.on {
-            collect(right);
+        for (left, right) in &join.on {
+            collect(if swapped { left } else { right });
         }
         if let Some(filter) = &join.filter {
             collect(filter);
@@ -2457,9 +2484,29 @@ impl Unparser<'_> {
             // already mis-emitted for an unrelated reason (the body's own
             // relation shadows the outer one), so declining does not repair it;
             // it only avoids trading that wrong answer for a different one.
-            [] if !names_a_probe_relation => Some("derived_limit".to_string()),
-            [relation] => Some(relation.table().to_string()),
-            _ => None,
+            [] if !names_a_probe_relation => Ok(Some("derived_limit".to_string())),
+            // A derived table's alias is a single identifier, so only the last
+            // component of a qualified name survives it, while a dialect that
+            // spells columns in full still writes every component in the
+            // correlated predicate — leaving it qualified by a relation that is
+            // no longer in scope.
+            //
+            // Refused rather than declined, which the other arms here are. They
+            // fall back to output that is wrong in the way this PR describes
+            // but *fails to bind*, so a database rejects it; this one would
+            // bind and run, silently answering from rows outside the bound. A
+            // wrong answer that executes is worse than one that does not, so
+            // this arm costs the pushdown instead — the trade
+            // `derive_row_limited_scope` makes for the limit it scopes.
+            [relation]
+                if self.dialect.full_qualified_col() && relation.to_vec().len() > 1 =>
+            {
+                not_impl_err!(
+                    "Unparsing a row bound on an EXISTS-style join's build side is not supported for a qualified table name on a dialect that spells columns in full"
+                )
+            }
+            [relation] => Ok(Some(relation.table().to_string())),
+            _ => Ok(None),
         }
     }
 
