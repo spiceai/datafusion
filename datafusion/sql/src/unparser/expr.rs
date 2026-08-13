@@ -1251,9 +1251,9 @@ impl Unparser<'_> {
             && let Some(at_tz) = self
                 .dialect
                 .timestamp_at_time_zone_to_sql(inner_expr.clone(), tz.as_ref())
-            {
-                return Ok(at_tz);
-            }
+        {
+            return Ok(at_tz);
+        }
         match inner_expr {
             ast::Expr::Value(_) => match data_type {
                 DataType::Dictionary(_, _) | DataType::Binary | DataType::BinaryView
