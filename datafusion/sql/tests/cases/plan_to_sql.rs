@@ -23,14 +23,14 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{WindowFunction, WindowFunctionParams};
 use datafusion_expr::test::function_stub::{
-    count_udaf, max, max_udaf, min_udaf, sum, sum_udaf,
+    count, count_udaf, max, max_udaf, min_udaf, sum, sum_udaf,
 };
 use datafusion_expr::{
     ColumnarValue, EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
     ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
-    WindowFunctionDefinition, cast, col, exists, in_subquery, lit, scalar_subquery,
-    table_scan, wildcard,
+    WindowFunctionDefinition, cast, col, exists, in_subquery, lit, out_ref_col,
+    scalar_subquery, table_scan, wildcard,
 };
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
@@ -4417,6 +4417,340 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
     Ok(())
 }
 
+/// A `Filter` above a row limit must not be flattened into the same `SELECT`
+/// as that limit: SQL evaluates `WHERE` before `LIMIT`, so the flattened form
+/// means the opposite of the plan and can return rows the plan excludes.
+#[test]
+fn test_filter_above_limit_gets_its_own_scope() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    // Take 5 rows, then keep the matching ones. The limit belongs in a derived
+    // table, named after the relation the surviving predicate is qualified by.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .limit(0, Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.id, t."name" FROM (SELECT * FROM t LIMIT 5) AS t WHERE (t.id = 'a')"#
+    );
+
+    // An OFFSET is evaluated at the same point as a LIMIT, so a skip-only
+    // limit reorders against the predicate in exactly the same way.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .limit(3, None)?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.id, t."name" FROM (SELECT * FROM t OFFSET 3) AS t WHERE (t.id = 'a')"#
+    );
+
+    Ok(())
+}
+
+/// Builds `count(<col>)` with the aggregate-function stub used across these tests.
+fn count_col(name: &str) -> Expr {
+    use datafusion_expr::expr::{AggregateFunction, AggregateFunctionParams};
+    Expr::AggregateFunction(AggregateFunction {
+        func: count_udaf(),
+        params: AggregateFunctionParams {
+            args: vec![col(name)],
+            distinct: false,
+            filter: None,
+            order_by: vec![],
+            null_treatment: None,
+        },
+    })
+}
+
+/// A SELECT carries a single grouping, so an aggregate stacked directly on top of
+/// another has to be unparsed as a derived table. This is the plan
+/// `single_distinct_to_groupby` produces for `count(DISTINCT b)`: an outer
+/// `count(alias1)` over an inner `GROUP BY b AS alias1`. Folding both into one SELECT
+/// emits `count(alias1)` against the base table, where `alias1` does not exist — and
+/// where a column of that name happens to exist, the DISTINCT is silently dropped.
+#[test]
+fn stacked_aggregate_is_unparsed_as_a_derived_table() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+
+    // count(DISTINCT b) — the outer aggregate groups by nothing.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(vec![col("test.b").alias("alias1")], Vec::<Expr>::new())?
+        .aggregate(Vec::<Expr>::new(), vec![count_col("alias1")])?
+        .project(vec![col("COUNT(alias1)").alias("count(DISTINCT test.b)")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.b AS alias1 FROM test GROUP BY test.b) AS derived_aggregate_1"#
+    );
+
+    // a, count(DISTINCT b) ... GROUP BY a — the outer aggregate keeps its own grouping,
+    // which must not absorb the inner one.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .project(vec![
+            col("test.a"),
+            col("COUNT(alias1)").alias("count(DISTINCT test.b)"),
+        ])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT derived_aggregate_1.a, COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"#
+    );
+
+    // A lone aggregate is still folded into the SELECT it belongs to.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(vec![col("test.a")], vec![count_col("test.b")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(test.b), test.a FROM test GROUP BY test.a"
+    );
+
+    Ok(())
+}
+
+/// Once the inner aggregate becomes a derived table, the enclosing SELECT reads from that
+/// derived table and not from `test`, so a reference still qualified by `test` binds to
+/// nothing. DataFusion re-plans such a query, but PostgreSQL answers 42703 and DuckDB a
+/// Binder Error, so the failure surfaces as a driver error on a federated pushdown.
+#[test]
+fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    let stacked = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("test"), &schema, None)?.aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )
+    };
+
+    // GROUP BY on a bare qualified column.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"
+    );
+
+    // A qualifier nested inside a grouping expression is reached too — the projection and
+    // the GROUP BY have to agree, or the GROUP BY no longer covers the selected expression.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a") + lit(1u32)], vec![count_col("alias1")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), (derived_aggregate_1.a + 1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY (derived_aggregate_1.a + 1)"
+    );
+
+    // HAVING is built from a Filter above the aggregate and was never swept.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .filter(col("test.a").gt(lit(1u32)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+    );
+
+    // A query-level ORDER BY is reached by the existing dangling-identifier sweep, which
+    // runs later and strips the qualifier rather than repointing it. It binds either way;
+    // this pins that the two mechanisms do not fight over the same clause.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .sort(vec![col("test.a").sort(true, false)])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a ORDER BY a ASC NULLS LAST"
+    );
+
+    Ok(())
+}
+
+/// The derived table is aliased for every dialect, so a dialect that also *requires* the
+/// alias must not end up with a second one, and its references resolve the same way.
+#[test]
+fn stacked_aggregate_requalifies_onto_a_required_derived_table_alias() -> Result<()> {
+    struct AliasedDerivedTableDialect {}
+    impl UnparserDialect for AliasedDerivedTableDialect {
+        fn identifier_quote_style(&self, _: &str) -> Option<char> {
+            None
+        }
+        fn requires_derived_table_alias(&self) -> bool {
+            true
+        }
+    }
+
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .filter(col("test.a").gt(lit(1u32)))?
+        .build()?;
+
+    let unparser = Unparser::new(&AliasedDerivedTableDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+    );
+
+    Ok(())
+}
+
+/// A join shares one `SelectBuilder` across both sides, and the join is recorded on it only
+/// after the left side has been walked — so at the point the derived table is built, this
+/// SELECT reads from more than one relation even though nothing on the builder says so yet.
+/// A reference qualified by the *other* side must keep its qualifier, and one pointed at the
+/// derived table must name it rather than go bare, since `a` here is ambiguous between the
+/// two relations.
+#[test]
+fn stacked_aggregate_under_a_join_leaves_the_other_side_qualified() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    // `other` deliberately repeats the column name `a`.
+    let right = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+
+    let inner_aggregate = table_scan(Some("test"), &left, None)?
+        .aggregate(vec![col("test.a")], Vec::<Expr>::new())?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(inner_aggregate)
+        .join_on(
+            table_scan(Some("other"), &right, None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("test.a").eq(col("other.a"))],
+        )?
+        .aggregate(vec![col("other.a")], vec![count_col("test.a")])?
+        .build()?;
+
+    // `COUNT(derived_aggregate_1.a)` and `GROUP BY "other".a` stay distinguishable. Reducing
+    // either to a bare `a` would make the query ambiguous, and group by the wrong column.
+    //
+    // The join's `ON` still reads `test.a`: it is built as part of the join and attached
+    // after this SELECT's clauses, so it is not among the clauses that are swept. That is
+    // unchanged by the requalification and is tracked as spiceai/spiceai#12695; pinning it
+    // here keeps the gap visible rather than silent.
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(derived_aggregate_1.a), "other".a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
+    );
+
+    Ok(())
+}
+
+/// Both sides of a join can carry a stacked aggregate, and one `SelectBuilder` walks both,
+/// so both derive a table into the same FROM clause. Their aliases have to differ on two
+/// counts: a repeated name is a duplicate table name most engines reject outright, and —
+/// the quieter half — each side requalifies its own references onto its own alias, so a
+/// shared name would collapse the two sides' distinct columns onto one qualifier and group
+/// by whichever side was walked first.
+#[test]
+fn stacked_aggregates_on_both_join_sides_get_distinct_aliases() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    // `other` deliberately repeats the column name `a`, so a collapsed qualifier would
+    // still bind — and silently read the wrong side — rather than fail loudly.
+    let right = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+
+    let left_aggregate = table_scan(Some("test"), &left, None)?
+        .aggregate(vec![col("test.a")], Vec::<Expr>::new())?
+        .build()?;
+    let right_aggregate = table_scan(Some("other"), &right, None)?
+        .aggregate(vec![col("other.a")], Vec::<Expr>::new())?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(left_aggregate)
+        .join_on(
+            right_aggregate,
+            datafusion_expr::JoinType::Inner,
+            vec![col("test.a").eq(col("other.a"))],
+        )?
+        .aggregate(vec![col("other.a")], vec![count_col("test.a")])?
+        .build()?;
+
+    // `COUNT` keeps the left side and `GROUP BY` the right, each through its own alias.
+    // The join's `ON` still reads the pre-derivation qualifiers, which is the gap tracked
+    // as spiceai/spiceai#12695 and is pinned here rather than left silent.
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(derived_aggregate_1.a), derived_aggregate_2.a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN (SELECT "other".a FROM "other" GROUP BY "other".a) AS derived_aggregate_2 ON (test.a = "other".a) GROUP BY derived_aggregate_2.a"#
+    );
+
+    Ok(())
+}
+
+/// A correlated subquery references an enclosing query's relation by a qualifier that is
+/// indistinguishable, by name, from one addressing this SELECT's own relation — here both
+/// are `test.a`. Rewriting inside the subquery would repoint it at the derived table and
+/// silently change which column it reads, so an expression holding a subquery is left
+/// alone entirely.
+///
+/// The cost is visible below: the `test.a` on the left of the comparison is this SELECT's
+/// own and would otherwise be requalified, but it shares an expression with the subquery
+/// and so keeps its qualifier. That is the pre-existing output for this shape, not a
+/// regression, and it is the conservative direction — an unbindable qualifier is a loud
+/// error at the remote engine, whereas a repointed correlated reference returns wrong rows.
+#[test]
+fn stacked_aggregate_leaves_a_correlated_outer_reference_alone() -> Result<()> {
+    let outer = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    let inner = Schema::new(vec![Field::new("c", DataType::UInt32, false)]);
+
+    // HAVING count(alias1) > (SELECT count(other.c) FROM other WHERE other.c = test.a)
+    let correlated = scalar_subquery(Arc::new(
+        table_scan(Some("other"), &inner, None)?
+            .filter(col("other.c").eq(out_ref_col(DataType::UInt32, "test.a")))?
+            .aggregate(Vec::<Expr>::new(), vec![count_col("other.c")])?
+            .build()?,
+    ));
+
+    let plan = table_scan(Some("test"), &outer, None)?
+        .aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .filter(col("test.a").gt(correlated))?
+        .build()?;
+
+    // `other.c = test.a` inside the subquery still reads the outer `test.a`, which is the
+    // property that matters. `GROUP BY a` shows the requalification still runs on the
+    // clauses that hold no subquery.
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
+    );
+
+    Ok(())
+}
+
 /// A `Sort` that has to be emitted below the SELECT list must not end up inside a
 /// derived table: SQL does not require an enclosing query to honour the ORDER BY of
 /// a derived table, so the rows come back in an arbitrary order.
@@ -4446,6 +4780,401 @@ fn order_by_over_non_projected_field_stays_top_level() -> Result<()> {
         unparser_dialect: UnparserDefaultDialect {},
         expected: @"SELECT person.id FROM person ORDER BY person.age DESC NULLS FIRST",
     );
+
+    Ok(())
+}
+
+/// A `Sort` carrying a `fetch` renders that fetch as the query's `LIMIT`, so a
+/// predicate above it reorders in the same way. It cannot take the same fix: a
+/// derived table's row order is not carried out to the query selecting from
+/// it, so moving the sort inside one would repair the row set and lose the
+/// ordering the plan promises.
+#[test]
+fn test_filter_above_a_sort_fetch_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .sort_with_limit(vec![col("id").sort(true, false)], Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("a filter above a sort fetch cannot be unparsed");
+    assert_contains!(error.to_string(), "after a sort's fetch");
+
+    Ok(())
+}
+
+/// The two predicate sources around a limit are applied at different times: a
+/// `TableScan`'s own filters run before the scan's rows reach the limit, a
+/// `Filter` node above the limit runs after. Both are accumulated into the
+/// same `WHERE` while the walk is inside one `SELECT`, so the split has to
+/// come from where each one is unparsed, not from the clause it lands in.
+#[test]
+fn test_scan_filter_stays_below_the_limit_it_precedes() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan_with_filters(
+        Some("t"),
+        &schema,
+        None,
+        vec![col("name").eq(lit("z"))],
+    )?
+    .limit(0, Some(5))?
+    .filter(col("id").eq(lit("a")))?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.id, t."name" FROM (SELECT * FROM t WHERE (t."name" = 'z') LIMIT 5) AS t WHERE (t.id = 'a')"#
+    );
+
+    Ok(())
+}
+
+/// The new scope is only for a predicate that sits *above* the limit. A
+/// predicate below it is already in the order SQL evaluates, and a limit with
+/// no predicate above it has nothing to reorder against — neither may grow a
+/// derived table.
+#[test]
+fn test_limit_without_a_predicate_above_it_stays_flat() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    // Filter below the limit: keep the matching rows, then take 5 of them —
+    // which is what a single `SELECT ... WHERE ... LIMIT` already means.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .filter(col("id").eq(lit("a")))?
+        .limit(0, Some(5))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM t WHERE (t.id = 'a') LIMIT 5"#
+    );
+
+    // No predicate at all.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .limit(0, Some(5))?
+        .build()?;
+    assert_snapshot!(plan_to_sql(&plan)?, @r#"SELECT * FROM t LIMIT 5"#);
+
+    // A sort without a fetch contributes no limit, so a predicate above it is
+    // still evaluated first either way.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .sort(vec![col("id").sort(true, false)])?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM t WHERE (t.id = 'a') ORDER BY t.id ASC NULLS LAST"#
+    );
+
+    Ok(())
+}
+
+/// `HAVING` is evaluated before `LIMIT` too, so an aggregate-referencing
+/// filter above a limit reorders in the same way a `WHERE` does — but it
+/// cannot be lifted out the way a `WHERE` can, because the aggregate it
+/// references is only nameable in the `SELECT` that computes it. Refusing is
+/// the only answer that is neither reversed nor unbindable.
+#[test]
+fn test_having_above_limit_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("name")], vec![count(col("id"))])?
+        .limit(0, Some(5))?
+        .filter(col("COUNT(t.id)").gt(lit(1i64)))?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("a HAVING above a limit cannot be unparsed");
+    assert_contains!(
+        error.to_string(),
+        "HAVING or QUALIFY predicate that is applied after a row limit"
+    );
+
+    // The same aggregate with the limit above the filter is the order SQL
+    // already means, and still unparses.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("name")], vec![count(col("id"))])?
+        .filter(col("COUNT(t.id)").gt(lit(1i64)))?
+        .limit(0, Some(5))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(t.id), t."name" FROM t GROUP BY t."name" HAVING (COUNT(t.id) > 1) LIMIT 5"#
+    );
+
+    Ok(())
+}
+
+/// The generated SQL has to mean what the plan meant, and the derived table
+/// has to be addressable by the predicate left outside it. Planning the SQL
+/// back proves both: an unresolvable qualifier would fail to plan, and a
+/// reordered one would come back with the limit above the filter.
+#[test]
+fn test_filter_above_limit_round_trips() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::UInt32, false)]);
+    let plan = table_scan(Some("person"), &schema, None)?
+        .limit(0, Some(5))?
+        .filter(col("id").gt(lit(5u32)))?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(&sql.to_string())?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let replanned = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    let displayed = replanned.display_indent().to_string();
+    let filter_at = displayed
+        .find("Filter:")
+        .expect("re-planned SQL should still filter");
+    let limit_at = displayed
+        .find("Limit:")
+        .expect("re-planned SQL should still limit");
+    assert!(
+        filter_at < limit_at,
+        "the limit must stay below the filter, got:\n{displayed}"
+    );
+
+    Ok(())
+}
+
+/// A limited subtree that reads two relations cannot become a derived table
+/// the outer predicate can still address: both qualifiers leave scope, and no
+/// single name replaces them. Refuse, rather than reverse the two or emit a
+/// predicate with nothing to bind to.
+#[test]
+fn test_filter_above_limit_over_a_join_is_refused() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let plan = LogicalPlanBuilder::from(table_scan(Some("a"), &left, None)?.build()?)
+        .join(
+            table_scan(Some("b"), &right, None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["b.id"]),
+            None,
+        )?
+        .limit(0, Some(5))?
+        .filter(col("a.name").eq(lit("x")))?
+        .build()?;
+    let error = plan_to_sql(&plan)
+        .expect_err("a filter above a limit over a join cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+
+    Ok(())
+}
+
+/// A `SubqueryAlias` under the limit already supplies the name the outer
+/// predicate is qualified by, so it is the name the derived table takes.
+#[test]
+fn test_filter_above_limit_keeps_a_subquery_alias() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .alias("x")?
+        .limit(0, Some(5))?
+        .filter(col("x.name").eq(lit("q")))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x.id, x."name" FROM (SELECT * FROM t AS x LIMIT 5) AS x WHERE (x."name" = 'q')"#
+    );
+
+    Ok(())
+}
+
+/// A limit on one join input is that input's own, and the derived table it
+/// becomes contributes only that input's columns to the enclosing `SELECT`
+/// list. A wildcard there would expand to every relation in the `FROM`,
+/// returning the other side's columns twice.
+#[test]
+fn test_filter_above_a_limited_join_input_keeps_the_join_schema() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let limited_left = table_scan(Some("a"), &left, Some(vec![0, 1]))?
+        .limit(0, Some(5))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(limited_left)
+        .join(
+            table_scan(Some("b"), &right, Some(vec![0, 1]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["b.id"]),
+            None,
+        )?
+        .filter(col("a.name").eq(lit("x")))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a.id, a."name", b.id, b.age FROM (SELECT a.id, a."name" FROM a LIMIT 5) AS a INNER JOIN b ON a.id = b.id WHERE (a."name" = 'x')"#
+    );
+
+    Ok(())
+}
+
+/// The derived table's columns are named by the enclosing query, which only
+/// works if the derived query names them the same way. A projection breaks
+/// that: an unaliased expression is a column the derived query never names,
+/// and two aliases differing only by a qualifier collapse onto one SQL name.
+#[test]
+fn test_filter_above_limit_over_a_projection_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("a").add(col("b"))])?
+        .limit(0, Some(5))?
+        .filter(col("t.a + t.b").gt(lit(1i32)))?
+        .build()?;
+    let error = plan_to_sql(&plan)
+        .expect_err("a filter above a limited projection cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+
+    Ok(())
+}
+
+/// A sort below the limit orders what the plan returns just as surely as one
+/// above it, and a derived table does not carry its row order out. It is the
+/// one clause that may wrap a scan and still not be safe to move inside.
+#[test]
+fn test_filter_above_a_limited_sort_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .sort(vec![col("id").sort(true, false)])?
+        .limit(0, Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("a filter above a limited sort cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+
+    Ok(())
+}
+
+/// A dialect that spells columns in full leaves the outer predicate qualified
+/// by every part of the table's path, while a derived table can only be
+/// aliased by one identifier. The predicate would be left naming a path that
+/// is no longer in scope.
+#[test]
+fn test_filter_above_limit_is_refused_for_a_fully_qualified_column() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .with_identifier_quote_style('"')
+        .build();
+
+    let plan = table_scan(Some("catalog.schema.t"), &schema, None)?
+        .limit(0, Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    let error = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("a fully qualified predicate cannot survive the alias");
+    assert_contains!(error.to_string(), "dialect that spells columns in full");
+
+    // A bare table name has nothing to lose, so the same dialect renders it.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .limit(0, Some(5))?
+        .filter(col("id").eq(lit("a")))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @r#"SELECT "t"."id", "t"."name" FROM (SELECT * FROM "t" LIMIT 5) AS "t" WHERE ("t"."id" = 'a')"#
+    );
+
+    Ok(())
+}
+
+/// Join inputs are walked with one shared `SelectBuilder`, so a predicate on
+/// it need not be an ancestor of the node being unparsed. A `HAVING` from one
+/// input must not make the other input's limit unrenderable.
+#[test]
+fn test_a_sibling_having_does_not_refuse_the_other_inputs_limit() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let grouped_left = table_scan(Some("a"), &left, None)?
+        .aggregate(vec![col("id")], vec![count(col("name"))])?
+        .filter(col("COUNT(a.name)").gt(lit(1i64)))?
+        .build()?;
+    let limited_right = table_scan(Some("b"), &right, Some(vec![0, 1]))?
+        .limit(0, Some(5))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(grouped_left)
+        .join(
+            limited_right,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["b.id"]),
+            None,
+        )?
+        .build()?;
+
+    plan_to_sql(&plan).expect("a sibling's HAVING is not this limit's predicate");
+
+    Ok(())
+}
+
+/// A scan can project no columns, and then there is no column list to name
+/// the derived table's output with.
+#[test]
+fn test_filter_above_limit_over_an_empty_projection_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+
+    let plan = table_scan(Some("t"), &schema, Some(vec![]))?
+        .limit(0, Some(5))?
+        .filter(lit(true))?
+        .build()?;
+    let error = plan_to_sql(&plan)
+        .expect_err("a limited scan with no columns cannot be unparsed");
+    assert_contains!(error.to_string(), "projecting no columns");
 
     Ok(())
 }
