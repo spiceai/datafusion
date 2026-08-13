@@ -5312,6 +5312,341 @@ fn test_join_filter_nested_under_right_join_using() -> Result<()> {
     Ok(())
 }
 
+/// A `fetch` pushed into a join input bounds that input, not the join's output,
+/// so it has to be emitted as a derived table. Dropping it asks the remote
+/// engine for the whole table and joins over it.
+#[test]
+fn test_join_input_with_pushed_down_fetch() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let schema_right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let scan_with_fetch = |name: &'static str, schema: &Schema, filters: Vec<Expr>| {
+        table_scan_with_filter_and_fetch(
+            Some(name),
+            schema,
+            Some(vec![0, 1]),
+            filters,
+            Some(5),
+        )
+    };
+
+    // Left input: filter and fetch both move into the subquery. Keeping the
+    // filter outside would apply it after the limit, which returns fewer rows.
+    let plan = LogicalPlanBuilder::from(
+        scan_with_fetch(
+            "left_table",
+            &schema_left,
+            vec![col("left_table.id").eq(lit("a"))],
+        )?
+        .build()?,
+    )
+    .join(
+        table_scan(Some("right_table"), &schema_right, Some(vec![0, 1]))?.build()?,
+        datafusion_expr::JoinType::Inner,
+        (vec!["left_table.id"], vec!["right_table.id"]),
+        None,
+    )?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM (SELECT left_table.id, left_table."name" FROM left_table WHERE (left_table.id = 'a') LIMIT 5) AS left_table INNER JOIN right_table ON left_table.id = right_table.id"#
+    );
+
+    // Right input: the same, on the other side of the join.
+    let plan = LogicalPlanBuilder::from(
+        table_scan(Some("left_table"), &schema_left, Some(vec![0, 1]))?.build()?,
+    )
+    .join(
+        scan_with_fetch(
+            "right_table",
+            &schema_right,
+            vec![col("right_table.age").gt(lit(30))],
+        )?
+        .build()?,
+        datafusion_expr::JoinType::Inner,
+        (vec!["left_table.id"], vec!["right_table.id"]),
+        None,
+    )?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table INNER JOIN (SELECT right_table.id, right_table.age FROM right_table WHERE (right_table.age > 30) LIMIT 5) AS right_table ON left_table.id = right_table.id"#
+    );
+
+    // A fetch with no filter still needs the subquery.
+    let plan = LogicalPlanBuilder::from(
+        scan_with_fetch("left_table", &schema_left, vec![])?.build()?,
+    )
+    .join(
+        table_scan(Some("right_table"), &schema_right, Some(vec![0, 1]))?.build()?,
+        datafusion_expr::JoinType::Inner,
+        (vec!["left_table.id"], vec!["right_table.id"]),
+        None,
+    )?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM (SELECT left_table.id, left_table."name" FROM left_table LIMIT 5) AS left_table INNER JOIN right_table ON left_table.id = right_table.id"#
+    );
+
+    // Both inputs limited: each gets its own subquery.
+    let plan = LogicalPlanBuilder::from(
+        scan_with_fetch("left_table", &schema_left, vec![])?.build()?,
+    )
+    .join(
+        scan_with_fetch("right_table", &schema_right, vec![])?.build()?,
+        datafusion_expr::JoinType::Inner,
+        (vec!["left_table.id"], vec!["right_table.id"]),
+        None,
+    )?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM (SELECT left_table.id, left_table."name" FROM left_table LIMIT 5) AS left_table INNER JOIN (SELECT right_table.id, right_table.age FROM right_table LIMIT 5) AS right_table ON left_table.id = right_table.id"#
+    );
+
+    Ok(())
+}
+
+/// The clause a filter belongs in depends on the join type, but a limited input
+/// is always its own subquery — including on a side whose filter would
+/// otherwise have to stay in `ON`, and on a side of a `FULL JOIN`.
+#[test]
+fn test_outer_join_input_with_pushed_down_fetch() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let schema_right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let mut rendered = String::new();
+    for join_type in [
+        datafusion_expr::JoinType::Left,
+        datafusion_expr::JoinType::Right,
+        datafusion_expr::JoinType::Full,
+    ] {
+        let plan = LogicalPlanBuilder::from(
+            table_scan(Some("left_table"), &schema_left, Some(vec![0, 1]))?.build()?,
+        )
+        .join(
+            table_scan_with_filter_and_fetch(
+                Some("right_table"),
+                &schema_right,
+                Some(vec![0, 1]),
+                vec![col("right_table.age").gt(lit(30))],
+                Some(5),
+            )?
+            .build()?,
+            join_type,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+
+        rendered.push_str(&plan_to_sql(&plan)?.to_string());
+        rendered.push('\n');
+    }
+
+    // In all three the filter and the limit are inside the subquery: nothing is
+    // left for the enclosing `ON` or `WHERE` to re-apply after the limit.
+    assert_snapshot!(
+        rendered,
+        @r#"
+    SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table LEFT OUTER JOIN (SELECT right_table.id, right_table.age FROM right_table WHERE (right_table.age > 30) LIMIT 5) AS right_table ON left_table.id = right_table.id
+    SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table RIGHT OUTER JOIN (SELECT right_table.id, right_table.age FROM right_table WHERE (right_table.age > 30) LIMIT 5) AS right_table ON left_table.id = right_table.id
+    SELECT left_table.id, left_table."name", right_table.id, right_table.age FROM left_table FULL JOIN (SELECT right_table.id, right_table.age FROM right_table WHERE (right_table.age > 30) LIMIT 5) AS right_table ON left_table.id = right_table.id
+    "#
+    );
+
+    Ok(())
+}
+
+/// An aliased scan keeps its alias, so the columns the enclosing query
+/// references still resolve.
+#[test]
+fn test_aliased_join_input_with_pushed_down_fetch() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let schema_right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let plan = LogicalPlanBuilder::from(
+        table_scan_with_filter_and_fetch(
+            Some("left_table"),
+            &schema_left,
+            Some(vec![0, 1]),
+            vec![col("left_table.id").eq(lit("a"))],
+            Some(5),
+        )?
+        .alias("l")?
+        .build()?,
+    )
+    .join(
+        table_scan(Some("right_table"), &schema_right, Some(vec![0, 1]))?.build()?,
+        datafusion_expr::JoinType::Inner,
+        (vec!["l.id"], vec!["right_table.id"]),
+        None,
+    )?
+    .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT l.id, l."name", right_table.id, right_table.age FROM (SELECT l.id, l."name" FROM left_table AS l WHERE (l.id = 'a') LIMIT 5) AS l INNER JOIN right_table ON l.id = right_table.id"#
+    );
+
+    Ok(())
+}
+
+/// Text alone does not prove the limit survived: plan the generated SQL back
+/// and check that the limit is still bound to the one input, above that scan
+/// and below the join.
+#[test]
+fn test_join_input_fetch_survives_replanning() -> Result<()> {
+    let schema_j1 = Schema::new(vec![
+        Field::new("j1_id", DataType::Int32, false),
+        Field::new("j1_string", DataType::Utf8, false),
+    ]);
+    let schema_j2 = Schema::new(vec![
+        Field::new("j2_id", DataType::Int32, false),
+        Field::new("j2_string", DataType::Utf8, false),
+    ]);
+
+    let plan = LogicalPlanBuilder::from(
+        table_scan_with_filter_and_fetch(
+            Some("j1"),
+            &schema_j1,
+            Some(vec![0, 1]),
+            vec![col("j1.j1_id").gt(lit(1))],
+            Some(5),
+        )?
+        .build()?,
+    )
+    .join(
+        table_scan(Some("j2"), &schema_j2, Some(vec![0, 1]))?.build()?,
+        datafusion_expr::JoinType::Inner,
+        (vec!["j1.j1_id"], vec!["j2.j2_id"]),
+        None,
+    )?
+    .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(&sql.to_string())?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let replanned = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    assert_snapshot!(
+        replanned,
+        @r"
+    Projection: j1.j1_id, j1.j1_string, j2.j2_id, j2.j2_string
+      Inner Join:  Filter: j1.j1_id = j2.j2_id
+        SubqueryAlias: j1
+          Limit: skip=0, fetch=5
+            Projection: j1.j1_id, j1.j1_string
+              Filter: j1.j1_id > Int64(1)
+                TableScan: j1
+        TableScan: j2
+    "
+    );
+
+    Ok(())
+}
+
+/// The scan applies its own filters before its `fetch`; a `Filter` node above
+/// the scan applies afterwards. Both end up in the derived table, but they
+/// cannot share one `SELECT` — `WHERE` is evaluated before `LIMIT`, so a
+/// single scope would silently filter first.
+#[test]
+fn test_join_input_filter_above_pushed_down_fetch() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let schema_right = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+
+    let left = table_scan_with_filter_and_fetch(
+        Some("left_table"),
+        &schema_left,
+        Some(vec![0, 1]),
+        vec![col("left_table.v").gt(lit(1))],
+        Some(5),
+    )?
+    .filter(col("left_table.id").eq(lit("a")))?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            table_scan(Some("right_table"), &schema_right, Some(vec![0, 1]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, left_table.v, right_table.id, right_table.age FROM (SELECT * FROM (SELECT left_table.id, left_table.v FROM left_table WHERE (left_table.v > 1) LIMIT 5) AS left_table WHERE (left_table.id = 'a')) AS left_table INNER JOIN right_table ON left_table.id = right_table.id"#
+    );
+
+    Ok(())
+}
+
+/// A scan filter may name a column the projection prunes. Rebuilding the input
+/// keeps the original projection and lets the filter reference the wider source
+/// schema, which is what SQL allows too.
+#[test]
+fn test_join_input_fetch_with_pruned_filter_column() -> Result<()> {
+    let schema_left = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let schema_right = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+
+    let left = table_scan_with_filter_and_fetch(
+        Some("left_table"),
+        &schema_left,
+        Some(vec![0]),
+        vec![col("left_table.name").eq(lit("x"))],
+        Some(5),
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            table_scan(Some("right_table"), &schema_right, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec!["left_table.id"], vec!["right_table.id"]),
+            None,
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT left_table.id, right_table.id FROM (SELECT left_table.id FROM left_table WHERE (left_table."name" = 'x') LIMIT 5) AS left_table INNER JOIN right_table ON left_table.id = right_table.id"#
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_filter_on_unnamed_projection_output_binds() -> Result<()> {
     // A `Filter` whose predicate references a `Projection` output that the
@@ -5418,5 +5753,58 @@ fn test_filter_on_unnamed_volatile_projection_output_is_not_inlined() -> Result<
 
     let sql = plan_to_sql(&plan)?;
     assert_snapshot!(sql, @r#"SELECT random() FROM t WHERE ("random()" > 0.5)"#);
+    Ok(())
+}
+
+#[test]
+fn test_qualified_join_input_fetch_refused_on_full_qualified_col_dialect() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, false),
+        Field::new("value", DataType::Utf8, false),
+    ]);
+    let other = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+
+    let join_with_fetched_input = |name: &str| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(
+            table_scan_with_filter_and_fetch(
+                Some(name),
+                &schema,
+                Some(vec![0, 1]),
+                vec![],
+                Some(5),
+            )?
+            .build()?,
+        )
+        .join(
+            table_scan(Some("other"), &other, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec![format!("{name}.id")], vec!["other.id".to_string()]),
+            None,
+        )?
+        .build()
+    };
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let unparser = Unparser::new(&dialect);
+
+    // The derived table can only be aliased `table`, while this dialect spells
+    // the join condition `catalog.schema.table.id` — a relation the derived
+    // table no longer brings into scope.
+    let err = unparser
+        .plan_to_sql(&join_with_fetched_input("catalog.schema.table")?)
+        .expect_err("a qualified name must not unparse to an unresolvable alias");
+    assert_contains!(
+        err.to_string(),
+        "not supported for a qualified table name on a dialect that spells columns in full"
+    );
+
+    // A single-component name loses nothing to the alias, so the guard must
+    // not fire on it even on this dialect.
+    assert_snapshot!(
+        unparser.plan_to_sql(&join_with_fetched_input("t")?)?,
+        @"SELECT t.id, t.value, other.id FROM (SELECT t.id, t.value FROM t LIMIT 5) AS t INNER JOIN other ON t.id = other.id"
+    );
     Ok(())
 }
