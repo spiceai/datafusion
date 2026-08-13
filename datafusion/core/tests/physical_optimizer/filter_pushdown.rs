@@ -643,6 +643,87 @@ fn test_filter_with_fetch_not_pushed_to_unsupportive_scan() {
     );
 }
 
+/// A `FilterExec` sitting directly above a source that does not support
+/// pushdown may already carry the same predicate its own ancestor is trying
+/// to push down into it (a node in between can legitimately pre-attach its
+/// own copy of a predicate so this exact absorption lets a redundant
+/// ancestor `FilterExec` be dropped via `if_all`). `handle_child_pushdown_result`
+/// must not conjoin that pushed-down duplicate onto its own predicate
+/// verbatim -- doing so would apply the same condition twice on every row.
+#[test]
+fn test_filter_with_fetch_not_pushed_to_unsupportive_scan_dedups_repeated_ancestor_predicate()
+ {
+    let scan = TestScanBuilder::new(schema()).with_support(false).build();
+    let predicate = col_lit_predicate("a", "foo", &schema());
+    let inner_filter =
+        Arc::new(FilterExec::try_new(Arc::clone(&predicate), scan).unwrap());
+    // The outer FilterExec pushes the *same* predicate down into inner_filter.
+    let plan = Arc::new(FilterExec::try_new(predicate, inner_filter).unwrap());
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, FilterPushdown::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - FilterExec: a@0 = foo
+        -   FilterExec: a@0 = foo
+        -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
+      output:
+        Ok:
+          - FilterExec: a@0 = foo
+          -   DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
+    "
+    );
+}
+
+/// Companion to the test above: two independently-built calls to the same
+/// volatile function must never be merged into a single duplicated
+/// predicate, even when they are structurally identical. The generic
+/// `FilterPushdown` driver already declines to push a volatile expression
+/// at all (see its own `is_volatile` gate), so the two `FilterExec`s here
+/// never combine in the first place and each keeps its own single
+/// evaluation -- exactly the safety property `dedup_deterministic_exprs`'s
+/// volatility check exists to preserve if a filter ever *did* reach it.
+#[test]
+fn test_filter_with_fetch_not_pushed_to_unsupportive_scan_keeps_repeated_volatile_predicate()
+ {
+    let scan = TestScanBuilder::new(schema()).with_support(false).build();
+    let cfg = Arc::new(ConfigOptions::default());
+    let random_call = || {
+        Arc::new(BinaryExpr::new(
+            Arc::new(Column::new_with_schema("a", &schema()).unwrap()),
+            Operator::Eq,
+            Arc::new(
+                ScalarFunctionExpr::try_new(
+                    Arc::new(ScalarUDF::from(RandomFunc::new())),
+                    vec![],
+                    &schema(),
+                    Arc::clone(&cfg),
+                )
+                .unwrap(),
+            ),
+        )) as Arc<dyn PhysicalExpr>
+    };
+    let inner_filter = Arc::new(FilterExec::try_new(random_call(), scan).unwrap());
+    let plan = Arc::new(FilterExec::try_new(random_call(), inner_filter).unwrap());
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, FilterPushdown::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - FilterExec: a@0 = random()
+        -   FilterExec: a@0 = random()
+        -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
+      output:
+        Ok:
+          - FilterExec: a@0 = random()
+          -   FilterExec: a@0 = random()
+          -     DataSourceExec: file_groups={1 group: [[test.parquet]]}, projection=[a, b, c], file_type=test, pushdown_supported=false
+    "
+    );
+}
+
 #[test]
 fn test_push_down_through_transparent_nodes() {
     // expect the predicate to be pushed down into the DataSource

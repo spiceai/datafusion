@@ -68,7 +68,7 @@ use datafusion_physical_expr::{
     conjunction, split_conjunction,
 };
 
-use datafusion_physical_expr_common::physical_expr::fmt_sql;
+use datafusion_physical_expr_common::physical_expr::{fmt_sql, is_volatile};
 use futures::stream::{Stream, StreamExt};
 use log::trace;
 
@@ -714,6 +714,12 @@ impl ExecutionPlan for FilterExec {
             .chain(unsupported_self_filters)
             .collect_vec();
 
+        // `unsupported_parent_filters` and `unsupported_self_filters` can
+        // legitimately overlap: a parent may push filter `p` down into a
+        // `FilterExec` that already carries `p` itself as part of its own
+        // predicate. Drop the duplicate before building the combined predicate.
+        let unhandled_filters = dedup_deterministic_exprs(unhandled_filters);
+
         // If we have unhandled filters, we need to create a new FilterExec
         let filter_input = Arc::clone(self.input());
         let new_predicate = conjunction(unhandled_filters);
@@ -878,6 +884,30 @@ fn collect_equality_columns(predicate: &Arc<dyn PhysicalExpr>) -> (HashSet<usize
     }
 
     (eq_values.into_keys().collect(), infeasible)
+}
+
+/// Removes exact duplicates from `exprs`, keeping the first occurrence of
+/// each and preserving order.
+///
+/// A volatile expression (e.g. a call to a `Volatility::Volatile` UDF) is
+/// never treated as a duplicate, even against a structurally-identical
+/// sibling: two evaluations of a volatile expression can return different
+/// values or carry side effects, so removing one changes the predicate's
+/// meaning, not just its cost.
+fn dedup_deterministic_exprs(
+    exprs: Vec<Arc<dyn PhysicalExpr>>,
+) -> Vec<Arc<dyn PhysicalExpr>> {
+    let mut deduped: Vec<Arc<dyn PhysicalExpr>> = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let is_duplicate = !is_volatile(&expr)
+            && deduped
+                .iter()
+                .any(|kept| !is_volatile(kept) && kept.as_ref() == expr.as_ref());
+        if !is_duplicate {
+            deduped.push(expr);
+        }
+    }
+    deduped
 }
 
 /// Converts an interval bound to a [`Precision`] value. NULL bounds (which
