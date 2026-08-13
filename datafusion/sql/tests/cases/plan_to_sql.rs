@@ -29,8 +29,8 @@ use datafusion_expr::{
     ColumnarValue, EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
     ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
-    WindowFunctionDefinition, cast, col, exists, in_subquery, lit, scalar_subquery,
-    table_scan, wildcard,
+    WindowFunctionDefinition, cast, col, exists, in_subquery, lit, out_ref_col,
+    scalar_subquery, table_scan, wildcard,
 };
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
@@ -4414,6 +4414,305 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
         sql,
         @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" = "right"."first_name") AND ("left"."order_id" = "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" = "p"."first_name") AND ("left"."order_id" = "o"."order_id"))"#
     );
+    Ok(())
+}
+
+/// Builds `count(<col>)` with the aggregate-function stub used across these tests.
+fn count_col(name: &str) -> Expr {
+    use datafusion_expr::expr::{AggregateFunction, AggregateFunctionParams};
+    Expr::AggregateFunction(AggregateFunction {
+        func: count_udaf(),
+        params: AggregateFunctionParams {
+            args: vec![col(name)],
+            distinct: false,
+            filter: None,
+            order_by: vec![],
+            null_treatment: None,
+        },
+    })
+}
+
+/// A SELECT carries a single grouping, so an aggregate stacked directly on top of
+/// another has to be unparsed as a derived table. This is the plan
+/// `single_distinct_to_groupby` produces for `count(DISTINCT b)`: an outer
+/// `count(alias1)` over an inner `GROUP BY b AS alias1`. Folding both into one SELECT
+/// emits `count(alias1)` against the base table, where `alias1` does not exist — and
+/// where a column of that name happens to exist, the DISTINCT is silently dropped.
+#[test]
+fn stacked_aggregate_is_unparsed_as_a_derived_table() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+
+    // count(DISTINCT b) — the outer aggregate groups by nothing.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(vec![col("test.b").alias("alias1")], Vec::<Expr>::new())?
+        .aggregate(Vec::<Expr>::new(), vec![count_col("alias1")])?
+        .project(vec![col("COUNT(alias1)").alias("count(DISTINCT test.b)")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.b AS alias1 FROM test GROUP BY test.b) AS derived_aggregate_1"#
+    );
+
+    // a, count(DISTINCT b) ... GROUP BY a — the outer aggregate keeps its own grouping,
+    // which must not absorb the inner one.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .project(vec![
+            col("test.a"),
+            col("COUNT(alias1)").alias("count(DISTINCT test.b)"),
+        ])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT derived_aggregate_1.a, COUNT(alias1) AS "count(DISTINCT test.b)" FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"#
+    );
+
+    // A lone aggregate is still folded into the SELECT it belongs to.
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(vec![col("test.a")], vec![count_col("test.b")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(test.b), test.a FROM test GROUP BY test.a"
+    );
+
+    Ok(())
+}
+
+/// Once the inner aggregate becomes a derived table, the enclosing SELECT reads from that
+/// derived table and not from `test`, so a reference still qualified by `test` binds to
+/// nothing. DataFusion re-plans such a query, but PostgreSQL answers 42703 and DuckDB a
+/// Binder Error, so the failure surfaces as a driver error on a federated pushdown.
+#[test]
+fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    let stacked = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("test"), &schema, None)?.aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )
+    };
+
+    // GROUP BY on a bare qualified column.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"
+    );
+
+    // A qualifier nested inside a grouping expression is reached too — the projection and
+    // the GROUP BY have to agree, or the GROUP BY no longer covers the selected expression.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a") + lit(1u32)], vec![count_col("alias1")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), (derived_aggregate_1.a + 1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY (derived_aggregate_1.a + 1)"
+    );
+
+    // HAVING is built from a Filter above the aggregate and was never swept.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .filter(col("test.a").gt(lit(1u32)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+    );
+
+    // A query-level ORDER BY is reached by the existing dangling-identifier sweep, which
+    // runs later and strips the qualifier rather than repointing it. It binds either way;
+    // this pins that the two mechanisms do not fight over the same clause.
+    let plan = stacked()?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .sort(vec![col("test.a").sort(true, false)])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a ORDER BY a ASC NULLS LAST"
+    );
+
+    Ok(())
+}
+
+/// The derived table is aliased for every dialect, so a dialect that also *requires* the
+/// alias must not end up with a second one, and its references resolve the same way.
+#[test]
+fn stacked_aggregate_requalifies_onto_a_required_derived_table_alias() -> Result<()> {
+    struct AliasedDerivedTableDialect {}
+    impl UnparserDialect for AliasedDerivedTableDialect {
+        fn identifier_quote_style(&self, _: &str) -> Option<char> {
+            None
+        }
+        fn requires_derived_table_alias(&self) -> bool {
+            true
+        }
+    }
+
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    let plan = table_scan(Some("test"), &schema, None)?
+        .aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .filter(col("test.a").gt(lit(1u32)))?
+        .build()?;
+
+    let unparser = Unparser::new(&AliasedDerivedTableDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+    );
+
+    Ok(())
+}
+
+/// A join shares one `SelectBuilder` across both sides, and the join is recorded on it only
+/// after the left side has been walked — so at the point the derived table is built, this
+/// SELECT reads from more than one relation even though nothing on the builder says so yet.
+/// A reference qualified by the *other* side must keep its qualifier, and one pointed at the
+/// derived table must name it rather than go bare, since `a` here is ambiguous between the
+/// two relations.
+#[test]
+fn stacked_aggregate_under_a_join_leaves_the_other_side_qualified() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    // `other` deliberately repeats the column name `a`.
+    let right = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+
+    let inner_aggregate = table_scan(Some("test"), &left, None)?
+        .aggregate(vec![col("test.a")], Vec::<Expr>::new())?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(inner_aggregate)
+        .join_on(
+            table_scan(Some("other"), &right, None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("test.a").eq(col("other.a"))],
+        )?
+        .aggregate(vec![col("other.a")], vec![count_col("test.a")])?
+        .build()?;
+
+    // `COUNT(derived_aggregate_1.a)` and `GROUP BY "other".a` stay distinguishable. Reducing
+    // either to a bare `a` would make the query ambiguous, and group by the wrong column.
+    //
+    // The join's `ON` still reads `test.a`: it is built as part of the join and attached
+    // after this SELECT's clauses, so it is not among the clauses that are swept. That is
+    // unchanged by the requalification and is tracked as spiceai/spiceai#12695; pinning it
+    // here keeps the gap visible rather than silent.
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(derived_aggregate_1.a), "other".a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
+    );
+
+    Ok(())
+}
+
+/// Both sides of a join can carry a stacked aggregate, and one `SelectBuilder` walks both,
+/// so both derive a table into the same FROM clause. Their aliases have to differ on two
+/// counts: a repeated name is a duplicate table name most engines reject outright, and —
+/// the quieter half — each side requalifies its own references onto its own alias, so a
+/// shared name would collapse the two sides' distinct columns onto one qualifier and group
+/// by whichever side was walked first.
+#[test]
+fn stacked_aggregates_on_both_join_sides_get_distinct_aliases() -> Result<()> {
+    let left = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    // `other` deliberately repeats the column name `a`, so a collapsed qualifier would
+    // still bind — and silently read the wrong side — rather than fail loudly.
+    let right = Schema::new(vec![Field::new("a", DataType::UInt32, false)]);
+
+    let left_aggregate = table_scan(Some("test"), &left, None)?
+        .aggregate(vec![col("test.a")], Vec::<Expr>::new())?
+        .build()?;
+    let right_aggregate = table_scan(Some("other"), &right, None)?
+        .aggregate(vec![col("other.a")], Vec::<Expr>::new())?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(left_aggregate)
+        .join_on(
+            right_aggregate,
+            datafusion_expr::JoinType::Inner,
+            vec![col("test.a").eq(col("other.a"))],
+        )?
+        .aggregate(vec![col("other.a")], vec![count_col("test.a")])?
+        .build()?;
+
+    // `COUNT` keeps the left side and `GROUP BY` the right, each through its own alias.
+    // The join's `ON` still reads the pre-derivation qualifiers, which is the gap tracked
+    // as spiceai/spiceai#12695 and is pinned here rather than left silent.
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(derived_aggregate_1.a), derived_aggregate_2.a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN (SELECT "other".a FROM "other" GROUP BY "other".a) AS derived_aggregate_2 ON (test.a = "other".a) GROUP BY derived_aggregate_2.a"#
+    );
+
+    Ok(())
+}
+
+/// A correlated subquery references an enclosing query's relation by a qualifier that is
+/// indistinguishable, by name, from one addressing this SELECT's own relation — here both
+/// are `test.a`. Rewriting inside the subquery would repoint it at the derived table and
+/// silently change which column it reads, so an expression holding a subquery is left
+/// alone entirely.
+///
+/// The cost is visible below: the `test.a` on the left of the comparison is this SELECT's
+/// own and would otherwise be requalified, but it shares an expression with the subquery
+/// and so keeps its qualifier. That is the pre-existing output for this shape, not a
+/// regression, and it is the conservative direction — an unbindable qualifier is a loud
+/// error at the remote engine, whereas a repointed correlated reference returns wrong rows.
+#[test]
+fn stacked_aggregate_leaves_a_correlated_outer_reference_alone() -> Result<()> {
+    let outer = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    let inner = Schema::new(vec![Field::new("c", DataType::UInt32, false)]);
+
+    // HAVING count(alias1) > (SELECT count(other.c) FROM other WHERE other.c = test.a)
+    let correlated = scalar_subquery(Arc::new(
+        table_scan(Some("other"), &inner, None)?
+            .filter(col("other.c").eq(out_ref_col(DataType::UInt32, "test.a")))?
+            .aggregate(Vec::<Expr>::new(), vec![count_col("other.c")])?
+            .build()?,
+    ));
+
+    let plan = table_scan(Some("test"), &outer, None)?
+        .aggregate(
+            vec![col("test.a"), col("test.b").alias("alias1")],
+            Vec::<Expr>::new(),
+        )?
+        .aggregate(vec![col("test.a")], vec![count_col("alias1")])?
+        .filter(col("test.a").gt(correlated))?
+        .build()?;
+
+    // `other.c = test.a` inside the subquery still reads the outer `test.a`, which is the
+    // property that matters. `GROUP BY a` shows the requalification still runs on the
+    // clauses that hold no subquery.
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
+    );
+
     Ok(())
 }
 

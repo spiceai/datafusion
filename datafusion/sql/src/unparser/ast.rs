@@ -20,7 +20,8 @@ use std::ops::ControlFlow;
 
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
-    self, LimitClause, OrderByKind, SelectFlavor, visit_expressions_mut,
+    self, LimitClause, OrderByKind, SelectFlavor, visit_expressions,
+    visit_expressions_mut,
 };
 
 #[derive(Clone)]
@@ -138,6 +139,23 @@ impl Default for QueryBuilder {
     }
 }
 
+/// Returns true if `expr` holds a subquery anywhere within it.
+fn contains_subquery(expr: &ast::Expr) -> bool {
+    visit_expressions(expr, |expr| {
+        if matches!(
+            expr,
+            ast::Expr::Subquery(_)
+                | ast::Expr::InSubquery { .. }
+                | ast::Expr::Exists { .. }
+        ) {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    })
+    .is_break()
+}
+
 #[derive(Clone)]
 pub struct SelectBuilder {
     distinct: Option<ast::Distinct>,
@@ -167,13 +185,25 @@ pub struct SelectBuilder {
     flavor: Option<SelectFlavor>,
     /// Counter for generating unique LATERAL FLATTEN aliases within this SELECT.
     flatten_alias_counter: usize,
+    /// Counter for generating unique derived-aggregate aliases within this SELECT.
+    derived_aggregate_alias_counter: usize,
     /// Table aliases that correspond to LATERAL FLATTEN relations.
     /// Column references into these aliases must use `VALUE` as the column name.
     flatten_table_aliases: Vec<String>,
+    /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
+    /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so
+    /// a second aggregate below it belongs in a derived table.
+    ///
+    /// Set with `mark_aggregated()` and read with `already_aggregated()`.
+    aggregated: bool,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
 const FLATTEN_ALIAS_PREFIX: &str = "_unnest";
+
+/// Prefix used for the auto-generated alias of a derived table that carries an
+/// aggregate stacked below the one its enclosing SELECT already expresses.
+const DERIVED_AGGREGATE_ALIAS_PREFIX: &str = "derived_aggregate";
 
 impl SelectBuilder {
     /// Generate a unique alias for a LATERAL FLATTEN relation
@@ -181,6 +211,20 @@ impl SelectBuilder {
     pub fn next_flatten_alias(&mut self) -> String {
         self.flatten_alias_counter += 1;
         format!("{FLATTEN_ALIAS_PREFIX}_{}", self.flatten_alias_counter)
+    }
+
+    /// Generate a unique alias for a derived table holding a stacked aggregate
+    /// (`derived_aggregate_1`, `derived_aggregate_2`, …). Each call returns a fresh
+    /// name. A join walks both of its sides with one builder, so both sides can
+    /// derive an aggregate into the same FROM clause; the number is what keeps the
+    /// two apart, both as table names and as the qualifier each side's own column
+    /// references are rewritten onto.
+    pub fn next_derived_aggregate_alias(&mut self) -> String {
+        self.derived_aggregate_alias_counter += 1;
+        format!(
+            "{DERIVED_AGGREGATE_ALIAS_PREFIX}_{}",
+            self.derived_aggregate_alias_counter
+        )
     }
 
     /// Register a table alias as pointing to a LATERAL FLATTEN relation.
@@ -196,6 +240,16 @@ impl SelectBuilder {
     /// Returns true if the given table alias refers to a FLATTEN relation.
     pub fn is_flatten_table_alias(&self, alias: &str) -> bool {
         self.flatten_table_aliases.iter().any(|a| a == alias)
+    }
+
+    /// Record that an aggregate node is now expressed by this SELECT.
+    pub fn mark_aggregated(&mut self) {
+        self.aggregated = true;
+    }
+
+    /// Returns true if an aggregate node has already been folded into this SELECT.
+    pub fn already_aggregated(&self) -> bool {
+        self.aggregated
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -337,6 +391,60 @@ impl SelectBuilder {
         self.selection.take()
     }
 
+    /// Applies `f` to every expression this SELECT carries: the projection, `WHERE`,
+    /// `GROUP BY`, `HAVING`, `QUALIFY` and the builder's own sort. `f` sees nested
+    /// expressions too, so a rewrite reaches a column reference wherever it sits.
+    ///
+    /// This exists so a caller that replaces the SELECT's relation — unparsing a sub-plan
+    /// as a derived table — can re-point the column references that addressed the old one,
+    /// without the builder having to expose each clause for reading.
+    ///
+    /// An expression containing a subquery is skipped whole. A correlated subquery
+    /// references an enclosing query's relation, which stays in scope and is
+    /// indistinguishable by name from a reference to this SELECT's own relation, so
+    /// rewriting inside one would silently change which column the subquery reads. That
+    /// leaves such an expression untouched rather than risk rewriting it wrongly.
+    pub fn visit_expressions_in_clauses_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut ast::Expr),
+    {
+        let mut visit = |expr: &mut ast::Expr| {
+            if contains_subquery(expr) {
+                return;
+            }
+            let _ = visit_expressions_mut(expr, |expr| {
+                f(expr);
+                ControlFlow::<()>::Continue(())
+            });
+        };
+
+        for item in self.projection.iter_mut().flatten() {
+            match item {
+                ast::SelectItem::UnnamedExpr(expr)
+                | ast::SelectItem::ExprWithAlias { expr, .. }
+                | ast::SelectItem::ExprWithAliases { expr, .. } => visit(expr),
+                ast::SelectItem::QualifiedWildcard(..) | ast::SelectItem::Wildcard(_) => {
+                }
+            }
+        }
+        for expr in self
+            .selection
+            .iter_mut()
+            .chain(self.having.iter_mut())
+            .chain(self.qualify.iter_mut())
+        {
+            visit(expr);
+        }
+        if let Some(ast::GroupByExpr::Expressions(exprs, _)) = self.group_by.as_mut() {
+            for expr in exprs {
+                visit(expr);
+            }
+        }
+        for sort in &mut self.sort_by {
+            visit(&mut sort.expr);
+        }
+    }
+
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {
         self.group_by = Some(value);
         self
@@ -431,7 +539,9 @@ impl SelectBuilder {
             value_table_mode: Default::default(),
             flavor: Some(SelectFlavor::Standard),
             flatten_alias_counter: 0,
+            derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
+            aggregated: false,
         }
     }
 }

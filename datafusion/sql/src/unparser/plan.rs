@@ -23,7 +23,8 @@ use super::{
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_identifiers, rewrite_plan_for_sort_on_non_projected_fields,
+        remove_dangling_identifiers, requalify_column_onto_derived_table,
+        rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
     utils::{
@@ -54,7 +55,7 @@ use datafusion_expr::{
     UserDefinedLogicalNode, Window, expr::Alias,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::{sync::Arc, vec};
+use std::{collections::HashSet, sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -932,6 +933,60 @@ impl Unparser<'_> {
                 )
             }
             LogicalPlan::Aggregate(agg) => {
+                // A SELECT expresses a single grouping, so an aggregate stacked below the
+                // one this SELECT already carries has to become a derived table. Stacked
+                // aggregates are what `single_distinct_to_groupby` produces for
+                // `count(DISTINCT c)`: an outer `count(alias1)` over an inner
+                // `GROUP BY c AS alias1`. Folding both into one SELECT would emit
+                // `count(alias1)` against the base table — `alias1` does not exist there,
+                // and where it happens to, the DISTINCT is silently gone.
+                if select.already_aggregated() {
+                    // The derived table always carries an alias, even for a dialect that
+                    // would not require one, so this SELECT has a name to address its
+                    // columns through. A bare column name would do only where the derived
+                    // table is the SELECT's sole relation, which is not true under a join.
+                    //
+                    // The alias is numbered per SELECT because a join walks both of
+                    // its sides with this one builder, so both sides can derive an
+                    // aggregate into the same FROM clause. A fixed name would repeat
+                    // there, and since each side requalifies its own references onto
+                    // its own alias, the two sides' distinct columns would collapse
+                    // onto a single qualifier.
+                    let alias_name = select.next_derived_aggregate_alias();
+                    let alias = self.new_ident_quoted_if_needs(alias_name.clone());
+                    self.derive(
+                        plan,
+                        relation,
+                        Some(self.new_table_alias(alias_name, vec![])),
+                        false,
+                    )?;
+
+                    // This SELECT now reads those columns from the derived table, so a
+                    // reference still qualified by a relation the derived table encloses
+                    // binds to nothing. DataFusion re-plans such SQL, but a stricter remote
+                    // binder rejects it, which is what breaks a federated pushdown.
+                    let derived_qualifiers: HashSet<String> = plan
+                        .schema()
+                        .iter()
+                        .filter_map(|(qualifier, _)| qualifier)
+                        .flat_map(|qualifier| {
+                            [qualifier.to_string(), qualifier.table().to_string()]
+                        })
+                        .collect();
+                    select.visit_expressions_in_clauses_mut(|expr| {
+                        if let ast::Expr::CompoundIdentifier(idents) = expr {
+                            requalify_column_onto_derived_table(
+                                idents,
+                                &derived_qualifiers,
+                                &alias,
+                            );
+                        }
+                    });
+
+                    return Ok(());
+                }
+                select.mark_aggregated();
+
                 // Aggregation can be already handled in the projection case
                 if !select.already_projected() {
                     // The query returns aggregate and group expressions. If that weren't the case,
