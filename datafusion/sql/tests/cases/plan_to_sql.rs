@@ -3022,6 +3022,393 @@ fn test_unparse_left_semi_join() -> Result<()> {
     Ok(())
 }
 
+/// The schema the bounded-`EXISTS` cases below join on.
+fn exists_fetch_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("c", DataType::Int32, false),
+        Field::new("d", DataType::Int32, false),
+    ])
+}
+
+/// Builds `<join_type> Join: t1.c = t2.c` with `fetch` rows read from the
+/// build side, projecting `t1.d`.
+fn exists_join_with_build_side_fetch(
+    join_type: datafusion_expr::JoinType,
+    fetch: Option<usize>,
+) -> Result<LogicalPlan> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan_with_filter_and_fetch(
+        Some("t2"),
+        &schema,
+        Some(vec![0]),
+        vec![],
+        fetch,
+    )?
+    .build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d")])?
+        .join_on(build, join_type, vec![col("t1.c").eq(col("t2.c"))])?
+        .build()
+}
+
+/// A `fetch` on a semi join's build side bounds how much of that side the join
+/// reads, so the correlation has to be applied to the bounded rows. Emitting it
+/// beside the correlation in the `EXISTS` body instead makes `LIMIT` a no-op —
+/// the body is non-empty whenever *any* `t2` row matches, not only when one of
+/// the read rows does — and the semi join reports matches the plan never read.
+#[test]
+fn test_unparse_left_semi_join_scopes_build_side_fetch() -> Result<()> {
+    let plan =
+        exists_join_with_build_side_fetch(datafusion_expr::JoinType::LeftSemi, Some(5))?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t1"."d" FROM "t1" WHERE EXISTS (SELECT 1 FROM (SELECT "t2"."c" FROM "t2" LIMIT 5) AS "t2" WHERE ("t1"."c" = "t2"."c"))"#
+    );
+    Ok(())
+}
+
+/// The anti join is the mirror image: the unscoped `LIMIT` makes the body
+/// non-empty for matches outside the read rows, so `NOT EXISTS` drops rows it
+/// should have returned.
+#[test]
+fn test_unparse_left_anti_join_scopes_build_side_fetch() -> Result<()> {
+    let plan =
+        exists_join_with_build_side_fetch(datafusion_expr::JoinType::LeftAnti, Some(5))?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t1"."d" FROM "t1" WHERE NOT EXISTS (SELECT 1 FROM (SELECT "t2"."c" FROM "t2" LIMIT 5) AS "t2" WHERE ("t1"."c" = "t2"."c"))"#
+    );
+    Ok(())
+}
+
+/// A mark join carries the same `EXISTS` body into the boolean it projects, so
+/// the bound needs the same scope there — an unscoped `LIMIT` marks a row true
+/// on the strength of a `t2` row the plan never read.
+#[test]
+fn test_unparse_left_mark_join_scopes_build_side_fetch() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan_with_filter_and_fetch(
+        Some("t2"),
+        &schema,
+        Some(vec![0]),
+        vec![],
+        Some(5),
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftMark,
+            vec![col("t1.c").eq(col("t2.c"))],
+        )?
+        .project(vec![col("t1.d")])?
+        .filter(col("mark").or(col("t1.d").lt(lit(0))))?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t1"."d" FROM "t1" WHERE (EXISTS (SELECT 1 FROM (SELECT "t2"."c" FROM "t2" LIMIT 5) AS "t2" WHERE ("t1"."c" = "t2"."c")) OR ("t1"."d" < 0))"#
+    );
+    Ok(())
+}
+
+/// A right semi join swaps its inputs before the `EXISTS` body is built, so the
+/// side being scoped is `join.left` and the correlation names `join.right`. The
+/// scope's name has to follow that swap: taking it from the unswapped side
+/// aliases the bounded `t1` rows as `t2` and leaves the correlation naming a
+/// `t1` that is no longer in scope, so the subquery does not bind at all.
+#[test]
+fn test_unparse_right_semi_join_scopes_build_side_fetch() -> Result<()> {
+    let plan = exists_join_with_probe_side_fetch(datafusion_expr::JoinType::RightSemi)?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t2"."d" FROM "t2" WHERE EXISTS (SELECT 1 FROM (SELECT "t1"."c" FROM "t1" LIMIT 5) AS "t1" WHERE ("t1"."c" = "t2"."c"))"#
+    );
+    Ok(())
+}
+
+/// The right anti join takes the same swap, and inherits it from the same place.
+#[test]
+fn test_unparse_right_anti_join_scopes_build_side_fetch() -> Result<()> {
+    let plan = exists_join_with_probe_side_fetch(datafusion_expr::JoinType::RightAnti)?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t2"."d" FROM "t2" WHERE NOT EXISTS (SELECT 1 FROM (SELECT "t1"."c" FROM "t1" LIMIT 5) AS "t1" WHERE ("t1"."c" = "t2"."c"))"#
+    );
+    Ok(())
+}
+
+/// Builds `<join_type> Join: t1.c = t2.c` with the bound on `t1`, the input a
+/// right semi or anti join correlates *out of* — its build side.
+fn exists_join_with_probe_side_fetch(
+    join_type: datafusion_expr::JoinType,
+) -> Result<LogicalPlan> {
+    let schema = exists_fetch_schema();
+    let bounded = table_scan_with_filter_and_fetch(
+        Some("t1"),
+        &schema,
+        Some(vec![0]),
+        vec![],
+        Some(5),
+    )?
+    .build()?;
+    let correlated = table_scan(Some("t2"), &schema, Some(vec![0, 1]))?.build()?;
+
+    LogicalPlanBuilder::from(bounded)
+        .join_on(correlated, join_type, vec![col("t1.c").eq(col("t2.c"))])?
+        .project(vec![col("t2.d")])?
+        .build()
+}
+
+/// Builds `LeftSemi Join: t1.c = s.t2.c` with the build side `s.t2` qualified,
+/// optionally bounded, for the fully-qualified-dialect cases below.
+fn qualified_build_side_semi_join(fetch: Option<usize>) -> Result<LogicalPlan> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan_with_filter_and_fetch(
+        Some(TableReference::partial("s", "t2")),
+        &schema,
+        Some(vec![0]),
+        vec![],
+        fetch,
+    )?
+    .build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t1.c").eq(col("s.t2.c"))],
+        )?
+        .build()
+}
+
+/// A dialect that spells columns in full writes every component of a qualified
+/// name in the correlated predicate, but a derived table's alias is a single
+/// identifier and can only carry the last one, so the bound cannot be scoped.
+///
+/// This one is refused rather than declined. The other declines in
+/// `exists_scope_name` fall back to SQL that does not bind, which a database
+/// rejects; leaving the bound unscoped *here* would bind and run, silently
+/// answering from rows outside the bound. Losing the pushdown is the cheaper
+/// failure, and it is the trade `derive_row_limited_scope` already makes.
+#[test]
+fn test_unparse_semi_join_build_side_fetch_refuses_qualified_full_column_dialect()
+-> Result<()> {
+    let plan = qualified_build_side_semi_join(Some(5))?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let err = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("a bound that cannot be scoped must not unparse");
+    assert_contains!(
+        err.to_string(),
+        "not supported for a qualified table name on a dialect that spells columns in full"
+    );
+    Ok(())
+}
+
+/// The refusal above is owed only to the bound. Without one there is nothing to
+/// scope and nothing to get wrong, so the same plan and dialect must still
+/// unparse — which is why the bound is tested for before the scope is named.
+#[test]
+fn test_unparse_semi_join_without_fetch_keeps_qualified_full_column_dialect() -> Result<()>
+{
+    let plan = qualified_build_side_semi_join(None)?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @r#"SELECT t1.d FROM t1 WHERE EXISTS (SELECT 1 FROM s.t2 WHERE (t1.c = s.t2.c))"#
+    );
+    Ok(())
+}
+
+/// A `Limit` node above the build side bounds it just as a scan `fetch` does,
+/// and `OFFSET` picks *which* rows as much as `LIMIT` does — both belong inside
+/// the scope, with the correlation outside it.
+#[test]
+fn test_unparse_left_semi_join_scopes_build_side_limit_node() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t2"), &schema, Some(vec![0]))?
+        .limit(2, Some(5))?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t1.c").eq(col("t2.c"))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t1"."d" FROM "t1" WHERE EXISTS (SELECT 1 FROM (SELECT "t2"."c" FROM "t2" LIMIT 5 OFFSET 2) AS "t2" WHERE ("t1"."c" = "t2"."c"))"#
+    );
+    Ok(())
+}
+
+/// A build side that is a set operation is already wrapped as a derived table
+/// to serve as the `EXISTS` body. Bounding it adds a second scope around that
+/// one, and the inner select then has to project the union's columns rather
+/// than the `SELECT 1` the outermost body wants.
+#[test]
+fn test_unparse_left_semi_join_scopes_bounded_set_operation_build_side() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t2"), &schema, Some(vec![0]))?
+        .union(table_scan(Some("t3"), &schema, Some(vec![0]))?.build()?)?
+        .limit(0, Some(5))?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t1.c").eq(col("t2.c"))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let sql = unparser.plan_to_sql(&plan)?.to_string();
+    assert!(
+        !sql.contains("SELECT  FROM") && !sql.contains("SELECT FROM"),
+        "the scoped body must project something: {sql}"
+    );
+    assert_snapshot!(
+        sql,
+        @r#"SELECT "t1"."d" FROM "t1" WHERE EXISTS (SELECT 1 FROM (SELECT * FROM (SELECT "t2"."c" FROM "t2" UNION ALL SELECT "t3"."c" FROM "t3") LIMIT 5) AS "t2" WHERE ("t1"."c" = "t2"."c"))"#
+    );
+    Ok(())
+}
+
+/// A correlation naming more than one of the build side's own inputs cannot be
+/// scoped: one derived table can answer to only one of those names, so the
+/// alternative to leaving the bound where it is would be emitting `t2`/`t3`
+/// references that no longer bind.
+///
+/// The snapshot below is therefore **known-incorrect output**, recorded so the
+/// decline is visible rather than silent: the `LIMIT` still sits beside the
+/// correlation and still does nothing. Repairing it needs the correlation's
+/// qualifiers rewritten to the new scope, tracked by spiceai/spiceai#12840.
+/// Whoever implements that should expect this snapshot to change.
+#[test]
+fn test_unparse_left_semi_join_declines_multi_relation_build_side() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t2"), &schema, Some(vec![0]))?
+        .join_on(
+            table_scan(Some("t3"), &schema, Some(vec![0, 1]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t2.c").eq(col("t3.c"))],
+        )?
+        .limit(0, Some(5))?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t1.c").eq(col("t2.c")), col("t1.d").eq(col("t3.d"))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t1"."d" FROM "t1" WHERE EXISTS (SELECT 1 FROM "t2" INNER JOIN "t3" ON ("t2"."c" = "t3"."c") WHERE (("t1"."c" = "t2"."c") AND ("t1"."d" = "t3"."d")) LIMIT 5)"#
+    );
+    Ok(())
+}
+
+/// A correlation whose only qualifier is one the probe side also answers to
+/// cannot be scoped under an invented name: renaming the scope would rebind
+/// those references to the probe, turning the correlation into a comparison of
+/// the outer row with itself.
+///
+/// The snapshot below is **known-incorrect output** and declining does not
+/// repair it — the subquery's own `FROM "t"` already shadows the outer `"t"`,
+/// so both sides of the predicate bind to the inner relation and the
+/// correlation is lost whatever the bound does. That shadowing is independent
+/// of this change and is tracked, with the rewrite that fixes it, by
+/// spiceai/spiceai#12840. What declining buys is only that the scope is not
+/// *also* renamed out from under the reference, which would swap one wrong
+/// answer for a different one.
+#[test]
+fn test_unparse_left_semi_join_declines_probe_qualified_correlation() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan_with_filter_and_fetch(
+        Some("t"),
+        &schema,
+        Some(vec![0]),
+        vec![],
+        Some(5),
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.c").eq(col("t.c"))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let sql = unparser.plan_to_sql(&plan)?.to_string();
+    assert!(
+        !sql.contains("derived_limit"),
+        "must not rename a scope the correlation still names: {sql}"
+    );
+    assert_snapshot!(
+        sql,
+        @r#"SELECT "t"."d" FROM "t" WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t"."c" = "t"."c") LIMIT 5)"#
+    );
+    Ok(())
+}
+
+/// An unbounded build side keeps the flat body: nothing decides which rows
+/// survive, so the correlation can stay in the body's own `WHERE` and the extra
+/// scope would be noise. Pins that the fix costs nothing when it is not needed.
+#[test]
+fn test_unparse_left_semi_join_without_fetch_stays_flat() -> Result<()> {
+    let plan =
+        exists_join_with_build_side_fetch(datafusion_expr::JoinType::LeftSemi, None)?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t1"."d" FROM "t1" WHERE EXISTS (SELECT 1 FROM "t2" WHERE ("t1"."c" = "t2"."c"))"#
+    );
+    Ok(())
+}
+
 #[test]
 fn test_unparse_left_mark_join() -> Result<()> {
     // select t1.d from t1 where t1.d < 0 OR exists (select 1 from t2 where t1.c = t2.c)
