@@ -265,6 +265,84 @@ pub(crate) fn unproject_window_exprs(expr: Expr, windows: &[&Window]) -> Result<
     .map(|e| e.data)
 }
 
+/// Recursively searches children of [LogicalPlan] for the [Projection] that will be
+/// flattened into the same `SELECT` as `plan`, if there is one.
+///
+/// Stops at a node that opens a scope of its own: the columns of a relation, a
+/// subquery, or a derived table are addressable by name from outside, so a
+/// reference to one of them already binds.
+pub(crate) fn find_projection_node_within_select(
+    plan: &LogicalPlan,
+    already_projected: bool,
+) -> Option<&Projection> {
+    // A projection reached once the `SELECT` list is taken becomes a derived
+    // table rather than part of this statement, so it is not what a predicate
+    // here would be referring to.
+    if already_projected {
+        return None;
+    }
+    let input = plan.inputs();
+    if input.len() > 1 {
+        return None;
+    }
+    let input = input.first()?;
+    match input {
+        LogicalPlan::Projection(projection) => Some(projection),
+        // Stacked filters collapse into one `WHERE`, so keep looking through them.
+        LogicalPlan::Filter(_) => {
+            find_projection_node_within_select(input, already_projected)
+        }
+        _ => None,
+    }
+}
+
+/// Replaces a reference to a [Projection] output that the projection does not name
+/// with the expression that produces it.
+///
+/// The unparser names such an output by its logical name — `t.a + t.b` for
+/// `Projection: t.a + t.b` — which is a description of the expression, not an
+/// identifier the emitted statement carries. Emitting it as one yields SQL that
+/// no engine can bind, so the expression is inlined at the point of use instead,
+/// which needs no name at all.
+pub(crate) fn unproject_unnamed_projection_exprs(
+    expr: Expr,
+    projection: &Projection,
+) -> Result<Expr> {
+    expr.transform(|sub_expr| {
+        if let Expr::Column(c) = &sub_expr
+            && let Some(unprojected) = find_unnamed_projection_expr(projection, c)
+        {
+            return Ok(Transformed::yes(unprojected.clone()));
+        }
+        Ok(Transformed::no(sub_expr))
+    })
+    .map(|e| e.data)
+}
+
+/// The expression behind `column`, but only when the projection leaves it unnamed.
+///
+/// An alias names the output explicitly and a bare column carries the name it
+/// already had, so in both cases the emitted `SELECT` carries a name matching the
+/// reference and there is nothing to repair.
+///
+/// A volatile expression is left alone as well. Inlining evaluates it a second
+/// time, in a clause that may see a different value than the `SELECT` list did,
+/// which would answer the query with silently wrong rows. The unbindable
+/// reference this repairs is at least a loud failure, so it is the safer of the
+/// two to leave in place.
+fn find_unnamed_projection_expr<'a>(
+    projection: &'a Projection,
+    column: &Column,
+) -> Option<&'a Expr> {
+    let index = projection.schema.index_of_column(column).ok()?;
+    let expr = projection.expr.get(index)?;
+    if matches!(expr, Expr::Alias(_) | Expr::Column(_)) || expr.is_volatile() {
+        None
+    } else {
+        Some(expr)
+    }
+}
+
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {
     if let Ok(index) = agg.schema.index_of_column(column) {
         if matches!(agg.group_expr.as_slice(), [Expr::GroupingSet(_)]) {
