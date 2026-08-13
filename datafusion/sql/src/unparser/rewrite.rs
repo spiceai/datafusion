@@ -580,6 +580,49 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
     }
 }
 
+/// Re-points a column reference at the derived table that replaced the relation it names.
+///
+/// When a sub-plan is unparsed as a derived table, the SELECT above it stops reading from
+/// the relation its expressions are qualified by and reads from that derived table instead.
+/// A qualifier naming the original relation then binds to nothing, so a strict remote binder
+/// rejects the query even though DataFusion re-plans it.
+///
+/// A reference is rewritten only when its qualifier names one of the relations the derived
+/// table encloses (`derived_qualifiers`), so a reference to a relation the SELECT still
+/// reads directly — the other side of a join, say — keeps the qualifier it needs. The
+/// column is then addressed through `alias`, which the derived table always carries, rather
+/// than reduced to a bare name: bare would be ambiguous wherever the derived table is not
+/// the SELECT's only relation.
+///
+/// Both tests are on names alone, so neither distinguishes a correlated reference to an
+/// enclosing query — that qualifier can name the very same relation. A caller must not
+/// offer one, which is why [`SelectBuilder::visit_expressions_in_clauses_mut`] skips any
+/// expression holding a subquery.
+///
+/// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
+pub fn requalify_column_onto_derived_table(
+    idents: &mut Vec<Ident>,
+    derived_qualifiers: &HashSet<String>,
+    alias: &Ident,
+) {
+    if idents.len() < 2 {
+        return;
+    }
+    let qualifier = idents
+        .iter()
+        .take(idents.len() - 1)
+        .map(|ident| ident.value.clone())
+        .collect::<Vec<String>>()
+        .join(".");
+    if !derived_qualifiers.contains(&qualifier) {
+        return;
+    }
+    let Some(last) = idents.last() else {
+        unreachable!("CompoundIdentifier must have a last element");
+    };
+    *idents = vec![alias.clone(), last.clone()];
+}
+
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
 /// Removes any table identifiers that are not present in the list of available identifiers, retains original column names.
 pub fn remove_dangling_identifiers(
