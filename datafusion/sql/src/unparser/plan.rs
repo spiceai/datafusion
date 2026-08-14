@@ -2732,9 +2732,8 @@ impl Unparser<'_> {
     /// is a bound this unparser cannot place — and leaving the bound beside the
     /// correlation emits SQL that *binds and runs* while answering from rows
     /// outside the bound. A wrong answer that executes is worse than one that
-    /// does not, so these cost the pushdown instead: the trade
-    /// `derive_row_limited_scope` makes for the limit it scopes, and the one the
-    /// fully-qualified-dialect arm below already made.
+    /// does not, so these cost the pushdown instead — the trade
+    /// `derive_row_limited_scope` makes for the limit it scopes.
     ///
     /// Refusing is not the same as repairing. Each shape below is emitted
     /// correctly only once the correlation's own qualifiers are rewritten to the
