@@ -6144,6 +6144,140 @@ fn test_filter_on_unnamed_volatile_projection_output_is_not_inlined() -> Result<
 }
 
 #[test]
+fn test_derived_projection_output_is_named() -> Result<()> {
+    // The `Filter` sits above the projection rather than beside it, so the
+    // projection becomes a derived table and the predicate keeps the reference
+    // instead of inlining what produces it. The reference is the output's logical
+    // name, which the derived table only carries once the projection names it.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(col("t.a + t.b").gt(lit(1)))?
+        .project(vec![col("t.a + t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT (t.a + t.b) AS "t.a + t.b" FROM t) WHERE ("t.a + t.b" > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_limit_output_is_named() -> Result<()> {
+    // A row limit puts the projection in a scope of its own for a reason of its
+    // own, and the outer reference is unbindable there for the same reason.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .limit(0, Some(5))?
+        .project(vec![col("t.a + t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT (t.a + t.b) AS "t.a + t.b" FROM t LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_literal_output_is_named() -> Result<()> {
+    // A literal is named by the engine too, so a reference to one from the
+    // enclosing scope needs the same repair.
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![lit(1)])?
+        .filter(col("Int32(1)").gt(lit(0)))?
+        .project(vec![col("Int32(1)")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "Int32(1)" FROM (SELECT 1 AS "Int32(1)" FROM t) WHERE ("Int32(1)" > 0)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_volatile_output_is_named_and_evaluated_once() -> Result<()> {
+    // A volatile output is left in place rather than inlined, since inlining
+    // evaluates it a second time and answers the query with rows the `SELECT`
+    // list never saw. Naming the output binds the reference *and* keeps the
+    // single evaluation, so the scope the derived table provides repairs the
+    // case that inlining cannot.
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![datafusion_functions::math::random().call(vec![])])?
+        .filter(col("random()").gt(lit(0.5)))?
+        .project(vec![col("random()")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "random()" FROM (SELECT random() AS "random()" FROM t) WHERE ("random()" > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
+    // An alias and a bare column already carry the name the enclosing scope
+    // uses, so neither is renamed and neither picks up a redundant alias.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")).alias("s"), col("t.b")])?
+        .filter(col("s").gt(lit(1)))?
+        .project(vec![col("s"), col("t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s, b FROM (SELECT (t.a + t.b) AS s, t.b FROM t) WHERE (s > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_pushed_down_scan_still_unbindable() -> Result<()> {
+    // The scan pushdown requalifies the projection onto the subquery alias before
+    // the derived table is built, so the name the derived table can report for the
+    // output — `s.a + s.b` — is not the one the enclosing scope uses for it,
+    // `t.a + t.b`. Naming the output cannot close that gap: the repair is for the
+    // enclosing scope to name the relation's columns on the alias it attaches.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = LogicalPlanBuilder::from(
+        table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+            .project(vec![col("t.a").add(col("t.b"))])?
+            .alias("s")?
+            .build()?,
+    )
+    .project(vec![Expr::Column(Column::new(
+        Some(TableReference::bare("s")),
+        "t.a + t.b",
+    ))])?
+    .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) AS "s.a + s.b" FROM t AS s) AS s"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_qualified_join_input_fetch_refused_on_full_qualified_col_dialect() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("id", DataType::Utf8, false),

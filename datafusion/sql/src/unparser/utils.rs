@@ -296,6 +296,93 @@ pub(crate) fn find_projection_node_within_select(
     }
 }
 
+/// Names the outputs a derived table exposes, where the [Projection] that supplies
+/// them leaves them unnamed.
+///
+/// A derived table is addressed from the scope that encloses it, and the unparser
+/// spells such a reference with the output's logical name — `t.a + t.b` for
+/// `Projection: t.a + t.b`. That name describes the expression; it is not an
+/// identifier the derived table carries, since an engine names an unaliased
+/// expression itself (`?column?` on PostgreSQL). Aliasing each unnamed output to
+/// the logical name the enclosing scope uses makes the reference bind, and — unlike
+/// repeating the expression at the point of use — evaluates it exactly once.
+///
+/// Returns `None` when nothing needs naming, so the plan is unparsed as it stands.
+pub(crate) fn name_derived_scope_outputs(
+    plan: &LogicalPlan,
+) -> Result<Option<LogicalPlan>> {
+    let Some(named) = name_scope_projection_outputs(plan)? else {
+        return Ok(None);
+    };
+    // Naming an output must not rename it: the alias is the name the schema
+    // already reports, so the enclosing scope's references still resolve. Decline
+    // the rewrite rather than emit a derived table with different columns.
+    if named.schema().field_names() != plan.schema().field_names() {
+        return Ok(None);
+    }
+    Ok(Some(named))
+}
+
+/// Aliases the unnamed outputs of the [Projection] that becomes this scope's `SELECT`
+/// list, rebuilding the nodes walked through on the way down to it.
+fn name_scope_projection_outputs(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    match plan {
+        LogicalPlan::Projection(projection) => name_projection_outputs(projection),
+        // These carry the projection's output names through to the derived table
+        // unchanged, so the projection below is still the one exposing its columns.
+        LogicalPlan::Filter(_)
+        | LogicalPlan::Sort(_)
+        | LogicalPlan::Limit(_)
+        | LogicalPlan::Distinct(_)
+        | LogicalPlan::SubqueryAlias(_) => {
+            let inputs = plan.inputs();
+            let [input] = inputs.as_slice() else {
+                return Ok(None);
+            };
+            let Some(named_input) = name_scope_projection_outputs(input)? else {
+                return Ok(None);
+            };
+            plan.with_new_exprs(plan.expressions(), vec![named_input])
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The projection with each unnamed output aliased to the name its schema reports.
+fn name_projection_outputs(projection: &Projection) -> Result<Option<LogicalPlan>> {
+    if !projection.expr.iter().any(output_is_unnamed) {
+        return Ok(None);
+    }
+    let named = projection
+        .expr
+        .iter()
+        .map(|expr| {
+            if output_is_unnamed(expr) {
+                expr.clone().alias(expr.schema_name().to_string())
+            } else {
+                expr.clone()
+            }
+        })
+        .collect();
+    Projection::try_new(named, Arc::clone(&projection.input))
+        .map(|projection| Some(LogicalPlan::Projection(projection)))
+}
+
+/// Whether the emitted `SELECT` leaves this output for the engine to name.
+///
+/// An alias names it explicitly and a bare column keeps the name it already had,
+/// so in both cases the emitted name is the one the schema reports. A wildcard
+/// stands for a list of columns that each keep their own name, and cannot take an
+/// alias at all. Every other expression is emitted unnamed.
+fn output_is_unnamed(expr: &Expr) -> bool {
+    #[expect(deprecated)]
+    !matches!(
+        expr,
+        Expr::Alias(_) | Expr::Column(_) | Expr::Wildcard { .. }
+    )
+}
+
 /// Replaces a reference to a [Projection] output that the projection does not name
 /// with the expression that produces it.
 ///

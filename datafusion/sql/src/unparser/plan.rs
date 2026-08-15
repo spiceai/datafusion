@@ -30,8 +30,8 @@ use super::{
     utils::{
         find_agg_node_within_select, find_projection_node_within_select,
         find_unnest_node_within_select, find_window_nodes_within_select,
-        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
-        unproject_unnamed_projection_exprs, unproject_unnest_expr,
+        name_derived_scope_outputs, try_transform_to_simple_table_scan_with_filters,
+        unproject_sort_expr, unproject_unnamed_projection_exprs, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
     },
 };
@@ -417,6 +417,21 @@ impl Unparser<'_> {
         alias: Option<ast::TableAlias>,
         lateral: bool,
     ) -> Result<()> {
+        // A derived table is referred to by the names its schema reports, so any
+        // output the projection below leaves for the engine to name has to be
+        // aliased before the enclosing scope can bind it. A table alias that
+        // carries a column list already names every output, so it needs nothing.
+        let columns_named_by_alias = relation.has_columns_named_by_alias()
+            || alias
+                .as_ref()
+                .is_some_and(|alias| !alias.columns.is_empty());
+        let named = if columns_named_by_alias {
+            None
+        } else {
+            name_derived_scope_outputs(plan)?
+        };
+        let plan = named.as_ref().unwrap_or(plan);
+
         let mut derived_builder = DerivedRelationBuilder::default();
         derived_builder.lateral(lateral).alias(alias).subquery({
             let inner_statement = self.plan_to_sql(plan)?;
@@ -1643,7 +1658,17 @@ impl Unparser<'_> {
                         relation,
                     )?;
                 } else {
+                    // The alias attached below carries these names, so a derived
+                    // table built during the walk does not have to name its own
+                    // outputs to be addressable. An alias an enclosing scope has
+                    // already declared covers this relation too, since it is
+                    // attached last and is the one the outermost scope reads.
+                    let named_by_enclosing_alias = relation.has_columns_named_by_alias();
+                    relation.columns_named_by_alias(
+                        named_by_enclosing_alias || !columns.is_empty(),
+                    );
                     self.select_to_sql_recursively(&plan, query, select, relation)?;
+                    relation.columns_named_by_alias(named_by_enclosing_alias);
                 }
 
                 relation.alias(Some(
