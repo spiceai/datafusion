@@ -1660,15 +1660,13 @@ impl Unparser<'_> {
                 } else {
                     // The alias attached below carries these names, so a derived
                     // table built during the walk does not have to name its own
-                    // outputs to be addressable. An alias an enclosing scope has
-                    // already declared covers this relation too, since it is
-                    // attached last and is the one the outermost scope reads.
-                    let named_by_enclosing_alias = relation.has_columns_named_by_alias();
-                    relation.columns_named_by_alias(
-                        named_by_enclosing_alias || !columns.is_empty(),
-                    );
+                    // outputs to be addressable. Restored afterwards because this
+                    // builder outlives the walk — a join derives its other side
+                    // through the same one.
+                    let outer = relation.has_columns_named_by_alias();
+                    relation.columns_named_by_alias(outer || !columns.is_empty());
                     self.select_to_sql_recursively(&plan, query, select, relation)?;
-                    relation.columns_named_by_alias(named_by_enclosing_alias);
+                    relation.columns_named_by_alias(outer);
                 }
 
                 relation.alias(Some(

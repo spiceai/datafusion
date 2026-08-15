@@ -315,16 +315,27 @@ pub(crate) fn name_derived_scope_outputs(
         return Ok(None);
     };
     // Naming an output must not rename it: the alias is the name the schema
-    // already reports, so the enclosing scope's references still resolve. Decline
-    // the rewrite rather than emit a derived table with different columns.
-    if named.schema().field_names() != plan.schema().field_names() {
-        return Ok(None);
-    }
+    // already reports, so the enclosing scope's references still resolve. That
+    // holds by construction — the alias is taken from the schema itself — and a
+    // node added to the walk below that renames its outputs would break it.
+    debug_assert!(
+        named
+            .schema()
+            .logically_equivalent_names_and_types(plan.schema()),
+        "naming a derived table's outputs renamed them: {} became {}",
+        plan.schema(),
+        named.schema()
+    );
     Ok(Some(named))
 }
 
 /// Aliases the unnamed outputs of the [Projection] that becomes this scope's `SELECT`
 /// list, rebuilding the nodes walked through on the way down to it.
+///
+/// The nodes walked through are the ones that carry the projection's output names
+/// out to the derived table unchanged. [`find_projection_node_within_select`] walks
+/// the same way for a different purpose and stops at a narrower set, because a
+/// predicate can only reach a projection that stays in its own `SELECT`.
 fn name_scope_projection_outputs(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     match plan {
         LogicalPlan::Projection(projection) => name_projection_outputs(projection),
@@ -357,9 +368,12 @@ fn name_projection_outputs(projection: &Projection) -> Result<Option<LogicalPlan
     let named = projection
         .expr
         .iter()
-        .map(|expr| {
+        .zip(projection.schema.fields())
+        .map(|(expr, field)| {
             if output_is_unnamed(expr) {
-                expr.clone().alias(expr.schema_name().to_string())
+                // The schema's name for the output, rather than a second derivation
+                // of it: this is the name the enclosing scope refers to it by.
+                expr.clone().alias(field.name().clone())
             } else {
                 expr.clone()
             }
@@ -416,18 +430,16 @@ pub(crate) fn unproject_unnamed_projection_exprs(
 /// time, in a clause that may see a different value than the `SELECT` list did,
 /// which would answer the query with silently wrong rows. The unbindable
 /// reference this repairs is at least a loud failure, so it is the safer of the
-/// two to leave in place.
+/// two to leave in place. Volatility is a fact about whether inlining is safe, not
+/// about whether the output is named, so it is checked separately from
+/// [`output_is_unnamed`].
 fn find_unnamed_projection_expr<'a>(
     projection: &'a Projection,
     column: &Column,
 ) -> Option<&'a Expr> {
     let index = projection.schema.index_of_column(column).ok()?;
     let expr = projection.expr.get(index)?;
-    if matches!(expr, Expr::Alias(_) | Expr::Column(_)) || expr.is_volatile() {
-        None
-    } else {
-        Some(expr)
-    }
+    (output_is_unnamed(expr) && !expr.is_volatile()).then_some(expr)
 }
 
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {

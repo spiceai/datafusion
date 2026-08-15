@@ -730,11 +730,11 @@ impl RelationBuilder {
     /// The alias is attached once the relation has been built, so a derived table
     /// built in the meantime cannot see it and would otherwise name its own
     /// outputs redundantly.
-    pub fn columns_named_by_alias(&mut self, value: bool) -> &mut Self {
+    pub(super) fn columns_named_by_alias(&mut self, value: bool) -> &mut Self {
         self.columns_named_by_alias = value;
         self
     }
-    pub fn has_columns_named_by_alias(&self) -> bool {
+    pub(super) fn has_columns_named_by_alias(&self) -> bool {
         self.columns_named_by_alias
     }
     fn create_empty() -> Self {

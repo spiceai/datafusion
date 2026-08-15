@@ -6227,6 +6227,61 @@ fn test_derived_volatile_output_is_named_and_evaluated_once() -> Result<()> {
 }
 
 #[test]
+fn test_derived_output_under_sort_and_distinct_is_named() -> Result<()> {
+    // The nodes between the derived table and the projection carry the output's
+    // name out unchanged, so the projection below is still the one that has to
+    // name it — including for the `ORDER BY` inside the derived table, which
+    // refers to the output by the same name the enclosing scope does.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .distinct()?
+        .sort(vec![col("t.a + t.b").sort(true, false)])?
+        .limit(0, Some(5))?
+        .project(vec![col("t.a + t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT DISTINCT (t.a + t.b) AS "t.a + t.b" FROM t ORDER BY "t.a + t.b" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_output_under_subquery_alias_is_named() -> Result<()> {
+    // The subquery alias renames the relation, not the output, so the name the
+    // enclosing scope uses is still the one the projection reports — and the
+    // requalification of the expression onto the alias happens after the output
+    // has been named, so the two do not have to agree on the expression's spelling.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = LogicalPlanBuilder::from(
+        table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+            .project(vec![col("t.a").add(col("t.b"))])?
+            .alias("s")?
+            .build()?,
+    )
+    .limit(0, Some(5))?
+    .project(vec![Expr::Column(Column::new(
+        Some(TableReference::bare("s")),
+        "t.a + t.b",
+    ))])?
+    .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT (s.a + s.b) AS "t.a + t.b" FROM (SELECT s.a, s.b FROM t AS s) AS s LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     // An alias and a bare column already carry the name the enclosing scope
     // uses, so neither is renamed and neither picks up a redundant alias.
@@ -6243,6 +6298,27 @@ fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT s, b FROM (SELECT (t.a + t.b) AS s, t.b FROM t) WHERE (s > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_output_name_carrying_a_quote_is_escaped() -> Result<()> {
+    // The name comes from the plan, so it can carry any character a literal or a
+    // column name can — including the quote that delimits the identifier it is
+    // emitted as. Both the alias and the reference to it escape it, so neither
+    // closes the identifier early and injects into the statement.
+    let schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
+    let hostile = r#"Utf8("x" OR 1=1 --")"#;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![lit("x\" OR 1=1 --")])?
+        .filter(col(hostile).is_not_null())?
+        .project(vec![col(hostile)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "Utf8(""x"" OR 1=1 --"")" FROM (SELECT 'x" OR 1=1 --' AS "Utf8(""x"" OR 1=1 --"")" FROM t) WHERE "Utf8(""x"" OR 1=1 --"")" IS NOT NULL"#
     );
     Ok(())
 }
