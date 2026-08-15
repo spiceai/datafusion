@@ -27,8 +27,8 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::{
-    Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr, Unnest,
-    Window, expr, utils::grouping_set_to_exprlist,
+    Aggregate, Distinct, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr,
+    Unnest, Window, expr, utils::grouping_set_to_exprlist,
 };
 
 use indexmap::IndexSet;
@@ -337,27 +337,58 @@ pub(crate) fn name_derived_scope_outputs(
 /// the same way for a different purpose and stops at a narrower set, because a
 /// predicate can only reach a projection that stays in its own `SELECT`.
 fn name_scope_projection_outputs(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    // Each node is rebuilt by replacing its input and leaving every other field as
+    // it stands. `LogicalPlan::with_new_exprs` is the shorter spelling and the
+    // wrong one: it reconstructs a node from the expressions a plan reports, and
+    // that round trip does not carry a `DISTINCT ON`'s sort expressions — it
+    // panics on a plan that has them.
     match plan {
         LogicalPlan::Projection(projection) => name_projection_outputs(projection),
-        // These carry the projection's output names through to the derived table
-        // unchanged, so the projection below is still the one exposing its columns.
-        LogicalPlan::Filter(_)
-        | LogicalPlan::Sort(_)
-        | LogicalPlan::Limit(_)
-        | LogicalPlan::Distinct(_)
-        | LogicalPlan::SubqueryAlias(_) => {
-            let inputs = plan.inputs();
-            let [input] = inputs.as_slice() else {
-                return Ok(None);
-            };
-            let Some(named_input) = name_scope_projection_outputs(input)? else {
-                return Ok(None);
-            };
-            plan.with_new_exprs(plan.expressions(), vec![named_input])
-                .map(Some)
+        // The nodes below carry the projection's output names out to the derived
+        // table unchanged, so the projection under them is still the one exposing
+        // its columns.
+        LogicalPlan::Filter(filter) => with_named_input(&filter.input, |input| {
+            let mut filter = filter.clone();
+            filter.input = input;
+            LogicalPlan::Filter(filter)
+        }),
+        LogicalPlan::Sort(sort) => with_named_input(&sort.input, |input| {
+            let mut sort = sort.clone();
+            sort.input = input;
+            LogicalPlan::Sort(sort)
+        }),
+        LogicalPlan::Limit(limit) => with_named_input(&limit.input, |input| {
+            let mut limit = limit.clone();
+            limit.input = input;
+            LogicalPlan::Limit(limit)
+        }),
+        LogicalPlan::Distinct(Distinct::All(input)) => {
+            with_named_input(input, |input| LogicalPlan::Distinct(Distinct::All(input)))
+        }
+        LogicalPlan::Distinct(Distinct::On(distinct_on)) => {
+            with_named_input(&distinct_on.input, |input| {
+                let mut distinct_on = distinct_on.clone();
+                distinct_on.input = input;
+                LogicalPlan::Distinct(Distinct::On(distinct_on))
+            })
+        }
+        LogicalPlan::SubqueryAlias(subquery_alias) => {
+            with_named_input(&subquery_alias.input, |input| {
+                let mut subquery_alias = subquery_alias.clone();
+                subquery_alias.input = input;
+                LogicalPlan::SubqueryAlias(subquery_alias)
+            })
         }
         _ => Ok(None),
     }
+}
+
+/// Rebuilds a node around a named input, or `None` where the input needs no naming.
+fn with_named_input(
+    input: &Arc<LogicalPlan>,
+    rebuild: impl FnOnce(Arc<LogicalPlan>) -> LogicalPlan,
+) -> Result<Option<LogicalPlan>> {
+    Ok(name_scope_projection_outputs(input)?.map(|named| rebuild(Arc::new(named))))
 }
 
 /// The projection with each unnamed output aliased to the name its schema reports.

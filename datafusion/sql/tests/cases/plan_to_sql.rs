@@ -6282,6 +6282,34 @@ fn test_derived_output_under_subquery_alias_is_named() -> Result<()> {
 }
 
 #[test]
+fn test_derived_output_under_distinct_on_with_sort_is_named() -> Result<()> {
+    // `DISTINCT ON` carries its own `ORDER BY`, and rebuilding the node from the
+    // expressions a plan reports drops it — `LogicalPlan::with_new_exprs` asserts
+    // it was not asked to. Replacing only the input keeps every other field, so a
+    // plan with sort expressions is named rather than panicked on.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")), col("t.a")])?
+        .distinct_on(
+            vec![col("t.a")],
+            vec![col("t.a + t.b"), col("t.a")],
+            Some(vec![col("t.a").sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        .project(vec![col("t.a + t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT DISTINCT ON (t.a) "t.a + t.b", a FROM (SELECT (t.a + t.b) AS "t.a + t.b", t.a FROM t) ORDER BY a ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     // An alias and a bare column already carry the name the enclosing scope
     // uses, so neither is renamed and neither picks up a redundant alias.
