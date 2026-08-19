@@ -2719,36 +2719,56 @@ impl Unparser<'_> {
         matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
     }
 
+    /// Aliases the unparser may invent for a derived table it introduces.
+    ///
+    /// These reach the emitted `FROM` without appearing anywhere in the plan, so
+    /// [`Self::scope_qualifiers`] cannot find them by walking it. They are treated
+    /// as always in scope inside an `EXISTS` body: a correlated reference to a
+    /// relation a user happened to name one of these is refused rather than
+    /// emitted, since the invented alias would capture it.
+    const UNPARSER_DERIVED_ALIASES: [&'static str; 8] = [
+        "derived_aggregate",
+        "derived_distinct",
+        "derived_limit",
+        "derived_projection",
+        "derived_sort",
+        "derived_union",
+        "derived_unnest",
+        "derived_window_input",
+    ];
+
     /// The qualifiers the `EXISTS` body's `FROM` will answer to.
     ///
-    /// Not the same thing as the qualifiers on `plan`'s output schema. A
-    /// projection that prunes every column of a relation leaves that relation
-    /// with no qualified output field, yet it is still named in the emitted
-    /// `FROM` and still captures a reference using its name — so the schema
-    /// alone under-reports the scope, in the direction that emits wrong rows.
+    /// Read from the relations the `FROM` introduces rather than from `plan`'s
+    /// output schema, which is a proxy that is wrong in both directions:
     ///
-    /// So both halves are needed, and neither subsumes the other: the schema
-    /// reports a qualifier a node introduces without a scan beneath it — a
-    /// `SubqueryAlias`'s alias, say — while the walk reports a scanned relation
-    /// the schema has lost. The walk stops at a `SubqueryAlias` because a derived
-    /// table's inner relations are not addressable through its alias, so
-    /// collecting them would refuse references that bind perfectly well.
+    /// * A projection pruning every column of a relation leaves it with no
+    ///   qualified output field, while it is still named in the `FROM` and still
+    ///   captures a reference using its name.
+    /// * A `SubqueryAlias` puts its alias on the schema as the whole
+    ///   [`TableReference`] it was built from, but a derived table's alias is a
+    ///   single identifier, so only `table()` is emitted — and dialect-independently
+    ///   so, unlike a scanned relation. Keying an alias `s.a` off the schema would
+    ///   miss an outer `a.c` that `AS a` really does capture, and refuse an outer
+    ///   `s.a.c` that it does not.
+    ///
+    /// The walk stops at a `SubqueryAlias`: an alias replaces the name it is given
+    /// to, so the relations it encloses are not addressable through it and
+    /// collecting them would refuse references that bind correctly.
     fn scope_qualifiers(&self, plan: &LogicalPlan) -> Result<Vec<Vec<String>>> {
-        let mut qualifiers: Vec<Vec<String>> = plan
-            .schema()
+        let mut qualifiers: Vec<Vec<String>> = Self::UNPARSER_DERIVED_ALIASES
             .iter()
-            .filter_map(|(relation, _)| relation)
-            .map(|relation| self.emitted_qualifier(relation))
+            .map(|alias| vec![(*alias).to_string()])
             .collect();
         plan.apply(|node| match node {
             LogicalPlan::TableScan(scan) => {
                 qualifiers.push(self.emitted_qualifier(&scan.table_name));
                 Ok(TreeNodeRecursion::Continue)
             }
-            // The alias is already on this node's output schema, collected
-            // above; what the walk has to do here is stop, so the relations it
-            // encloses are not collected as if they were in scope.
-            LogicalPlan::SubqueryAlias(_) => Ok(TreeNodeRecursion::Jump),
+            LogicalPlan::SubqueryAlias(alias) => {
+                qualifiers.push(vec![alias.alias.table().to_string()]);
+                Ok(TreeNodeRecursion::Jump)
+            }
             _ => Ok(TreeNodeRecursion::Continue),
         })?;
         Ok(qualifiers)

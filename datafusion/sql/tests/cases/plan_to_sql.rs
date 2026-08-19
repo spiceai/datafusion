@@ -3546,6 +3546,97 @@ fn test_unparse_right_semi_join_without_fetch_refuses_shadowed_correlation() -> 
     Ok(())
 }
 
+/// Builds `LeftSemi Join` correlating `<probe>.c > 0` against a build side aliased
+/// `s.a`, which the unparser emits as the single identifier `AS "a"`.
+fn qualified_alias_build_side_semi_join(probe_name: &str) -> Result<LogicalPlan> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some(probe_name), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t2"), &schema, Some(vec![0]))?
+        .alias("s.a")?
+        .build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .project(vec![col(format!("{probe_name}.d"))])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col(format!("{probe_name}.c")).gt(lit(0))],
+        )?
+        .build()
+}
+
+/// A derived table's alias is a single identifier however the dialect spells
+/// columns, so a *qualified* alias captures under only its last component.
+///
+/// The build side is aliased `s.a` and emitted `AS "a"`, so an outer relation
+/// named `a` is shadowed. Keying the alias off the output schema — which carries
+/// the whole `s.a` reference — misses this, because on a fully-qualifying dialect
+/// it looks for `s.a` while the SQL only ever says `a`.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_qualified_alias_last_component()
+-> Result<()> {
+    let plan = qualified_alias_build_side_semi_join("a")?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let err = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("an alias emitted as `AS a` must be seen to shadow the outer `a`");
+    assert_eq!(err.to_string(), CAPTURED_CORRELATION_REFUSAL);
+    Ok(())
+}
+
+/// The other direction: `AS "a"` does not shadow an outer `s.a`, so that keeps its
+/// pushdown.
+///
+/// `s.a.c` names schema `s`, table `a`; the alias is an unqualified `a` and does
+/// not answer to it, so the reference binds outward. Keying the alias off the
+/// schema would have matched `s.a` here and refused correct SQL — the same
+/// mismatch as the test above, costing pushdown instead of correctness.
+#[test]
+fn test_unparse_left_semi_join_keeps_qualified_reference_past_bare_alias() -> Result<()> {
+    let plan = qualified_alias_build_side_semi_join("s.a")?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @"SELECT s.a.d FROM s.a WHERE EXISTS (SELECT 1 FROM t2 AS a WHERE (s.a.c > 0))"
+    );
+    Ok(())
+}
+
+/// An alias the unparser invents for a derived table is in the emitted scope even
+/// though it appears nowhere in the plan.
+///
+/// A relation a user named `derived_limit` cannot be distinguished from the alias
+/// `exists_scope_name` hands a bounded build side, so a correlation naming it is
+/// refused rather than risk the invented alias capturing it. Refusing costs the
+/// pushdown on a pathological table name; emitting risks wrong rows.
+#[test]
+fn test_unparse_left_semi_join_refuses_correlation_naming_an_invented_alias() -> Result<()>
+{
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("derived_limit"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("derived_limit.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("derived_limit.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a correlation naming an alias the unparser can invent must be refused",
+    );
+    Ok(())
+}
+
 /// A relation the build side renames is not in the emitted scope under its own
 /// name, so a correlation naming it is not captured and must keep its pushdown.
 ///
