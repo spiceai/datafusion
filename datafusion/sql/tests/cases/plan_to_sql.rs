@@ -3546,6 +3546,110 @@ fn test_unparse_right_semi_join_without_fetch_refuses_shadowed_correlation() -> 
     Ok(())
 }
 
+/// A relation the build side renames is not in the emitted scope under its own
+/// name, so a correlation naming it is not captured and must keep its pushdown.
+///
+/// The build side scans `t` — the probe's own relation — but emits it as
+/// `FROM "t" AS "derived"`. An alias *replaces* the name it is given to, so `"t"`
+/// is not addressable inside the subquery and `"t"."c" > 0` binds outward,
+/// exactly as intended.
+///
+/// This is why the scope walk stops at a `SubqueryAlias` rather than descending:
+/// collecting the renamed `t` would read this as a collision and refuse working
+/// SQL.
+#[test]
+fn test_unparse_left_semi_join_keeps_relation_enclosed_by_build_side_alias() -> Result<()>
+{
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .alias("derived")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t"."d" FROM "t" WHERE EXISTS (SELECT 1 FROM "t" AS "derived" WHERE ("t"."c" > 0))"#
+    );
+    Ok(())
+}
+
+/// A build side aliased to the probe's own name captures through the alias.
+///
+/// The enclosed relation is `t2`, which shares nothing with the probe — what
+/// collides is the alias the derived table is given. `EXISTS (SELECT 1 FROM
+/// (...) AS "t" WHERE ...)` puts `"t"` in the inner scope, so a correlated
+/// reference qualified by `t` binds there.
+///
+/// This is the half of the scope the `FROM` walk cannot see: it stops at the
+/// alias, so the alias has to come from the output schema, which is what carries
+/// it.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_build_side_alias() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t2"), &schema, Some(vec![0]))?
+        .alias("t")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a build side aliased to the probe's name must be seen to capture",
+    );
+    Ok(())
+}
+
+/// A build side that projects away every column still names its relation in the
+/// emitted `FROM`, so it still captures.
+///
+/// `TableScan t` with `projection=[]` has no qualified output field at all, so
+/// reading the scope off the output schema reports it as sharing nothing. The SQL
+/// says otherwise: `FROM "t"` is emitted, and a probe-only filter `"t"."c" > 0`
+/// binds to that inner `t`. The `EXISTS` then asks whether *any* inner row is
+/// positive rather than testing each probe row — one answer for the whole join,
+/// so a semi join keeps every probe row or none.
+///
+/// Before the scope was read from the relations the `FROM` introduces, this
+/// unparsed to
+/// `SELECT "t"."d" FROM "t" WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t"."c" > 0))`.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_unprojected_build_relation()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a build relation with no projected columns must still be seen to capture",
+    );
+    Ok(())
+}
+
 /// A dialect that spells columns in full keeps those two relations apart, so
 /// there is no capture and the pushdown must survive.
 ///

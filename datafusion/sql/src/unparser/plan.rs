@@ -2719,6 +2719,41 @@ impl Unparser<'_> {
         matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
     }
 
+    /// The qualifiers the `EXISTS` body's `FROM` will answer to.
+    ///
+    /// Not the same thing as the qualifiers on `plan`'s output schema. A
+    /// projection that prunes every column of a relation leaves that relation
+    /// with no qualified output field, yet it is still named in the emitted
+    /// `FROM` and still captures a reference using its name — so the schema
+    /// alone under-reports the scope, in the direction that emits wrong rows.
+    ///
+    /// So both halves are needed, and neither subsumes the other: the schema
+    /// reports a qualifier a node introduces without a scan beneath it — a
+    /// `SubqueryAlias`'s alias, say — while the walk reports a scanned relation
+    /// the schema has lost. The walk stops at a `SubqueryAlias` because a derived
+    /// table's inner relations are not addressable through its alias, so
+    /// collecting them would refuse references that bind perfectly well.
+    fn scope_qualifiers(&self, plan: &LogicalPlan) -> Result<Vec<Vec<String>>> {
+        let mut qualifiers: Vec<Vec<String>> = plan
+            .schema()
+            .iter()
+            .filter_map(|(relation, _)| relation)
+            .map(|relation| self.emitted_qualifier(relation))
+            .collect();
+        plan.apply(|node| match node {
+            LogicalPlan::TableScan(scan) => {
+                qualifiers.push(self.emitted_qualifier(&scan.table_name));
+                Ok(TreeNodeRecursion::Continue)
+            }
+            // The alias is already on this node's output schema, collected
+            // above; what the walk has to do here is stop, so the relations it
+            // encloses are not collected as if they were in scope.
+            LogicalPlan::SubqueryAlias(_) => Ok(TreeNodeRecursion::Jump),
+            _ => Ok(TreeNodeRecursion::Continue),
+        })?;
+        Ok(qualifiers)
+    }
+
     /// Refuses a correlation that the `EXISTS` body's own `FROM` would capture.
     ///
     /// The correlated predicates are emitted inside the subquery, so every
@@ -2759,9 +2794,11 @@ impl Unparser<'_> {
     ///
     /// * An unqualified correlated reference, which names no relation to collide
     ///   with, so which scope it resolves against is that rewrite's question.
-    /// * A shared relation whose columns one side projects away entirely, which
-    ///   drops that side's qualifier from the schema read here, so a
-    ///   filter-carried collision becomes invisible.
+    /// * A relation reached through a `SubqueryAlias`, whose own name the emitted
+    ///   SQL replaces with the alias. The alias is what this compares, which is
+    ///   right for a reference written against it, but a correlated reference
+    ///   still qualified by the enclosed relation is a shape the rewrite has to
+    ///   requalify rather than refuse.
     fn ensure_exists_correlation_not_shadowed(&self, join: &Join) -> Result<()> {
         let swapped = Self::swaps_join_inputs(join.join_type);
         let (probe_plan, build_plan) = if swapped {
@@ -2770,14 +2807,6 @@ impl Unparser<'_> {
             (&join.left, &join.right)
         };
 
-        // Duplicates cannot change a membership test, so these are not deduped.
-        let emitted_qualifiers = |plan: &LogicalPlan| -> Vec<Vec<String>> {
-            plan.schema()
-                .iter()
-                .filter_map(|(relation, _)| relation)
-                .map(|relation| self.emitted_qualifier(relation))
-                .collect()
-        };
         let references_any = |expr: &Expr, candidates: &[Vec<String>]| {
             expr.column_refs().into_iter().any(|column| {
                 column.relation.as_ref().is_some_and(|relation| {
@@ -2786,20 +2815,24 @@ impl Unparser<'_> {
             })
         };
 
-        let build_qualifiers = emitted_qualifiers(build_plan);
+        let build_qualifiers = self.scope_qualifiers(build_plan)?;
         let on_captured = join
             .on
             .iter()
             .map(|(left, right)| if swapped { right } else { left })
             .any(|correlated| references_any(correlated, &build_qualifiers));
         // Computed only when there is a filter, which most joins do not have.
-        let filter_captured = join.filter.as_ref().is_some_and(|filter| {
-            let shared: Vec<Vec<String>> = emitted_qualifiers(probe_plan)
-                .into_iter()
-                .filter(|qualifier| build_qualifiers.contains(qualifier))
-                .collect();
-            references_any(filter, &shared)
-        });
+        let filter_captured = match &join.filter {
+            Some(filter) => {
+                let shared: Vec<Vec<String>> = self
+                    .scope_qualifiers(probe_plan)?
+                    .into_iter()
+                    .filter(|qualifier| build_qualifiers.contains(qualifier))
+                    .collect();
+                references_any(filter, &shared)
+            }
+            None => false,
+        };
 
         if on_captured || filter_captured {
             return not_impl_err!(
