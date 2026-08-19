@@ -3439,13 +3439,9 @@ fn test_unparse_left_semi_join_refuses_multi_relation_build_side() -> Result<()>
 fn test_unparse_left_semi_join_refuses_probe_qualified_correlation() -> Result<()> {
     let plan = probe_qualified_self_join(Some(5), datafusion_expr::JoinType::LeftSemi)?;
 
-    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
-    let err = unparser
-        .plan_to_sql(&plan)
-        .expect_err("a probe-qualified correlation must be refused, not shadowed");
-    assert_snapshot!(
-        err,
-        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
+    assert_captured_correlation_refused(
+        &plan,
+        "a probe-qualified correlation must be refused, not shadowed",
     );
     Ok(())
 }
@@ -3470,6 +3466,22 @@ fn test_unparse_left_semi_join_without_fetch_keeps_multi_relation_correlation()
     Ok(())
 }
 
+/// The refusal every captured-correlation shape must produce, spelled once.
+///
+/// Asserted rather than snapshotted: an inline snapshot is keyed by the location
+/// of its macro, so one shared by several tests collides between them. Every
+/// caller has to produce this identical string, which is what makes sharing it
+/// the point — a reword stays a one-place edit.
+const CAPTURED_CORRELATION_REFUSAL: &str = "This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query";
+
+#[track_caller]
+fn assert_captured_correlation_refused(plan: &LogicalPlan, context: &str) {
+    let err = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(plan)
+        .expect_err(context);
+    assert_eq!(err.to_string(), CAPTURED_CORRELATION_REFUSAL);
+}
+
 /// The capture does not need a bound to bite. With no bound at all the same
 /// plan used to unparse to
 /// `... WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t"."c" = "t"."c"))`, whose inner
@@ -3489,13 +3501,9 @@ fn test_unparse_left_semi_join_without_fetch_refuses_shadowed_correlation() -> R
 {
     let plan = probe_qualified_self_join(None, datafusion_expr::JoinType::LeftSemi)?;
 
-    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
-    let err = unparser
-        .plan_to_sql(&plan)
-        .expect_err("an unbounded shadowed correlation must be refused, not emitted");
-    assert_snapshot!(
-        err,
-        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
+    assert_captured_correlation_refused(
+        &plan,
+        "an unbounded shadowed correlation must be refused, not emitted",
     );
     Ok(())
 }
@@ -3511,11 +3519,10 @@ fn test_unparse_left_anti_join_without_fetch_refuses_shadowed_correlation() -> R
 {
     let plan = probe_qualified_self_join(None, datafusion_expr::JoinType::LeftAnti)?;
 
-    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
-    let err = unparser
-        .plan_to_sql(&plan)
-        .expect_err("an unbounded shadowed anti-join correlation must be refused");
-    assert_snapshot!(err, @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query");
+    assert_captured_correlation_refused(
+        &plan,
+        "an unbounded shadowed anti-join correlation must be refused",
+    );
     Ok(())
 }
 
@@ -3532,11 +3539,88 @@ fn test_unparse_right_semi_join_without_fetch_refuses_shadowed_correlation() -> 
 {
     let plan = probe_qualified_self_join(None, datafusion_expr::JoinType::RightSemi)?;
 
+    assert_captured_correlation_refused(
+        &plan,
+        "a swapped shadowed correlation must be refused too",
+    );
+    Ok(())
+}
+
+/// A dialect that spells columns in full keeps those two relations apart, so
+/// there is no capture and the pushdown must survive.
+///
+/// This is the other half of the finding above: keying the refusal on the bare
+/// table name unconditionally refuses this plan, whose SQL binds correctly —
+/// `public.t.c` names the outer relation and nothing shadows it. The refusal has
+/// to ask the dialect how the qualifier will be spelled, which is why it goes
+/// through `emitted_qualifier` rather than reading the `TableReference`.
+///
+/// The bound is absent deliberately: `exists_scope_name` is consulted only when
+/// one is present, so nothing else in this file would refuse this shape, and a
+/// guard keyed on the bare name would be the only thing standing between a
+/// working pushdown and a query failure.
+#[test]
+fn test_unparse_left_semi_join_keeps_cross_schema_on_full_column_dialect() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("public.t"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("other.t"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("public.t.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("public.t.c").eq(col("other.t.c"))],
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @"SELECT public.t.d FROM public.t WHERE EXISTS (SELECT 1 FROM other.t WHERE (public.t.c = other.t.c))"
+    );
+    Ok(())
+}
+
+/// `exists_scope_name`'s probe-qualified arm still has a shape that reaches it,
+/// and this pins that it does.
+///
+/// The correlation is carried entirely by a filter naming only probe relations,
+/// and the two sides share no qualifier — so the capture guard returns without
+/// refusing, and the bound then demands a scope name that has no build-side
+/// relation to take. Without this, that arm has no coverage: the test that used
+/// to reach it now stops at the capture guard instead, which is a refusal moving
+/// rather than a shape disappearing.
+#[test]
+fn test_unparse_left_semi_join_refuses_probe_only_filter_with_bound() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan_with_filter_and_fetch(
+        Some("t2"),
+        &schema,
+        Some(vec![0]),
+        vec![],
+        Some(5),
+    )?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t1.c").gt(col("t1.d"))],
+        )?
+        .build()?;
+
     let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
     let err = unparser
         .plan_to_sql(&plan)
-        .expect_err("a swapped shadowed correlation must be refused too");
-    assert_snapshot!(err, @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query");
+        .expect_err("a bound with no build-side qualifier to scope must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a row bound on an EXISTS-style join's build side is not supported when the correlation's only qualifier is one the probe side also answers to"
+    );
     Ok(())
 }
 
@@ -3544,8 +3628,8 @@ fn test_unparse_right_semi_join_without_fetch_refuses_shadowed_correlation() -> 
 /// emitted SQL even though their `TableReference`s differ.
 ///
 /// On a dialect that does not spell columns in full, a qualified column renders
-/// as its relation's last component, so both `s1.t.c` and `s2.t.c` emit as
-/// `"t"."c"` — and inside `FROM "s2"."t"` both bind to the inner relation, which
+/// as its relation's last component, so both `public.t.c` and `other.t.c` emit as
+/// `"t"."c"` — and inside `FROM "other"."t"` both bind to the inner relation, which
 /// is the same tautology as the bare self-join. Comparing the references whole
 /// would read these as disjoint and let it through; before this was caught, the
 /// plan unparsed to
@@ -3564,11 +3648,10 @@ fn test_unparse_left_semi_join_refuses_cross_schema_name_collision() -> Result<(
         )?
         .build()?;
 
-    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
-    let err = unparser
-        .plan_to_sql(&plan)
-        .expect_err("relations sharing an emitted name must be refused");
-    assert_snapshot!(err, @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query");
+    assert_captured_correlation_refused(
+        &plan,
+        "relations sharing an emitted name must be refused",
+    );
     Ok(())
 }
 
@@ -3633,13 +3716,9 @@ fn test_unparse_left_semi_join_refuses_shadowed_correlation_in_join_keys() -> Re
         )?
         .build()?;
 
-    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
-    let err = unparser
-        .plan_to_sql(&plan)
-        .expect_err("a shadowed correlation in the join keys must be refused too");
-    assert_snapshot!(
-        err,
-        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
+    assert_captured_correlation_refused(
+        &plan,
+        "a shadowed correlation in the join keys must be refused too",
     );
     Ok(())
 }

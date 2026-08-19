@@ -2595,7 +2595,7 @@ impl Unparser<'_> {
         // Checked before any of the body is built: this refusal is about the
         // correlation's qualifiers alone, and holds whether or not a bound is
         // found below.
-        Self::ensure_exists_correlation_not_shadowed(join)?;
+        self.ensure_exists_correlation_not_shadowed(join)?;
 
         let mut query_builder = Some(QueryBuilder::default());
         let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
@@ -2723,7 +2723,7 @@ impl Unparser<'_> {
     ///
     /// The correlated predicates are emitted inside the subquery, so every
     /// reference in them binds to the innermost scope answering to its qualifier.
-    /// A reference meant for the outer query whose name the build side also
+    /// A reference meant for the outer query whose qualifier the build side also
     /// answers to therefore binds to the subquery's own relation instead: the
     /// correlation becomes a comparison of an inner row with itself, `EXISTS`
     /// degenerates to "this relation has a row", and a semi or mark join then
@@ -2731,41 +2731,38 @@ impl Unparser<'_> {
     /// SQL, so a database runs it and returns those wrong rows.
     ///
     /// SQL's scoping rules decide it on their own, so the capture does not need a
-    /// row bound to happen and is checked before one is looked for. Refusing
-    /// costs the pushdown, which is the trade [`Self::exists_scope_name`] already
-    /// makes for output that binds and runs rather than failing.
+    /// row bound to happen. Refusing costs the pushdown, which is the trade
+    /// [`Self::exists_scope_name`] already makes for output that binds and runs
+    /// rather than failing.
     ///
-    /// Two things this has to get right, both of which cost correctness in one
-    /// direction and pushdown in the other:
+    /// Two things this has to get right, each of which costs correctness one way
+    /// and pushdown the other:
     ///
-    /// * **Compare the name the SQL is spelled with, not the `TableReference`.**
-    ///   A qualified column renders as its relation's last component on the
-    ///   dialects that do not spell columns in full, so `s1.t` and `s2.t` are
-    ///   distinct references that both emit as `t` and both bind to whichever
-    ///   `t` the subquery's `FROM` introduces. Comparing the references whole
-    ///   reads them as disjoint and lets the capture through.
+    /// * **Ask how the qualifier will be spelled**, via
+    ///   [`Self::emitted_qualifier`], rather than comparing the
+    ///   [`TableReference`]. A dialect that elides the prefix emits `s1.t` and
+    ///   `s2.t` alike as `t`, so distinct references collide; a dialect that
+    ///   spells columns in full keeps them apart, and refusing there would cost
+    ///   the pushdown on SQL that binds correctly. Neither is inferable from the
+    ///   reference alone.
     /// * **Attribute each `on` pair by side.** The pairs are already split into
     ///   `(left, right)`, and only the probe half is the correlated reference; a
     ///   build half naming a build relation is an ordinary local reference that
     ///   binds inside on purpose. Testing both halves refuses every join whose
-    ///   build side shares a name with the probe, including the correct ones.
-    ///   `join.filter` carries no such split, so a reference in it cannot be
-    ///   attributed — there, only a name *both* sides answer to is refused,
-    ///   which no reference to a distinct relation can be.
+    ///   build side shares a qualifier with the probe, including the correct
+    ///   ones. `join.filter` carries no such split, so a reference in it cannot
+    ///   be attributed — there, only a qualifier *both* sides answer to is
+    ///   refused, which no reference to a distinct relation can be.
     ///
-    /// Left alone, and left to the qualifier rewrite tracked by
-    /// spiceai/spiceai#12840: an unqualified correlated reference, which names no
-    /// relation to collide with; and a shared relation whose columns one side
-    /// projects away entirely, which drops that side's name from the schema this
-    /// reads, so a filter-carried collision becomes invisible. Conversely this is
-    /// conservative under a dialect that spells columns in full, where the
-    /// distinct qualifiers would have kept the reference bound — that dialect is
-    /// already refused a scope by [`Self::exists_scope_name`] for the same
-    /// spelling reason.
-    fn ensure_exists_correlation_not_shadowed(join: &Join) -> Result<()> {
-        // Which input is correlated against, and therefore which half of each
-        // `on` pair is the correlated reference, follows the same swap the join
-        // arm applies before it builds this subquery.
+    /// Two gaps are left to the qualifier rewrite tracked by
+    /// spiceai/spiceai#12840:
+    ///
+    /// * An unqualified correlated reference, which names no relation to collide
+    ///   with, so which scope it resolves against is that rewrite's question.
+    /// * A shared relation whose columns one side projects away entirely, which
+    ///   drops that side's qualifier from the schema read here, so a
+    ///   filter-carried collision becomes invisible.
+    fn ensure_exists_correlation_not_shadowed(&self, join: &Join) -> Result<()> {
         let swapped = Self::swaps_join_inputs(join.join_type);
         let (probe_plan, build_plan) = if swapped {
             (&join.right, &join.left)
@@ -2773,41 +2770,38 @@ impl Unparser<'_> {
             (&join.left, &join.right)
         };
 
-        // The emitted name, which is what a reference in the subquery binds on.
-        let emitted_names = |plan: &LogicalPlan| -> Vec<String> {
-            let mut names: Vec<String> = Vec::new();
-            for (relation, _) in plan.schema().iter() {
-                if let Some(relation) = relation
-                    && !names.iter().any(|name| name == relation.table())
-                {
-                    names.push(relation.table().to_string());
-                }
-            }
-            names
+        // Duplicates cannot change a membership test, so these are not deduped.
+        let emitted_qualifiers = |plan: &LogicalPlan| -> Vec<Vec<String>> {
+            plan.schema()
+                .iter()
+                .filter_map(|(relation, _)| relation)
+                .map(|relation| self.emitted_qualifier(relation))
+                .collect()
         };
-        let build_names = emitted_names(build_plan);
-        let names_any = |expr: &Expr, candidates: &[String]| {
+        let references_any = |expr: &Expr, candidates: &[Vec<String>]| {
             expr.column_refs().into_iter().any(|column| {
                 column.relation.as_ref().is_some_and(|relation| {
-                    candidates.iter().any(|name| name == relation.table())
+                    candidates.contains(&self.emitted_qualifier(relation))
                 })
             })
         };
 
-        let captured = join
+        let build_qualifiers = emitted_qualifiers(build_plan);
+        let on_captured = join
             .on
             .iter()
             .map(|(left, right)| if swapped { right } else { left })
-            .any(|correlated| names_any(correlated, &build_names))
-            || join.filter.as_ref().is_some_and(|filter| {
-                let shared: Vec<String> = emitted_names(probe_plan)
-                    .into_iter()
-                    .filter(|name| build_names.contains(name))
-                    .collect();
-                names_any(filter, &shared)
-            });
+            .any(|correlated| references_any(correlated, &build_qualifiers));
+        // Computed only when there is a filter, which most joins do not have.
+        let filter_captured = join.filter.as_ref().is_some_and(|filter| {
+            let shared: Vec<Vec<String>> = emitted_qualifiers(probe_plan)
+                .into_iter()
+                .filter(|qualifier| build_qualifiers.contains(qualifier))
+                .collect();
+            references_any(filter, &shared)
+        });
 
-        if captured {
+        if on_captured || filter_captured {
             return not_impl_err!(
                 "Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
             );

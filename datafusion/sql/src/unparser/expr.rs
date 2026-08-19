@@ -45,8 +45,9 @@ use arrow::datatypes::{
 };
 use arrow::util::display::array_value_to_string;
 use datafusion_common::{
-    Column, Result, ScalarValue, assert_eq_or_internal_err, assert_or_internal_err,
-    internal_datafusion_err, internal_err, not_impl_err, plan_err,
+    Column, Result, ScalarValue, TableReference, assert_eq_or_internal_err,
+    assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
+    plan_err,
 };
 use datafusion_expr::{
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator, TryCast,
@@ -841,6 +842,22 @@ impl Unparser<'_> {
         }
     }
 
+    /// The identifier components this dialect spells a column's qualifier with.
+    ///
+    /// A dialect that does not spell columns in full writes only the relation's
+    /// last component, so two relations distinguished by schema or catalog are
+    /// emitted — and therefore bound — identically. Anything reasoning about how a
+    /// reference will resolve has to ask this rather than read the
+    /// [`TableReference`], or it will disagree with what
+    /// [`Self::col_to_sql`] actually writes.
+    pub(crate) fn emitted_qualifier(&self, table_ref: &TableReference) -> Vec<String> {
+        if self.dialect.full_qualified_col() {
+            table_ref.to_vec()
+        } else {
+            vec![table_ref.table().to_string()]
+        }
+    }
+
     pub fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
         // Replace the column name if the dialect has an override
         let col_name =
@@ -851,11 +868,7 @@ impl Unparser<'_> {
             };
 
         if let Some(table_ref) = &col.relation {
-            let mut id = if self.dialect.full_qualified_col() {
-                table_ref.to_vec()
-            } else {
-                vec![table_ref.table().to_string()]
-            };
+            let mut id = self.emitted_qualifier(table_ref);
             id.push(col_name);
             return Ok(ast::Expr::CompoundIdentifier(
                 id.iter()
