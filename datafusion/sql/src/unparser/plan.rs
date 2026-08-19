@@ -2592,6 +2592,11 @@ impl Unparser<'_> {
         right_plan: &LogicalPlan,
         join: &Join,
     ) -> Result<ast::Query> {
+        // Checked before any of the body is built: this refusal is about the
+        // correlation's qualifiers alone, and holds whether or not a bound is
+        // found below.
+        Self::ensure_exists_correlation_not_shadowed(join)?;
+
         let mut query_builder = Some(QueryBuilder::default());
         let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
         let mut query_builder = query_builder.unwrap();
@@ -2714,6 +2719,102 @@ impl Unparser<'_> {
         matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
     }
 
+    /// Refuses a correlation that the `EXISTS` body's own `FROM` would capture.
+    ///
+    /// The correlated predicates are emitted inside the subquery, so every
+    /// reference in them binds to the innermost scope answering to its qualifier.
+    /// A reference meant for the outer query whose name the build side also
+    /// answers to therefore binds to the subquery's own relation instead: the
+    /// correlation becomes a comparison of an inner row with itself, `EXISTS`
+    /// degenerates to "this relation has a row", and a semi or mark join then
+    /// keeps every probe row while an anti join drops every one. That is valid
+    /// SQL, so a database runs it and returns those wrong rows.
+    ///
+    /// SQL's scoping rules decide it on their own, so the capture does not need a
+    /// row bound to happen and is checked before one is looked for. Refusing
+    /// costs the pushdown, which is the trade [`Self::exists_scope_name`] already
+    /// makes for output that binds and runs rather than failing.
+    ///
+    /// Two things this has to get right, both of which cost correctness in one
+    /// direction and pushdown in the other:
+    ///
+    /// * **Compare the name the SQL is spelled with, not the `TableReference`.**
+    ///   A qualified column renders as its relation's last component on the
+    ///   dialects that do not spell columns in full, so `s1.t` and `s2.t` are
+    ///   distinct references that both emit as `t` and both bind to whichever
+    ///   `t` the subquery's `FROM` introduces. Comparing the references whole
+    ///   reads them as disjoint and lets the capture through.
+    /// * **Attribute each `on` pair by side.** The pairs are already split into
+    ///   `(left, right)`, and only the probe half is the correlated reference; a
+    ///   build half naming a build relation is an ordinary local reference that
+    ///   binds inside on purpose. Testing both halves refuses every join whose
+    ///   build side shares a name with the probe, including the correct ones.
+    ///   `join.filter` carries no such split, so a reference in it cannot be
+    ///   attributed — there, only a name *both* sides answer to is refused,
+    ///   which no reference to a distinct relation can be.
+    ///
+    /// Left alone, and left to the qualifier rewrite tracked by
+    /// spiceai/spiceai#12840: an unqualified correlated reference, which names no
+    /// relation to collide with; and a shared relation whose columns one side
+    /// projects away entirely, which drops that side's name from the schema this
+    /// reads, so a filter-carried collision becomes invisible. Conversely this is
+    /// conservative under a dialect that spells columns in full, where the
+    /// distinct qualifiers would have kept the reference bound — that dialect is
+    /// already refused a scope by [`Self::exists_scope_name`] for the same
+    /// spelling reason.
+    fn ensure_exists_correlation_not_shadowed(join: &Join) -> Result<()> {
+        // Which input is correlated against, and therefore which half of each
+        // `on` pair is the correlated reference, follows the same swap the join
+        // arm applies before it builds this subquery.
+        let swapped = Self::swaps_join_inputs(join.join_type);
+        let (probe_plan, build_plan) = if swapped {
+            (&join.right, &join.left)
+        } else {
+            (&join.left, &join.right)
+        };
+
+        // The emitted name, which is what a reference in the subquery binds on.
+        let emitted_names = |plan: &LogicalPlan| -> Vec<String> {
+            let mut names: Vec<String> = Vec::new();
+            for (relation, _) in plan.schema().iter() {
+                if let Some(relation) = relation
+                    && !names.iter().any(|name| name == relation.table())
+                {
+                    names.push(relation.table().to_string());
+                }
+            }
+            names
+        };
+        let build_names = emitted_names(build_plan);
+        let names_any = |expr: &Expr, candidates: &[String]| {
+            expr.column_refs().into_iter().any(|column| {
+                column.relation.as_ref().is_some_and(|relation| {
+                    candidates.iter().any(|name| name == relation.table())
+                })
+            })
+        };
+
+        let captured = join
+            .on
+            .iter()
+            .map(|(left, right)| if swapped { right } else { left })
+            .any(|correlated| names_any(correlated, &build_names))
+            || join.filter.as_ref().is_some_and(|filter| {
+                let shared: Vec<String> = emitted_names(probe_plan)
+                    .into_iter()
+                    .filter(|name| build_names.contains(name))
+                    .collect();
+                names_any(filter, &shared)
+            });
+
+        if captured {
+            return not_impl_err!(
+                "Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
+            );
+        }
+        Ok(())
+    }
+
     /// The name a scope around the `EXISTS` build side has to answer to, so the
     /// correlated predicates still resolve against it.
     ///
@@ -2783,10 +2884,15 @@ impl Unparser<'_> {
             [] if !names_a_probe_relation => Ok("derived_limit".to_string()),
             // A qualifier the probe side also answers to can be a build-side
             // reference on a self-join, where naming the scope anything else
-            // rebinds it to the probe. Both readings are wrong: the body's own
-            // relation already shadows the outer one, so the correlation is lost
-            // whatever the bound does, and renaming would only swap that wrong
-            // answer for a different one.
+            // rebinds it to the probe.
+            //
+            // Where the build side answers to that qualifier too — the self-join
+            // proper — `ensure_exists_correlation_not_shadowed` has already
+            // refused the plan, bound or not. What reaches here is the residue:
+            // a correlation qualified only by a probe relation the build side
+            // does not share, so nothing is captured, but there is also no
+            // build-side name for the scope to keep bound. Renaming it would
+            // rebind the reference to the probe, so this refuses instead.
             [] => {
                 not_impl_err!(
                     "Unparsing a row bound on an EXISTS-style join's build side is not supported when the correlation's only qualifier is one the probe side also answers to"

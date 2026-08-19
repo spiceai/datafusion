@@ -3333,10 +3333,13 @@ fn multi_relation_build_side_semi_join(fetch: Option<usize>) -> Result<LogicalPl
         .build()
 }
 
-/// Builds `LeftSemi Join: t.c = t.c` where the build side is the same relation as
-/// the probe, optionally bounded — the self-join whose correlation carries only a
-/// qualifier the probe also answers to.
-fn probe_qualified_self_join(fetch: Option<usize>) -> Result<LogicalPlan> {
+/// Builds `<join_type> Join: t.c = t.c` where the build side is the same relation
+/// as the probe, optionally bounded — the self-join whose correlation carries
+/// only a qualifier the probe also answers to.
+fn probe_qualified_self_join(
+    fetch: Option<usize>,
+    join_type: datafusion_expr::JoinType,
+) -> Result<LogicalPlan> {
     let schema = exists_fetch_schema();
     let probe = table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?;
     let build = table_scan_with_filter_and_fetch(
@@ -3350,10 +3353,42 @@ fn probe_qualified_self_join(fetch: Option<usize>) -> Result<LogicalPlan> {
 
     LogicalPlanBuilder::from(probe)
         .project(vec![col("t.d")])?
+        .join_on(build, join_type, vec![col("t.c").eq(col("t.c"))])?
+        .build()
+}
+
+/// Builds `LeftSemi Join: t1.c = t3.c` where the probe is `t1 INNER JOIN t` and
+/// the build side is `t INNER JOIN t3`, so the two sides share the qualifier `t`
+/// while the correlation names neither of them.
+///
+/// The shared qualifier is what makes capture *possible*; this plan separates
+/// that from a correlation actually being captured.
+fn overlapping_but_unreferenced_qualifier_semi_join() -> Result<LogicalPlan> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?
+        .join_on(
+            table_scan(Some("t"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.c").eq(col("t.c"))],
+        )?
+        .build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            table_scan(Some("t3"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.c").eq(col("t3.c"))],
+        )?
+        .build()?;
+
+    // `t.c` is kept in the projection deliberately: projecting every column of
+    // `t` away would leave the probe's schema carrying no `t` qualifier at all,
+    // and the overlap this plan exists to exercise would not be there.
+    LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d"), col("t.c")])?
         .join_on(
             build,
             datafusion_expr::JoinType::LeftSemi,
-            vec![col("t.c").eq(col("t.c"))],
+            vec![col("t1.c").eq(col("t3.c"))],
         )?
         .build()
 }
@@ -3387,24 +3422,22 @@ fn test_unparse_left_semi_join_refuses_multi_relation_build_side() -> Result<()>
     Ok(())
 }
 
-/// A correlation whose only qualifier is one the probe side also answers to
-/// cannot be scoped under an invented name: renaming the scope would rebind
-/// those references to the probe, turning the correlation into a comparison of
-/// the outer row with itself.
+/// A correlation whose only qualifier is one the probe side also answers to is
+/// captured by the subquery's own `FROM "t"`: `"t"."c" = "t"."c"` binds entirely
+/// to the inner relation, so the correlation is lost, the `EXISTS` reduces to
+/// "this table has a row", and the semi join keeps every probe row. That is
+/// valid SQL, so a database runs it and returns those wrong rows.
 ///
-/// Nor is leaving it alone a fallback. The subquery's own `FROM "t"` shadows the
-/// outer `"t"`, so `"t"."c" = "t"."c"` binds entirely to the inner relation: the
-/// correlation is lost, the `EXISTS` reduces to "this table has a row", and the
-/// semi join keeps every probe row. That is valid SQL, so it runs — both
-/// readings are wrong, which is why this is refused rather than emitted.
+/// Scoping the bound under an invented name does not repair it either — that
+/// would rebind the references to the probe, trading one wrong answer for
+/// another — so the shape is refused.
 ///
-/// The shadowing is independent of the bound and is tracked, with the rewrite
-/// that fixes it, by spiceai/spiceai#12840. This refusal only covers the bounded
-/// build side, which is where the scope is demanded; the unbounded shape is
-/// still emitted and still wrong.
+/// The bounded case is refused by the same bound-independent check as
+/// [`test_unparse_left_semi_join_without_fetch_refuses_shadowed_correlation`],
+/// which is why both report capture rather than a bound that cannot be scoped.
 #[test]
 fn test_unparse_left_semi_join_refuses_probe_qualified_correlation() -> Result<()> {
-    let plan = probe_qualified_self_join(Some(5))?;
+    let plan = probe_qualified_self_join(Some(5), datafusion_expr::JoinType::LeftSemi)?;
 
     let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
     let err = unparser
@@ -3412,7 +3445,7 @@ fn test_unparse_left_semi_join_refuses_probe_qualified_correlation() -> Result<(
         .expect_err("a probe-qualified correlation must be refused, not shadowed");
     assert_snapshot!(
         err,
-        @"This feature is not implemented: Unparsing a row bound on an EXISTS-style join's build side is not supported when the correlation's only qualifier is one the probe side also answers to"
+        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
     );
     Ok(())
 }
@@ -3437,21 +3470,199 @@ fn test_unparse_left_semi_join_without_fetch_keeps_multi_relation_correlation()
     Ok(())
 }
 
-/// Pins that the refusal above is gated on the bound: unbounded, the same
-/// correlation is still emitted. This output is **known-incorrect** — the inner
-/// `FROM "t"` shadows the outer `"t"`, so the correlation is lost — and it is not
-/// an endorsement. That shadowing is the pre-existing defect independent of any
-/// bound, so whoever lands the qualifier rewrite should expect this snapshot to
-/// change too.
+/// The capture does not need a bound to bite. With no bound at all the same
+/// plan used to unparse to
+/// `... WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t"."c" = "t"."c"))`, whose inner
+/// `FROM "t"` shadows the outer `"t"` — valid SQL that runs and answers from an
+/// inner tautology, so a semi or mark join keeps every probe row and an anti
+/// join drops every one.
+///
+/// Nothing about that depends on a row bound, so the refusal is decided by the
+/// correlation's qualifiers rather than by the bound, and the unbounded shape is
+/// refused on the same terms as the bounded one above.
+///
+/// Repairing it rather than refusing it needs the correlated qualifiers
+/// rewritten to the scope the derived table introduces, tracked by
+/// spiceai/spiceai#12840.
 #[test]
-fn test_unparse_left_semi_join_without_fetch_still_shadows_probe_qualifier() -> Result<()>
+fn test_unparse_left_semi_join_without_fetch_refuses_shadowed_correlation() -> Result<()>
 {
-    let plan = probe_qualified_self_join(None)?;
+    let plan = probe_qualified_self_join(None, datafusion_expr::JoinType::LeftSemi)?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let err = unparser
+        .plan_to_sql(&plan)
+        .expect_err("an unbounded shadowed correlation must be refused, not emitted");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
+    );
+    Ok(())
+}
+
+/// The anti join's harm runs the other way and is covered by the same refusal.
+///
+/// Captured, the correlation is an inner tautology, so `NOT EXISTS` is false for
+/// every probe row and the join returns nothing — where a semi join keeps rows it
+/// should not, an anti join drops rows it should return. Both are wrong rows, so
+/// neither may be emitted.
+#[test]
+fn test_unparse_left_anti_join_without_fetch_refuses_shadowed_correlation() -> Result<()>
+{
+    let plan = probe_qualified_self_join(None, datafusion_expr::JoinType::LeftAnti)?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let err = unparser
+        .plan_to_sql(&plan)
+        .expect_err("an unbounded shadowed anti-join correlation must be refused");
+    assert_snapshot!(err, @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query");
+    Ok(())
+}
+
+/// The right semi join reaches the same refusal, covering the join types that
+/// swap which input is correlated against.
+///
+/// The check does not consult that swap — a shared qualifier is shared whichever
+/// side is read first — so this covers the join type rather than pinning an
+/// orientation. It is here because the swap is easy to reintroduce while
+/// reworking this code, and reaching the refusal from both orientations is what
+/// says it is not needed.
+#[test]
+fn test_unparse_right_semi_join_without_fetch_refuses_shadowed_correlation() -> Result<()>
+{
+    let plan = probe_qualified_self_join(None, datafusion_expr::JoinType::RightSemi)?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let err = unparser
+        .plan_to_sql(&plan)
+        .expect_err("a swapped shadowed correlation must be refused too");
+    assert_snapshot!(err, @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query");
+    Ok(())
+}
+
+/// Two relations in different schemas that share a table name collide in the
+/// emitted SQL even though their `TableReference`s differ.
+///
+/// On a dialect that does not spell columns in full, a qualified column renders
+/// as its relation's last component, so both `s1.t.c` and `s2.t.c` emit as
+/// `"t"."c"` — and inside `FROM "s2"."t"` both bind to the inner relation, which
+/// is the same tautology as the bare self-join. Comparing the references whole
+/// would read these as disjoint and let it through; before this was caught, the
+/// plan unparsed to
+/// `SELECT "d" FROM "public"."t" WHERE EXISTS (SELECT 1 FROM "other"."t" WHERE ("t"."c" = "t"."c"))`.
+#[test]
+fn test_unparse_left_semi_join_refuses_cross_schema_name_collision() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("public.t"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("other.t"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("public.t.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("public.t.c").eq(col("other.t.c"))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let err = unparser
+        .plan_to_sql(&plan)
+        .expect_err("relations sharing an emitted name must be refused");
+    assert_snapshot!(err, @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query");
+    Ok(())
+}
+
+/// A build-side join key naming the shared relation is not a capture, and must
+/// keep its pushdown.
+///
+/// The probe is `t1 INNER JOIN t` and the build side is `t`, so the two share the
+/// name `t`, but the key is `(t1.c, t.c)`: only `t1.c` is correlated, and the
+/// build half `t.c` is meant to bind to the subquery's own `t` — which is exactly
+/// what it does. Refusing here would cost the pushdown on correct SQL, and
+/// testing both halves of each pair rather than the correlated one does refuse
+/// it, which is what this pins.
+#[test]
+fn test_unparse_left_semi_join_keeps_build_side_key_on_shared_relation() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?
+        .join_on(
+            table_scan(Some("t"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.d").eq(col("t.c"))],
+        )?
+        .build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d"), col("t.c")])?
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["t1.c"], vec!["t.c"]),
+            None,
+        )?
+        .build()?;
 
     let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
     assert_snapshot!(
         unparser.plan_to_sql(&plan)?,
-        @r#"SELECT "t"."d" FROM "t" WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t"."c" = "t"."c"))"#
+        @r#"SELECT "t1"."d", "t"."c" FROM "t1" INNER JOIN "t" ON ("t1"."d" = "t"."c") WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t1"."c" = "t"."c"))"#
+    );
+    Ok(())
+}
+
+/// The same capture through `join.on` rather than `join.filter`.
+///
+/// A shared-qualifier equality cannot be attributed to two sides, so
+/// [`LogicalPlanBuilder::join_on`] puts it in the filter and the other refusals
+/// here reach it there. Naming the join keys directly puts the identical
+/// predicate in `on` instead, which is a plan the unparser can be handed even
+/// though the higher-level builder will not produce it — and the emitted SQL,
+/// and so the capture, is the same either way.
+#[test]
+fn test_unparse_left_semi_join_refuses_shadowed_correlation_in_join_keys() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t.d")])?
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["t.c"], vec!["t.c"]),
+            None,
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    let err = unparser
+        .plan_to_sql(&plan)
+        .expect_err("a shadowed correlation in the join keys must be refused too");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
+    );
+    Ok(())
+}
+
+/// Sharing a qualifier is not on its own a reason to refuse. Both sides here
+/// answer to `t`, but the correlated half of the `on` pair names `t1`, which the
+/// build side does not answer to, so nothing is captured and the plan unparses.
+///
+/// This is the boundary the refusal is drawn on: the correlated reference's own
+/// qualifier, not an overlap between the two sides' relations. Refusing on
+/// overlap alone would cost the pushdown on federated self-joins that unparse
+/// correctly today — the same trade
+/// [`test_unparse_left_semi_join_without_fetch_keeps_multi_relation_correlation`]
+/// guards from the other direction.
+#[test]
+fn test_unparse_left_semi_join_keeps_overlapping_but_unreferenced_qualifier() -> Result<()>
+{
+    let plan = overlapping_but_unreferenced_qualifier_semi_join()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t1"."d", "t"."c" FROM "t1" INNER JOIN "t" ON ("t1"."c" = "t"."c") WHERE EXISTS (SELECT 1 FROM "t" INNER JOIN "t3" ON ("t"."c" = "t3"."c") WHERE ("t1"."c" = "t3"."c"))"#
     );
     Ok(())
 }
