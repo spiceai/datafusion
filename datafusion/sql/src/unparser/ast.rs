@@ -632,6 +632,9 @@ impl Default for TableWithJoinsBuilder {
 #[derive(Clone)]
 pub struct RelationBuilder {
     relation: Option<TableFactorBuilder>,
+    /// Whether the enclosing scope names this relation's output columns itself,
+    /// through a column list on the alias it attaches once the relation is built.
+    columns_named_by_alias: bool,
 }
 
 #[derive(Clone)]
@@ -722,9 +725,22 @@ impl RelationBuilder {
             None => return Err(Into::into(UninitializedFieldError::from("relation"))),
         })
     }
+    /// Declares that the alias this relation is given will carry a column list.
+    ///
+    /// The alias is attached once the relation has been built, so a derived table
+    /// built in the meantime cannot see it and would otherwise name its own
+    /// outputs redundantly.
+    pub(super) fn columns_named_by_alias(&mut self, value: bool) -> &mut Self {
+        self.columns_named_by_alias = value;
+        self
+    }
+    pub(super) fn has_columns_named_by_alias(&self) -> bool {
+        self.columns_named_by_alias
+    }
     fn create_empty() -> Self {
         Self {
             relation: Default::default(),
+            columns_named_by_alias: false,
         }
     }
 }

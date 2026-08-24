@@ -22,13 +22,13 @@ use super::{
     rewrite::TableAliasRewriter,
 };
 use datafusion_common::{
-    Column, DataFusionError, Result, ScalarValue, TableReference,
+    Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
     assert_eq_or_internal_err, internal_err,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::{
-    Aggregate, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr, Unnest,
-    Window, expr, utils::grouping_set_to_exprlist,
+    Aggregate, Distinct, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr,
+    Unnest, Window, expr, utils::grouping_set_to_exprlist,
 };
 
 use indexmap::IndexSet;
@@ -296,6 +296,168 @@ pub(crate) fn find_projection_node_within_select(
     }
 }
 
+/// Names the outputs a derived table exposes, where the [Projection] that supplies
+/// them leaves them unnamed.
+///
+/// A derived table is addressed from the scope that encloses it, and the unparser
+/// spells such a reference with the output's logical name — `t.a + t.b` for
+/// `Projection: t.a + t.b`. That name describes the expression; it is not an
+/// identifier the derived table carries, since an engine names an unaliased
+/// expression itself (`?column?` on PostgreSQL). Aliasing each unnamed output to
+/// the logical name the enclosing scope uses makes the reference bind, and — unlike
+/// repeating the expression at the point of use — evaluates it exactly once.
+///
+/// Returns `None` when nothing needs naming, so the plan is unparsed as it stands.
+pub(crate) fn name_derived_scope_outputs(
+    plan: &LogicalPlan,
+) -> Result<Option<LogicalPlan>> {
+    let Some(named) = name_scope_projection_outputs(plan)? else {
+        return Ok(None);
+    };
+    // Naming an output must not rename it: the alias is the name the schema
+    // already reports, so the enclosing scope's references still resolve. That
+    // holds by construction — the alias is taken from the schema itself — and a
+    // node added to the walk below that renames its outputs would break it.
+    debug_assert!(
+        named
+            .schema()
+            .logically_equivalent_names_and_types(plan.schema()),
+        "naming a derived table's outputs renamed them: {} became {}",
+        plan.schema(),
+        named.schema()
+    );
+    Ok(Some(named))
+}
+
+/// Aliases the unnamed outputs of the [Projection] that becomes this scope's `SELECT`
+/// list, rebuilding the nodes walked through on the way down to it.
+///
+/// The nodes walked through are the ones that carry the projection's output names
+/// out to the derived table unchanged. [`find_projection_node_within_select`] walks
+/// the same way for a different purpose and stops at a narrower set, because a
+/// predicate can only reach a projection that stays in its own `SELECT`.
+fn name_scope_projection_outputs(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    // Each node is rebuilt by replacing its input and leaving every other field as
+    // it stands. `LogicalPlan::with_new_exprs` is the shorter spelling and the
+    // wrong one: it reconstructs a node from the expressions a plan reports, and
+    // that round trip does not carry a `DISTINCT ON`'s sort expressions — it
+    // panics on a plan that has them.
+    match plan {
+        LogicalPlan::Projection(projection) => name_projection_outputs(projection),
+        // The nodes below carry the projection's output names out to the derived
+        // table unchanged, so the projection under them is still the one exposing
+        // its columns.
+        LogicalPlan::Filter(filter) => with_named_input(&filter.input, |input| {
+            let mut filter = filter.clone();
+            filter.input = input;
+            LogicalPlan::Filter(filter)
+        }),
+        LogicalPlan::Sort(sort) => with_named_input(&sort.input, |input| {
+            let mut sort = sort.clone();
+            sort.input = input;
+            LogicalPlan::Sort(sort)
+        }),
+        LogicalPlan::Limit(limit) => with_named_input(&limit.input, |input| {
+            let mut limit = limit.clone();
+            limit.input = input;
+            LogicalPlan::Limit(limit)
+        }),
+        LogicalPlan::Distinct(Distinct::All(input)) => {
+            with_named_input(input, |input| LogicalPlan::Distinct(Distinct::All(input)))
+        }
+        // A `DISTINCT ON` is the one node here that emits its own `SELECT` list:
+        // `select_expr` becomes the projection, and the projection beneath it is
+        // flattened into the same `SELECT` rather than exposed. So the outputs the
+        // enclosing scope binds are `select_expr`, and naming only the input misses
+        // a computed one — `DISTINCT ON (a) a + b` straight off a scan emits
+        // `(t.a + t.b)` for the engine to name. Both are named: `select_expr` for
+        // the outputs themselves, and the input for the case where they are bare
+        // columns carrying an inner projection's names out.
+        LogicalPlan::Distinct(Distinct::On(distinct_on)) => {
+            let named_input = name_scope_projection_outputs(&distinct_on.input)?;
+            let named_select =
+                name_unnamed_outputs(&distinct_on.select_expr, &distinct_on.schema);
+            if named_input.is_none() && named_select.is_none() {
+                return Ok(None);
+            }
+            let mut distinct_on = distinct_on.clone();
+            if let Some(input) = named_input {
+                distinct_on.input = Arc::new(input);
+            }
+            if let Some(select_expr) = named_select {
+                distinct_on.select_expr = select_expr;
+            }
+            Ok(Some(LogicalPlan::Distinct(Distinct::On(distinct_on))))
+        }
+        LogicalPlan::SubqueryAlias(subquery_alias) => {
+            with_named_input(&subquery_alias.input, |input| {
+                let mut subquery_alias = subquery_alias.clone();
+                subquery_alias.input = input;
+                LogicalPlan::SubqueryAlias(subquery_alias)
+            })
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Rebuilds a node around a named input, or `None` where the input needs no naming.
+fn with_named_input(
+    input: &Arc<LogicalPlan>,
+    rebuild: impl FnOnce(Arc<LogicalPlan>) -> LogicalPlan,
+) -> Result<Option<LogicalPlan>> {
+    Ok(name_scope_projection_outputs(input)?.map(|named| rebuild(Arc::new(named))))
+}
+
+/// The projection with each unnamed output aliased to the name its schema reports.
+fn name_projection_outputs(projection: &Projection) -> Result<Option<LogicalPlan>> {
+    let Some(named) = name_unnamed_outputs(&projection.expr, &projection.schema) else {
+        return Ok(None);
+    };
+    Projection::try_new(named, Arc::clone(&projection.input))
+        .map(|projection| Some(LogicalPlan::Projection(projection)))
+}
+
+/// `exprs` with each unnamed output aliased to the name `schema` reports for it, or
+/// `None` where every output is already named.
+///
+/// `schema` is the schema the expressions produce, so its fields are positionally
+/// aligned with them — true of a [`Projection`] and of a `DISTINCT ON`, whose schema is
+/// likewise built from its `select_expr` alone.
+fn name_unnamed_outputs(exprs: &[Expr], schema: &DFSchema) -> Option<Vec<Expr>> {
+    if !exprs.iter().any(output_is_unnamed) {
+        return None;
+    }
+    Some(
+        exprs
+            .iter()
+            .zip(schema.fields())
+            .map(|(expr, field)| {
+                if output_is_unnamed(expr) {
+                    // The schema's name for the output, rather than a second derivation
+                    // of it: this is the name the enclosing scope refers to it by.
+                    expr.clone().alias(field.name().clone())
+                } else {
+                    expr.clone()
+                }
+            })
+            .collect(),
+    )
+}
+
+/// Whether the emitted `SELECT` leaves this output for the engine to name.
+///
+/// An alias names it explicitly and a bare column keeps the name it already had,
+/// so in both cases the emitted name is the one the schema reports. A wildcard
+/// stands for a list of columns that each keep their own name, and cannot take an
+/// alias at all. Every other expression is emitted unnamed.
+fn output_is_unnamed(expr: &Expr) -> bool {
+    #[expect(deprecated)]
+    !matches!(
+        expr,
+        Expr::Alias(_) | Expr::Column(_) | Expr::Wildcard { .. }
+    )
+}
+
 /// Replaces a reference to a [Projection] output that the projection does not name
 /// with the expression that produces it.
 ///
@@ -329,18 +491,16 @@ pub(crate) fn unproject_unnamed_projection_exprs(
 /// time, in a clause that may see a different value than the `SELECT` list did,
 /// which would answer the query with silently wrong rows. The unbindable
 /// reference this repairs is at least a loud failure, so it is the safer of the
-/// two to leave in place.
+/// two to leave in place. Volatility is a fact about whether inlining is safe, not
+/// about whether the output is named, so it is checked separately from
+/// [`output_is_unnamed`].
 fn find_unnamed_projection_expr<'a>(
     projection: &'a Projection,
     column: &Column,
 ) -> Option<&'a Expr> {
     let index = projection.schema.index_of_column(column).ok()?;
     let expr = projection.expr.get(index)?;
-    if matches!(expr, Expr::Alias(_) | Expr::Column(_)) || expr.is_volatile() {
-        None
-    } else {
-        Some(expr)
-    }
+    (output_is_unnamed(expr) && !expr.is_volatile()).then_some(expr)
 }
 
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {
