@@ -6310,6 +6310,33 @@ fn test_derived_output_under_distinct_on_with_sort_is_named() -> Result<()> {
 }
 
 #[test]
+fn test_derived_computed_distinct_on_output_is_named() -> Result<()> {
+    // A `DISTINCT ON` emits its own `select_expr` as the `SELECT` list, so a
+    // computed one is an unnamed output of the derived table even with no
+    // projection beneath to name — the projection under a `DISTINCT ON` is
+    // flattened into the same `SELECT` rather than exposed as a scope.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .distinct_on(
+            vec![col("t.a")],
+            vec![col("t.a").add(col("t.b"))],
+            Some(vec![col("t.a").sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        .project(vec![col("t.a + t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT DISTINCT ON (t.a) (t.a + t.b) AS "t.a + t.b" FROM t ORDER BY t.a ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     // An alias and a bare column already carry the name the enclosing scope
     // uses, so neither is renamed and neither picks up a redundant alias.

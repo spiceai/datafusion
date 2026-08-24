@@ -22,7 +22,7 @@ use super::{
     rewrite::TableAliasRewriter,
 };
 use datafusion_common::{
-    Column, DataFusionError, Result, ScalarValue, TableReference,
+    Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
     assert_eq_or_internal_err, internal_err,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
@@ -365,12 +365,29 @@ fn name_scope_projection_outputs(plan: &LogicalPlan) -> Result<Option<LogicalPla
         LogicalPlan::Distinct(Distinct::All(input)) => {
             with_named_input(input, |input| LogicalPlan::Distinct(Distinct::All(input)))
         }
+        // A `DISTINCT ON` is the one node here that emits its own `SELECT` list:
+        // `select_expr` becomes the projection, and the projection beneath it is
+        // flattened into the same `SELECT` rather than exposed. So the outputs the
+        // enclosing scope binds are `select_expr`, and naming only the input misses
+        // a computed one — `DISTINCT ON (a) a + b` straight off a scan emits
+        // `(t.a + t.b)` for the engine to name. Both are named: `select_expr` for
+        // the outputs themselves, and the input for the case where they are bare
+        // columns carrying an inner projection's names out.
         LogicalPlan::Distinct(Distinct::On(distinct_on)) => {
-            with_named_input(&distinct_on.input, |input| {
-                let mut distinct_on = distinct_on.clone();
-                distinct_on.input = input;
-                LogicalPlan::Distinct(Distinct::On(distinct_on))
-            })
+            let named_input = name_scope_projection_outputs(&distinct_on.input)?;
+            let named_select =
+                name_unnamed_outputs(&distinct_on.select_expr, &distinct_on.schema);
+            if named_input.is_none() && named_select.is_none() {
+                return Ok(None);
+            }
+            let mut distinct_on = distinct_on.clone();
+            if let Some(input) = named_input {
+                distinct_on.input = Arc::new(input);
+            }
+            if let Some(select_expr) = named_select {
+                distinct_on.select_expr = select_expr;
+            }
+            Ok(Some(LogicalPlan::Distinct(Distinct::On(distinct_on))))
         }
         LogicalPlan::SubqueryAlias(subquery_alias) => {
             with_named_input(&subquery_alias.input, |input| {
@@ -393,25 +410,38 @@ fn with_named_input(
 
 /// The projection with each unnamed output aliased to the name its schema reports.
 fn name_projection_outputs(projection: &Projection) -> Result<Option<LogicalPlan>> {
-    if !projection.expr.iter().any(output_is_unnamed) {
+    let Some(named) = name_unnamed_outputs(&projection.expr, &projection.schema) else {
         return Ok(None);
-    }
-    let named = projection
-        .expr
-        .iter()
-        .zip(projection.schema.fields())
-        .map(|(expr, field)| {
-            if output_is_unnamed(expr) {
-                // The schema's name for the output, rather than a second derivation
-                // of it: this is the name the enclosing scope refers to it by.
-                expr.clone().alias(field.name().clone())
-            } else {
-                expr.clone()
-            }
-        })
-        .collect();
+    };
     Projection::try_new(named, Arc::clone(&projection.input))
         .map(|projection| Some(LogicalPlan::Projection(projection)))
+}
+
+/// `exprs` with each unnamed output aliased to the name `schema` reports for it, or
+/// `None` where every output is already named.
+///
+/// `schema` is the schema the expressions produce, so its fields are positionally
+/// aligned with them — true of a [`Projection`] and of a `DISTINCT ON`, whose schema is
+/// likewise built from its `select_expr` alone.
+fn name_unnamed_outputs(exprs: &[Expr], schema: &DFSchema) -> Option<Vec<Expr>> {
+    if !exprs.iter().any(output_is_unnamed) {
+        return None;
+    }
+    Some(
+        exprs
+            .iter()
+            .zip(schema.fields())
+            .map(|(expr, field)| {
+                if output_is_unnamed(expr) {
+                    // The schema's name for the output, rather than a second derivation
+                    // of it: this is the name the enclosing scope refers to it by.
+                    expr.clone().alias(field.name().clone())
+                } else {
+                    expr.clone()
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Whether the emitted `SELECT` leaves this output for the engine to name.
