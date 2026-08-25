@@ -19,10 +19,10 @@ use super::{
     Unparser,
     ast::{
         BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
-        DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_UNION_ALIAS,
-        DERIVED_UNNEST_ALIAS, DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder,
-        QueryBuilder, RelationBuilder, SelectBuilder, TableRelationBuilder,
-        TableWithJoinsBuilder, is_numbered_alias,
+        DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_TABLE_ALIASES,
+        DERIVED_UNION_ALIAS, DERIVED_UNNEST_ALIAS, DERIVED_WINDOW_INPUT_ALIAS,
+        DerivedRelationBuilder, QueryBuilder, RelationBuilder, SelectBuilder,
+        TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
@@ -2723,27 +2723,6 @@ impl Unparser<'_> {
         matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
     }
 
-    /// Aliases the unparser emits verbatim for a derived table it introduces.
-    ///
-    /// These reach the emitted `FROM` without appearing anywhere in the plan, so
-    /// [`Self::emitted_scope`] cannot find them by walking it. They are treated
-    /// as always in scope inside an `EXISTS` body: a correlated reference to a
-    /// relation a user happened to name one of these is refused rather than
-    /// emitted, since the invented alias would capture it.
-    ///
-    /// Read from the constants the emitter writes rather than restated, so the
-    /// two cannot drift apart — the numbered aliases are recognised by
-    /// [`is_numbered_alias`], which its own generators are the inverse of.
-    const UNPARSER_DERIVED_ALIASES: [&'static str; 7] = [
-        DERIVED_DISTINCT_ALIAS,
-        DERIVED_LIMIT_ALIAS,
-        DERIVED_PROJECTION_ALIAS,
-        DERIVED_SORT_ALIAS,
-        DERIVED_UNION_ALIAS,
-        DERIVED_UNNEST_ALIAS,
-        DERIVED_WINDOW_INPUT_ALIAS,
-    ];
-
     /// Whether `qualifier`, as the emitted SQL spells it, is a name the unparser
     /// can invent for a derived table of its own.
     ///
@@ -2755,14 +2734,16 @@ impl Unparser<'_> {
         let [name] = qualifier else {
             return false;
         };
-        Self::UNPARSER_DERIVED_ALIASES.contains(&name.as_str()) || is_numbered_alias(name)
+        DERIVED_TABLE_ALIASES.contains(&name.as_str()) || is_numbered_alias(name)
     }
 
     /// What the `EXISTS` body's `FROM` will answer to: its relation names, and the
-    /// column names those relations expose.
+    /// column names a reference inside it can collide with — including one the
+    /// body renames, which no relation exposes.
     ///
-    /// Read from the relations the `FROM` introduces rather than from `plan`'s
-    /// output schema, which is a proxy that is wrong in both directions:
+    /// The qualifiers are read from the relations the `FROM` introduces rather
+    /// than from `plan`'s output schema, which is a proxy that is wrong in both
+    /// directions:
     ///
     /// * A projection pruning every column of a relation leaves it with no
     ///   qualified output field, while it is still named in the `FROM` and still
@@ -2774,6 +2755,13 @@ impl Unparser<'_> {
     ///   miss an outer `a.c` that `AS a` really does capture, and refuse an outer
     ///   `s.a.c` that it does not.
     ///
+    /// The column names take both: the relations the walk finds expose every
+    /// column they have rather than the projected ones, and the output schema
+    /// carries names no relation in the plan has, because a rename names a
+    /// column something. Neither alone is the set an unqualified reference can
+    /// collide with. The seed below says where each of those lands in the
+    /// emitted SQL.
+    ///
     /// The walk stops at a `SubqueryAlias`: an alias replaces the name it is given
     /// to, so the relations it encloses are not addressable through it and
     /// collecting them would refuse references that bind correctly.
@@ -2782,21 +2770,20 @@ impl Unparser<'_> {
     /// they appear nowhere in the plan, so no walk can find them. They are
     /// recognised by [`Self::is_unparser_derived_alias`] instead.
     fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
-        // The build side's own output names, which no walk below can find: a
-        // rename names a column something the plan holds no relation for. Both
-        // ways the body is emitted put those names where an unqualified
-        // correlation collides with them — as the columns of a derived table
-        // when the emitter wraps the body, and as bare names that escape
-        // outward, to be compared with the outer query's own column, when it
-        // folds the projection into the `SELECT 1` instead.
-        //
-        // Taken unconditionally, which over-approximates the case where the
-        // body folds and the correlation's build half names a column of the
-        // scan rather than the renamed one: there the outer reference does bind
-        // outward and the refusal costs a pushdown it did not need to. That is
-        // the same approximation, and the same fix, as spiceai/spiceai#13469.
         let mut scope = EmittedScope {
             qualifiers: Vec::new(),
+            // Both ways the body is emitted put these names where an unqualified
+            // correlation collides with them — as the columns of a derived table
+            // when the emitter wraps the body, and as bare names that escape
+            // outward, to be compared with the outer query's own column, when it
+            // folds the projection into the `SELECT 1` instead.
+            //
+            // Taken unconditionally, which over-approximates the case where the
+            // body folds and the correlation's build half names a column of the
+            // scan rather than the renamed one: there the outer reference does
+            // bind outward and the refusal costs a pushdown it did not need to.
+            // That is the same approximation, and the same fix, as
+            // spiceai/spiceai#13469.
             schemas: vec![Arc::clone(plan.schema().inner())],
         };
         plan.apply(|node| match node {
@@ -3183,10 +3170,11 @@ impl From<BuilderError> for DataFusionError {
 ///
 /// * `qualifiers` — the relation names the `FROM` introduces, spelled the way
 ///   this dialect will spell a column's qualifier.
-/// * `schemas` — the schemas whose column names those relations expose. An
-///   unqualified reference carries no relation to compare, so a name being
-///   found in one of these is the only thing that decides whether the body
-///   captures it.
+/// * `schemas` — the schemas carrying the column names the body can answer to,
+///   which is more than the emitted relations expose: a rename names a column
+///   something no relation has. An unqualified reference carries no relation to
+///   compare, so a name being found in one of these is the only thing that
+///   decides whether the body captures it.
 #[derive(Debug)]
 struct EmittedScope {
     qualifiers: Vec<Vec<String>>,

@@ -222,6 +222,12 @@ const DERIVED_AGGREGATE_ALIAS_PREFIX: &str = "derived_aggregate";
 const NUMBERED_ALIAS_PREFIXES: [&str; 2] =
     [FLATTEN_ALIAS_PREFIX, DERIVED_AGGREGATE_ALIAS_PREFIX];
 
+/// The first counter any of the generators below reaches.
+///
+/// They pre-increment a counter starting at zero, so no name they build ends in
+/// `_0`. Read by [`is_numbered_alias`], which cannot derive it from the name.
+const FIRST_ALIAS_COUNTER: usize = 1;
+
 /// Aliases the unparser gives verbatim to a derived table it introduces, one
 /// per kind of node that has to be wrapped.
 ///
@@ -235,6 +241,25 @@ pub(crate) const DERIVED_SORT_ALIAS: &str = "derived_sort";
 pub(crate) const DERIVED_UNION_ALIAS: &str = "derived_union";
 pub(crate) const DERIVED_UNNEST_ALIAS: &str = "derived_unnest";
 pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
+
+/// Every one of those aliases, enumerated for code that has to recognise a name
+/// the unparser can invent without generating it.
+///
+/// Beside the declarations on purpose: the recogniser and the emitter agreeing
+/// about the *spelling* is what reading the constants buys, and it is only half
+/// of it — the two must also agree about the *set*. A new `DERIVED_*_ALIAS` left
+/// out of this list still compiles and still emits, and the guard reading it
+/// simply stops recognising the alias, which is the wrong-rows direction. Adding
+/// one here is the other half of adding one above.
+pub(crate) const DERIVED_TABLE_ALIASES: [&str; 7] = [
+    DERIVED_DISTINCT_ALIAS,
+    DERIVED_LIMIT_ALIAS,
+    DERIVED_PROJECTION_ALIAS,
+    DERIVED_SORT_ALIAS,
+    DERIVED_UNION_ALIAS,
+    DERIVED_UNNEST_ALIAS,
+    DERIVED_WINDOW_INPUT_ALIAS,
+];
 
 /// The name the counter-numbered generators below build: a prefix, an
 /// underscore, and the count.
@@ -256,16 +281,19 @@ fn numbered_alias(prefix: &str, counter: usize) -> String {
 /// alias the unparser invented, and refuse a correlation against it that binds
 /// correctly.
 ///
-/// Decided by rebuilding the name rather than by inspecting the digits, so the
-/// two cannot disagree about a form neither anticipated.
+/// The rendering is decided by rebuilding the name rather than by inspecting the
+/// digits, so the two cannot disagree about a form neither anticipated: a leading
+/// `+` and a leading zero both parse to a number the rebuild then spells
+/// differently. The one thing the rebuild cannot know is where the counters
+/// start, so that alone is stated here.
 pub(crate) fn is_numbered_alias(name: &str) -> bool {
     let Some((prefix, counter)) = name.rsplit_once('_') else {
         return false;
     };
     NUMBERED_ALIAS_PREFIXES.contains(&prefix)
-        && counter
-            .parse::<usize>()
-            .is_ok_and(|counter| counter > 0 && numbered_alias(prefix, counter) == name)
+        && counter.parse::<usize>().is_ok_and(|value| {
+            value >= FIRST_ALIAS_COUNTER && numbered_alias(prefix, value) == name
+        })
 }
 
 impl SelectBuilder {
@@ -1105,11 +1133,39 @@ impl std::error::Error for BuilderError {}
 mod tests {
     use super::*;
 
+    /// Every alias the unparser emits verbatim is in the list the guard reads.
+    ///
+    /// The list and the constants are declared together so an omission is visible
+    /// where it would be made, but adjacency is not enforcement: this pins each
+    /// member so removing one fails here rather than silently un-guarding an alias
+    /// the emitter still writes.
+    ///
+    /// What it cannot catch is the other direction — an eighth `DERIVED_*_ALIAS`
+    /// added and left out of the list. Nothing short of the two being generated
+    /// from one declaration can, which is why they sit in the same block.
+    #[test]
+    fn every_derived_table_alias_is_listed() {
+        for alias in [
+            DERIVED_DISTINCT_ALIAS,
+            DERIVED_LIMIT_ALIAS,
+            DERIVED_PROJECTION_ALIAS,
+            DERIVED_SORT_ALIAS,
+            DERIVED_UNION_ALIAS,
+            DERIVED_UNNEST_ALIAS,
+            DERIVED_WINDOW_INPUT_ALIAS,
+        ] {
+            assert!(
+                DERIVED_TABLE_ALIASES.contains(&alias),
+                "{alias} reaches the emitted FROM but is not in DERIVED_TABLE_ALIASES, so the EXISTS capture guard cannot recognise it"
+            );
+        }
+    }
+
     /// Every name the counter-numbered generators actually produce is recognised.
     ///
     /// Driven from the generators rather than from written-out strings, so the
     /// pairing is pinned by the code that builds the names instead of by a copy
-    /// of it.
+    /// of it — a copy stays green through a rename that breaks the pairing.
     #[test]
     fn generated_numbered_aliases_are_recognised() {
         let mut select = SelectBuilder::default();
@@ -1129,28 +1185,36 @@ mod tests {
 
     /// A name no generator can build is not one, however much it looks like one.
     ///
-    /// The counters start at 1 and render canonically, so a zero, a leading zero
-    /// and a run of digits wider than a `usize` are all names the unparser never
-    /// invents. Recognising one would treat a user's own relation as an invented
-    /// alias and refuse a correlation against it.
+    /// The forms are built onto the real prefixes rather than written out, for the
+    /// same reason as the test above: spelled literally, renaming a prefix would
+    /// leave every row here a lookalike of nothing, still asserting and no longer
+    /// covering anything. Why each form is unbuildable is on [`is_numbered_alias`].
     #[test]
     fn numbered_alias_lookalikes_are_not_recognised() {
-        for name in [
-            "_unnest_0",
-            "_unnest_01",
-            "_unnest_+1",
-            "_unnest_",
-            "_unnest",
-            "_unnest_1x",
-            "_unnest_99999999999999999999999999999999999999",
-            "derived_aggregate_0",
-            "derived_aggregate_007",
-            "unnest_1",
-            "_flatten_1",
-        ] {
+        for prefix in NUMBERED_ALIAS_PREFIXES {
+            for suffix in [
+                "_0",  // the counters pre-increment, so they never reach zero
+                "_01", // parses to 1, but 1 is not spelled this way
+                "_+1", // `usize::from_str` accepts the sign; the rebuild does not
+                "_",   // no counter at all
+                "",    // the bare prefix is never a name
+                "_1x",
+                "_99999999999999999999999999999999999999", // wider than a `usize`
+            ] {
+                let name = format!("{prefix}{suffix}");
+                assert!(
+                    !is_numbered_alias(&name),
+                    "{name} is not a name any generator here builds, so it must not be recognised as one"
+                );
+            }
+        }
+
+        // Deliberately literal: these are wrong *prefixes*, so building them from
+        // the constants would defeat the point.
+        for name in ["unnest_1", "_flatten_1", "derived_aggregates_1"] {
             assert!(
                 !is_numbered_alias(name),
-                "{name} is not a name any generator here builds, so it must not be recognised as one"
+                "{name} carries no prefix any generator here uses, so it must not be recognised"
             );
         }
     }
