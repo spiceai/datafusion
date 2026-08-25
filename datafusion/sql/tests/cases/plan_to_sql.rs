@@ -8583,3 +8583,81 @@ fn test_unparse_left_semi_join_refuses_nested_reference_captured_above_its_own_n
     );
     Ok(())
 }
+
+/// A relation the emitter buries behind a derived table of its own is not one a
+/// nested reference can be said to have arrived at.
+///
+/// The body is a `Window` over a `Projection` over `far.t`, which the emitter
+/// renders as `FROM (SELECT "c", "d" FROM "far"."t") AS "derived_projection"` —
+/// a fixed alias in place of whatever the plan called the relation. The plan
+/// still says `far.t` plainly, so a scope collected from the plan alone reports
+/// the reference as bound there and stops examining it; nothing after that would
+/// look at it again, and this join's build side is `other.t`, whose emitted
+/// component is the same `t` the reference is spelled with.
+///
+/// The refusal is a price, not a repair. Rendered, this plan's SQL happens to
+/// bind correctly — the body's own `FROM` is aliased `"t"`, which re-supplies the
+/// component the derived table took away, so the innermost `"t"."c"` resolves to
+/// the row the correlation meant. Whether that holds is a property of aliases the
+/// emitter chooses after this guard has run, so the guard cannot rely on it, and
+/// being wrong the other way emits the capture instead of refusing it. This
+/// records which way it errs.
+#[test]
+fn test_unparse_left_semi_join_refuses_nested_reference_behind_a_derived_window_input()
+-> Result<()> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "p")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let innermost = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(col("z.k").eq(out_ref_col(DataType::Int32, "far.t.c")))?
+        .build()?;
+
+    let projected = table_scan(
+        Some(TableReference::partial("far", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .project(vec![col("far.t.c"), col("far.t.d")])?
+    .build()?;
+    let window_expr = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+        params: WindowFunctionParams {
+            args: vec![col("c")],
+            partition_by: vec![],
+            order_by: vec![],
+            window_frame: WindowFrame::new(None),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }));
+    let body = LogicalPlanBuilder::from(projected)
+        .window(vec![window_expr])?
+        .filter(exists(Arc::new(innermost)))?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(body))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a nested reference behind a derived table the emitter invents must not be \
+         read as having arrived",
+    );
+    Ok(())
+}
