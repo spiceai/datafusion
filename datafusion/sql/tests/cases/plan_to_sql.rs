@@ -8918,3 +8918,40 @@ fn test_unparse_left_semi_join_refuses_capture_by_a_qualified_scans_bare_name()
     );
     Ok(())
 }
+
+/// A body spelled like the reference's relation but not identical to it is not
+/// where the reference arrives, so crediting it drops the reference unexamined.
+///
+/// Deciding a reference *binds* to an enclosing body ends the enquiry into it —
+/// the scopes past that one, which may capture it, are never asked. Every other
+/// comparison in this guard folds case, because calling two identifiers the same
+/// there costs a pushdown; folding here costs rows instead. On PostgreSQL a body
+/// selecting from `"PUBLIC"."T"` does not resolve a reference written against
+/// `"public"."t"`, but folded the two are one relation, and this was emitted:
+///
+/// ```sql
+/// SELECT "c", "d" FROM "public"."t"
+/// WHERE EXISTS (SELECT 1 FROM "other"."t"
+///   WHERE EXISTS (SELECT "c", "d" FROM "PUBLIC"."T"
+///     WHERE EXISTS (SELECT "z"."k" FROM "z" WHERE ("z"."k" = "t"."c"))))
+/// ```
+///
+/// `"t"."c"` reaches no `"public"."t"` from there — it binds to the nearest
+/// enclosing `FROM` that answers to `t`, which is a relation this join emits.
+///
+/// The exact comparison declines the arrival, so the reference goes on to be
+/// examined and is refused as the capture it is. On a dialect that really does
+/// bind the two alike the same strictness costs a pushdown, which is the trade
+/// every other name in this guard already makes.
+#[test]
+fn test_unparse_left_semi_join_refuses_nested_reference_a_case_distinct_body_only_folds_onto()
+-> Result<()> {
+    let plan =
+        nested_exists_bodies(&[TableReference::partial("PUBLIC", "T")], "public.t")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a body that only case-folds onto the reference's relation must not be read as its home",
+    );
+    Ok(())
+}

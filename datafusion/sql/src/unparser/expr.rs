@@ -894,6 +894,13 @@ impl Unparser<'_> {
     /// an outer reference, that is the direction that costs a pushdown — on a
     /// case-sensitive dialect, given two relations spelled alike — rather than
     /// rows.
+    ///
+    /// That holds only where treating two identifiers as one *refuses*, which is
+    /// every comparison in the guard but one: deciding that a reference arrives
+    /// at an enclosing body permits, and ends the enquiry, so folding there would
+    /// drop unexamined a reference the emitted SQL binds elsewhere. That one
+    /// comparison is exact and must stay so — see
+    /// `Unparser::scope_names_relation`.
     pub(crate) fn identifier_comparison_key(&self, ident: &str) -> String {
         ident.to_lowercase()
     }

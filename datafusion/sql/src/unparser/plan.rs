@@ -3012,11 +3012,10 @@ impl Unparser<'_> {
         while let Some(node) = pending.pop() {
             match node {
                 LogicalPlan::TableScan(scan) => {
-                    addressable.push(self.qualifier_key(&scan.table_name.to_vec()));
+                    addressable.push(scan.table_name.to_vec());
                 }
                 LogicalPlan::SubqueryAlias(alias) => {
-                    addressable
-                        .push(vec![self.identifier_comparison_key(alias.alias.table())]);
+                    addressable.push(vec![alias.alias.table().to_string()]);
                 }
                 LogicalPlan::Filter(_) | LogicalPlan::Join(_) => {
                     pending.extend(node.inputs());
@@ -3496,6 +3495,21 @@ impl Unparser<'_> {
     /// enquiry into a reference, so a relation it wrongly credits is a reference
     /// dropped unexamined.
     ///
+    /// Compared exactly, and it is the one comparison in this guard that is —
+    /// everywhere else identifiers are folded through
+    /// [`Self::identifier_comparison_key`], which errs toward calling two of
+    /// them the same. That direction refuses, and refusing is what the rest of
+    /// the guard wants; here it *permits*, so the same fold would end the
+    /// enquiry into a reference the emitted SQL never binds where this claims.
+    /// On PostgreSQL a body scanning `"t"` does not resolve a reference to
+    /// `"T"`, yet folded they are one relation, and the scopes past this one —
+    /// which may genuinely capture it — would never be asked. An exact
+    /// comparison declines to credit the arrival instead, and the reference goes
+    /// on to [`Self::scope_answers`], whose folded reading refuses it. The cost
+    /// runs the other way, on a dialect that really does bind them alike: a
+    /// pushdown, not a row. Asking the dialect rather than guessing is
+    /// spiceai/spiceai#13474.
+    ///
     /// An unqualified reference names no relation, so nothing can be said to be
     /// it: such a reference binds to whichever relation in the colliding scope
     /// exposes the column, and which one the plan meant is not recoverable —
@@ -3510,7 +3524,7 @@ impl Unparser<'_> {
         let Some(relation) = column.relation.as_ref() else {
             return false;
         };
-        addressable.contains(&self.qualifier_key(&relation.to_vec()))
+        addressable.contains(&relation.to_vec())
     }
 
     /// Whether `scope` answers to the reference `column` emits.
