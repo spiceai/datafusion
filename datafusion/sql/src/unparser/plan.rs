@@ -2763,29 +2763,64 @@ impl Unparser<'_> {
     /// they appear nowhere in the plan, so no walk can find them. They are
     /// recognised by [`Self::is_unparser_derived_alias`] instead.
     ///
-    /// An extension node is the one shape neither list can describe. Its
-    /// [`UserDefinedLogicalNodeUnparser`] is handed the `RelationBuilder` and
-    /// decides the emitted `FROM` outright, so the relation it names is not a
-    /// function of the plan and the walk is wrong in both directions at once:
-    /// it collects the extension's inputs, which the emitted SQL does not name,
-    /// and misses whatever the unparser writes, which it does. The scope is
-    /// marked opaque instead of guessed at.
+    /// A node whose emitted relation the plan does not describe yields
+    /// [`EmittedScope::Unreadable`] — see
+    /// [`Self::emits_unreadable_relation`] for which those are and why, and
+    /// [`Self::introduces_unreadable_relation`] for why an enclosing alias does
+    /// not shield one.
     ///
-    /// An enclosing `SubqueryAlias` does not contain that. The alias reaches
-    /// the one relation the `RelationBuilder` holds, while the same unparser is
-    /// handed the `SelectBuilder` and can join a second relation onto the same
-    /// `FROM`, which keeps its own name and answers to it. So the walk looks
-    /// past an alias for an extension — and for nothing else, since the
-    /// relations an alias really does shield are the reason it stops.
-    ///
-    /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
+    /// Only the plan's own inputs are walked, never the plans inside an
+    /// `Expr::ScalarSubquery` or `Expr::Exists`. That is what makes the model
+    /// hold: a relation in a nested subquery's `FROM` is not in scope for a
+    /// predicate emitted at this body's level, so it cannot capture one.
     fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
-        let mut scope = EmittedScope {
-            qualifiers: Vec::new(),
-            exposed: HashSet::new(),
-            opaque: false,
-        };
-        // The build side's own output names, which no walk below can find: a
+        // Collected during the walk and keyed after it: the walk's closure
+        // reports a `DataFusionError`, while keying a name asks the dialect and
+        // can fail with one of its own.
+        let mut qualifiers: Vec<Vec<String>> = Vec::new();
+        let mut scans: Vec<SchemaRef> = Vec::new();
+        let mut unreadable = false;
+
+        plan.apply(|node| {
+            // Asked of every node before it is classified, so there is one
+            // definition of which nodes this walk cannot read rather than one
+            // per arm.
+            if Self::emits_unreadable_relation(node) {
+                unreadable = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            match node {
+                LogicalPlan::TableScan(scan) => {
+                    qualifiers.push(self.emitted_qualifier_key(&scan.table_name));
+                    // A relation emitted bare answers to every column it has,
+                    // not just the projected ones — the same reason the
+                    // qualifier is read from the `FROM` rather than from the
+                    // output schema.
+                    scans.push(scan.source.schema());
+                    Ok(TreeNodeRecursion::Continue)
+                }
+                LogicalPlan::SubqueryAlias(alias) => {
+                    if Self::introduces_unreadable_relation(&alias.input)? {
+                        unreadable = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    qualifiers
+                        .push(vec![self.identifier_comparison_key(alias.alias.table())]);
+                    Ok(TreeNodeRecursion::Jump)
+                }
+                _ => Ok(TreeNodeRecursion::Continue),
+            }
+        })?;
+
+        // Nothing collected above can be read once the scope is unreadable, so
+        // it is not built: the naming below is the expensive half of this walk,
+        // and a list that cannot be consulted is a list a later reader can
+        // consult by mistake.
+        if unreadable {
+            return Ok(EmittedScope::Unreadable);
+        }
+
+        // The build side's own output names, which no walk above can find: a
         // rename names a column something the plan holds no relation for. Both
         // ways the body is emitted put these names where an unqualified
         // correlation collides with them — as the columns of a derived table
@@ -2798,60 +2833,48 @@ impl Unparser<'_> {
         // scan rather than the renamed one: there the outer reference does bind
         // outward and the refusal costs a pushdown it did not need to. That is
         // the same approximation, and the same fix, as spiceai/spiceai#13469.
-        self.expose_columns(&mut scope, plan.schema().inner())?;
-
-        // Collected during the walk and keyed after it: the walk's closure
-        // reports a `DataFusionError`, while keying a name asks the dialect and
-        // can fail with one of its own.
-        let mut scans: Vec<SchemaRef> = Vec::new();
-        plan.apply(|node| match node {
-            LogicalPlan::TableScan(scan) => {
-                scope
-                    .qualifiers
-                    .push(self.emitted_qualifier_key(&scan.table_name));
-                // A relation emitted bare answers to every column it has, not
-                // just the projected ones — the same reason the qualifier is
-                // read from the `FROM` rather than from the output schema.
-                scans.push(scan.source.schema());
-                Ok(TreeNodeRecursion::Continue)
-            }
-            LogicalPlan::SubqueryAlias(alias) => {
-                scope
-                    .qualifiers
-                    .push(vec![self.identifier_comparison_key(alias.alias.table())]);
-                // The alias shields what it encloses only as far as the alias
-                // reaches, which is the one relation the `RelationBuilder`
-                // holds. An extension below it is also handed the
-                // `SelectBuilder`, so it can join a second relation onto the
-                // same `FROM` — and that one keeps its own name. Look past the
-                // alias for that shape alone, without collecting the relations
-                // the alias really does shield.
-                if alias
-                    .input
-                    .exists(|node| Ok(matches!(node, LogicalPlan::Extension(_))))?
-                {
-                    scope.opaque = true;
-                }
-                Ok(TreeNodeRecursion::Jump)
-            }
-            // An extension's unparser is handed the `RelationBuilder` and may
-            // put anything in it, including a table whose name appears nowhere
-            // in the plan. The walk cannot know that name, so it says so.
-            //
-            // Its inputs are jumped rather than collected: once the unparser
-            // writes the relation, `select_to_sql_recursively` returns without
-            // descending, so those inputs describe relations the emitted SQL
-            // never names.
-            LogicalPlan::Extension(_) => {
-                scope.opaque = true;
-                Ok(TreeNodeRecursion::Jump)
-            }
-            _ => Ok(TreeNodeRecursion::Continue),
-        })?;
+        let mut exposed = HashSet::new();
+        self.expose_columns(&mut exposed, plan.schema().inner())?;
         for schema in &scans {
-            self.expose_columns(&mut scope, schema)?;
+            self.expose_columns(&mut exposed, schema)?;
         }
-        Ok(scope)
+        Ok(EmittedScope::Readable {
+            qualifiers,
+            exposed,
+        })
+    }
+
+    /// Whether this node's emitted relation is decided outside the plan, so no
+    /// walk over the plan can say what the `FROM` will answer to.
+    ///
+    /// An extension node is the one such shape. Its
+    /// [`UserDefinedLogicalNodeUnparser`] is handed the `RelationBuilder` and
+    /// decides the emitted `FROM` outright, so a walk is wrong in both
+    /// directions at once: it collects the extension's inputs, which the
+    /// emitted SQL does not name — `select_to_sql_recursively` returns without
+    /// descending once the unparser writes the relation — and misses whatever
+    /// the unparser wrote, which it does name.
+    ///
+    /// This is the one place that judgement lives, so the refinement it is
+    /// waiting for — a trait method by which an unparser declares the scope it
+    /// will emit — replaces one function rather than several match arms.
+    ///
+    /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
+    const fn emits_unreadable_relation(node: &LogicalPlan) -> bool {
+        matches!(node, LogicalPlan::Extension(_))
+    }
+
+    /// Whether `plan` holds such a node anywhere below it.
+    ///
+    /// Asked of a `SubqueryAlias`'s input, because an alias does not contain
+    /// one. The alias reaches the single relation the `RelationBuilder` holds,
+    /// while the same unparser is handed the `SelectBuilder` and can join a
+    /// second relation onto the same `FROM` — and that one keeps its own name.
+    /// So the walk looks past an alias for this and for nothing else: the
+    /// relations an alias really does shield are why it stops there at all,
+    /// and collecting them would refuse references that bind correctly.
+    fn introduces_unreadable_relation(plan: &LogicalPlan) -> Result<bool> {
+        plan.exists(|node| Ok(Self::emits_unreadable_relation(node)))
     }
 
     /// Adds every name `schema`'s columns let the body answer to.
@@ -2862,12 +2885,14 @@ impl Unparser<'_> {
     /// is not decided here — that is the approximation tracked by
     /// spiceai/spiceai#13469 — so both are taken, in the direction that refuses
     /// rather than emits.
-    fn expose_columns(&self, scope: &mut EmittedScope, schema: &SchemaRef) -> Result<()> {
+    fn expose_columns(
+        &self,
+        exposed: &mut HashSet<String>,
+        schema: &SchemaRef,
+    ) -> Result<()> {
         for field in schema.fields() {
-            scope
-                .exposed
-                .insert(self.identifier_comparison_key(field.name()));
-            scope.exposed.insert(self.emitted_column_key(field.name())?);
+            exposed.insert(self.identifier_comparison_key(field.name()));
+            exposed.insert(self.emitted_column_key(field.name())?);
         }
         Ok(())
     }
@@ -2949,27 +2974,24 @@ impl Unparser<'_> {
     /// [`Self::emitted_column_key`] — against a scope that already holds only
     /// that form.
     ///
-    /// An opaque scope answers to everything, so neither half is asked: the
-    /// relation it emits was never read, and a reference cannot be cleared
+    /// An [`EmittedScope::Unreadable`] scope answers to everything, so neither
+    /// half is asked — and neither exists to ask: a reference cannot be cleared
     /// against a name nobody knows.
     fn scope_answers(&self, scope: &EmittedScope, column: &Column) -> Result<bool> {
-        // A scope that could not be read cannot clear a reference, and this is
-        // the one place every comparison passes through, so it is the one place
-        // that has to know it.
-        if scope.opaque {
+        let EmittedScope::Readable {
+            qualifiers,
+            exposed,
+        } = scope
+        else {
             return Ok(true);
-        }
+        };
         Ok(match column.relation.as_ref() {
-            Some(relation) => scope
-                .qualifiers
-                .contains(&self.emitted_qualifier_key(relation)),
+            Some(relation) => qualifiers.contains(&self.emitted_qualifier_key(relation)),
             // An unqualified reference names no relation to disagree with, so
             // it binds to whichever relation in the innermost scope exposes the
             // column — the `EXISTS` body's own, whenever that body exposes the
             // name at all.
-            None => scope
-                .exposed
-                .contains(&self.emitted_column_key(&column.name)?),
+            None => exposed.contains(&self.emitted_column_key(&column.name)?),
         })
     }
 
@@ -3038,13 +3060,10 @@ impl Unparser<'_> {
     /// That costs the pushdown on correct SQL, which is the safe way round for
     /// a guard whose other failure is wrong rows.
     ///
-    /// An extension node on either side is refused wholesale on the same trade,
-    /// because its unparser decides the emitted `FROM` and nothing readable
-    /// from the plan distinguishes a relation that captures the correlation
-    /// from one that does not. This runs before any of the body is built, so
-    /// there is no emitted `FROM` to read either — narrowing it needs the
-    /// unparser to report the scope it will emit, which is a change to the
-    /// extension trait rather than to this walk.
+    /// A build or probe side whose emitted `FROM` the plan does not describe —
+    /// [`Self::emits_unreadable_relation`] — is refused wholesale on the same
+    /// trade. This runs before any of the body is built, so there is no emitted
+    /// `FROM` to read instead; narrowing it is the trait change noted there.
     fn ensure_exists_correlation_not_shadowed(&self, join: &Join) -> Result<()> {
         let swapped = Self::swaps_join_inputs(join.join_type);
         let (probe_plan, build_plan) = if swapped {
@@ -3324,19 +3343,26 @@ impl From<BuilderError> for DataFusionError {
 /// Both are held in the form [`Unparser::identifier_comparison_key`] gives, put
 /// there once by [`Unparser::emitted_scope`] rather than derived again at each
 /// comparison. That is what keeps the normalization from being forgotten: the
-/// plan's own spelling is not in the struct, so a comparison site has nothing to
-/// compare wrongly.
-///
-/// `opaque` is the third state, and it outranks both lists: the emitted `FROM`
-/// holds a relation that neither list can describe, so nothing was learned by
-/// looking. A scope in that state answers to every reference, because the one
-/// thing that can be said about a relation whose name is unknown is that it
-/// might be the name in hand.
+/// plan's own spelling is not in the variant, so a comparison site has nothing
+/// to compare wrongly.
 #[derive(Debug)]
-struct EmittedScope {
-    qualifiers: Vec<Vec<String>>,
-    exposed: HashSet<String>,
-    opaque: bool,
+enum EmittedScope {
+    Readable {
+        qualifiers: Vec<Vec<String>>,
+        exposed: HashSet<String>,
+    },
+    /// The emitted `FROM` holds a relation the plan does not describe, so
+    /// nothing was learned by looking — see
+    /// [`Unparser::emits_unreadable_relation`].
+    ///
+    /// This carries no lists rather than empty or unread ones. A scope that
+    /// answers to every reference is only safe while nothing reads *past* that
+    /// answer, and the one enforcement that cannot be forgotten is for the
+    /// names not to be there: the next reader of a scope — the qualifier
+    /// rewrite spiceai/spiceai#12840 is waiting for, or any narrowing of this
+    /// guard — then cannot consult a name list without first saying what it
+    /// does when there is none.
+    Unreadable,
 }
 
 /// The type of the input to the UNNEST table factor.
