@@ -861,7 +861,7 @@ impl Unparser<'_> {
     /// The column name this dialect writes for a reference to `name`.
     ///
     /// [`Self::col_to_sql`] passes every column name through
-    /// [`Dialect::col_alias_overrides`] before emitting it — BigQuery rewrites
+    /// [`super::dialect::Dialect::col_alias_overrides`] before emitting it — BigQuery rewrites
     /// `min(a)` to `min_40a_41`, since the original is not a legal identifier
     /// there. Anything reasoning about where an emitted reference binds has to
     /// ask for the rewritten form, or it compares a name the statement does not

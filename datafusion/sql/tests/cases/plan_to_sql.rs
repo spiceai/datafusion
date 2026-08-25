@@ -7604,7 +7604,7 @@ fn test_qualified_join_input_fetch_refused_on_full_qualified_col_dialect() -> Re
 /// reference, since a key of only outer references owns no input and is routed
 /// to the filter instead.
 fn outer_reference_in_join_key(
-    outer_ref_side: JoinSide,
+    outer_ref_side: OnHalf,
     outer_ref: &str,
 ) -> Result<LogicalPlan> {
     let schema = int32_schema(&["x", "c"]);
@@ -7612,8 +7612,8 @@ fn outer_reference_in_join_key(
     let build = table_scan(Some("b"), &schema, Some(vec![0, 1]))?.build()?;
     let outer = out_ref_col(DataType::Int32, outer_ref);
     let (left, right) = match outer_ref_side {
-        JoinSide::Probe => (col("p.x") + outer, col("b.x")),
-        JoinSide::Build => (col("p.x"), col("b.x") + outer),
+        OnHalf::Probe => (col("p.x") + outer, col("b.x")),
+        OnHalf::Build => (col("p.x"), col("b.x") + outer),
     };
     LogicalPlanBuilder::from(probe)
         .join_with_expr_keys(
@@ -7626,7 +7626,9 @@ fn outer_reference_in_join_key(
 }
 
 /// Which half of an `on` pair a test puts its outer reference on.
-enum JoinSide {
+///
+/// Not `JoinSide` — `datafusion_common::JoinSide` is a different, public thing.
+enum OnHalf {
     Probe,
     Build,
 }
@@ -7644,7 +7646,7 @@ enum JoinSide {
 #[test]
 fn test_unparse_left_semi_join_refuses_outer_reference_in_build_half_of_a_key()
 -> Result<()> {
-    let plan = outer_reference_in_join_key(JoinSide::Build, "b.c")?;
+    let plan = outer_reference_in_join_key(OnHalf::Build, "b.c")?;
 
     assert_captured_correlation_refused(
         &plan,
@@ -7666,7 +7668,7 @@ fn test_unparse_left_semi_join_refuses_outer_reference_in_build_half_of_a_key()
 #[test]
 fn test_unparse_left_semi_join_refuses_outer_reference_in_probe_half_of_a_key()
 -> Result<()> {
-    let plan = outer_reference_in_join_key(JoinSide::Probe, "p.c")?;
+    let plan = outer_reference_in_join_key(OnHalf::Probe, "p.c")?;
 
     assert_captured_correlation_refused(
         &plan,
@@ -7685,7 +7687,7 @@ fn test_unparse_left_semi_join_refuses_outer_reference_in_probe_half_of_a_key()
 #[test]
 fn test_unparse_left_semi_join_keeps_outer_reference_neither_side_answers_to()
 -> Result<()> {
-    let plan = outer_reference_in_join_key(JoinSide::Build, "elsewhere.c")?;
+    let plan = outer_reference_in_join_key(OnHalf::Build, "elsewhere.c")?;
 
     let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
     assert_snapshot!(
