@@ -3017,7 +3017,7 @@ impl Unparser<'_> {
 
         if captured {
             return not_impl_err!(
-                "Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
+                "Unparsing an EXISTS-style join is not supported when a FROM the emitted SQL introduces would capture the correlation: it answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, or is a relation this unparser cannot read at all, so the reference binds there instead of in the query it was written against"
             );
         }
         Ok(())

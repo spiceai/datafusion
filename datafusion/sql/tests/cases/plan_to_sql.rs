@@ -3495,7 +3495,7 @@ fn test_unparse_left_semi_join_without_fetch_keeps_multi_relation_correlation()
 /// of its macro, so one shared by several tests collides between them. Every
 /// caller has to produce this identical string, which is what makes sharing it
 /// the point — a reword stays a one-place edit.
-const CAPTURED_CORRELATION_REFUSAL: &str = "This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query";
+const CAPTURED_CORRELATION_REFUSAL: &str = "This feature is not implemented: Unparsing an EXISTS-style join is not supported when a FROM the emitted SQL introduces would capture the correlation: it answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, or is a relation this unparser cannot read at all, so the reference binds there instead of in the query it was written against";
 
 #[track_caller]
 fn assert_captured_correlation_refused(plan: &LogicalPlan, context: &str) {
@@ -3803,7 +3803,7 @@ fn unqualified_correlation_semi_join(build_columns: &[&str]) -> Result<LogicalPl
 }
 
 /// An unqualified correlated reference is captured by whichever relation in the
-/// body exposes its column name, and needs no shared relation to be.
+/// body exposes its column name, and needs no shared relation to be captured.
 ///
 /// The two sides here are `p` and `b`, which share no relation name — but the
 /// probe projects its column to a bare `c` and `b` has a column called `c`, so
