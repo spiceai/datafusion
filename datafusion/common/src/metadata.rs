@@ -20,7 +20,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use hashbrown::HashMap;
 
-use crate::{DataFusionError, ScalarValue, error::_plan_err};
+use crate::{DataFusionError, JoinType, ScalarValue, error::_plan_err};
 
 /// A [`ScalarValue`] with optional [`FieldMetadata`]
 #[derive(Debug, Clone)]
@@ -380,5 +380,187 @@ impl From<&HashMap<String, String>> for FieldMetadata {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         Self::new(inner)
+    }
+}
+
+/// Merge the schema-level metadata of a join's two inputs.
+///
+/// When both inputs define the same key, the output inherits it from the input
+/// whose rows the join preserves: the right input for the right-preserving join
+/// types, the left input otherwise.
+///
+/// [`JoinType::Inner`] and [`JoinType::Full`] preserve both inputs, so they have
+/// no such side, and instead keep only the keys both inputs agree on. That
+/// matters because an optimizer may swap a join's inputs to choose a build
+/// side. Swapping flips the join type too, which leaves the preference above
+/// resolving to the same input as before — but `Inner` and `Full` are their own
+/// mirror under [`JoinType::swap`], so a preference would instead follow
+/// whichever input the swap put on the left, changing the output schema.
+pub fn merge_join_metadata(
+    left: &std::collections::HashMap<String, String>,
+    right: &std::collections::HashMap<String, String>,
+    join_type: &JoinType,
+) -> std::collections::HashMap<String, String> {
+    match join_type {
+        JoinType::Inner | JoinType::Full => metadata_agreed_on(left, right),
+        JoinType::Right
+        | JoinType::RightSemi
+        | JoinType::RightAnti
+        | JoinType::RightMark => metadata_preferring(right, left),
+        JoinType::Left | JoinType::LeftSemi | JoinType::LeftAnti | JoinType::LeftMark => {
+            metadata_preferring(left, right)
+        }
+    }
+}
+
+/// Merge two metadata maps, keeping only the entries both agree on. Commutative,
+/// so the result does not depend on which map is which.
+fn metadata_agreed_on(
+    left: &std::collections::HashMap<String, String>,
+    right: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    let mut merged = left.clone();
+    merged.retain(|key, value| right.get(key).is_none_or(|other| other == value));
+    for (key, value) in right {
+        if !left.contains_key(key) {
+            merged.insert(key.clone(), value.clone());
+        }
+    }
+    merged
+}
+
+/// Merge two metadata maps, with `preferred`'s value winning any key both define.
+fn metadata_preferring(
+    preferred: &std::collections::HashMap<String, String>,
+    other: &std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    other.clone().into_iter().chain(preferred.clone()).collect()
+}
+
+#[cfg(test)]
+mod join_metadata_tests {
+    use super::merge_join_metadata;
+    use crate::JoinType;
+    use std::collections::HashMap;
+
+    const ALL_JOIN_TYPES: [JoinType; 10] = [
+        JoinType::Inner,
+        JoinType::Left,
+        JoinType::Right,
+        JoinType::Full,
+        JoinType::LeftSemi,
+        JoinType::RightSemi,
+        JoinType::LeftAnti,
+        JoinType::RightAnti,
+        JoinType::LeftMark,
+        JoinType::RightMark,
+    ];
+
+    fn map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn keeps_keys_only_one_input_defines() {
+        let left = map(&[("a", "1")]);
+        let right = map(&[("b", "2")]);
+
+        for join_type in ALL_JOIN_TYPES {
+            assert_eq!(
+                merge_join_metadata(&left, &right, &join_type),
+                map(&[("a", "1"), ("b", "2")]),
+                "join type {join_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn keeps_keys_both_inputs_agree_on() {
+        let left = map(&[("description", "same")]);
+        let right = map(&[("description", "same")]);
+
+        for join_type in ALL_JOIN_TYPES {
+            assert_eq!(
+                merge_join_metadata(&left, &right, &join_type),
+                map(&[("description", "same")]),
+                "join type {join_type}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserved_side_wins_a_conflicting_key() {
+        let left = map(&[("description", "left table")]);
+        let right = map(&[("description", "right table")]);
+
+        for join_type in [
+            JoinType::Left,
+            JoinType::LeftSemi,
+            JoinType::LeftAnti,
+            JoinType::LeftMark,
+        ] {
+            assert_eq!(
+                merge_join_metadata(&left, &right, &join_type),
+                map(&[("description", "left table")]),
+                "join type {join_type}"
+            );
+        }
+
+        for join_type in [
+            JoinType::Right,
+            JoinType::RightSemi,
+            JoinType::RightAnti,
+            JoinType::RightMark,
+        ] {
+            assert_eq!(
+                merge_join_metadata(&left, &right, &join_type),
+                map(&[("description", "right table")]),
+                "join type {join_type}"
+            );
+        }
+    }
+
+    /// `Inner` and `Full` preserve both inputs, so neither input's value for a
+    /// conflicting key describes the output.
+    #[test]
+    fn inner_and_full_drop_a_conflicting_key() {
+        let left = map(&[("description", "left table"), ("a", "1")]);
+        let right = map(&[("description", "right table"), ("b", "2")]);
+
+        for join_type in [JoinType::Inner, JoinType::Full] {
+            assert_eq!(
+                merge_join_metadata(&left, &right, &join_type),
+                map(&[("a", "1"), ("b", "2")]),
+                "join type {join_type}"
+            );
+        }
+    }
+
+    /// An optimizer may swap a join's inputs to pick a build side, swapping the
+    /// join type with them. The output metadata must survive that unchanged, or
+    /// the swap alters the plan's output schema.
+    #[test]
+    fn swapping_the_inputs_leaves_the_metadata_unchanged() {
+        let left = map(&[
+            ("description", "left table"),
+            ("shared", "same"),
+            ("a", "1"),
+        ]);
+        let right = map(&[
+            ("description", "right table"),
+            ("shared", "same"),
+            ("b", "2"),
+        ]);
+
+        for join_type in ALL_JOIN_TYPES {
+            assert_eq!(
+                merge_join_metadata(&left, &right, &join_type),
+                merge_join_metadata(&right, &left, &join_type.swap()),
+                "join type {join_type}"
+            );
+        }
     }
 }
