@@ -2865,7 +2865,7 @@ impl Unparser<'_> {
                         Ok(TreeNodeRecursion::Continue)
                     })?;
                     // The names below are hidden by the alias only while there
-                    // is one relation for it to replace. `FROM "t" AS "derived"`
+                    // is a single relation for it to replace. `FROM "t" AS "derived"`
                     // really does put `"t"` out of reach — the pushdown that
                     // depends on it is pinned by
                     // `test_unparse_left_semi_join_keeps_relation_enclosed_by_build_side_alias`.
@@ -2885,9 +2885,11 @@ impl Unparser<'_> {
                     //
                     // Which relation the emitter renames is not decided here, so
                     // all of them are taken, including the one that will be
-                    // replaced. These are read only to refuse, so a name too
-                    // many costs a pushdown and never a row.
-                    if Self::relations_under_alias(&alias.input) > 1 {
+                    // replaced — and so is the join wrapped in a derived table
+                    // after all, whose names really are hidden. These are read
+                    // only to refuse, so a name too many costs a pushdown and
+                    // never a row.
+                    if Self::alias_input_holds_a_join(&alias.input) {
                         alias.input.apply(|inner| {
                             match inner {
                                 LogicalPlan::TableScan(scan) => {
@@ -2957,53 +2959,31 @@ impl Unparser<'_> {
         })
     }
 
-    /// How many relations an alias's input puts in the emitted `FROM`.
+    /// Whether an alias's input puts more than one relation in the emitted
+    /// `FROM`, so the alias cannot replace all of them.
     ///
-    /// One means the alias has a single name to replace and replaces it, so
-    /// nothing below stays addressable. More than one means the input is a join,
-    /// which SQL cannot name as a whole: unless the emitter wraps it in a derived
-    /// table, `relation.alias` renames the primary relation and the rest keep the
-    /// names they were scanned under.
+    /// Asked as "is there a join here" rather than by counting relations,
+    /// because a join is the only thing that puts a second one there and the
+    /// count is the fragile half: it would have to enumerate every node the
+    /// emitter can write as a table factor — a scan, a nested alias, an `UNNEST`
+    /// — and a factor left off that list reads as one relation, which is the
+    /// answer that declines to collect. A join present is enough to know the
+    /// alias renames one side and leaves the other named as it was.
     ///
-    /// A nested `SubqueryAlias` counts as the one relation it presents and is not
-    /// descended into, for the reason this function is asked in the first place.
-    fn relations_under_alias(plan: &LogicalPlan) -> usize {
-        let mut relations = 0;
+    /// A nested `SubqueryAlias` ends the descent: whatever it holds is its own
+    /// boundary, decided on these same terms when the walk reaches it.
+    fn alias_input_holds_a_join(plan: &LogicalPlan) -> bool {
         let mut pending = vec![plan];
         while let Some(node) = pending.pop() {
             match node {
-                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_) => {
-                    relations += 1;
-                }
+                LogicalPlan::Join(_) => return true,
+                LogicalPlan::SubqueryAlias(_) => {}
                 _ => pending.extend(node.inputs()),
             }
         }
-        relations
+        false
     }
 
-    /// The relations the emitted `FROM` at this level can actually name.
-    ///
-    /// A subset of what [`Self::emitted_scope`] collects, and the two are needed
-    /// separately because the questions asked of a scope fail in opposite
-    /// directions. For a *collision* test, a relation wrongly included costs a
-    /// refusal, so that walk collects everything the plan mentions. For an
-    /// *arrival* test — [`Self::scope_names_relation`], which ends the enquiry
-    /// into a reference — a relation wrongly included means the reference is
-    /// dropped unexamined and the capture it would have refused is emitted.
-    ///
-    /// So this descends only through the nodes that leave a relation nameable at
-    /// this level: a `Filter` becomes a `WHERE` and a `Join` a `JOIN`, neither
-    /// of which renames anything, and a `SubqueryAlias` supplies a name of its
-    /// own. Every other node stops the descent, the emitter's own derived tables
-    /// among them — `derived_projection`, `derived_limit`,
-    /// `derived_window_input` and the rest replace whatever the plan called the
-    /// relation beneath them with a fixed alias, so a reference to that relation
-    /// does not resolve there however plainly the plan names it.
-    ///
-    /// Stopping at an unlisted node is the conservative direction: one that
-    /// would in fact have left the relation nameable costs a refusal, never a
-    /// wrong binding. That price is real and is pinned by
-    /// `refuses_nested_reference_behind_a_derived_window_input`.
     fn addressable_relations(&self, plan: &LogicalPlan) -> Vec<Vec<String>> {
         let mut addressable = Vec::new();
         let mut pending = vec![plan];
