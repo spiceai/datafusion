@@ -18,9 +18,11 @@
 use super::{
     Unparser,
     ast::{
-        BuilderError, DERIVED_AGGREGATE_ALIAS_PREFIX, DerivedRelationBuilder,
-        FLATTEN_ALIAS_PREFIX, QueryBuilder, RelationBuilder, SelectBuilder,
-        TableRelationBuilder, TableWithJoinsBuilder,
+        BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
+        DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_UNION_ALIAS,
+        DERIVED_UNNEST_ALIAS, DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder,
+        QueryBuilder, RelationBuilder, SelectBuilder, TableRelationBuilder,
+        TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
@@ -44,6 +46,7 @@ use crate::unparser::{
     ast::FlattenRelationBuilder, ast::UnnestRelationBuilder, rewrite::rewrite_qualify,
 };
 use crate::utils::UNNEST_PLACEHOLDER;
+use arrow::datatypes::SchemaRef;
 use datafusion_common::{
     Column, DataFusionError, Result, ScalarValue, TableReference, assert_or_internal_err,
     internal_datafusion_err, internal_err, not_impl_err,
@@ -829,7 +832,7 @@ impl Unparser<'_> {
         select: &mut SelectBuilder,
         relation: &mut RelationBuilder,
     ) -> Result<()> {
-        let input_alias = "derived_window_input";
+        let input_alias = DERIVED_WINDOW_INPUT_ALIAS;
         self.derive(
             window.input.as_ref(),
             relation,
@@ -952,7 +955,7 @@ impl Unparser<'_> {
                 // Projection can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_projection",
+                        DERIVED_PROJECTION_ALIAS,
                         plan,
                         relation,
                         unnest_input_type
@@ -1034,7 +1037,7 @@ impl Unparser<'_> {
                 // Limit can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_limit",
+                        DERIVED_LIMIT_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1079,7 +1082,7 @@ impl Unparser<'_> {
                 // Sort can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_sort",
+                        DERIVED_SORT_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1232,7 +1235,7 @@ impl Unparser<'_> {
                 // Distinct can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_distinct",
+                        DERIVED_DISTINCT_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1667,7 +1670,7 @@ impl Unparser<'_> {
                 // Covers cases where the UNION is a subquery and the projection is at the top level
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_union",
+                        DERIVED_UNION_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1844,7 +1847,7 @@ impl Unparser<'_> {
                     )
                 } else {
                     self.derive_with_dialect_alias(
-                        "derived_unnest",
+                        DERIVED_UNNEST_ALIAS,
                         subquery.subquery.as_ref(),
                         relation,
                         true,
@@ -2727,30 +2730,19 @@ impl Unparser<'_> {
     /// as always in scope inside an `EXISTS` body: a correlated reference to a
     /// relation a user happened to name one of these is refused rather than
     /// emitted, since the invented alias would capture it.
+    ///
+    /// Read from the constants the emitter writes rather than restated, so the
+    /// two cannot drift apart — the numbered aliases are recognised by
+    /// [`is_numbered_alias`], which its own generators are the inverse of.
     const UNPARSER_DERIVED_ALIASES: [&'static str; 7] = [
-        "derived_distinct",
-        "derived_limit",
-        "derived_projection",
-        "derived_sort",
-        "derived_union",
-        "derived_unnest",
-        "derived_window_input",
+        DERIVED_DISTINCT_ALIAS,
+        DERIVED_LIMIT_ALIAS,
+        DERIVED_PROJECTION_ALIAS,
+        DERIVED_SORT_ALIAS,
+        DERIVED_UNION_ALIAS,
+        DERIVED_UNNEST_ALIAS,
+        DERIVED_WINDOW_INPUT_ALIAS,
     ];
-
-    /// Prefixes of the aliases the unparser numbers per `SELECT`
-    /// (`derived_aggregate_1`, `_unnest_2`, …).
-    ///
-    /// The counter is part of the name: `SelectBuilder::next_derived_aggregate_alias`
-    /// and `SelectBuilder::next_flatten_alias` always append one, so the bare
-    /// prefix is never emitted as a table name. Reserving the prefix instead of
-    /// the generated form gets it exactly backwards — it refuses a relation
-    /// nothing can capture, and leaves every name that really is emitted open.
-    ///
-    /// The generated names cannot be enumerated here: how many derived tables a
-    /// body needs is not known until it is built, and this refusal is decided
-    /// before that, from the correlation's qualifiers alone.
-    const UNPARSER_NUMBERED_ALIAS_PREFIXES: [&'static str; 2] =
-        [DERIVED_AGGREGATE_ALIAS_PREFIX, FLATTEN_ALIAS_PREFIX];
 
     /// Whether `qualifier`, as the emitted SQL spells it, is a name the unparser
     /// can invent for a derived table of its own.
@@ -2763,15 +2755,7 @@ impl Unparser<'_> {
         let [name] = qualifier else {
             return false;
         };
-        Self::UNPARSER_DERIVED_ALIASES.contains(&name.as_str())
-            || Self::UNPARSER_NUMBERED_ALIAS_PREFIXES.iter().any(|prefix| {
-                name.strip_prefix(prefix)
-                    .and_then(|rest| rest.strip_prefix('_'))
-                    .is_some_and(|counter| {
-                        !counter.is_empty()
-                            && counter.bytes().all(|byte| byte.is_ascii_digit())
-                    })
-            })
+        Self::UNPARSER_DERIVED_ALIASES.contains(&name.as_str()) || is_numbered_alias(name)
     }
 
     /// What the `EXISTS` body's `FROM` will answer to: its relation names, and the
@@ -2798,19 +2782,12 @@ impl Unparser<'_> {
     /// they appear nowhere in the plan, so no walk can find them. They are
     /// recognised by [`Self::is_unparser_derived_alias`] instead.
     fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
+        // A derived table exposes its input's output columns, including one the
+        // body renamed — a rename no walk below can see, since the unparser
+        // introduces that derived table without the plan holding a node for it.
         let mut scope = EmittedScope {
-            // The names the emitted relation exposes at its top level. Taken
-            // from the plan's own output because a derived table exposes
-            // exactly that, including a column the body renamed — a rename the
-            // walk below cannot see, since the unparser introduces that derived
-            // table without the plan holding a node for it.
-            names: plan
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| field.name().clone())
-                .collect(),
             qualifiers: Vec::new(),
+            schemas: vec![Arc::clone(plan.schema().inner())],
         };
         plan.apply(|node| match node {
             LogicalPlan::TableScan(scan) => {
@@ -2820,13 +2797,7 @@ impl Unparser<'_> {
                 // A relation emitted bare answers to every column it has, not
                 // just the projected ones — the same reason the qualifier is
                 // read from the `FROM` rather than from the output schema.
-                scope.names.extend(
-                    scan.source
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|field| field.name().clone()),
-                );
+                scope.schemas.push(scan.source.schema());
                 Ok(TreeNodeRecursion::Continue)
             }
             LogicalPlan::SubqueryAlias(alias) => {
@@ -2838,8 +2809,7 @@ impl Unparser<'_> {
         Ok(scope)
     }
 
-    /// Whether a qualified reference `expr` emits would bind inside the scope
-    /// described by `candidates`.
+    /// Whether a reference `expr` emits would bind inside every one of `scopes`.
     ///
     /// Both column variants are walked. [`Expr::column_refs`] collects only
     /// [`Expr::Column`], but [`Self::col_to_sql`] renders
@@ -2848,35 +2818,37 @@ impl Unparser<'_> {
     /// guard that reasons about where an emitted reference resolves has to see
     /// both, or the variant it does not walk goes on being captured.
     ///
-    /// A qualifier the unparser can invent for a derived table of its own binds
-    /// inside whatever `candidates` says, since the alias reaches the emitted
-    /// `FROM` without the plan naming it.
-    fn references_scope(&self, expr: &Expr, scope: &EmittedScope) -> Result<bool> {
-        let mut captured = false;
-        expr.apply(|node| {
+    /// Asking *every* scope is how a reference that two of them could each mean
+    /// is separated from one only a single scope answers to: a `join.filter`
+    /// carries no split by side, so a name or qualifier one input alone owns is
+    /// attributable after all, while one they share is not.
+    fn references_every_scope(
+        &self,
+        expr: &Expr,
+        scopes: &[&EmittedScope],
+    ) -> Result<bool> {
+        expr.exists(|node| {
             let (Expr::Column(column) | Expr::OuterReferenceColumn(_, column)) = node
             else {
-                return Ok(TreeNodeRecursion::Continue);
+                return Ok(false);
             };
-            let bound_inside = match column.relation.as_ref() {
+            Ok(match column.relation.as_ref() {
                 Some(relation) => {
                     let emitted = self.emitted_qualifier(relation);
+                    // An alias the unparser invents is in the emitted `FROM`
+                    // whatever the plan holds, so no scope has to claim it.
                     Self::is_unparser_derived_alias(&emitted)
-                        || scope.qualifiers.contains(&emitted)
+                        || scopes
+                            .iter()
+                            .all(|scope| scope.qualifiers.contains(&emitted))
                 }
                 // An unqualified reference names no relation to disagree with,
                 // so it binds to whichever relation in the innermost scope
                 // exposes the column — the `EXISTS` body's own, whenever that
                 // body exposes the name at all.
-                None => scope.names.contains(&column.name),
-            };
-            if bound_inside {
-                captured = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        Ok(captured)
+                None => scopes.iter().all(|scope| scope.exposes(&column.name)),
+            })
+        })
     }
 
     /// Refuses a correlation that the `EXISTS` body's own `FROM` would capture.
@@ -2895,8 +2867,8 @@ impl Unparser<'_> {
     /// [`Self::exists_scope_name`] already makes for output that binds and runs
     /// rather than failing.
     ///
-    /// Two things this has to get right, each of which costs correctness one way
-    /// and pushdown the other:
+    /// Three things this has to get right, each of which costs correctness one
+    /// way and pushdown the other:
     ///
     /// * **Ask how the qualifier will be spelled**, via
     ///   [`Self::emitted_qualifier`], rather than comparing the
@@ -2913,17 +2885,24 @@ impl Unparser<'_> {
     ///   ones. `join.filter` carries no such split, so a reference in it cannot
     ///   be attributed — there, only a qualifier *both* sides answer to is
     ///   refused, which no reference to a distinct relation can be.
+    /// * **Ask what the body exposes, not only what it is called.** An
+    ///   unqualified reference names no relation to collide with, so it is a
+    ///   column name that decides where it binds. Comparing qualifiers alone
+    ///   lets two sides that share no relation at all emit a correlation the
+    ///   body captures.
     ///
-    /// Two gaps are left to the qualifier rewrite tracked by
-    /// spiceai/spiceai#12840:
+    /// One gap is left to the qualifier rewrite tracked by spiceai/spiceai#12840:
+    /// a relation reached through a `SubqueryAlias`, whose own name the emitted
+    /// SQL replaces with the alias. The alias is what this compares, which is
+    /// right for a reference written against it, but a correlated reference
+    /// still qualified by the enclosed relation is a shape the rewrite has to
+    /// requalify rather than refuse.
     ///
-    /// * An unqualified correlated reference, which names no relation to collide
-    ///   with, so which scope it resolves against is that rewrite's question.
-    /// * A relation reached through a `SubqueryAlias`, whose own name the emitted
-    ///   SQL replaces with the alias. The alias is what this compares, which is
-    ///   right for a reference written against it, but a correlated reference
-    ///   still qualified by the enclosed relation is a shape the rewrite has to
-    ///   requalify rather than refuse.
+    /// It over-refuses in the other direction as well, tracked by
+    /// spiceai/spiceai#13469: the walk collects relations the emitter will bury
+    /// inside a derived table of its own, which the emitted SQL cannot address.
+    /// That costs the pushdown on correct SQL, which is the safe way round for
+    /// a guard whose other failure is wrong rows.
     fn ensure_exists_correlation_not_shadowed(&self, join: &Join) -> Result<()> {
         let swapped = Self::swaps_join_inputs(join.join_type);
         let (probe_plan, build_plan) = if swapped {
@@ -2939,27 +2918,20 @@ impl Unparser<'_> {
             .iter()
             .map(|(left, right)| if swapped { right } else { left })
         {
-            if self.references_scope(correlated, &build_scope)? {
+            if self.references_every_scope(correlated, &[&build_scope])? {
                 captured = true;
                 break;
             }
         }
         // Walked only when there is a filter, which most joins do not have.
+        // A filter can only reference the join's own two inputs, so a name or
+        // qualifier just one of them answers to is attributable after all and
+        // binds where it was meant to; only what both answer to is ambiguous,
+        // which is what asking both scopes says.
         if !captured && let Some(filter) = &join.filter {
             let probe_scope = self.emitted_scope(probe_plan)?;
-            let shared = EmittedScope {
-                qualifiers: probe_scope
-                    .qualifiers
-                    .into_iter()
-                    .filter(|qualifier| build_scope.qualifiers.contains(qualifier))
-                    .collect(),
-                names: probe_scope
-                    .names
-                    .into_iter()
-                    .filter(|name| build_scope.names.contains(name))
-                    .collect(),
-            };
-            captured = self.references_scope(filter, &shared)?;
+            captured =
+                self.references_every_scope(filter, &[&build_scope, &probe_scope])?;
         }
 
         if captured {
@@ -3036,7 +3008,7 @@ impl Unparser<'_> {
         match relations.as_slice() {
             // Nothing to preserve, so any name will do — but only once the
             // correlation has been shown to name nothing.
-            [] if !names_a_probe_relation => Ok("derived_limit".to_string()),
+            [] if !names_a_probe_relation => Ok(DERIVED_LIMIT_ALIAS.to_string()),
             // A qualifier the probe side also answers to can be a build-side
             // reference on a self-join, where naming the scope anything else
             // rebinds it to the probe.
@@ -3201,13 +3173,23 @@ impl From<BuilderError> for DataFusionError {
 ///
 /// * `qualifiers` — the relation names the `FROM` introduces, spelled the way
 ///   this dialect will spell a column's qualifier.
-/// * `names` — the column names those relations expose. An unqualified
-///   reference carries no relation to compare, so this is the only thing that
-///   decides whether the body captures it.
+/// * `schemas` — the schemas whose column names those relations expose. An
+///   unqualified reference carries no relation to compare, so a name being
+///   found in one of these is the only thing that decides whether the body
+///   captures it.
 #[derive(Debug)]
 struct EmittedScope {
     qualifiers: Vec<Vec<String>>,
-    names: HashSet<String>,
+    schemas: Vec<SchemaRef>,
+}
+
+impl EmittedScope {
+    /// Whether an unqualified reference to `name` finds a column here.
+    fn exposes(&self, name: &str) -> bool {
+        self.schemas
+            .iter()
+            .any(|schema| schema.column_with_name(name).is_some())
+    }
 }
 
 /// The type of the input to the UNNEST table factor.

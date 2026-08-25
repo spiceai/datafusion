@@ -3030,6 +3030,29 @@ fn exists_fetch_schema() -> Schema {
     ])
 }
 
+/// A flat schema of non-nullable `Int32` columns, for a build side whose column
+/// *names* are what a test varies.
+fn int32_schema(names: &[&str]) -> Schema {
+    Schema::new(
+        names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int32, false))
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The probe side shared by the unqualified-correlation tests: `p`, projected so
+/// that both of its output columns carry a bare name.
+///
+/// That projection is what leaves the join keys built from it unqualified, which
+/// is the whole point — a correlation with no qualifier collides on its column
+/// name instead.
+fn unqualified_probe() -> Result<LogicalPlan> {
+    table_scan(Some("p"), &exists_fetch_schema(), Some(vec![0, 1]))?
+        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
+        .build()
+}
+
 /// Builds `<join_type> Join: t1.c = t2.c` with `fetch` rows read from the
 /// build side, projecting `t1.d`.
 fn exists_join_with_build_side_fetch(
@@ -3753,15 +3776,8 @@ fn test_unparse_left_semi_join_refuses_shadowed_outer_reference() -> Result<()> 
 /// captures it turns entirely on whether the build relation has a column called
 /// `c` — which `build_columns` decides.
 fn unqualified_correlation_semi_join(build_columns: &[&str]) -> Result<LogicalPlan> {
-    let probe = table_scan(Some("p"), &exists_fetch_schema(), Some(vec![0, 1]))?
-        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
-        .build()?;
-    let build_schema = Schema::new(
-        build_columns
-            .iter()
-            .map(|name| Field::new(*name, DataType::Int32, false))
-            .collect::<Vec<_>>(),
-    );
+    let probe = unqualified_probe()?;
+    let build_schema = int32_schema(build_columns);
     let build = table_scan(Some("b"), &build_schema, Some(vec![0]))?.build()?;
 
     LogicalPlanBuilder::from(probe)
@@ -3837,13 +3853,8 @@ fn test_unparse_left_semi_join_keeps_unqualified_reference_the_body_lacks() -> R
 /// is that restriction for names.
 #[test]
 fn test_unparse_left_semi_join_keeps_build_only_unqualified_filter_name() -> Result<()> {
-    let probe = table_scan(Some("p"), &exists_fetch_schema(), Some(vec![0, 1]))?
-        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
-        .build()?;
-    let build_schema = Schema::new(vec![
-        Field::new("e", DataType::Int32, false),
-        Field::new("f", DataType::Int32, false),
-    ]);
+    let probe = unqualified_probe()?;
+    let build_schema = int32_schema(&["e", "f"]);
     // Aliased so the build side's output field is unqualified, which is what
     // leaves the filter's reference to it unqualified too.
     let build = table_scan(Some("b"), &build_schema, Some(vec![0]))?
@@ -3882,9 +3893,7 @@ fn test_unparse_left_semi_join_keeps_build_only_unqualified_filter_name() -> Res
 fn test_unparse_left_semi_join_refuses_unqualified_capture_by_unprojected_column()
 -> Result<()> {
     let schema = exists_fetch_schema();
-    let probe = table_scan(Some("p"), &schema, Some(vec![0, 1]))?
-        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
-        .build()?;
+    let probe = unqualified_probe()?;
     let build = table_scan(Some("b"), &schema, Some(vec![1]))?.build()?;
     let plan = LogicalPlanBuilder::from(probe)
         .join(
@@ -3918,13 +3927,8 @@ fn test_unparse_left_semi_join_refuses_unqualified_capture_by_unprojected_column
 #[test]
 fn test_unparse_left_semi_join_refuses_unqualified_capture_by_renamed_column()
 -> Result<()> {
-    let probe = table_scan(Some("p"), &exists_fetch_schema(), Some(vec![0, 1]))?
-        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
-        .build()?;
-    let build_schema = Schema::new(vec![
-        Field::new("x", DataType::Int32, false),
-        Field::new("y", DataType::Int32, false),
-    ]);
+    let probe = unqualified_probe()?;
+    let build_schema = int32_schema(&["x", "y"]);
     let build = table_scan(Some("b"), &build_schema, Some(vec![0]))?
         .project(vec![col("b.x").alias("c")])?
         .project(vec![col("c")])?

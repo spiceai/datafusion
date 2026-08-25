@@ -212,18 +212,60 @@ pub struct SelectBuilder {
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
-pub(crate) const FLATTEN_ALIAS_PREFIX: &str = "_unnest";
+const FLATTEN_ALIAS_PREFIX: &str = "_unnest";
 
 /// Prefix used for the auto-generated alias of a derived table that carries an
 /// aggregate stacked below the one its enclosing SELECT already expresses.
-pub(crate) const DERIVED_AGGREGATE_ALIAS_PREFIX: &str = "derived_aggregate";
+const DERIVED_AGGREGATE_ALIAS_PREFIX: &str = "derived_aggregate";
+
+/// The prefixes [`numbered_alias`] builds a name from.
+const NUMBERED_ALIAS_PREFIXES: [&str; 2] =
+    [FLATTEN_ALIAS_PREFIX, DERIVED_AGGREGATE_ALIAS_PREFIX];
+
+/// Aliases the unparser gives verbatim to a derived table it introduces, one
+/// per kind of node that has to be wrapped.
+///
+/// Public because a name the unparser can invent is in the emitted scope
+/// without the plan holding it anywhere, so code reasoning about what that
+/// scope answers to has to be able to ask.
+pub(crate) const DERIVED_DISTINCT_ALIAS: &str = "derived_distinct";
+pub(crate) const DERIVED_LIMIT_ALIAS: &str = "derived_limit";
+pub(crate) const DERIVED_PROJECTION_ALIAS: &str = "derived_projection";
+pub(crate) const DERIVED_SORT_ALIAS: &str = "derived_sort";
+pub(crate) const DERIVED_UNION_ALIAS: &str = "derived_union";
+pub(crate) const DERIVED_UNNEST_ALIAS: &str = "derived_unnest";
+pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
+
+/// The name the counter-numbered generators below build: a prefix, an
+/// underscore, and the count.
+///
+/// Written once so that [`is_numbered_alias`] is its exact inverse. A guard
+/// that has to recognise these names without generating them lives in another
+/// module, and the two agreeing is what keeps such a guard from quietly
+/// matching nothing.
+fn numbered_alias(prefix: &str, counter: usize) -> String {
+    format!("{prefix}_{counter}")
+}
+
+/// Whether `name` is one this module's counter-numbered generators can produce.
+///
+/// The inverse of [`numbered_alias`]: the bare prefix is never a name — the
+/// counter is always appended — so only the numbered form is recognised.
+pub(crate) fn is_numbered_alias(name: &str) -> bool {
+    let Some((prefix, counter)) = name.rsplit_once('_') else {
+        return false;
+    };
+    NUMBERED_ALIAS_PREFIXES.contains(&prefix)
+        && !counter.is_empty()
+        && counter.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 impl SelectBuilder {
     /// Generate a unique alias for a LATERAL FLATTEN relation
     /// (`_unnest_1`, `_unnest_2`, …). Each call returns a fresh name.
     pub fn next_flatten_alias(&mut self) -> String {
         self.flatten_alias_counter += 1;
-        format!("{FLATTEN_ALIAS_PREFIX}_{}", self.flatten_alias_counter)
+        numbered_alias(FLATTEN_ALIAS_PREFIX, self.flatten_alias_counter)
     }
 
     /// Generate a unique alias for a derived table holding a stacked aggregate
@@ -234,9 +276,9 @@ impl SelectBuilder {
     /// references are rewritten onto.
     pub fn next_derived_aggregate_alias(&mut self) -> String {
         self.derived_aggregate_alias_counter += 1;
-        format!(
-            "{DERIVED_AGGREGATE_ALIAS_PREFIX}_{}",
-            self.derived_aggregate_alias_counter
+        numbered_alias(
+            DERIVED_AGGREGATE_ALIAS_PREFIX,
+            self.derived_aggregate_alias_counter,
         )
     }
 
@@ -269,9 +311,9 @@ impl SelectBuilder {
     /// `next_flatten_alias` has not been called yet.
     pub fn current_flatten_alias(&self) -> Option<String> {
         if self.flatten_alias_counter > 0 {
-            Some(format!(
-                "{FLATTEN_ALIAS_PREFIX}_{}",
-                self.flatten_alias_counter
+            Some(numbered_alias(
+                FLATTEN_ALIAS_PREFIX,
+                self.flatten_alias_counter,
             ))
         } else {
             None
