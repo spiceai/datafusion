@@ -2723,7 +2723,7 @@ impl Unparser<'_> {
     /// Aliases the unparser emits verbatim for a derived table it introduces.
     ///
     /// These reach the emitted `FROM` without appearing anywhere in the plan, so
-    /// [`Self::scope_qualifiers`] cannot find them by walking it. They are treated
+    /// [`Self::emitted_scope`] cannot find them by walking it. They are treated
     /// as always in scope inside an `EXISTS` body: a correlated reference to a
     /// relation a user happened to name one of these is refused rather than
     /// emitted, since the invented alias would capture it.
@@ -2774,7 +2774,8 @@ impl Unparser<'_> {
             })
     }
 
-    /// The qualifiers the `EXISTS` body's `FROM` will answer to.
+    /// What the `EXISTS` body's `FROM` will answer to: its relation names, and the
+    /// column names those relations expose.
     ///
     /// Read from the relations the `FROM` introduces rather than from `plan`'s
     /// output schema, which is a proxy that is wrong in both directions:
@@ -2796,20 +2797,45 @@ impl Unparser<'_> {
     /// Aliases the unparser invents for derived tables of its own are not here —
     /// they appear nowhere in the plan, so no walk can find them. They are
     /// recognised by [`Self::is_unparser_derived_alias`] instead.
-    fn scope_qualifiers(&self, plan: &LogicalPlan) -> Result<Vec<Vec<String>>> {
-        let mut qualifiers: Vec<Vec<String>> = Vec::new();
+    fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
+        let mut scope = EmittedScope {
+            // The names the emitted relation exposes at its top level. Taken
+            // from the plan's own output because a derived table exposes
+            // exactly that, including a column the body renamed — a rename the
+            // walk below cannot see, since the unparser introduces that derived
+            // table without the plan holding a node for it.
+            names: plan
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.name().clone())
+                .collect(),
+            qualifiers: Vec::new(),
+        };
         plan.apply(|node| match node {
             LogicalPlan::TableScan(scan) => {
-                qualifiers.push(self.emitted_qualifier(&scan.table_name));
+                scope
+                    .qualifiers
+                    .push(self.emitted_qualifier(&scan.table_name));
+                // A relation emitted bare answers to every column it has, not
+                // just the projected ones — the same reason the qualifier is
+                // read from the `FROM` rather than from the output schema.
+                scope.names.extend(
+                    scan.source
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name().clone()),
+                );
                 Ok(TreeNodeRecursion::Continue)
             }
             LogicalPlan::SubqueryAlias(alias) => {
-                qualifiers.push(vec![alias.alias.table().to_string()]);
+                scope.qualifiers.push(vec![alias.alias.table().to_string()]);
                 Ok(TreeNodeRecursion::Jump)
             }
             _ => Ok(TreeNodeRecursion::Continue),
         })?;
-        Ok(qualifiers)
+        Ok(scope)
     }
 
     /// Whether a qualified reference `expr` emits would bind inside the scope
@@ -2825,19 +2851,26 @@ impl Unparser<'_> {
     /// A qualifier the unparser can invent for a derived table of its own binds
     /// inside whatever `candidates` says, since the alias reaches the emitted
     /// `FROM` without the plan naming it.
-    fn references_scope(&self, expr: &Expr, candidates: &[Vec<String>]) -> Result<bool> {
+    fn references_scope(&self, expr: &Expr, scope: &EmittedScope) -> Result<bool> {
         let mut captured = false;
         expr.apply(|node| {
             let (Expr::Column(column) | Expr::OuterReferenceColumn(_, column)) = node
             else {
                 return Ok(TreeNodeRecursion::Continue);
             };
-            let Some(relation) = column.relation.as_ref() else {
-                return Ok(TreeNodeRecursion::Continue);
+            let bound_inside = match column.relation.as_ref() {
+                Some(relation) => {
+                    let emitted = self.emitted_qualifier(relation);
+                    Self::is_unparser_derived_alias(&emitted)
+                        || scope.qualifiers.contains(&emitted)
+                }
+                // An unqualified reference names no relation to disagree with,
+                // so it binds to whichever relation in the innermost scope
+                // exposes the column — the `EXISTS` body's own, whenever that
+                // body exposes the name at all.
+                None => scope.names.contains(&column.name),
             };
-            let emitted = self.emitted_qualifier(relation);
-            if Self::is_unparser_derived_alias(&emitted) || candidates.contains(&emitted)
-            {
+            if bound_inside {
                 captured = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -2899,31 +2932,39 @@ impl Unparser<'_> {
             (&join.left, &join.right)
         };
 
-        let build_qualifiers = self.scope_qualifiers(build_plan)?;
+        let build_scope = self.emitted_scope(build_plan)?;
         let mut captured = false;
         for correlated in join
             .on
             .iter()
             .map(|(left, right)| if swapped { right } else { left })
         {
-            if self.references_scope(correlated, &build_qualifiers)? {
+            if self.references_scope(correlated, &build_scope)? {
                 captured = true;
                 break;
             }
         }
         // Walked only when there is a filter, which most joins do not have.
         if !captured && let Some(filter) = &join.filter {
-            let shared: Vec<Vec<String>> = self
-                .scope_qualifiers(probe_plan)?
-                .into_iter()
-                .filter(|qualifier| build_qualifiers.contains(qualifier))
-                .collect();
+            let probe_scope = self.emitted_scope(probe_plan)?;
+            let shared = EmittedScope {
+                qualifiers: probe_scope
+                    .qualifiers
+                    .into_iter()
+                    .filter(|qualifier| build_scope.qualifiers.contains(qualifier))
+                    .collect(),
+                names: probe_scope
+                    .names
+                    .into_iter()
+                    .filter(|name| build_scope.names.contains(name))
+                    .collect(),
+            };
             captured = self.references_scope(filter, &shared)?;
         }
 
         if captured {
             return not_impl_err!(
-                "Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query"
+                "Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
             );
         }
         Ok(())
@@ -3151,6 +3192,22 @@ impl From<BuilderError> for DataFusionError {
     fn from(e: BuilderError) -> Self {
         DataFusionError::External(Box::new(e))
     }
+}
+
+/// What an `EXISTS` body's emitted `FROM` will answer to.
+///
+/// A reference inside the body binds to the innermost scope that answers to it,
+/// and it can be addressed two ways, so both are collected:
+///
+/// * `qualifiers` — the relation names the `FROM` introduces, spelled the way
+///   this dialect will spell a column's qualifier.
+/// * `names` — the column names those relations expose. An unqualified
+///   reference carries no relation to compare, so this is the only thing that
+///   decides whether the body captures it.
+#[derive(Debug)]
+struct EmittedScope {
+    qualifiers: Vec<Vec<String>>,
+    names: HashSet<String>,
 }
 
 /// The type of the input to the UNNEST table factor.

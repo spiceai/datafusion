@@ -3472,7 +3472,7 @@ fn test_unparse_left_semi_join_without_fetch_keeps_multi_relation_correlation()
 /// of its macro, so one shared by several tests collides between them. Every
 /// caller has to produce this identical string, which is what makes sharing it
 /// the point — a reword stays a one-place edit.
-const CAPTURED_CORRELATION_REFUSAL: &str = "This feature is not implemented: Unparsing an EXISTS-style join is not supported when the correlation is qualified by a relation the build side also answers to: the subquery's own FROM would capture that reference instead of the outer query";
+const CAPTURED_CORRELATION_REFUSAL: &str = "This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query";
 
 #[track_caller]
 fn assert_captured_correlation_refused(plan: &LogicalPlan, context: &str) {
@@ -3741,6 +3741,207 @@ fn test_unparse_left_semi_join_refuses_shadowed_outer_reference() -> Result<()> 
     assert_captured_correlation_refused(
         &plan,
         "a shadowed outer reference must be refused, not emitted",
+    );
+    Ok(())
+}
+
+/// Builds `LeftSemi Join` on an unqualified key: the probe projects `p.c AS c`,
+/// and the build side is a relation whose own columns are `build_columns`,
+/// joined on its first one.
+///
+/// The correlation therefore carries no qualifier, and whether the emitted body
+/// captures it turns entirely on whether the build relation has a column called
+/// `c` — which `build_columns` decides.
+fn unqualified_correlation_semi_join(build_columns: &[&str]) -> Result<LogicalPlan> {
+    let probe = table_scan(Some("p"), &exists_fetch_schema(), Some(vec![0, 1]))?
+        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
+        .build()?;
+    let build_schema = Schema::new(
+        build_columns
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int32, false))
+            .collect::<Vec<_>>(),
+    );
+    let build = table_scan(Some("b"), &build_schema, Some(vec![0]))?.build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["c"], vec![build_columns[0]]),
+            None,
+        )?
+        .build()
+}
+
+/// An unqualified correlated reference is captured by whichever relation in the
+/// body exposes its column name, and needs no shared relation to be.
+///
+/// The two sides here are `p` and `b`, which share no relation name — but the
+/// probe projects its column to a bare `c` and `b` has a column called `c`, so
+/// the body's own `FROM "b"` answers to the reference. Before this was caught,
+/// the plan unparsed to
+/// `SELECT "p"."c" AS "c", "p"."d" AS "d" FROM "p" WHERE EXISTS (SELECT 1 FROM "b" WHERE ("c" = "c"))`,
+/// where both halves bind to `b.c`: the same inner tautology as the self-join,
+/// reached without either side naming the other.
+///
+/// So the scope has to carry the column names the emitted `FROM` exposes and
+/// not only the relations it introduces — a qualifier is simply not what an
+/// unqualified reference collides with.
+#[test]
+fn test_unparse_left_semi_join_refuses_unqualified_correlation() -> Result<()> {
+    let plan = unqualified_correlation_semi_join(&["c", "d"])?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an unqualified correlation the build side exposes must be refused",
+    );
+    Ok(())
+}
+
+/// The other direction: an unqualified reference to a name the body does not
+/// expose binds outward, so it keeps its pushdown.
+///
+/// Identical to the test above except that `b`'s columns are `e` and `f`. The
+/// correlated `c` matches nothing the subquery's `FROM` answers to, so it
+/// resolves against the outer query and the SQL is emitted.
+///
+/// The name has to be absent from the *relation*, not merely unprojected: `b`
+/// is emitted bare, so `FROM "b"` exposes every column it has whatever the plan
+/// projects — which is why the build side here is a different relation rather
+/// than the same one projected differently.
+#[test]
+fn test_unparse_left_semi_join_keeps_unqualified_reference_the_body_lacks() -> Result<()>
+{
+    let plan = unqualified_correlation_semi_join(&["e", "f"])?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "p"."c" AS "c", "p"."d" AS "d" FROM "p" WHERE EXISTS (SELECT 1 FROM "b" WHERE ("c" = "b"."e"))"#
+    );
+    Ok(())
+}
+
+/// An unqualified reference in the join's filter that only the build side can
+/// mean is a build-side reference, binds inside on purpose, and keeps its
+/// pushdown.
+///
+/// `join.filter` carries no split by side, but it can only reference the join's
+/// own two inputs — so a name just one of them exposes is attributable after
+/// all. Here `e` belongs to `b` alone, and `("e" > 0)` inside the body is meant
+/// for the body's own relation. Testing filter names against the build side
+/// outright, rather than against the names both sides answer to, refuses this.
+///
+/// The qualifier arm is restricted the same way and for the same reason; this
+/// is that restriction for names.
+#[test]
+fn test_unparse_left_semi_join_keeps_build_only_unqualified_filter_name() -> Result<()> {
+    let probe = table_scan(Some("p"), &exists_fetch_schema(), Some(vec![0, 1]))?
+        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
+        .build()?;
+    let build_schema = Schema::new(vec![
+        Field::new("e", DataType::Int32, false),
+        Field::new("f", DataType::Int32, false),
+    ]);
+    // Aliased so the build side's output field is unqualified, which is what
+    // leaves the filter's reference to it unqualified too.
+    let build = table_scan(Some("b"), &build_schema, Some(vec![0]))?
+        .project(vec![col("b.e").alias("e")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("e").gt(lit(0))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "p"."c" AS "c", "p"."d" AS "d" FROM "p" WHERE EXISTS (SELECT 1 FROM "b" WHERE ("e" > 0))"#
+    );
+    Ok(())
+}
+
+/// A build relation exposes every column it has, not the projected ones, so an
+/// unqualified correlation collides with a name the plan never selects.
+///
+/// `b` is scanned for `d` alone, but it is emitted bare as `FROM "b"`, and a
+/// bare relation answers to all of its columns. Reading the exposed names off
+/// the build side's *output* schema reports only `d`, so the correlated `c`
+/// reads as unclaimed; the SQL says otherwise. Un-guarded this emits
+/// `... EXISTS (SELECT 1 FROM "b" WHERE ("c" = "b"."d"))`, where `"c"` binds to
+/// `b.c` and the correlation is gone.
+///
+/// This is the unqualified counterpart of
+/// [`test_unparse_left_semi_join_refuses_capture_by_unprojected_build_relation`],
+/// and it is why the scan's own schema is collected as well as the plan's.
+#[test]
+fn test_unparse_left_semi_join_refuses_unqualified_capture_by_unprojected_column()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("p"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
+        .build()?;
+    let build = table_scan(Some("b"), &schema, Some(vec![1]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["c"], vec!["b.d"]),
+            None,
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a build column the plan does not project must still be seen to capture",
+    );
+    Ok(())
+}
+
+/// The mirror case: a derived table the unparser invents exposes a name that
+/// belongs to no relation in the plan at all.
+///
+/// `b`'s columns are `x` and `y`; the build side renames `x` to `c` and stacks
+/// enough operators that the emitter wraps it, so the body reads
+/// `FROM (SELECT "b"."x" AS "c" FROM "b") AS "derived_projection"` — and that
+/// derived table answers to `c`. Un-guarded the whole predicate is
+/// `("c" = "c")`, both halves binding to `derived_projection.c`: the inner
+/// tautology again, so a semi join keeps every probe row.
+///
+/// No walk over the plan's relations can find that name — it is not a column of
+/// `b` — which is why the exposed names start from the build plan's own output
+/// schema. A derived table exposes exactly that, whatever it was renamed from.
+#[test]
+fn test_unparse_left_semi_join_refuses_unqualified_capture_by_renamed_column()
+-> Result<()> {
+    let probe = table_scan(Some("p"), &exists_fetch_schema(), Some(vec![0, 1]))?
+        .project(vec![col("p.c").alias("c"), col("p.d").alias("d")])?
+        .build()?;
+    let build_schema = Schema::new(vec![
+        Field::new("x", DataType::Int32, false),
+        Field::new("y", DataType::Int32, false),
+    ]);
+    let build = table_scan(Some("b"), &build_schema, Some(vec![0]))?
+        .project(vec![col("b.x").alias("c")])?
+        .project(vec![col("c")])?
+        .distinct()?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["c"], vec!["c"]),
+            None,
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a name a derived table renames into the body must be seen to capture",
     );
     Ok(())
 }
