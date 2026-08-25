@@ -7903,3 +7903,37 @@ fn test_unparse_left_semi_join_keeps_build_local_filter_on_a_reserved_relation_n
     assert_snapshot!(unparser.plan_to_sql(&plan)?);
     Ok(())
 }
+
+/// The mirror of the test above, and what keeps the invented-alias answer
+/// load-bearing rather than redundant once it stopped refusing on sight.
+///
+/// Here `derived_limit` is the **probe** relation, and the filter reference to it
+/// has to reach outward. The build side answers to nothing it names, so the
+/// ordinary attribution alone would allow it — while the emitter may well wrap
+/// the build side as `derived_limit` directly in that reference's way, which is
+/// a name no scope can see because it is in no plan. Counting the invented-alias
+/// answer as the build side answering is what keeps this refused.
+///
+/// Together with the build-relation case, this is why the answer is folded into
+/// `captured_by_build` rather than either returned early or dropped: returning
+/// early refuses the build-local reference, and dropping it emits this one.
+#[test]
+fn test_unparse_left_semi_join_refuses_probe_only_reserved_name_in_a_filter() -> Result<()>
+{
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("derived_limit"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("b"), &schema, Some(vec![0, 1]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("derived_limit.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a probe-side reference an invented alias could shadow must be refused",
+    );
+    Ok(())
+}
