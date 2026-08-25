@@ -8522,6 +8522,128 @@ fn test_unparse_left_semi_join_keeps_nested_reference_a_joined_body_names() -> R
     Ok(())
 }
 
+/// An `EXISTS` body that is a set operation, with the nested correlation in one
+/// branch and `colliding` scanned by the other.
+///
+/// The branch holding the correlation selects from the very relation the
+/// correlation names, so the reference binds there and never travels to the join.
+fn nested_exists_over_union_body(colliding: TableReference) -> Result<LogicalPlan> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let innermost = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(col("z.k").eq(out_ref_col(DataType::Int32, "public.t.c")))?
+        .build()?;
+    let holding = table_scan(
+        Some(TableReference::partial("public", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .filter(exists(Arc::new(innermost)))?
+    .build()?;
+    let body = LogicalPlanBuilder::from(holding)
+        .union(table_scan(Some(colliding), &schema, Some(vec![0, 1]))?.build()?)?
+        .build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(body))],
+        )?
+        .build()
+}
+
+/// A set-operation body is emitted as one `SELECT` per branch, so a relation in
+/// one branch is not in scope for a correlation held by another.
+///
+/// The branch holding the nested `EXISTS` selects from `public.t`, exactly where
+/// `outer_ref(public.t.c)` was sent, so `"t"."c"` binds inside that branch and the
+/// join never sees the reference. The sibling branch selects from `mid.t`, which
+/// on this dialect is also written `"t"` — but it is emitted in a `SELECT` of its
+/// own, whose `FROM` the first branch's `WHERE` cannot see. Scoping the two
+/// branches as one body reads that sibling as a relation the reference could
+/// resolve against and refuses SQL that binds correctly.
+#[test]
+fn test_unparse_left_semi_join_keeps_nested_reference_a_sibling_branch_names()
+-> Result<()> {
+    let plan = nested_exists_over_union_body(TableReference::partial("mid", "t"))?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
+
+/// The control the branch-scoping above must not swallow: a collision inside the
+/// branch that holds the correlation is still a capture.
+///
+/// Splitting the body per branch narrows each scope, and narrowing it past the
+/// branch's own `FROM` would stop reporting captures the emitter really does
+/// write. Here the sibling branch names `public.t` while the holding branch scans
+/// `mid.t`, so the nested `"t"."c"` resolves against that `mid.t` — a relation the
+/// correlation does not name — and the comparison answers from a row of `mid.t`
+/// read against itself.
+#[test]
+fn test_unparse_left_semi_join_refuses_nested_reference_its_own_branch_captures()
+-> Result<()> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let innermost = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(col("z.k").eq(out_ref_col(DataType::Int32, "public.t.c")))?
+        .build()?;
+    let holding = table_scan(
+        Some(TableReference::partial("mid", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .filter(exists(Arc::new(innermost)))?
+    .build()?;
+    let body = LogicalPlanBuilder::from(holding)
+        .union(
+            table_scan(
+                Some(TableReference::partial("public", "t")),
+                &schema,
+                Some(vec![0, 1]),
+            )?
+            .build()?,
+        )?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(body))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a branch colliding with the correlation it holds captures it",
+    );
+    Ok(())
+}
+
 /// The body's scope is the whole body, not the subtree beneath the node holding
 /// the correlation — because that is the scope the *statement* has.
 ///

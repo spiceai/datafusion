@@ -3245,9 +3245,10 @@ impl Unparser<'_> {
     /// captures it. Reaching it needs this descent.
     ///
     /// Each level contributes one scope to the chain — the body's own, built once
-    /// here rather than per node holding a subquery. A body is a single query
-    /// level whatever the plan's shape, so every correlation inside it is emitted
-    /// against the same `FROM`.
+    /// here rather than per node holding a subquery. A body whose emitted form is
+    /// a single `SELECT` has one `FROM`, so every correlation inside it is emitted
+    /// against the same relations; a set-operation body is emitted as one `SELECT`
+    /// per branch, and [`Self::set_operation_branches`] scopes those separately.
     fn nested_subqueries_reach_captured_scope(
         &self,
         plan: &LogicalPlan,
@@ -3259,6 +3260,23 @@ impl Unparser<'_> {
         // collects two sets of names: most subqueries hold no further subquery,
         // and for those there is nothing the scope would be asked about.
         if !Self::holds_subquery(plan)? {
+            return Ok(false);
+        }
+        // Each branch is emitted as its own `SELECT` with its own `FROM`, so a
+        // relation named in one branch never answers a correlation held in
+        // another. Scoping the branches together would read such a pairing as a
+        // capture and refuse a query the emitter renders correctly.
+        if let Some(branches) = Self::set_operation_branches(plan) {
+            for branch in branches {
+                if self.nested_subqueries_reach_captured_scope(
+                    branch,
+                    enclosing,
+                    build_scope,
+                    probe_scope,
+                )? {
+                    return Ok(true);
+                }
+            }
             return Ok(false);
         }
         let scope = self.emitted_scope(plan)?;
@@ -3287,6 +3305,27 @@ impl Unparser<'_> {
             })
         })?;
         Ok(captured)
+    }
+
+    /// The bodies a set-operation `plan` is emitted as, or `None` when `plan` is
+    /// emitted as a single `SELECT`.
+    ///
+    /// Mirrors what `select_to_sql_recursively` writes: its [`LogicalPlan::Union`]
+    /// arm emits every input as its own `SetExpr`, and its [`Distinct::All`] arm
+    /// delegates a distinct union straight to that same arm, so both shapes reach
+    /// the reader as one `SELECT` per branch. Only a set operation standing as the
+    /// body itself is reported — one buried below is emitted as a derived table,
+    /// whose alias is the name a correlation can reach and which
+    /// [`Self::emitted_scope`] already stops at.
+    fn set_operation_branches(plan: &LogicalPlan) -> Option<&[Arc<LogicalPlan>]> {
+        match plan {
+            LogicalPlan::Union(union) => Some(&union.inputs),
+            LogicalPlan::Distinct(Distinct::All(input)) => match input.as_ref() {
+                LogicalPlan::Union(union) => Some(&union.inputs),
+                _ => None,
+            },
+            _ => None,
+        }
     }
 
     /// Whether any expression anywhere in `plan` carries a subquery.
