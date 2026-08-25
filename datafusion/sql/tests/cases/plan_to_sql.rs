@@ -7512,3 +7512,110 @@ fn test_qualified_join_input_fetch_refused_on_full_qualified_col_dialect() -> Re
     );
     Ok(())
 }
+
+/// An extension unparser that writes an innocuous relation for the enclosing
+/// `SubqueryAlias` to alias, and cross-joins a second one onto the same `FROM`.
+///
+/// Both halves are ordinary uses of what the trait hands out: `RelationBuilder`
+/// for the first, `SelectBuilder` for the second. The alias reaches only the
+/// first, so the joined relation keeps its own name inside the body.
+struct MockJoiningExtensionUnparser {
+    aliased: &'static str,
+    joined: &'static str,
+}
+
+impl UserDefinedLogicalNodeUnparser for MockJoiningExtensionUnparser {
+    fn unparse(
+        &self,
+        node: &dyn UserDefinedLogicalNode,
+        _unparser: &Unparser,
+        _query: &mut Option<&mut QueryBuilder>,
+        select: &mut Option<&mut SelectBuilder>,
+        relation: &mut Option<&mut RelationBuilder>,
+    ) -> Result<UnparseWithinStatementResult> {
+        if node
+            .as_any()
+            .downcast_ref::<MockUserDefinedLogicalPlan>()
+            .is_none()
+        {
+            return Ok(UnparseWithinStatementResult::Unmodified);
+        }
+        let mut aliased = TableRelationBuilder::default();
+        aliased.name(ObjectName::from(vec![Ident::with_quote('"', self.aliased)]));
+        if let Some(rel) = relation {
+            rel.table(aliased);
+        }
+
+        // A join rather than a second `push_from`: the emitter treats the FROM
+        // list as a stack it pops from and pushes back, so an extra entry
+        // breaks that invariant and fails loudly instead. A join is the shape
+        // that emits.
+        let mut joined = TableRelationBuilder::default();
+        joined.name(ObjectName::from(vec![Ident::with_quote('"', self.joined)]));
+        let cross = sqlparser::ast::Join {
+            relation: joined
+                .build()
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+            global: false,
+            join_operator: sqlparser::ast::JoinOperator::CrossJoin(
+                sqlparser::ast::JoinConstraint::None,
+            ),
+        };
+        if let Some(sel) = select
+            && let Some(mut from) = sel.pop_from()
+        {
+            from.push_join(cross);
+            sel.push_from(from);
+        }
+        Ok(UnparseWithinStatementResult::Modified)
+    }
+}
+
+/// A `SubqueryAlias` over an extension does not make the extension readable, so
+/// the alias cannot be taken as the whole of what the body's `FROM` answers to.
+///
+/// The walk stops at a `SubqueryAlias` on purpose — an alias replaces the name
+/// it is given to, so the relations below it are not addressable through it.
+/// That reasoning holds for relations the walk can see, and an extension is
+/// exactly the one it cannot: the alias reaches the single relation the
+/// `RelationBuilder` holds, while the same unparser is handed the
+/// `SelectBuilder` and can join a second relation onto the same `FROM`.
+///
+/// Here the extension writes `safe` for the alias to take and cross-joins `t`,
+/// which is also the probe. Before this was caught, the plan unparsed to
+/// `SELECT "t"."d" FROM "t" WHERE EXISTS (SELECT 1 FROM "safe" AS "a" CROSS JOIN "t" WHERE ("t"."c" = "a"."k"))`,
+/// where `"t"."c"` binds to the joined-in `t` rather than the outer one: the
+/// correlation is gone, the `EXISTS` is uncorrelated, and the semi join keeps
+/// every probe row whenever that cross join has a row at all.
+///
+/// This costs the pushdown for an aliased extension that only ever writes its
+/// own relation, which would have been correct — the guard runs before any of
+/// the body is built, so there is no emitted `FROM` to tell the two apart.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_an_aliased_extensions_join()
+-> Result<()> {
+    let probe = table_scan(Some("t"), &exists_fetch_schema(), Some(vec![0, 1]))?
+        .project(vec![col("t.d")])?
+        .build()?;
+    let build = subquery_alias(unqualified_extension(&["k"])?, "a")?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["t.c"], vec!["a.k"]),
+            None,
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&UnparserPostgreSqlDialect {}).with_extension_unparsers(vec![
+            Arc::new(MockJoiningExtensionUnparser {
+                aliased: "safe",
+                joined: "t",
+            }),
+        ]),
+        &plan,
+        "an alias over an extension must not be taken as the whole emitted FROM",
+    );
+    Ok(())
+}

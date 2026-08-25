@@ -2771,6 +2771,13 @@ impl Unparser<'_> {
     /// and misses whatever the unparser writes, which it does. The scope is
     /// marked opaque instead of guessed at.
     ///
+    /// An enclosing `SubqueryAlias` does not contain that. The alias reaches
+    /// the one relation the `RelationBuilder` holds, while the same unparser is
+    /// handed the `SelectBuilder` and can join a second relation onto the same
+    /// `FROM`, which keeps its own name and answers to it. So the walk looks
+    /// past an alias for an extension — and for nothing else, since the
+    /// relations an alias really does shield are the reason it stops.
+    ///
     /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
     fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
         let mut scope = EmittedScope {
@@ -2812,6 +2819,19 @@ impl Unparser<'_> {
                 scope
                     .qualifiers
                     .push(vec![self.identifier_comparison_key(alias.alias.table())]);
+                // The alias shields what it encloses only as far as the alias
+                // reaches, which is the one relation the `RelationBuilder`
+                // holds. An extension below it is also handed the
+                // `SelectBuilder`, so it can join a second relation onto the
+                // same `FROM` — and that one keeps its own name. Look past the
+                // alias for that shape alone, without collecting the relations
+                // the alias really does shield.
+                if alias
+                    .input
+                    .exists(|node| Ok(matches!(node, LogicalPlan::Extension(_))))?
+                {
+                    scope.opaque = true;
+                }
                 Ok(TreeNodeRecursion::Jump)
             }
             // An extension's unparser is handed the `RelationBuilder` and may
@@ -3021,9 +3041,10 @@ impl Unparser<'_> {
     /// An extension node on either side is refused wholesale on the same trade,
     /// because its unparser decides the emitted `FROM` and nothing readable
     /// from the plan distinguishes a relation that captures the correlation
-    /// from one that does not. Narrowing that needs the unparser to report the
-    /// scope it will emit, which is a change to the extension trait rather than
-    /// to this walk.
+    /// from one that does not. This runs before any of the body is built, so
+    /// there is no emitted `FROM` to read either — narrowing it needs the
+    /// unparser to report the scope it will emit, which is a change to the
+    /// extension trait rather than to this walk.
     fn ensure_exists_correlation_not_shadowed(&self, join: &Join) -> Result<()> {
         let swapped = Self::swaps_join_inputs(join.join_type);
         let (probe_plan, build_plan) = if swapped {
