@@ -7868,3 +7868,38 @@ fn test_unparse_left_semi_join_keeps_qualified_correlation_over_a_flatten_relati
     assert_snapshot!(unparser.plan_to_sql(&plan)?);
     Ok(())
 }
+
+/// A relation the user happened to name like an alias the unparser invents is
+/// still a relation, and a build-local filter reference to it binds inside the
+/// body on purpose.
+///
+/// `derived_limit` is one of the seven names the emitter uses for derived tables
+/// of its own, so a reference qualified by it might be captured — but only if
+/// the emitter actually introduces one *and* the reference was meant to reach
+/// outward. Here `derived_limit` is the build relation itself and the reference
+/// is in `join.filter`, which the probe does not answer to: it is the same
+/// build-local reference `keeps_build_only_unqualified_filter_name` allows,
+/// wearing a reserved name.
+///
+/// So the invented-alias answer counts as the build side answering and then
+/// follows the ordinary attribution, rather than refusing outright. Refusing
+/// here would fail the query, not fall back — see the summary — for the sole
+/// reason that someone named a table after one of our internal aliases.
+#[test]
+fn test_unparse_left_semi_join_keeps_build_local_filter_on_a_reserved_relation_name()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("p"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("derived_limit"), &schema, Some(vec![0, 1]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("derived_limit.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}

@@ -1,0 +1,5 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: unparser.plan_to_sql(&plan)?
+---
+SELECT "p"."c", "p"."d" FROM "p" WHERE EXISTS (SELECT 1 FROM "derived_limit" WHERE ("derived_limit"."c" > 0))

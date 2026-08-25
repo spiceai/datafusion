@@ -3017,19 +3017,26 @@ impl Unparser<'_> {
                 return Ok(false);
             }
 
-            if let Some(relation) = column.relation.as_ref() {
-                // An alias the unparser invents is in the emitted `FROM`
-                // whatever the plan holds, so no scope has to claim it. Asked of
-                // the keyed spelling, since a relation a user named
-                // `DERIVED_PROJECTION` is the alias `derived_projection` once a
-                // dialect that folds case has emitted them both.
-                let emitted = self.emitted_qualifier(relation);
-                if Self::is_unparser_derived_alias(&self.qualifier_key(&emitted)) {
-                    return Ok(true);
+            // An alias the unparser invents is in the emitted `FROM` whatever
+            // the plan holds, so no scope can claim it. Asked of the keyed
+            // spelling, since a relation a user named `DERIVED_PROJECTION` is
+            // the alias `derived_projection` once a dialect that folds case has
+            // emitted them both.
+            let names_invented_alias = match column.relation.as_ref() {
+                Some(relation) => {
+                    let emitted = self.emitted_qualifier(relation);
+                    Self::is_unparser_derived_alias(&self.qualifier_key(&emitted))
                 }
-            }
+                None => false,
+            };
 
-            let captured_by_build = self.scope_answers(build_scope, column)?;
+            // Counted as the build side answering rather than answered on its
+            // own, so the attribution below still applies. Returning early here
+            // would refuse a *build-local* reference to a relation the user
+            // happened to name `derived_limit`, which binds inside the body on
+            // purpose — the same reference the side split exists to allow.
+            let captured_by_build =
+                names_invented_alias || self.scope_answers(build_scope, column)?;
             Ok(match probe_scope {
                 // An outer reference passes *through* the probe's scope on its
                 // way out, so the probe shadowing it is as much a capture as the
