@@ -2877,6 +2877,18 @@ impl Unparser<'_> {
         plan.exists(|node| Ok(Self::emits_unreadable_relation(node)))
     }
 
+    /// Whether `expr` carries a reference on its way out of this join.
+    ///
+    /// Asked of both halves of an `on` pair, because such a reference cannot be
+    /// attributed to a side and an equi-join key can hold one:
+    /// `find_valid_equijoin_key_pair` decides which input a key belongs to from
+    /// `Expr::column_refs`, which collects `Expr::Column` alone, so a key like
+    /// `p.x + outer_ref(p.c)` is accepted as belonging to `p` with the outer
+    /// reference unexamined.
+    fn reaches_past_the_join(expr: &Expr) -> Result<bool> {
+        expr.exists(|node| Ok(matches!(node, Expr::OuterReferenceColumn(..))))
+    }
+
     /// Adds every name `schema`'s columns let the body answer to.
     ///
     /// Each column is exposed under two names: its own, which a relation emitted
@@ -2925,6 +2937,7 @@ impl Unparser<'_> {
     fn references_captured_scope(
         &self,
         expr: &Expr,
+        kind: ReferenceKind,
         build_scope: &EmittedScope,
         probe_scope: Option<&EmittedScope>,
     ) -> Result<bool> {
@@ -2934,6 +2947,16 @@ impl Unparser<'_> {
                 Expr::OuterReferenceColumn(_, column) => (column, true),
                 _ => return Ok(false),
             };
+
+            // Asked before anything else, including the invented-alias answer
+            // below: a caller that narrowed to the references reaching past the
+            // join has already asked about the rest under the other rule, and
+            // answering for them here would apply this one twice.
+            if matches!(kind, ReferenceKind::ReachingPastTheJoin)
+                && !reaches_past_the_join
+            {
+                return Ok(false);
+            }
 
             if let Some(relation) = column.relation.as_ref() {
                 // An alias the unparser invents is in the emitted `FROM`
@@ -3027,20 +3050,37 @@ impl Unparser<'_> {
     ///   with a column of the rewritten name then captures the reference while
     ///   the two plan names look nothing alike.
     /// * **Compare identifiers the way the engine will resolve them**, via
-    ///   [`Self::identifier_comparison_key`]. An identifier emitted unquoted is
-    ///   case-folded before it binds, so `T` and `t` written bare are one name;
-    ///   quoted, they are two, and folding them together would refuse a
-    ///   correlation that resolves correctly.
-    /// * **Attribute each `on` pair by side.** The pairs are already split into
-    ///   `(left, right)`, and only the probe half is the correlated reference; a
-    ///   build half naming a build relation is an ordinary local reference that
-    ///   binds inside on purpose. Testing both halves refuses every join whose
-    ///   build side shares a qualifier with the probe, including the correct
-    ///   ones. `join.filter` carries no such split, so an `Expr::Column` in it
-    ///   cannot be attributed — there, only a qualifier *both* sides answer to
-    ///   is refused, which no reference to a distinct relation can be. An
-    ///   `Expr::OuterReferenceColumn` inverts that rule rather than following
-    ///   it — see [`Self::references_captured_scope`].
+    ///   [`Self::identifier_comparison_key`], which folds case
+    ///   *unconditionally*. An identifier emitted unquoted is case-folded
+    ///   before it binds, so `T` and `t` written bare are one name. Keying that
+    ///   on the quote style instead would be false in both directions — DuckDB
+    ///   folds even a quoted identifier, and BigQuery folds a column name
+    ///   despite the backticks — so the fold does not ask. The price is a
+    ///   PostgreSQL build side whose `"T"` and `"t"` really are two relations:
+    ///   that correlation binds correctly and is refused anyway, which
+    ///   `refuses_case_distinct_quoted_relations` pins and spiceai/spiceai#13474
+    ///   tracks. Do not reintroduce the quote-style heuristic to buy it back.
+    /// * **Attribute an `Expr::Column` by side, and an
+    ///   `Expr::OuterReferenceColumn` not at all.** The two follow opposite
+    ///   rules, and collapsing either into the other is a defect in one
+    ///   direction or the other:
+    ///   * An `Expr::Column` belongs to one of the join's own inputs. In an
+    ///     `on` pair the split says which: only the probe half is the
+    ///     correlated reference, and a build half naming a build relation is an
+    ///     ordinary local reference that binds inside on purpose — testing both
+    ///     halves refuses every join whose build side shares a qualifier with
+    ///     its probe, including the correct ones, which
+    ///     `keeps_build_side_key_on_shared_relation` pins. `join.filter` has no
+    ///     such split, so there a qualifier *both* sides answer to is what is
+    ///     refused, which no reference to a distinct relation can be.
+    ///   * An `Expr::OuterReferenceColumn` belongs to neither input — it is on
+    ///     its way out of both. So the half it was written on says nothing, both
+    ///     halves of every pair are asked, and *either* scope shadowing it is a
+    ///     capture. Asking with the `Expr::Column` rule instead would let a
+    ///     reference through whenever one side alone shadows it.
+    ///
+    ///   [`Self::references_captured_scope`] holds both rules; the caller
+    ///   selects which references to ask about with [`ReferenceKind`].
     /// * **Ask what the body exposes, not only what it is called.** An
     ///   unqualified reference names no relation to collide with, so it is a
     ///   column name that decides where it binds. Comparing qualifiers alone
@@ -3074,25 +3114,66 @@ impl Unparser<'_> {
 
         let build_scope = self.emitted_scope(build_plan)?;
         let mut captured = false;
+
+        // The probe half of each pair, and every reference in it: that half is
+        // the correlated one, so the build side answering to it is enough.
         for correlated in join
             .on
             .iter()
             .map(|(left, right)| if swapped { right } else { left })
         {
-            if self.references_captured_scope(correlated, &build_scope, None)? {
+            if self.references_captured_scope(
+                correlated,
+                ReferenceKind::Any,
+                &build_scope,
+                None,
+            )? {
                 captured = true;
                 break;
             }
         }
-        // Walked only when there is a filter, which most joins do not have.
-        // A filter can only reference the join's own two inputs, so a name or
-        // qualifier just one of them answers to is attributable after all and
-        // binds where it was meant to; only what both answer to is ambiguous,
-        // which is what asking both scopes says.
-        if !captured && let Some(filter) = &join.filter {
+
+        // What the probe's own scope has to be asked about as well. Two sources,
+        // for the same reason: a reference that cannot be attributed to one side
+        // by where it was written.
+        //
+        // * `join.filter` is not split into halves at all, so an
+        //   `Expr::Column` in it could have come from either input.
+        // * Both halves of every `on` pair, for the references that reach past
+        //   the join. Those belong to neither input, so the half they were
+        //   written on says nothing about where they were meant to bind — and
+        //   `join_with_expr_keys` admits one into a pair whenever the
+        //   expression also carries a local column, because
+        //   `find_valid_equijoin_key_pair` decides ownership from
+        //   `Expr::column_refs`, which collects only `Expr::Column`.
+        //
+        // Collected first so the probe scope is named only when something will
+        // ask it. Most joins carry no filter and no outer reference in a key,
+        // and naming a scope walks every column the side exposes.
+        let mut needs_probe_scope: Vec<(&Expr, ReferenceKind)> = Vec::new();
+        if !captured {
+            if let Some(filter) = &join.filter {
+                needs_probe_scope.push((filter, ReferenceKind::Any));
+            }
+            for half in join.on.iter().flat_map(|(left, right)| [left, right]) {
+                if Self::reaches_past_the_join(half)? {
+                    needs_probe_scope.push((half, ReferenceKind::ReachingPastTheJoin));
+                }
+            }
+        }
+        if !needs_probe_scope.is_empty() {
             let probe_scope = self.emitted_scope(probe_plan)?;
-            captured =
-                self.references_captured_scope(filter, &build_scope, Some(&probe_scope))?;
+            for (expr, kind) in needs_probe_scope {
+                if self.references_captured_scope(
+                    expr,
+                    kind,
+                    &build_scope,
+                    Some(&probe_scope),
+                )? {
+                    captured = true;
+                    break;
+                }
+            }
         }
 
         if captured {
@@ -3363,6 +3444,22 @@ enum EmittedScope {
     /// guard — then cannot consult a name list without first saying what it
     /// does when there is none.
     Unreadable,
+}
+
+/// Which of an expression's column references a capture check is being asked
+/// about.
+///
+/// The two kinds follow opposite rules — see
+/// [`Unparser::ensure_exists_correlation_not_shadowed`] — so an expression that
+/// carries both is asked twice, once under each, rather than once under
+/// whichever rule happens to be looser.
+#[derive(Clone, Copy)]
+enum ReferenceKind {
+    /// Every reference the expression carries.
+    Any,
+    /// Only [`Expr::OuterReferenceColumn`], which belongs to neither of the
+    /// join's inputs and so cannot be attributed by the side it was written on.
+    ReachingPastTheJoin,
 }
 
 /// The type of the input to the UNNEST table factor.

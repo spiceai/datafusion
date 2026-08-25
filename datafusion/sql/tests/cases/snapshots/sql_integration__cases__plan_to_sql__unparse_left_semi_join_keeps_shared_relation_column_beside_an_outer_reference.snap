@@ -1,0 +1,5 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: unparser.plan_to_sql(&plan)?
+---
+SELECT "t1"."c", "t1"."d" FROM "t1" INNER JOIN "t" ON ("t1"."d" = "t"."c") WHERE EXISTS (SELECT 1 FROM "t" INNER JOIN "t3" ON ("t"."c" = "t3"."c") WHERE ("t1"."c" = ("t"."c" + "elsewhere"."c")))

@@ -7592,3 +7592,156 @@ fn test_qualified_join_input_fetch_refused_on_full_qualified_col_dialect() -> Re
     );
     Ok(())
 }
+
+/// `LeftSemi Join` whose equi-join key carries a reference reaching past the
+/// join, on the half named by `outer_ref_side`.
+///
+/// Built through `join_with_expr_keys` because that is the only route that
+/// admits one: `find_valid_equijoin_key_pair` decides which input a key belongs
+/// to from `Expr::column_refs`, which collects `Expr::Column` alone, so
+/// `p.x + outer_ref(p.c)` reads as belonging to `p` with the outer reference
+/// never examined. Each key pairs a local column of its own side with the outer
+/// reference, since a key of only outer references owns no input and is routed
+/// to the filter instead.
+fn outer_reference_in_join_key(
+    outer_ref_side: JoinSide,
+    outer_ref: &str,
+) -> Result<LogicalPlan> {
+    let schema = int32_schema(&["x", "c"]);
+    let probe = table_scan(Some("p"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("b"), &schema, Some(vec![0, 1]))?.build()?;
+    let outer = out_ref_col(DataType::Int32, outer_ref);
+    let (left, right) = match outer_ref_side {
+        JoinSide::Probe => (col("p.x") + outer, col("b.x")),
+        JoinSide::Build => (col("p.x"), col("b.x") + outer),
+    };
+    LogicalPlanBuilder::from(probe)
+        .join_with_expr_keys(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec![left], vec![right]),
+            None,
+        )?
+        .build()
+}
+
+/// Which half of an `on` pair a test puts its outer reference on.
+enum JoinSide {
+    Probe,
+    Build,
+}
+
+/// A reference reaching past the join, in the build half of an `on` pair, binds
+/// to the body's own `FROM`.
+///
+/// The build half is not the correlated one, so the side split skips it — right
+/// for an `Expr::Column`, which belongs to that input on purpose, and wrong for
+/// an outer reference, which belongs to neither and is only passing through.
+/// Before this was caught, the plan unparsed to
+/// `SELECT "p"."x", "p"."c" FROM "p" WHERE EXISTS (SELECT 1 FROM "b" WHERE ("p"."x" = ("b"."x" + "b"."c")))`,
+/// where the `out_ref_col("b.c")` written for an enclosing query binds to the
+/// subquery's own `b` instead.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_in_build_half_of_a_key()
+-> Result<()> {
+    let plan = outer_reference_in_join_key(JoinSide::Build, "b.c")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference the body's own FROM answers to must be refused",
+    );
+    Ok(())
+}
+
+/// The same reference in the probe half, captured by the *probe's* emitted
+/// `FROM` rather than the build's.
+///
+/// `out_ref_col("p.c")` is on its way past the outer query as well, so the
+/// probe shadowing it is as much a capture as the build shadowing it — the
+/// build side here answers to nothing it names. Before this was caught, the
+/// plan unparsed to
+/// `SELECT "p"."x", "p"."c" FROM "p" WHERE EXISTS (SELECT 1 FROM "b" WHERE (("p"."x" + "p"."c") = "b"."x"))`,
+/// where the `"p"."x"` correlation binds outward correctly and the `"p"."c"`
+/// beside it stops one scope short of where it was written to reach.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_in_probe_half_of_a_key()
+-> Result<()> {
+    let plan = outer_reference_in_join_key(JoinSide::Probe, "p.c")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference the probe's own FROM answers to must be refused",
+    );
+    Ok(())
+}
+
+/// The bound on the fix: asking both halves is for outer references only, and
+/// an ordinary `Expr::Column` keeps the side split.
+///
+/// An outer reference naming a relation neither side emits is not captured, so
+/// this plan has to unparse — and it unparses with the local `p.x`/`b.x`
+/// columns in the same pair, which is what would break if the both-halves pass
+/// applied the `Expr::Column` rule to them as well.
+#[test]
+fn test_unparse_left_semi_join_keeps_outer_reference_neither_side_answers_to()
+-> Result<()> {
+    let plan = outer_reference_in_join_key(JoinSide::Build, "elsewhere.c")?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "p"."x", "p"."c" FROM "p" WHERE EXISTS (SELECT 1 FROM "b" WHERE ("p"."x" = ("b"."x" + "elsewhere"."c")))"#
+    );
+    Ok(())
+}
+
+/// The narrowing to outer references is what keeps the side split, and this is
+/// the shape that needs it: one `on` half carrying an outer reference *and* a
+/// plain column that both sides answer to.
+///
+/// The probe is `t1 INNER JOIN t` and the build side is `t INNER JOIN t3`, so
+/// both emitted `FROM`s answer to `t`. The build half of the key is
+/// `t.c + outer_ref(elsewhere.c)`: the `t.c` is an ordinary build-side column
+/// binding inside on purpose, and the outer reference names a relation neither
+/// side emits. Asking this half about *every* reference rather than only the
+/// ones reaching past the join applies the `Expr::Column` rule to `t.c`, which
+/// both scopes answer to, and refuses a plan that unparses correctly.
+///
+/// So the pass over both halves has to be narrowed by reference kind and not
+/// merely by which halves it reads — a distinction no plan without both kinds
+/// in one half can show.
+#[test]
+fn test_unparse_left_semi_join_keeps_shared_relation_column_beside_an_outer_reference()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?
+        .join_on(
+            table_scan(Some("t"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.d").eq(col("t.c"))],
+        )?
+        .build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            table_scan(Some("t3"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.c").eq(col("t3.c"))],
+        )?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.c"), col("t1.d")])?
+        .join_with_expr_keys(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (
+                vec![col("t1.c")],
+                vec![col("t.c") + out_ref_col(DataType::Int32, "elsewhere.c")],
+            ),
+            None,
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
