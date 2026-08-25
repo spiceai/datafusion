@@ -8231,3 +8231,355 @@ fn test_unparse_left_semi_join_refuses_outer_reference_held_by_a_nested_set_comp
     );
     Ok(())
 }
+
+/// A semi join from `public.t` to `other.t` whose filter is an `EXISTS` with a
+/// further `EXISTS` nested inside it for each entry in `bodies`, the innermost
+/// correlating on `outer_ref(<outer_relation>.c)`.
+///
+/// `bodies` names the relation each intermediate body selects from, outermost
+/// first, which is how a test says where the correlation's qualifier is answered
+/// — by one of those bodies, or by nothing until it reaches the join.
+fn nested_exists_bodies(
+    bodies: &[TableReference],
+    outer_relation: &str,
+) -> Result<LogicalPlan> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+
+    let mut subquery = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(
+            col("z.k").eq(out_ref_col(DataType::Int32, format!("{outer_relation}.c"))),
+        )?
+        .build()?;
+    for body in bodies.iter().rev() {
+        subquery = table_scan(Some(body.clone()), &schema, Some(vec![0, 1]))?
+            .filter(exists(Arc::new(subquery)))?
+            .build()?;
+    }
+
+    LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(subquery))],
+        )?
+        .build()
+}
+
+/// An outer reference held two subqueries down is on no list the predicate's own
+/// walk sees, and it still passes through the `EXISTS` body this join introduces.
+///
+/// Every site that builds [`Subquery::outer_ref_columns`] uses
+/// `LogicalPlan::all_out_ref_exprs`, which collects over the plan's own
+/// expressions and its `inputs()` — and `inputs()` excludes subqueries, while
+/// `Expr` traversal reports a subquery-bearing expression as a leaf. So the
+/// intermediate body's list is *empty*: reading it alone reports no reference to
+/// examine, and the walk clears a plan it never looked at.
+///
+/// Here the correlation names `public.t`, the probe, and the body this join
+/// emits introduces `FROM "other"."t"`. On a dialect that does not spell columns
+/// in full both are written `"t"`, so the innermost `"t"."c"` binds to the
+/// nearest enclosing scope answering to `t` — `other.t` — rather than to the row
+/// the query was written to correlate with. Before this was caught, the plan
+/// unparsed to
+/// `SELECT "c", "d" FROM "public"."t" WHERE EXISTS (SELECT 1 FROM "other"."t" WHERE EXISTS (SELECT "w"."c", "w"."d" FROM "w" WHERE EXISTS (SELECT "z"."k" FROM "z" WHERE ("z"."k" = "t"."c"))))`,
+/// which is valid SQL that runs and compares an inner row with itself.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_held_two_subqueries_down()
+-> Result<()> {
+    let plan = nested_exists_bodies(&[TableReference::bare("w")], "public.t")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference held two subqueries down must be refused",
+    );
+    Ok(())
+}
+
+/// The other direction, and the reason the descent above cannot simply collect
+/// every nested list: a nested subquery's outer references are relative to the
+/// scope enclosing *it*, which is usually the body one level out rather than
+/// anything past this join.
+///
+/// The correlation names `public.t` and the body holding it selects from
+/// `public.t`, so `"t"."c"` binds to that body — exactly where the plan says it
+/// should, and never reaching this join at all. A union of the nested lists
+/// cannot tell this apart from the case above, and would refuse it; the refusal
+/// is a hard error rather than a different emission, so it would trade wrong SQL
+/// for a wrong error on a query that unparses correctly today.
+#[test]
+fn test_unparse_left_semi_join_keeps_nested_reference_the_enclosing_body_answers_to()
+-> Result<()> {
+    let plan =
+        nested_exists_bodies(&[TableReference::partial("public", "t")], "public.t")?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
+
+/// The descent is not two levels deep but every level: the same reference held
+/// three subqueries down, past two bodies neither of which answers to it, is
+/// still captured by the one this join emits.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_held_three_subqueries_down()
+-> Result<()> {
+    let plan = nested_exists_bodies(
+        &[TableReference::bare("w"), TableReference::bare("v")],
+        "public.t",
+    )?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference held three subqueries down must be refused",
+    );
+    Ok(())
+}
+
+/// And the bodies that answer are asked at every level too, not just the
+/// outermost one.
+///
+/// `w` does not answer to `public.t`, but the body nested inside it does, so the
+/// correlation binds there and this join never sees it. Testing only the
+/// outermost body's scope would report the reference as still travelling and
+/// refuse a plan that unparses correctly.
+#[test]
+fn test_unparse_left_semi_join_keeps_reference_an_inner_body_answers_to() -> Result<()> {
+    let plan = nested_exists_bodies(
+        &[
+            TableReference::bare("w"),
+            TableReference::partial("public", "t"),
+        ],
+        "public.t",
+    )?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
+
+/// The body that answers need not be the innermost one either: the scopes
+/// between a reference and this join are asked as a chain, not one at a time.
+///
+/// `w` encloses the correlation and does not answer to it, and `public.t`
+/// encloses `w` and does. The reference binds to that outer body, so it never
+/// reaches this join — a chain rebuilt at each level from the enclosing body
+/// alone would forget `public.t` and refuse it.
+#[test]
+fn test_unparse_left_semi_join_keeps_reference_an_outer_body_answers_to() -> Result<()> {
+    let plan = nested_exists_bodies(
+        &[
+            TableReference::partial("public", "t"),
+            TableReference::bare("w"),
+        ],
+        "public.t",
+    )?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
+
+/// A body whose emitted `FROM` the plan does not describe consumes *nothing*.
+///
+/// The scope built for such a body is [`EmittedScope::Unreadable`], which the
+/// capture test reads as answering to every reference — the direction that
+/// refuses there. Read the same way here it would do the opposite, because a
+/// consumed reference is one that is never examined: the correlation would be
+/// dropped on the strength of a name nobody knows, and the capture the join's own
+/// scopes would have refused is emitted instead.
+#[test]
+fn test_unparse_left_semi_join_refuses_nested_reference_an_unreadable_body_cannot_place()
+-> Result<()> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let innermost = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(col("z.k").eq(out_ref_col(DataType::Int32, "public.t.c")))?
+        .build()?;
+    let body = LogicalPlanBuilder::from(unqualified_extension(&["c", "d"])?)
+        .filter(exists(Arc::new(innermost)))?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(body))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused_by(
+        &extension_unparser("ext", None),
+        &plan,
+        "a nested reference an unreadable body cannot place must be refused",
+    );
+    Ok(())
+}
+
+/// A semi join from `public.t` to `other.t` whose filter is an `EXISTS` over a
+/// body selecting from `a` joined to `joined`, correlating on
+/// `outer_ref(public.t.c)` from a further `EXISTS` nested inside it.
+///
+/// `joined` is what a test varies: the reference's emitted qualifier collides
+/// with the body's own `FROM` either way, and whether that collision is the
+/// relation the plan named is the whole difference.
+fn nested_exists_over_joined_body(joined: TableReference) -> Result<LogicalPlan> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let innermost = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(col("z.k").eq(out_ref_col(DataType::Int32, "public.t.c")))?
+        .build()?;
+    let body = LogicalPlanBuilder::from(
+        table_scan(Some("a"), &schema, Some(vec![0, 1]))?.build()?,
+    )
+    .join_on(
+        table_scan(Some(joined.clone()), &schema, Some(vec![0, 1]))?.build()?,
+        datafusion_expr::JoinType::Inner,
+        vec![col("a.c").eq(Expr::Column(Column::new(Some(joined), "c")))],
+    )?
+    .filter(exists(Arc::new(innermost)))?
+    .build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(body))],
+        )?
+        .build()
+}
+
+/// A body that answers to the reference without naming the relation it names
+/// captures it, and the capture is decided before this join emits anything.
+///
+/// The correlation names `public.t`; the body selects from `mid.t`. On a dialect
+/// that does not spell columns in full both are written `"t"`, so the emitted
+/// `"t"."c"` resolves against `"mid"."t"` — an unrelated relation that merely
+/// spells the same — and the comparison reads a row of `mid.t` against itself.
+/// Reading a collision as the reference having arrived would drop it here
+/// unexamined and emit
+/// `... WHERE EXISTS (SELECT 1 FROM "other"."t" WHERE EXISTS (SELECT ... FROM "a" INNER JOIN "mid"."t" ON ("a"."c" = "t"."c") WHERE EXISTS (SELECT "z"."k" FROM "z" WHERE ("z"."k" = "t"."c"))))`,
+/// which is valid SQL that runs and answers from that self-comparison.
+#[test]
+fn test_unparse_left_semi_join_refuses_nested_reference_a_body_captures_by_spelling()
+-> Result<()> {
+    let plan = nested_exists_over_joined_body(TableReference::partial("mid", "t"))?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a body colliding with the reference without naming its relation captures it",
+    );
+    Ok(())
+}
+
+/// The control the refusal above must not swallow: the same collision, by the
+/// relation the plan actually named.
+///
+/// The body selects from `public.t`, which is where `outer_ref(public.t.c)` was
+/// sent, so `"t"."c"` resolves exactly as the plan intends and this join never
+/// sees the reference. Refusing every colliding body alike would refuse this too,
+/// on SQL that binds correctly.
+#[test]
+fn test_unparse_left_semi_join_keeps_nested_reference_a_joined_body_names() -> Result<()>
+{
+    let plan = nested_exists_over_joined_body(TableReference::partial("public", "t"))?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
+
+/// The body's scope is the whole body, not the subtree beneath the node holding
+/// the correlation — because that is the scope the *statement* has.
+///
+/// The nested `EXISTS` sits under a filter over `a` alone, with `mid.t` joined in
+/// above it, so the subtree holding it knows only `a`. The emitter nonetheless
+/// hoists the predicate to the body's own `WHERE`, emitting
+/// `FROM "a" INNER JOIN "mid"."t" ON (…) WHERE EXISTS (…)`, where `"t"."c"`
+/// resolves against `"mid"."t"` — a relation `far.t` is not. Neither side of this
+/// join answers to the reference, so nothing downstream would refuse it: reading
+/// the holding node's subtree as the scope reports a reference still travelling
+/// outward and emits the capture.
+#[test]
+fn test_unparse_left_semi_join_refuses_nested_reference_captured_above_its_own_node()
+-> Result<()> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "p")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "b")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let innermost = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(col("z.k").eq(out_ref_col(DataType::Int32, "far.t.c")))?
+        .build()?;
+    let body = LogicalPlanBuilder::from(
+        table_scan(Some("a"), &schema, Some(vec![0, 1]))?
+            .filter(exists(Arc::new(innermost)))?
+            .build()?,
+    )
+    .join_on(
+        table_scan(
+            Some(TableReference::partial("mid", "t")),
+            &schema,
+            Some(vec![0, 1]),
+        )?
+        .build()?,
+        datafusion_expr::JoinType::Inner,
+        vec![col("a.c").eq(col("mid.t.c"))],
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(body))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a reference the body captures above the node holding it must be refused",
+    );
+    Ok(())
+}

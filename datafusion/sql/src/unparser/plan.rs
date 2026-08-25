@@ -2777,7 +2777,7 @@ impl Unparser<'_> {
         // Collected during the walk and keyed after it: the walk's closure
         // reports a `DataFusionError`, while keying a name asks the dialect and
         // can fail with one of its own.
-        let mut qualifiers: Vec<Vec<String>> = Vec::new();
+        let mut qualifiers: Vec<EmittedRelation> = Vec::new();
         // Every schema whose column names the emitted `FROM` can answer to,
         // keyed after the walk rather than during it.
         let mut schemas: Vec<SchemaRef> = Vec::new();
@@ -2801,7 +2801,10 @@ impl Unparser<'_> {
             }
             match node {
                 LogicalPlan::TableScan(scan) => {
-                    qualifiers.push(self.emitted_qualifier_key(&scan.table_name));
+                    qualifiers.push(EmittedRelation {
+                        emitted: self.emitted_qualifier_key(&scan.table_name),
+                        named: self.qualifier_key(&scan.table_name.to_vec()),
+                    });
                     // A relation emitted bare answers to every column it has,
                     // not just the projected ones — the same reason the
                     // qualifier is read from the `FROM` rather than from the
@@ -2825,8 +2828,16 @@ impl Unparser<'_> {
                         Some(UnreadablePart::ColumnNames) => columns_unreadable = true,
                         None => {}
                     }
-                    qualifiers
-                        .push(vec![self.identifier_comparison_key(alias.alias.table())]);
+                    // An alias is its own whole path: it replaces the names
+                    // below it, so nothing it encloses is addressable through
+                    // it and a reference qualified by more than the alias names
+                    // a different relation.
+                    let alias_key =
+                        vec![self.identifier_comparison_key(alias.alias.table())];
+                    qualifiers.push(EmittedRelation {
+                        emitted: alias_key.clone(),
+                        named: alias_key,
+                    });
 
                     // An alias replaces the *names* below it, which is why the
                     // walk stops here — but it does not replace the *columns*.
@@ -3036,23 +3047,17 @@ impl Unparser<'_> {
         probe_scope: Option<&EmittedScope>,
     ) -> Result<bool> {
         expr.exists(|node| {
-            // A subquery is a leaf here, so its own outer references have to be
-            // reached for explicitly. They pass out through this join as well
-            // as out of the subquery, so they follow the same rule as an
-            // `OuterReferenceColumn` written directly into the predicate —
-            // whichever scope shadows one captures it.
+            // A subquery is a leaf here, so the outer references it carries have
+            // to be reached for explicitly — and at every depth, since the list
+            // one subquery holds leaves out the references a subquery nested
+            // inside it holds.
             if let Some(subquery) = Self::subquery_of(node) {
-                for outer in &subquery.outer_ref_columns {
-                    if self.references_captured_scope(
-                        outer,
-                        ReferenceKind::ReachingPastTheJoin,
-                        build_scope,
-                        probe_scope,
-                    )? {
-                        return Ok(true);
-                    }
-                }
-                return Ok(false);
+                return self.subquery_reaches_captured_scope(
+                    subquery,
+                    &[],
+                    build_scope,
+                    probe_scope,
+                );
             }
 
             let (column, reaches_past_the_join) = match node {
@@ -3145,6 +3150,200 @@ impl Unparser<'_> {
             || expr.exists(|node| Ok(Self::subquery_of(node).is_some()))?)
     }
 
+    /// Whether an outer reference `subquery` carries at any depth is captured by
+    /// one of the scopes this join emits.
+    ///
+    /// `enclosing` holds the bodies between `subquery` and this join, innermost
+    /// first; it is empty for a subquery written directly into the predicate,
+    /// which is what makes that case identical to asking about its own list
+    /// alone. A reference one of those bodies resolves — bound there or captured
+    /// there — never reaches this join, and [`Self::outward_reference`] says
+    /// which. Only what survives the whole chain reaches the join, and that
+    /// follows the same rule as an `OuterReferenceColumn` written directly into
+    /// the predicate: whichever scope the join emits shadows one captures it.
+    fn subquery_reaches_captured_scope(
+        &self,
+        subquery: &Subquery,
+        enclosing: &[EnclosingBody<'_>],
+        build_scope: &EmittedScope,
+        probe_scope: Option<&EmittedScope>,
+    ) -> Result<bool> {
+        for outer in &subquery.outer_ref_columns {
+            match self.outward_reference(outer, enclosing)? {
+                OutwardReference::BindsToAnEnclosingBody => continue,
+                OutwardReference::CapturedByAnEnclosingBody => return Ok(true),
+                OutwardReference::ReachesTheJoin => {}
+            }
+            if self.references_captured_scope(
+                outer,
+                ReferenceKind::ReachingPastTheJoin,
+                build_scope,
+                probe_scope,
+            )? {
+                return Ok(true);
+            }
+        }
+
+        self.nested_subqueries_reach_captured_scope(
+            &subquery.subquery,
+            enclosing,
+            build_scope,
+            probe_scope,
+        )
+    }
+
+    /// [`Self::subquery_reaches_captured_scope`] for the subqueries `plan`'s own
+    /// expressions hold — the ones its [`Subquery::outer_ref_columns`] leaves out.
+    ///
+    /// Every site that builds that list uses [`LogicalPlan::all_out_ref_exprs`],
+    /// which collects over `apply_expressions` and `inputs()`. `inputs()`
+    /// documents itself as not including subqueries, and `Expr` traversal reports
+    /// a subquery-bearing expression as a leaf (see [`Self::subquery_of`]), so a
+    /// reference held two levels down appears on no list at all:
+    /// `EXISTS (S1 WHERE EXISTS (S2 WHERE outer_ref(p.c)))` leaves S1's list
+    /// empty and `p.c` unexamined, and an emitted `FROM` that shadows `p` then
+    /// captures it. Reaching it needs this descent.
+    ///
+    /// Each level contributes an [`EnclosingBody`] to the chain, holding the two
+    /// scopes that body presents: the subtree beneath the node carrying the
+    /// nested subquery, and everything the body's `FROM` introduces.
+    fn nested_subqueries_reach_captured_scope(
+        &self,
+        plan: &LogicalPlan,
+        enclosing: &[EnclosingBody<'_>],
+        build_scope: &EmittedScope,
+        probe_scope: Option<&EmittedScope>,
+    ) -> Result<bool> {
+        // Asked before the scopes below are built, each of which walks a plan
+        // again and collects a set of names: most subqueries hold no further
+        // subquery, and for those there is nothing a scope would be asked about.
+        if !Self::holds_subquery(plan)? {
+            return Ok(false);
+        }
+        let emitted = self.emitted_scope(plan)?;
+
+        let mut captured = false;
+        plan.apply(|node| {
+            if !Self::holds_subquery(node)? {
+                return Ok(TreeNodeRecursion::Continue);
+            }
+            let holding = self.emitted_scope(node)?;
+            let mut chain = Vec::with_capacity(enclosing.len() + 1);
+            chain.push(EnclosingBody {
+                holding: &holding,
+                emitted: &emitted,
+            });
+            chain.extend_from_slice(enclosing);
+
+            node.apply_expressions(|expr| {
+                expr.apply(|node| {
+                    let Some(nested) = Self::subquery_of(node) else {
+                        return Ok(TreeNodeRecursion::Continue);
+                    };
+                    if self.subquery_reaches_captured_scope(
+                        nested,
+                        &chain,
+                        build_scope,
+                        probe_scope,
+                    )? {
+                        captured = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })?;
+
+            Ok(if captured {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        })?;
+        Ok(captured)
+    }
+
+    /// Whether any expression anywhere in `plan` carries a subquery.
+    fn holds_subquery(plan: &LogicalPlan) -> Result<bool> {
+        let mut found = false;
+        plan.apply(|node| {
+            node.apply_expressions(|expr| {
+                found =
+                    found || expr.exists(|node| Ok(Self::subquery_of(node).is_some()))?;
+                Ok(if found {
+                    TreeNodeRecursion::Stop
+                } else {
+                    TreeNodeRecursion::Continue
+                })
+            })
+        })?;
+        Ok(found)
+    }
+
+    /// What becomes of the reference `outer` emits on its way out to this join,
+    /// given the bodies `enclosing` between the two, innermost first.
+    ///
+    /// A nested subquery's outer references are relative to the scope enclosing
+    /// *it*, which is usually the body one level out rather than anything past
+    /// this join, so the scopes in between have to be asked before the join's own
+    /// are. In
+    /// `EXISTS (SELECT 1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.b))`
+    /// the inner list holds `t1.b`, which binds against `FROM t1` and reaches
+    /// nothing this join emits: taking every nested reference straight to the
+    /// join's scopes would refuse it, and a refusal is a hard error rather than a
+    /// different emission, so that trades wrong SQL for a wrong error.
+    ///
+    /// SQL resolves the reference at the first scope its emitted qualifier
+    /// collides with, so a colliding body ends the journey either way; what the
+    /// two answers separate is whether that body is the relation the plan named.
+    /// Collapsing them into "a colliding body consumes it" is the wrong-rows
+    /// direction, and not hypothetically: on a dialect that does not spell
+    /// columns in full, a body selecting from `mid.t` collides with a reference
+    /// to `public.t`, and reading that as arrival drops the reference unexamined
+    /// and emits the capture.
+    ///
+    /// The two questions are asked of *different* scopes, because the two errors
+    /// they can make are not equally bad — see [`EnclosingBody`].
+    fn outward_reference(
+        &self,
+        outer: &Expr,
+        enclosing: &[EnclosingBody<'_>],
+    ) -> Result<OutwardReference> {
+        // Only a reference this can place is placed. Anything else is left to
+        // `references_captured_scope`, which walks the expression itself.
+        let Expr::OuterReferenceColumn(_, column) = outer else {
+            return Ok(OutwardReference::ReachesTheJoin);
+        };
+        for body in enclosing {
+            if self.scope_names_relation(body.holding, column) {
+                return Ok(OutwardReference::BindsToAnEnclosingBody);
+            }
+            if self.scope_answers(body.emitted, column)? {
+                return Ok(OutwardReference::CapturedByAnEnclosingBody);
+            }
+        }
+        Ok(OutwardReference::ReachesTheJoin)
+    }
+
+    /// Whether `scope` introduces the very relation `column` names, as opposed to
+    /// one this dialect merely spells the same way.
+    ///
+    /// An unqualified reference names no relation, so nothing can be said to be
+    /// it: such a reference binds to whichever relation in the colliding scope
+    /// exposes the column, and which one the plan meant is not recoverable. That
+    /// is answered `false` — the same stance [`Self::scope_answers`] takes on an
+    /// unqualified reference against the join's own scopes, and the one that
+    /// refuses rather than emits.
+    fn scope_names_relation(&self, scope: &EmittedScope, column: &Column) -> bool {
+        let EmittedScope::Readable { qualifiers, .. } = scope else {
+            return false;
+        };
+        let Some(relation) = column.relation.as_ref() else {
+            return false;
+        };
+        let named = self.qualifier_key(&relation.to_vec());
+        qualifiers.iter().any(|candidate| candidate.named == named)
+    }
+
     /// Whether `scope` answers to the reference `column` emits.
     ///
     /// Both halves are asked in the emitted, keyed form — the qualifier through
@@ -3152,9 +3351,12 @@ impl Unparser<'_> {
     /// [`Self::emitted_column_key`] — against a scope that already holds only
     /// that form.
     ///
-    /// An [`EmittedScope::Unreadable`] scope answers to everything, so neither
-    /// half is asked — and neither exists to ask: a reference cannot be cleared
-    /// against a name nobody knows.
+    /// A scope whose names are not knowable — an [`EmittedScope::Unreadable`]
+    /// one, or a `Readable` one whose column list is `None` — answers to
+    /// everything, so neither half is asked, and neither exists to ask: a
+    /// reference cannot be cleared against a name nobody knows. Both callers need
+    /// that reading, for opposite-looking reasons that come to the same thing —
+    /// see [`OutwardReference::CapturedByAnEnclosingBody`].
     fn scope_answers(&self, scope: &EmittedScope, column: &Column) -> Result<bool> {
         let EmittedScope::Readable {
             qualifiers,
@@ -3164,13 +3366,18 @@ impl Unparser<'_> {
             return Ok(true);
         };
         Ok(match column.relation.as_ref() {
-            Some(relation) => qualifiers.contains(&self.emitted_qualifier_key(relation)),
+            Some(relation) => {
+                let emitted = self.emitted_qualifier_key(relation);
+                qualifiers
+                    .iter()
+                    .any(|candidate| candidate.emitted == emitted)
+            }
             // An unqualified reference names no relation to disagree with, so
             // it binds to whichever relation in the innermost scope exposes the
             // column — the `EXISTS` body's own, whenever that body exposes the
-            // name at all. With no list to ask, every such reference is a
-            // capture: the names that are missing are exactly the ones the plan
-            // never held.
+            // name at all. The names missing from a list that is not knowable
+            // are exactly the ones the plan never held, so nothing about such a
+            // reference can be settled by looking.
             None => match exposed {
                 Some(exposed) => {
                     exposed.contains(&self.emitted_column_key(&column.name)?)
@@ -3589,7 +3796,7 @@ impl From<BuilderError> for DataFusionError {
 #[derive(Debug)]
 enum EmittedScope {
     Readable {
-        qualifiers: Vec<Vec<String>>,
+        qualifiers: Vec<EmittedRelation>,
         /// The column names an unqualified reference can collide with, or
         /// `None` when the emitted `FROM` presents names the plan does not hold
         /// — see [`UnreadablePart::ColumnNames`]. `None` rather than an empty set,
@@ -3609,6 +3816,89 @@ enum EmittedScope {
     /// guard — then cannot consult a name list without first saying what it
     /// does when there is none.
     Unreadable,
+}
+
+/// What becomes of a nested subquery's outer reference on its way out to a join
+/// whose `EXISTS`-style body is being emitted.
+///
+/// The three are distinct because the scope that resolves a reference and the
+/// scope the plan sent it to are not the same question, and a two-valued answer
+/// has to fold one of them into another — either refusing references that bind
+/// correctly, or emitting captures unexamined.
+#[derive(Clone, Copy, Debug)]
+enum OutwardReference {
+    /// A body between the reference and the join both answers to it and names the
+    /// relation it names, so it binds there, as the plan intends, and this join
+    /// never sees it.
+    BindsToAnEnclosingBody,
+    /// A body between the two answers to the reference without naming the
+    /// relation it names, so it binds there *instead of* where the plan sent it.
+    /// The capture is already decided, whatever the join goes on to emit.
+    CapturedByAnEnclosingBody,
+    /// Nothing between the two answers to the reference, so it reaches the join
+    /// and the scopes the join emits decide it.
+    ReachesTheJoin,
+}
+
+/// The two scopes an enclosing `EXISTS` body presents to a correlation nested
+/// inside it.
+///
+/// They differ when the body joins, because how much of that join is in scope
+/// where the correlation is written depends on a decision the emitter has not
+/// made yet: a predicate the plan holds below the join is usually hoisted into
+/// the body's own `WHERE`, where both sides are in scope, but a boundary the
+/// emitter has to write as a derived table leaves only the side beneath it. The
+/// guard cannot know which, so it asks its two questions of whichever scope
+/// makes being wrong cost a pushdown instead of rows:
+///
+/// * **Does the body name the relation the reference names**, so the reference
+///   has arrived and needs no further examination? Asked of `holding`, the
+///   narrower one — a relation the wider scope adds might be behind a derived
+///   table the reference never sees, and treating that as arrival would drop it
+///   unexamined.
+/// * **Does the body merely answer to the reference**, so it binds there instead
+///   of where the plan sent it? Asked of `emitted`, the wider one — a relation
+///   only it knows about may still be in scope for the emitted predicate, and
+///   overlooking that collision would emit the capture.
+///
+/// Only the second of those is pinned by a test. Separating the first needs a
+/// body whose two scopes disagree *and* a reference neither side of the join
+/// answers to, and a reference the wider scope names is refused by those scopes
+/// in every such shape reachable here — so a test asserting the refusal would
+/// pass whichever scope were asked. It is asked of the narrower one anyway,
+/// because the two ways of being wrong are not symmetric: reading arrival too
+/// readily drops a reference unexamined, while reading it too reluctantly costs
+/// the pushdown the rest of this guard already trades away.
+#[derive(Clone, Copy)]
+struct EnclosingBody<'a> {
+    /// Everything in scope in the subtree beneath the node carrying the nested
+    /// subquery.
+    holding: &'a EmittedScope,
+    /// Everything the body's own `FROM` introduces, wherever in its plan.
+    emitted: &'a EmittedScope,
+}
+
+/// A relation an emitted `FROM` introduces, in the two forms a reference has to
+/// be compared against.
+///
+/// The two differ exactly where a capture hides, so a scope that kept only one
+/// of them could not tell the difference. Keeping both here rather than deriving
+/// either at a comparison site is the same discipline as the rest of
+/// [`EmittedScope`]: the plan's own spelling is not in the struct, so a
+/// comparison cannot reach for it by mistake.
+#[derive(Debug)]
+struct EmittedRelation {
+    /// How this dialect will spell the relation's qualifier, keyed for
+    /// comparison — what decides whether a reference *collides* with it, which
+    /// is what SQL resolves a reference by.
+    emitted: Vec<String>,
+    /// The relation's own path, keyed for comparison — what decides whether a
+    /// colliding reference names *this* relation or a different one the dialect
+    /// happens to spell the same way. A dialect that does not spell columns in
+    /// full writes `mid.t` and `public.t` alike as `t`: a reference to the
+    /// second binding to the first collides, and is a capture rather than the
+    /// reference arriving where the plan sent it.
+    named: Vec<String>,
 }
 
 /// What a node's emitted relation keeps [`Unparser::emitted_scope`] from
