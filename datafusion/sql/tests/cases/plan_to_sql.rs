@@ -7939,3 +7939,120 @@ fn test_unparse_left_semi_join_refuses_probe_only_reserved_name_in_a_filter() ->
     );
     Ok(())
 }
+
+/// `LeftSemi` join whose build side is `build` behind the alias `a`, correlated
+/// by the unqualified reference `correlated_name`.
+fn aliased_build_side_unqualified_correlation(
+    build: LogicalPlan,
+    correlated_name: &str,
+) -> Result<LogicalPlan> {
+    let probe = unqualified_probe()?;
+    let build = subquery_alias(build, "a")?;
+    LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![
+                Expr::Column(Column::new(None::<TableReference>, correlated_name))
+                    .gt(lit(0)),
+            ],
+        )?
+        .build()
+}
+
+/// An alias replaces the names below it, not the columns, so the walk cannot
+/// stop collecting columns where it stops collecting qualifiers.
+///
+/// The build side is `t` behind `AS "a"`, projected down to `x` alone, and the
+/// correlation is an unqualified `c` — a column `t` has and the aliased plan
+/// does not output. The emitter writes the side as an aliased *scan*, so
+/// `FROM "t" AS "a"` answers to every column `t` has, `c` included. Before this
+/// was caught, the plan unparsed to
+/// `SELECT "p"."c" AS "c", "p"."d" AS "d" FROM "p" WHERE EXISTS (SELECT 1 FROM "t" AS "a" WHERE ("c" > 0))`,
+/// where `("c" > 0)` was written against the probe's `p.c` and binds to `t.c`.
+///
+/// The alias is the entire difference: the same plan without it is refused,
+/// because the scan's own schema is collected at the top level. That is what
+/// makes this a boundary the walk was jumping rather than a missing arm — the
+/// column names are gathered at the plan's root and at its leaf scans, and an
+/// alias sits between the two.
+#[test]
+fn test_unparse_left_semi_join_refuses_unqualified_capture_behind_an_alias() -> Result<()>
+{
+    let inner = table_scan(Some("t"), &int32_schema(&["x", "c"]), Some(vec![0]))?
+        .project(vec![col("t.x")])?
+        .build()?;
+    let plan = aliased_build_side_unqualified_correlation(inner, "c")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a column the aliased relation exposes must be seen through the alias",
+    );
+    Ok(())
+}
+
+/// The other half of the same boundary: a name the aliased plan *renames into*
+/// the body, which no relation below the alias has at all.
+///
+/// `t` holds `x` and `y`; the aliased side renames `x` to `c`, so the emitted
+/// derived table answers to `c` while `t` does not. Collecting only the scans
+/// below the alias would miss it, which is why the aliased subtree's own output
+/// schema is taken as well — the same pair of sources the top level already
+/// takes, for the same two reasons.
+/// The other half of the same boundary: a name the aliased plan *renames into*
+/// the body, which no relation below the alias has at all.
+///
+/// The alias deliberately is **not** the build plan's root — a rename above it
+/// puts `c` out of the root schema, which is otherwise collected at the top
+/// level and would cover this case for the wrong reason. `t` holds `x` and `y`;
+/// the aliased side renames `x` to `c`; the projection above renames that to
+/// `renamed`. So the emitted derived table answers to `c` while neither `t` nor
+/// the build plan's output has it, and only the aliased subtree's own output
+/// schema says so.
+///
+/// A first version of this test put the alias at the root, and the neuter that
+/// drops the output-schema collection killed nothing — the top-level push was
+/// carrying it. That is the whole reason for the shape here.
+#[test]
+fn test_unparse_left_semi_join_refuses_renamed_capture_behind_an_inner_alias()
+-> Result<()> {
+    let inner = table_scan(Some("t"), &int32_schema(&["x", "y"]), Some(vec![0]))?
+        .project(vec![col("t.x").alias("c")])?
+        .build()?;
+    let build = LogicalPlanBuilder::from(subquery_alias(inner, "a")?)
+        .project(vec![col("a.c").alias("renamed")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(unqualified_probe()?)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![Expr::Column(Column::new(None::<TableReference>, "c")).gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a name the aliased plan renames into the body must be seen through the alias",
+    );
+    Ok(())
+}
+
+/// And the direction that must keep its pushdown: an unqualified reference to a
+/// name nothing behind the alias answers to, neither as a column of the scan nor
+/// as an output of the aliased plan.
+///
+/// Without this the fix above could have been "refuse every unqualified
+/// correlation whenever the build side carries an alias", which no other test
+/// here would notice.
+#[test]
+fn test_unparse_left_semi_join_keeps_unqualified_name_absent_behind_an_alias()
+-> Result<()> {
+    let inner = table_scan(Some("t"), &int32_schema(&["x", "y"]), Some(vec![0, 1]))?
+        .project(vec![col("t.x"), col("t.y")])?
+        .build()?;
+    let plan = aliased_build_side_unqualified_correlation(inner, "c")?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}

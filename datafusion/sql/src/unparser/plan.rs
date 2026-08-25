@@ -2778,7 +2778,9 @@ impl Unparser<'_> {
         // reports a `DataFusionError`, while keying a name asks the dialect and
         // can fail with one of its own.
         let mut qualifiers: Vec<Vec<String>> = Vec::new();
-        let mut scans: Vec<SchemaRef> = Vec::new();
+        // Every schema whose column names the emitted `FROM` can answer to,
+        // keyed after the walk rather than during it.
+        let mut schemas: Vec<SchemaRef> = Vec::new();
         let mut unreadable = false;
         let mut columns_unreadable = false;
 
@@ -2804,7 +2806,7 @@ impl Unparser<'_> {
                     // not just the projected ones — the same reason the
                     // qualifier is read from the `FROM` rather than from the
                     // output schema.
-                    scans.push(scan.source.schema());
+                    schemas.push(scan.source.schema());
                     Ok(TreeNodeRecursion::Continue)
                 }
                 LogicalPlan::SubqueryAlias(alias) => {
@@ -2818,6 +2820,26 @@ impl Unparser<'_> {
                     }
                     qualifiers
                         .push(vec![self.identifier_comparison_key(alias.alias.table())]);
+
+                    // An alias replaces the *names* below it, which is why the
+                    // walk stops here — but it does not replace the *columns*.
+                    // The relation it introduces answers to whatever it
+                    // exposes, and the emitter writes it either as an aliased
+                    // scan (`FROM "t" AS "a"`, exposing every column `t` has)
+                    // or as a derived table (exposing the ones it selects).
+                    // Which of the two is not decided until the body is built,
+                    // so both are taken, in the direction that refuses.
+                    //
+                    // Jumping without this lost the whole set: `exposed` is
+                    // otherwise collected at the plan's root and at its leaf
+                    // scans, and an alias is a relation boundary in between.
+                    schemas.push(Arc::clone(alias.input.schema().inner()));
+                    alias.input.apply(|inner| {
+                        if let LogicalPlan::TableScan(scan) = inner {
+                            schemas.push(scan.source.schema());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
                     Ok(TreeNodeRecursion::Jump)
                 }
                 _ => Ok(TreeNodeRecursion::Continue),
@@ -2853,7 +2875,7 @@ impl Unparser<'_> {
         } else {
             let mut exposed = HashSet::new();
             self.expose_columns(&mut exposed, plan.schema().inner())?;
-            for schema in &scans {
+            for schema in &schemas {
                 self.expose_columns(&mut exposed, schema)?;
             }
             Some(exposed)
