@@ -8056,3 +8056,117 @@ fn test_unparse_left_semi_join_keeps_unqualified_name_absent_behind_an_alias()
     assert_snapshot!(unparser.plan_to_sql(&plan)?);
     Ok(())
 }
+
+/// A semi join from `public.t` to `other.t` whose filter is a nested `EXISTS`
+/// carrying `outer_ref(<outer_relation>.c)`.
+fn nested_exists_outer_reference(outer_relation: &str) -> Result<LogicalPlan> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(
+        Some(TableReference::partial("public", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let build = table_scan(
+        Some(TableReference::partial("other", "t")),
+        &schema,
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let inner = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(
+            col("z.k").eq(out_ref_col(DataType::Int32, format!("{outer_relation}.c"))),
+        )?
+        .build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![exists(Arc::new(inner))],
+        )?
+        .build()
+}
+
+/// An outer reference held by a *nested* subquery is invisible to a walk over
+/// the predicate, and it passes through the `EXISTS` body this join introduces.
+///
+/// `Expr::apply_children` returns `Continue` for `Exists` and `ScalarSubquery`
+/// without descending, so the plan inside one is never reached and the outer
+/// references it carries — held separately on `Subquery::outer_ref_columns` —
+/// are seen by nothing. `Expr::contains_outer` reports `false` for this
+/// predicate; the walk that looks for captures sees an empty set of references.
+///
+/// Here the reference names `public.t`, the probe. On a dialect that spells
+/// neither qualifier in full the body introduces `FROM "other"."t"`, and the
+/// nested `"t"."c"` resolves against the innermost scope answering to `t` —
+/// which is now `other.t`. Before this was caught, the plan unparsed to
+/// `SELECT "c", "d" FROM "public"."t" WHERE EXISTS (SELECT 1 FROM "other"."t" WHERE EXISTS (SELECT "z"."k" FROM "z" WHERE ("z"."k" = "t"."c")))`,
+/// where the innermost comparison reads `other.t.c` against itself rather than
+/// against the row the query was written to correlate with.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_held_by_a_nested_subquery()
+-> Result<()> {
+    let plan = nested_exists_outer_reference("public.t")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference a nested subquery holds must be refused",
+    );
+    Ok(())
+}
+
+/// The other direction: a nested subquery whose outer reference names a relation
+/// neither side of this join introduces keeps its pushdown.
+///
+/// `elsewhere.c` passes through both emitted scopes untouched, so there is
+/// nothing for it to collide with and the correlation still reaches whatever
+/// enclosing query it was written against. Without this, the fix above could
+/// have been "refuse every join whose filter holds a subquery", which nothing
+/// else here would catch.
+#[test]
+fn test_unparse_left_semi_join_keeps_nested_outer_reference_neither_side_answers_to()
+-> Result<()> {
+    let plan = nested_exists_outer_reference("elsewhere")?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
+
+/// The case the pre-check is actually load-bearing for: a subquery-held outer
+/// reference that only the **probe** shadows.
+///
+/// The build side is `b`, which answers to nothing the reference names, so the
+/// probe-half pass — which asks the build scope alone — clears it. Only asking
+/// the probe scope refuses it, and the probe scope is built only if this half
+/// is noticed to carry such a reference. `Expr::contains_outer` says `false`
+/// here, because the reference lives on the subquery.
+#[test]
+fn test_unparse_left_semi_join_refuses_probe_shadowed_reference_in_a_key_subquery()
+-> Result<()> {
+    let schema = int32_schema(&["c", "d"]);
+    let probe = table_scan(Some("p"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("b"), &schema, Some(vec![0, 1]))?.build()?;
+    let inner = table_scan(Some("z"), &int32_schema(&["k"]), Some(vec![0]))?
+        .filter(col("z.k").eq(out_ref_col(DataType::Int32, "p.c")))?
+        .project(vec![col("z.k")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_with_expr_keys(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (
+                vec![col("p.c") + scalar_subquery(Arc::new(inner))],
+                vec![col("b.c")],
+            ),
+            None,
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a subquery-held reference the probe's own FROM shadows must be refused",
+    );
+    Ok(())
+}

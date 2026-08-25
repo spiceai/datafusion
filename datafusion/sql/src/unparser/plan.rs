@@ -55,7 +55,7 @@ use datafusion_common::{
 use datafusion_expr::expr::{OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
-    LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan, Unnest,
+    LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
     UserDefinedLogicalNode, Window, expr::Alias,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
@@ -3036,6 +3036,25 @@ impl Unparser<'_> {
         probe_scope: Option<&EmittedScope>,
     ) -> Result<bool> {
         expr.exists(|node| {
+            // A subquery is a leaf here, so its own outer references have to be
+            // reached for explicitly. They pass out through this join as well
+            // as out of the subquery, so they follow the same rule as an
+            // `OuterReferenceColumn` written directly into the predicate —
+            // whichever scope shadows one captures it.
+            if let Some(subquery) = Self::subquery_of(node) {
+                for outer in &subquery.outer_ref_columns {
+                    if self.references_captured_scope(
+                        outer,
+                        ReferenceKind::ReachingPastTheJoin,
+                        build_scope,
+                        probe_scope,
+                    )? {
+                        return Ok(true);
+                    }
+                }
+                return Ok(false);
+            }
+
             let (column, reaches_past_the_join) = match node {
                 Expr::Column(column) => (column, false),
                 Expr::OuterReferenceColumn(_, column) => (column, true),
@@ -3089,6 +3108,33 @@ impl Unparser<'_> {
                 None => captured_by_build,
             })
         })
+    }
+
+    /// The [`Subquery`] a subquery-bearing expression holds.
+    ///
+    /// These are leaves to `Expr` traversal — `Expr::apply_children` returns
+    /// `Continue` for `Exists` and `ScalarSubquery` without descending — so a
+    /// walk over an expression never reaches the plan inside one, and never
+    /// sees the outer references that plan carries. Those are held separately,
+    /// on [`Subquery::outer_ref_columns`], and have to be asked for by name.
+    const fn subquery_of(expr: &Expr) -> Option<&Subquery> {
+        match expr {
+            Expr::Exists(exists) => Some(&exists.subquery),
+            Expr::ScalarSubquery(subquery) => Some(subquery),
+            Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery),
+            _ => None,
+        }
+    }
+
+    /// Whether `expr` carries a reference that reaches past this join, counting
+    /// the ones held by a nested subquery.
+    ///
+    /// [`Expr::contains_outer`] cannot see those, for the reason
+    /// [`Self::subquery_of`] gives, so asking it alone would leave the probe
+    /// scope unbuilt and the reference unexamined.
+    fn carries_outer_reference(expr: &Expr) -> Result<bool> {
+        Ok(expr.contains_outer()
+            || expr.exists(|node| Ok(Self::subquery_of(node).is_some()))?)
     }
 
     /// Whether `scope` answers to the reference `column` emits.
@@ -3262,7 +3308,7 @@ impl Unparser<'_> {
                 needs_probe_scope.push((filter, ReferenceKind::Every));
             }
             for half in join.on.iter().flat_map(|(left, right)| [left, right]) {
-                if half.contains_outer() {
+                if Self::carries_outer_reference(half)? {
                     needs_probe_scope.push((half, ReferenceKind::ReachingPastTheJoin));
                 }
             }
