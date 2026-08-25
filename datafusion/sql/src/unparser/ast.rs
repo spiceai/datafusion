@@ -249,15 +249,23 @@ fn numbered_alias(prefix: &str, counter: usize) -> String {
 
 /// Whether `name` is one this module's counter-numbered generators can produce.
 ///
-/// The inverse of [`numbered_alias`]: the bare prefix is never a name — the
-/// counter is always appended — so only the numbered form is recognised.
+/// The inverse of [`numbered_alias`], and exactly it: the counters start at 1 and
+/// `usize` renders canonically, so `_unnest_0`, `_unnest_01` and a run of digits
+/// too long to be a `usize` are names no generator here can build. Recognising
+/// one of those would treat a relation a user happened to give that name as an
+/// alias the unparser invented, and refuse a correlation against it that binds
+/// correctly.
+///
+/// Decided by rebuilding the name rather than by inspecting the digits, so the
+/// two cannot disagree about a form neither anticipated.
 pub(crate) fn is_numbered_alias(name: &str) -> bool {
     let Some((prefix, counter)) = name.rsplit_once('_') else {
         return false;
     };
     NUMBERED_ALIAS_PREFIXES.contains(&prefix)
-        && !counter.is_empty()
-        && counter.bytes().all(|byte| byte.is_ascii_digit())
+        && counter
+            .parse::<usize>()
+            .is_ok_and(|counter| counter > 0 && numbered_alias(prefix, counter) == name)
 }
 
 impl SelectBuilder {
@@ -1092,3 +1100,58 @@ impl fmt::Display for BuilderError {
     }
 }
 impl std::error::Error for BuilderError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every name the counter-numbered generators actually produce is recognised.
+    ///
+    /// Driven from the generators rather than from written-out strings, so the
+    /// pairing is pinned by the code that builds the names instead of by a copy
+    /// of it.
+    #[test]
+    fn generated_numbered_aliases_are_recognised() {
+        let mut select = SelectBuilder::default();
+        for _ in 0..3 {
+            let flatten = select.next_flatten_alias();
+            assert!(
+                is_numbered_alias(&flatten),
+                "the flatten generator produced {flatten}, which is not recognised"
+            );
+            let aggregate = select.next_derived_aggregate_alias();
+            assert!(
+                is_numbered_alias(&aggregate),
+                "the aggregate generator produced {aggregate}, which is not recognised"
+            );
+        }
+    }
+
+    /// A name no generator can build is not one, however much it looks like one.
+    ///
+    /// The counters start at 1 and render canonically, so a zero, a leading zero
+    /// and a run of digits wider than a `usize` are all names the unparser never
+    /// invents. Recognising one would treat a user's own relation as an invented
+    /// alias and refuse a correlation against it.
+    #[test]
+    fn numbered_alias_lookalikes_are_not_recognised() {
+        for name in [
+            "_unnest_0",
+            "_unnest_01",
+            "_unnest_+1",
+            "_unnest_",
+            "_unnest",
+            "_unnest_1x",
+            "_unnest_99999999999999999999999999999999999999",
+            "derived_aggregate_0",
+            "derived_aggregate_007",
+            "unnest_1",
+            "_flatten_1",
+        ] {
+            assert!(
+                !is_numbered_alias(name),
+                "{name} is not a name any generator here builds, so it must not be recognised as one"
+            );
+        }
+    }
+}
