@@ -2762,10 +2762,21 @@ impl Unparser<'_> {
     /// Aliases the unparser invents for derived tables of its own are not here —
     /// they appear nowhere in the plan, so no walk can find them. They are
     /// recognised by [`Self::is_unparser_derived_alias`] instead.
+    ///
+    /// An extension node is the one shape neither list can describe. Its
+    /// [`UserDefinedLogicalNodeUnparser`] is handed the `RelationBuilder` and
+    /// decides the emitted `FROM` outright, so the relation it names is not a
+    /// function of the plan and the walk is wrong in both directions at once:
+    /// it collects the extension's inputs, which the emitted SQL does not name,
+    /// and misses whatever the unparser writes, which it does. The scope is
+    /// marked opaque instead of guessed at.
+    ///
+    /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
     fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
         let mut scope = EmittedScope {
             qualifiers: Vec::new(),
             exposed: HashSet::new(),
+            opaque: false,
         };
         // The build side's own output names, which no walk below can find: a
         // rename names a column something the plan holds no relation for. Both
@@ -2801,6 +2812,18 @@ impl Unparser<'_> {
                 scope
                     .qualifiers
                     .push(vec![self.identifier_comparison_key(alias.alias.table())]);
+                Ok(TreeNodeRecursion::Jump)
+            }
+            // An extension's unparser is handed the `RelationBuilder` and may
+            // put anything in it, including a table whose name appears nowhere
+            // in the plan. The walk cannot know that name, so it says so.
+            //
+            // Its inputs are jumped rather than collected: once the unparser
+            // writes the relation, `select_to_sql_recursively` returns without
+            // descending, so those inputs describe relations the emitted SQL
+            // never names.
+            LogicalPlan::Extension(_) => {
+                scope.opaque = true;
                 Ok(TreeNodeRecursion::Jump)
             }
             _ => Ok(TreeNodeRecursion::Continue),
@@ -2905,7 +2928,17 @@ impl Unparser<'_> {
     /// [`Self::emitted_qualifier_key`] and the name through
     /// [`Self::emitted_column_key`] — against a scope that already holds only
     /// that form.
+    ///
+    /// An opaque scope answers to everything, so neither half is asked: the
+    /// relation it emits was never read, and a reference cannot be cleared
+    /// against a name nobody knows.
     fn scope_answers(&self, scope: &EmittedScope, column: &Column) -> Result<bool> {
+        // A scope that could not be read cannot clear a reference, and this is
+        // the one place every comparison passes through, so it is the one place
+        // that has to know it.
+        if scope.opaque {
+            return Ok(true);
+        }
         Ok(match column.relation.as_ref() {
             Some(relation) => scope
                 .qualifiers
@@ -2984,6 +3017,13 @@ impl Unparser<'_> {
     /// inside a derived table of its own, which the emitted SQL cannot address.
     /// That costs the pushdown on correct SQL, which is the safe way round for
     /// a guard whose other failure is wrong rows.
+    ///
+    /// An extension node on either side is refused wholesale on the same trade,
+    /// because its unparser decides the emitted `FROM` and nothing readable
+    /// from the plan distinguishes a relation that captures the correlation
+    /// from one that does not. Narrowing that needs the unparser to report the
+    /// scope it will emit, which is a change to the extension trait rather than
+    /// to this walk.
     fn ensure_exists_correlation_not_shadowed(&self, join: &Join) -> Result<()> {
         let swapped = Self::swaps_join_inputs(join.join_type);
         let (probe_plan, build_plan) = if swapped {
@@ -3265,10 +3305,17 @@ impl From<BuilderError> for DataFusionError {
 /// comparison. That is what keeps the normalization from being forgotten: the
 /// plan's own spelling is not in the struct, so a comparison site has nothing to
 /// compare wrongly.
+///
+/// `opaque` is the third state, and it outranks both lists: the emitted `FROM`
+/// holds a relation that neither list can describe, so nothing was learned by
+/// looking. A scope in that state answers to every reference, because the one
+/// thing that can be said about a relation whose name is unknown is that it
+/// might be the name in hand.
 #[derive(Debug)]
 struct EmittedScope {
     qualifiers: Vec<Vec<String>>,
     exposed: HashSet<String>,
+    opaque: bool,
 }
 
 /// The type of the input to the UNNEST table factor.

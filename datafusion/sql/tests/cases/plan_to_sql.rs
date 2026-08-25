@@ -46,7 +46,7 @@ use datafusion_sql::unparser::dialect::{
 };
 use datafusion_sql::unparser::{Unparser, expr_to_sql, plan_to_sql};
 use insta::assert_snapshot;
-use sqlparser::ast::Statement;
+use sqlparser::ast::{Ident, ObjectName, Statement};
 use std::hash::Hash;
 use std::ops::Add;
 use std::sync::Arc;
@@ -62,6 +62,7 @@ use datafusion_functions_nested::extract::array_element_udf;
 use datafusion_functions_nested::planner::{FieldAccessPlanner, NestedFunctionPlanner};
 use datafusion_sql::unparser::ast::{
     DerivedRelationBuilder, QueryBuilder, RelationBuilder, SelectBuilder,
+    TableRelationBuilder,
 };
 use datafusion_sql::unparser::extension_unparser::{
     UnparseToStatementResult, UnparseWithinStatementResult,
@@ -3958,6 +3959,134 @@ fn test_unparse_left_semi_join_refuses_unqualified_capture_by_renamed_column()
     assert_captured_correlation_refused(
         &plan,
         "a name a derived table renames into the body must be seen to capture",
+    );
+    Ok(())
+}
+/// An extension unparser that writes a table relation of its own choosing into
+/// the emitted `FROM`, with no relationship to the node's inputs.
+///
+/// That is the whole latitude [`UserDefinedLogicalNodeUnparser`] has — it is
+/// handed the `RelationBuilder` — and it is what makes an extension's emitted
+/// scope unreadable from the plan: `emitted_scope` walks the inputs, which say
+/// nothing about the name written here.
+struct MockTableRelationUnparser {
+    name: &'static str,
+}
+
+impl UserDefinedLogicalNodeUnparser for MockTableRelationUnparser {
+    fn unparse(
+        &self,
+        node: &dyn UserDefinedLogicalNode,
+        _unparser: &Unparser,
+        _query: &mut Option<&mut QueryBuilder>,
+        _select: &mut Option<&mut SelectBuilder>,
+        relation: &mut Option<&mut RelationBuilder>,
+    ) -> Result<UnparseWithinStatementResult> {
+        if node
+            .as_any()
+            .downcast_ref::<MockUserDefinedLogicalPlan>()
+            .is_none()
+        {
+            return Ok(UnparseWithinStatementResult::Unmodified);
+        }
+        let mut builder = TableRelationBuilder::default();
+        builder.name(ObjectName::from(vec![Ident::with_quote('"', self.name)]));
+        if let Some(rel) = relation {
+            rel.table(builder);
+        }
+        Ok(UnparseWithinStatementResult::Modified)
+    }
+}
+
+/// An extension node whose inputs expose `columns` unqualified, so a join key
+/// built from one of them is an unqualified reference into the emitted body.
+fn unqualified_extension(columns: &[&str]) -> Result<LogicalPlan> {
+    let input = LogicalPlan::EmptyRelation(EmptyRelation {
+        produce_one_row: false,
+        schema: Arc::new(DFSchema::try_from(int32_schema(columns))?),
+    });
+    Ok(LogicalPlan::Extension(Extension {
+        node: Arc::new(MockUserDefinedLogicalPlan { input }),
+    }))
+}
+
+/// An [`Unparser`] that lets an extension build side emit `FROM "t"`.
+fn extension_unparser(name: &'static str) -> Unparser<'static> {
+    Unparser::new(&UnparserPostgreSqlDialect {})
+        .with_extension_unparsers(vec![Arc::new(MockTableRelationUnparser { name })])
+}
+
+/// An extension node decides its own emitted `FROM`, so the relation it
+/// introduces cannot be read from the plan — and the correlation has to be
+/// refused rather than cleared against a scope nobody looked at.
+///
+/// The probe is `t`; the build side is an extension whose *inputs* name no
+/// relation at all and whose unparser writes `FROM "t"`. Every part of the walk
+/// is misled at once: it finds no qualifier to compare `t.c` with, and the one
+/// name it would have needed is not in the plan to be found. Before this was
+/// caught, the plan unparsed to
+/// `SELECT "t"."d" FROM "t" WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t"."c" = "c"))`,
+/// where the outer `"t"."c"` binds to the extension's own `t` and the build half
+/// `"c"` binds to the same row: the inner tautology again, so the semi join
+/// keeps every probe row.
+///
+/// Refusing costs the pushdown for every extension on a correlated side,
+/// including the ones that would have been correct. Narrowing it needs the
+/// extension unparser to report the scope it will emit, which the trait has no
+/// way to say.
+#[test]
+fn test_unparse_left_semi_join_refuses_correlation_captured_by_extension_relation()
+-> Result<()> {
+    let probe = table_scan(Some("t"), &exists_fetch_schema(), Some(vec![0, 1]))?
+        .project(vec![col("t.d")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            unqualified_extension(&["c"])?,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["t.c"], vec!["c"]),
+            None,
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused_by(
+        &extension_unparser("t"),
+        &plan,
+        "a relation an extension emits must be refused, not cleared unseen",
+    );
+    Ok(())
+}
+
+/// The same for a probe side: an outer reference passes through the probe's own
+/// `FROM` on its way out, so a probe whose emitted relation cannot be read
+/// captures it just as a build side would.
+///
+/// The reference here names `x`, which neither side's plan holds, so nothing the
+/// walk *can* read would refuse it — only the extension's unreadable `FROM "x"`
+/// does. Asking the probe scope at all needs a `join.filter`, which is where an
+/// [`Expr::OuterReferenceColumn`] reaches past the join.
+///
+/// [`Expr::OuterReferenceColumn`]: datafusion_expr::Expr::OuterReferenceColumn
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_captured_by_extension_probe()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = LogicalPlanBuilder::from(unqualified_extension(&["c", "d"])?)
+        .project(vec![col("c"), col("d")])?
+        .build()?;
+    let build = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![out_ref_col(DataType::Int32, "x.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused_by(
+        &extension_unparser("x"),
+        &plan,
+        "an outer reference passing through an unreadable probe FROM must be refused",
     );
     Ok(())
 }
