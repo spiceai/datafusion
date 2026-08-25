@@ -3313,10 +3313,17 @@ impl Unparser<'_> {
     /// Mirrors what `select_to_sql_recursively` writes: its [`LogicalPlan::Union`]
     /// arm emits every input as its own `SetExpr`, and its [`Distinct::All`] arm
     /// delegates a distinct union straight to that same arm, so both shapes reach
-    /// the reader as one `SELECT` per branch. Only a set operation standing as the
-    /// body itself is reported — one buried below is emitted as a derived table,
-    /// whose alias is the name a correlation can reach and which
-    /// [`Self::emitted_scope`] already stops at.
+    /// the reader as one `SELECT` per branch.
+    ///
+    /// Only a set operation standing as the body itself is reported. Below a
+    /// [`LogicalPlan::SubqueryAlias`] there is nothing to report:
+    /// `requires_derived_subquery` sends a union there to a derived table, and the
+    /// name a correlation can reach is that alias, which [`Self::emitted_scope`]
+    /// records as it stops. A union buried under any other node is left to the
+    /// single-scope path, which reads its branches together — an
+    /// over-approximation that costs a refusal rather than a wrong emission, and
+    /// which splitting here would not fix, since the derived table's own alias is
+    /// the name that path is missing.
     fn set_operation_branches(plan: &LogicalPlan) -> Option<&[Arc<LogicalPlan>]> {
         match plan {
             LogicalPlan::Union(union) => Some(&union.inputs),
