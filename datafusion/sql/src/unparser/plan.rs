@@ -2782,9 +2782,19 @@ impl Unparser<'_> {
     /// they appear nowhere in the plan, so no walk can find them. They are
     /// recognised by [`Self::is_unparser_derived_alias`] instead.
     fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
-        // A derived table exposes its input's output columns, including one the
-        // body renamed — a rename no walk below can see, since the unparser
-        // introduces that derived table without the plan holding a node for it.
+        // The build side's own output names, which no walk below can find: a
+        // rename names a column something the plan holds no relation for. Both
+        // ways the body is emitted put those names where an unqualified
+        // correlation collides with them — as the columns of a derived table
+        // when the emitter wraps the body, and as bare names that escape
+        // outward, to be compared with the outer query's own column, when it
+        // folds the projection into the `SELECT 1` instead.
+        //
+        // Taken unconditionally, which over-approximates the case where the
+        // body folds and the correlation's build half names a column of the
+        // scan rather than the renamed one: there the outer reference does bind
+        // outward and the refusal costs a pushdown it did not need to. That is
+        // the same approximation, and the same fix, as spiceai/spiceai#13469.
         let mut scope = EmittedScope {
             qualifiers: Vec::new(),
             schemas: vec![Arc::clone(plan.schema().inner())],

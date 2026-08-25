@@ -3950,6 +3950,46 @@ fn test_unparse_left_semi_join_refuses_unqualified_capture_by_renamed_column()
     Ok(())
 }
 
+/// The same rename with nothing stacked on it is folded away, and then the name
+/// is exposed nowhere at all — so both halves of the correlation escape outward.
+///
+/// `b` holds `x` and `y`; the build side renames `x` to `c`, and with no operator
+/// above it the emitter folds that projection into the `SELECT 1`. The body is
+/// `FROM "b"`, which answers to `x` and `y` and to no `c` whatever. Un-guarded
+/// the predicate is `("c" = "c")` with *both* halves binding to the outer
+/// `"p"."c"`: the build half was meant to be `b.x`, so the correlation is gone,
+/// `EXISTS` asks only whether `b` has a row, and the semi join keeps every probe
+/// row.
+///
+/// The derived-table case above does not cover this one. There the emitted body
+/// really does expose the renamed name, and a check that collected the output
+/// names only when the emitter wraps the body would still refuse it — while
+/// emitting the tautology here. Both arms are why those names are collected
+/// whether or not the body is wrapped.
+#[test]
+fn test_unparse_left_semi_join_refuses_unqualified_capture_by_folded_rename() -> Result<()>
+{
+    let probe = unqualified_probe()?;
+    let build_schema = int32_schema(&["x", "y"]);
+    let build = table_scan(Some("b"), &build_schema, Some(vec![0]))?
+        .project(vec![col("b.x").alias("c")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["c"], vec!["c"]),
+            None,
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a rename the emitter folds away must still be seen to capture",
+    );
+    Ok(())
+}
+
 /// A relation the build side renames is not in the emitted scope under its own
 /// name, so a correlation naming it is not captured and must keep its pushdown.
 ///
@@ -3993,9 +4033,9 @@ fn test_unparse_left_semi_join_keeps_relation_enclosed_by_build_side_alias() -> 
 /// (...) AS "t" WHERE ...)` puts `"t"` in the inner scope, so a correlated
 /// reference qualified by `t` binds there.
 ///
-/// This is the half of the scope the `FROM` walk cannot see: it stops at the
-/// alias, so the alias has to come from the output schema, which is what carries
-/// it.
+/// This is the half of the scope the walk itself supplies: reaching a
+/// `SubqueryAlias`, it records that alias as a qualifier and stops there rather
+/// than descending to the relation the alias replaces.
 #[test]
 fn test_unparse_left_semi_join_refuses_capture_by_build_side_alias() -> Result<()> {
     let schema = exists_fetch_schema();
