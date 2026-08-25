@@ -2841,12 +2841,59 @@ impl Unparser<'_> {
                     // otherwise collected at the plan's root and at its leaf
                     // scans, and an alias is a relation boundary in between.
                     schemas.push(Arc::clone(alias.input.schema().inner()));
+
                     alias.input.apply(|inner| {
                         if let LogicalPlan::TableScan(scan) = inner {
                             schemas.push(scan.source.schema());
                         }
                         Ok(TreeNodeRecursion::Continue)
                     })?;
+                    // The names below are hidden by the alias only while there
+                    // is one relation for it to replace. `FROM "t" AS "derived"`
+                    // really does put `"t"` out of reach — the pushdown that
+                    // depends on it is pinned by
+                    // `test_unparse_left_semi_join_keeps_relation_enclosed_by_build_side_alias`.
+                    //
+                    // An alias over a *join* is the other shape. SQL has no way
+                    // to name a join, so unless the emitter wraps it in a
+                    // derived table — which `requires_derived_subquery` declines
+                    // to do for inner, outer and cross joins — `relation.alias`
+                    // renames the primary relation alone and every relation
+                    // joined to it keeps the name it was scanned under, still
+                    // addressable beside the alias: `FROM "safe" AS "a" CROSS
+                    // JOIN "t"`. Recording only `"a"` there leaves a correlated
+                    // `"t"."c"` matching no name in this scope, so the guard
+                    // reads a capture as a reference that reaches outward and
+                    // emits SQL binding it to the inner `"t"` — valid, silent,
+                    // and answering from the wrong rows.
+                    //
+                    // Which relation the emitter renames is not decided here, so
+                    // all of them are taken, including the one that will be
+                    // replaced. These are read only to refuse, so a name too
+                    // many costs a pushdown and never a row.
+                    if Self::relations_under_alias(&alias.input) > 1 {
+                        alias.input.apply(|inner| {
+                            match inner {
+                                LogicalPlan::TableScan(scan) => {
+                                    qualifiers.push(
+                                        self.emitted_qualifier_key(&scan.table_name),
+                                    );
+                                    Ok(TreeNodeRecursion::Continue)
+                                }
+                                LogicalPlan::SubqueryAlias(inner_alias) => {
+                                    qualifiers.push(vec![
+                                        self.identifier_comparison_key(
+                                            inner_alias.alias.table(),
+                                        ),
+                                    ]);
+                                    // Its own input is hidden behind it, on the
+                                    // same terms this arm is deciding.
+                                    Ok(TreeNodeRecursion::Jump)
+                                }
+                                _ => Ok(TreeNodeRecursion::Continue),
+                            }
+                        })?;
+                    }
                     Ok(TreeNodeRecursion::Jump)
                 }
                 _ => Ok(TreeNodeRecursion::Continue),
@@ -2892,6 +2939,30 @@ impl Unparser<'_> {
             qualifiers,
             exposed,
         })
+    }
+
+    /// How many relations an alias's input puts in the emitted `FROM`.
+    ///
+    /// One means the alias has a single name to replace and replaces it, so
+    /// nothing below stays addressable. More than one means the input is a join,
+    /// which SQL cannot name as a whole: unless the emitter wraps it in a derived
+    /// table, `relation.alias` renames the primary relation and the rest keep the
+    /// names they were scanned under.
+    ///
+    /// A nested `SubqueryAlias` counts as the one relation it presents and is not
+    /// descended into, for the reason this function is asked in the first place.
+    fn relations_under_alias(plan: &LogicalPlan) -> usize {
+        let mut relations = 0;
+        let mut pending = vec![plan];
+        while let Some(node) = pending.pop() {
+            match node {
+                LogicalPlan::TableScan(_) | LogicalPlan::SubqueryAlias(_) => {
+                    relations += 1;
+                }
+                _ => pending.extend(node.inputs()),
+            }
+        }
+        relations
     }
 
     /// The relations the emitted `FROM` at this level can actually name.

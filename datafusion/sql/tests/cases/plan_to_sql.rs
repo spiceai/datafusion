@@ -8783,3 +8783,86 @@ fn test_unparse_left_semi_join_refuses_nested_reference_behind_a_derived_window_
     );
     Ok(())
 }
+
+/// Builds a `LeftSemi` join whose build side is `SubqueryAlias(join_type(safe, t))`
+/// and whose correlation is qualified by `t` — the relation the alias does *not*
+/// rename.
+///
+/// The two joined relations are given disjoint column names on purpose. A shared
+/// name makes the planner insert a renaming projection, and the alias is then
+/// emitted as a derived table, which hides both relations and is the very case
+/// this shape has to be kept distinct from.
+fn aliased_join_build_side(join_on: Vec<Expr>) -> Result<LogicalPlan> {
+    let probe =
+        table_scan(Some("t"), &exists_fetch_schema(), Some(vec![0, 1]))?.build()?;
+
+    let joined = table_scan(Some("t"), &int32_schema(&["c"]), Some(vec![0]))?.build()?;
+    let inner = table_scan(Some("safe"), &int32_schema(&["k"]), Some(vec![0]))?
+        .join_on(joined, datafusion_expr::JoinType::Inner, join_on)?
+        .build()?;
+
+    let build = LogicalPlan::SubqueryAlias(datafusion_expr::SubqueryAlias::try_new(
+        Arc::new(inner),
+        "a",
+    )?);
+
+    LogicalPlanBuilder::from(probe)
+        .project(vec![col("t.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.c").eq(col("a.k"))],
+        )?
+        .build()
+}
+
+/// An alias over a join renames one relation, not the join, so the relations
+/// beside the renamed one stay addressable and can capture the correlation.
+///
+/// SQL has no syntax for naming a join, so an alias over one is emitted either as
+/// a derived table — which does hide everything below it — or, for the join types
+/// `requires_derived_subquery` declines to wrap, by renaming the primary relation
+/// in place. This is the second shape:
+///
+/// ```sql
+/// SELECT "t"."d" FROM "t"
+/// WHERE EXISTS (SELECT 1 FROM "safe" AS "a" CROSS JOIN "t" WHERE ("t"."c" = "a"."k"))
+/// ```
+///
+/// That is valid SQL, and every database runs it. `"t"."c"` was written against
+/// the outer `"t"`, but the subquery's own `FROM` now introduces `"t"`, so it
+/// binds there instead: the correlation is gone, the `EXISTS` asks only whether
+/// the cross join has a row, and the semi join keeps probe rows it must drop.
+/// Wrong rows, with nothing to report them.
+///
+/// Refused rather than repaired, on the same terms as every other capture this
+/// guard finds.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_a_relation_beside_an_alias()
+-> Result<()> {
+    // No join condition, so this emits `CROSS JOIN` and nothing in the emitted
+    // `ON` names the aliased relation: the SQL below is valid as well as wrong.
+    let plan = aliased_join_build_side(vec![])?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a relation the build-side alias does not rename must be seen to capture",
+    );
+    Ok(())
+}
+
+/// The same shape with an inner join, so the refusal is not read as peculiar to
+/// `CROSS JOIN`: what decides it is the alias having more than one relation to
+/// replace, which is true of every join type `requires_derived_subquery` leaves
+/// on the inline path.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_beside_an_aliased_inner_join() -> Result<()>
+{
+    let plan = aliased_join_build_side(vec![col("safe.k").eq(col("t.c"))])?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an inner join beside the aliased relation must be seen to capture too",
+    );
+    Ok(())
+}
