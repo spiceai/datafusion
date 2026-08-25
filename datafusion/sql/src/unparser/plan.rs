@@ -2377,14 +2377,7 @@ impl Unparser<'_> {
             Expr::Alias(Alias { expr, name, .. }) => {
                 let inner = self.expr_to_sql(expr)?;
 
-                // Determine the alias name to use
-                let col_name = if let Some(rewritten_name) =
-                    self.dialect.col_alias_overrides(name)?
-                {
-                    rewritten_name.to_string()
-                } else {
-                    name.to_string()
-                };
+                let col_name = self.emitted_column_name(name)?;
 
                 Ok(ast::SelectItem::ExprWithAlias {
                     expr: inner,
@@ -2772,20 +2765,27 @@ impl Unparser<'_> {
     fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
         let mut scope = EmittedScope {
             qualifiers: Vec::new(),
-            // Both ways the body is emitted put these names where an unqualified
-            // correlation collides with them — as the columns of a derived table
-            // when the emitter wraps the body, and as bare names that escape
-            // outward, to be compared with the outer query's own column, when it
-            // folds the projection into the `SELECT 1` instead.
-            //
-            // Taken unconditionally, which over-approximates the case where the
-            // body folds and the correlation's build half names a column of the
-            // scan rather than the renamed one: there the outer reference does
-            // bind outward and the refusal costs a pushdown it did not need to.
-            // That is the same approximation, and the same fix, as
-            // spiceai/spiceai#13469.
-            schemas: vec![Arc::clone(plan.schema().inner())],
+            exposed: HashSet::new(),
         };
+        // The build side's own output names, which no walk below can find: a
+        // rename names a column something the plan holds no relation for. Both
+        // ways the body is emitted put these names where an unqualified
+        // correlation collides with them — as the columns of a derived table
+        // when the emitter wraps the body, and as bare names that escape
+        // outward, to be compared with the outer query's own column, when it
+        // folds the projection into the `SELECT 1` instead.
+        //
+        // Taken unconditionally, which over-approximates the case where the
+        // body folds and the correlation's build half names a column of the
+        // scan rather than the renamed one: there the outer reference does bind
+        // outward and the refusal costs a pushdown it did not need to. That is
+        // the same approximation, and the same fix, as spiceai/spiceai#13469.
+        self.expose_columns(&mut scope, plan.schema().inner())?;
+
+        // Collected during the walk and keyed after it: the walk's closure
+        // reports a `DataFusionError`, while keying a name asks the dialect and
+        // can fail with one of its own.
+        let mut scans: Vec<SchemaRef> = Vec::new();
         plan.apply(|node| match node {
             LogicalPlan::TableScan(scan) => {
                 scope
@@ -2794,7 +2794,7 @@ impl Unparser<'_> {
                 // A relation emitted bare answers to every column it has, not
                 // just the projected ones — the same reason the qualifier is
                 // read from the `FROM` rather than from the output schema.
-                scope.schemas.push(scan.source.schema());
+                scans.push(scan.source.schema());
                 Ok(TreeNodeRecursion::Continue)
             }
             LogicalPlan::SubqueryAlias(alias) => {
@@ -2805,7 +2805,28 @@ impl Unparser<'_> {
             }
             _ => Ok(TreeNodeRecursion::Continue),
         })?;
+        for schema in &scans {
+            self.expose_columns(&mut scope, schema)?;
+        }
         Ok(scope)
+    }
+
+    /// Adds every name `schema`'s columns let the body answer to.
+    ///
+    /// Each column is exposed under two names: its own, which a relation emitted
+    /// bare answers to, and the one this dialect would rewrite it to, which is
+    /// what a derived table carries it under. Which of the two the body will be
+    /// is not decided here — that is the approximation tracked by
+    /// spiceai/spiceai#13469 — so both are taken, in the direction that refuses
+    /// rather than emits.
+    fn expose_columns(&self, scope: &mut EmittedScope, schema: &SchemaRef) -> Result<()> {
+        for field in schema.fields() {
+            scope
+                .exposed
+                .insert(self.identifier_comparison_key(field.name()));
+            scope.exposed.insert(self.emitted_column_key(field.name())?);
+        }
+        Ok(())
     }
 
     /// Whether any column in `expr` emits a reference the `EXISTS` body captures.
@@ -2828,9 +2849,11 @@ impl Unparser<'_> {
     ///   made by the caller, so there is no probe scope to ask.
     /// * An [`Expr::OuterReferenceColumn`] names neither input by construction:
     ///   it reaches past this join to an enclosing query. Nothing about the
-    ///   probe can make it a local reference, so requiring the probe to answer
-    ///   to it as well only hides the capture — the build side answering alone
-    ///   is the whole of it.
+    ///   probe can make it a local reference, so the two scopes stop excusing
+    ///   each other and start adding up — the reference passes *through* the
+    ///   probe's scope on its way out, so either scope answering to it is a
+    ///   capture. Requiring both hides one; requiring only the build hides the
+    ///   other.
     fn references_captured_scope(
         &self,
         expr: &Expr,
@@ -2838,62 +2861,63 @@ impl Unparser<'_> {
         probe_scope: Option<&EmittedScope>,
     ) -> Result<bool> {
         expr.exists(|node| {
-            let (is_outer, column) = match node {
-                Expr::Column(column) => (false, column),
-                Expr::OuterReferenceColumn(_, column) => (true, column),
+            let (column, reaches_past_the_join) = match node {
+                Expr::Column(column) => (column, false),
+                Expr::OuterReferenceColumn(_, column) => (column, true),
                 _ => return Ok(false),
             };
-            // An outer reference is attributable to neither input, so the probe
-            // scope has no say in whether the body captures it.
-            let also = if is_outer { None } else { probe_scope };
-            match column.relation.as_ref() {
-                Some(relation) => {
-                    // An alias the unparser invents is in the emitted `FROM`
-                    // whatever the plan holds, so no scope has to claim it.
-                    if Self::is_unparser_derived_alias(&self.emitted_qualifier(relation))
-                    {
-                        return Ok(true);
-                    }
-                    let emitted = self.emitted_qualifier_key(relation);
-                    Ok(build_scope.qualifiers.contains(&emitted)
-                        && also.is_none_or(|scope| scope.qualifiers.contains(&emitted)))
-                }
-                // An unqualified reference names no relation to disagree with,
-                // so it binds to whichever relation in the innermost scope
-                // exposes the column — the `EXISTS` body's own, whenever that
-                // body exposes the name at all.
-                None => Ok(self.scope_exposes(build_scope, &column.name)?
-                    && match also {
-                        Some(scope) => self.scope_exposes(scope, &column.name)?,
-                        None => true,
-                    }),
-            }
-        })
-    }
 
-    /// Whether `scope` answers to the reference this dialect emits for `name`.
-    ///
-    /// Compared as the statement will spell them, not as the plan holds them:
-    /// the reference goes through [`Self::emitted_column_name`], and each
-    /// candidate is tested both as the column's own name — what a relation
-    /// emitted bare answers to — and as the name a derived table would carry it
-    /// under, which is that same override applied to the alias the emitter
-    /// writes. Which of the two the body will be is not decided here, so both
-    /// are asked, in the direction that refuses rather than emits.
-    fn scope_exposes(&self, scope: &EmittedScope, name: &str) -> Result<bool> {
-        let reference = self.identifier_comparison_key(&self.emitted_column_name(name)?);
-        for schema in &scope.schemas {
-            for field in schema.fields() {
-                if self.identifier_comparison_key(field.name()) == reference
-                    || self.identifier_comparison_key(
-                        &self.emitted_column_name(field.name())?,
-                    ) == reference
-                {
+            if let Some(relation) = column.relation.as_ref() {
+                // An alias the unparser invents is in the emitted `FROM`
+                // whatever the plan holds, so no scope has to claim it. Asked of
+                // the keyed spelling, since a relation a user named
+                // `DERIVED_PROJECTION` is the alias `derived_projection` once a
+                // dialect that folds case has emitted them both.
+                let emitted = self.emitted_qualifier(relation);
+                if Self::is_unparser_derived_alias(&self.qualifier_key(&emitted)) {
                     return Ok(true);
                 }
             }
-        }
-        Ok(false)
+
+            let captured_by_build = self.scope_answers(build_scope, column)?;
+            Ok(match probe_scope {
+                // An outer reference passes *through* the probe's scope on its
+                // way out, so the probe shadowing it is as much a capture as the
+                // build shadowing it. Neither can be excused by the other.
+                Some(probe) if reaches_past_the_join => {
+                    captured_by_build || self.scope_answers(probe, column)?
+                }
+                // A plain column can only mean one of the join's own two inputs,
+                // so a name or qualifier a single input owns is attributable
+                // after all and binds where it was meant to. Only what both
+                // answer to is ambiguous.
+                Some(probe) => captured_by_build && self.scope_answers(probe, column)?,
+                // The caller already split this reference by side, so there is
+                // no other scope to attribute it to.
+                None => captured_by_build,
+            })
+        })
+    }
+
+    /// Whether `scope` answers to the reference `column` emits.
+    ///
+    /// Both halves are asked in the emitted, keyed form — the qualifier through
+    /// [`Self::emitted_qualifier_key`] and the name through
+    /// [`Self::emitted_column_key`] — against a scope that already holds only
+    /// that form.
+    fn scope_answers(&self, scope: &EmittedScope, column: &Column) -> Result<bool> {
+        Ok(match column.relation.as_ref() {
+            Some(relation) => scope
+                .qualifiers
+                .contains(&self.emitted_qualifier_key(relation)),
+            // An unqualified reference names no relation to disagree with, so
+            // it binds to whichever relation in the innermost scope exposes the
+            // column — the `EXISTS` body's own, whenever that body exposes the
+            // name at all.
+            None => scope
+                .exposed
+                .contains(&self.emitted_column_key(&column.name)?),
+        })
     }
 
     /// Refuses a correlation that the `EXISTS` body's own `FROM` would capture.
@@ -2940,9 +2964,8 @@ impl Unparser<'_> {
     ///   ones. `join.filter` carries no such split, so an `Expr::Column` in it
     ///   cannot be attributed — there, only a qualifier *both* sides answer to
     ///   is refused, which no reference to a distinct relation can be. An
-    ///   `Expr::OuterReferenceColumn` is the exception, and
-    ///   [`Self::references_captured_scope`] says why: it belongs to neither
-    ///   input, so the build side answering alone is already the capture.
+    ///   `Expr::OuterReferenceColumn` inverts that rule rather than following
+    ///   it — see [`Self::references_captured_scope`].
     /// * **Ask what the body exposes, not only what it is called.** An
     ///   unqualified reference names no relation to collide with, so it is a
     ///   column name that decides where it binds. Comparing qualifiers alone
@@ -3231,15 +3254,21 @@ impl From<BuilderError> for DataFusionError {
 ///
 /// * `qualifiers` — the relation names the `FROM` introduces, spelled the way
 ///   this dialect will spell a column's qualifier.
-/// * `schemas` — the schemas carrying the column names the body can answer to,
-///   which is more than the emitted relations expose: a rename names a column
-///   something no relation has. An unqualified reference carries no relation to
-///   compare, so a name being found in one of these is the only thing that
-///   decides whether the body captures it.
+/// * `exposed` — the column names the body can answer to, which is more than
+///   the emitted relations expose: a rename names a column something no relation
+///   has. An unqualified reference carries no relation to compare, so a name
+///   being found here is the only thing that decides whether the body captures
+///   it.
+///
+/// Both are held in the form [`Unparser::identifier_comparison_key`] gives, put
+/// there once by [`Unparser::emitted_scope`] rather than derived again at each
+/// comparison. That is what keeps the normalization from being forgotten: the
+/// plan's own spelling is not in the struct, so a comparison site has nothing to
+/// compare wrongly.
 #[derive(Debug)]
 struct EmittedScope {
     qualifiers: Vec<Vec<String>>,
-    schemas: Vec<SchemaRef>,
+    exposed: HashSet<String>,
 }
 
 /// The type of the input to the UNNEST table factor.

@@ -3499,9 +3499,21 @@ const CAPTURED_CORRELATION_REFUSAL: &str = "This feature is not implemented: Unp
 
 #[track_caller]
 fn assert_captured_correlation_refused(plan: &LogicalPlan, context: &str) {
-    let err = Unparser::new(&UnparserPostgreSqlDialect {})
-        .plan_to_sql(plan)
-        .expect_err(context);
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&UnparserPostgreSqlDialect {}),
+        plan,
+        context,
+    );
+}
+
+/// [`assert_captured_correlation_refused`] for a shape whose dialect is the point.
+#[track_caller]
+fn assert_captured_correlation_refused_by(
+    unparser: &Unparser,
+    plan: &LogicalPlan,
+    context: &str,
+) {
+    let err = unparser.plan_to_sql(plan).expect_err(context);
     assert_eq!(err.to_string(), CAPTURED_CORRELATION_REFUSAL);
 }
 
@@ -4029,6 +4041,86 @@ fn test_unparse_left_semi_join_refuses_outer_reference_only_the_build_answers_to
     Ok(())
 }
 
+/// The probe's own scope can shadow an outer reference just as the build's can.
+///
+/// An `OuterReferenceColumn` reaches past this join to an enclosing query, so on
+/// its way out it passes through *both* emitted scopes: the `EXISTS` body's
+/// `FROM`, and then the enclosing `SELECT`'s. Checking only the build side left
+/// the second one open — here the probe is `b`, the build is `c`, and
+/// `SELECT "b"."d" FROM "b" WHERE EXISTS (SELECT 1 FROM "c" WHERE ("b"."c" > 0))`
+/// was emitted, where `"b"."c"` resolves at the probe's `b` and never reaches the
+/// `b` the reference was written against.
+///
+/// This is the other half of
+/// [`test_unparse_left_semi_join_refuses_outer_reference_only_the_build_answers_to`]:
+/// neither scope excuses the other, so either one answering is a capture.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_only_the_probe_answers_to()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("b"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("b.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![out_ref_col(DataType::Int32, "b.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference the probe side alone answers to must be seen to capture",
+    );
+    Ok(())
+}
+
+/// A relation whose name folds onto an alias the unparser invents is captured by
+/// that alias.
+///
+/// The build side is wrapped, so the body reads `FROM (...) AS derived_projection`
+/// — a name that appears nowhere in the plan, which is why it is recognised by
+/// spelling rather than found by the scope walk. Recognising it as written let a
+/// probe relation named `DERIVED_PROJECTION` through, and a dialect that emits
+/// both unquoted binds them together:
+/// `... EXISTS (SELECT 1 FROM (SELECT b.c AS c FROM b) AS derived_projection WHERE (DERIVED_PROJECTION.c > 0))`,
+/// where the correlated reference resolves at the invented derived table.
+///
+/// The invented-alias test therefore has to key its comparison the same way the
+/// scope's own qualifiers are keyed; comparing one in emitted form and the other
+/// as written is what left the gap.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_case_folded_invented_alias()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some(r#""DERIVED_PROJECTION""#), &schema, Some(vec![0, 1]))?
+        .build()?;
+    let build = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .project(vec![col("b.c").alias("c")])?
+        .project(vec![col("c")])?
+        .distinct()?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col(r#""DERIVED_PROJECTION".d"#)])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col(r#""DERIVED_PROJECTION".c"#).gt(lit(0))],
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::new()
+        .with_requires_derived_table_alias(true)
+        .build();
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&dialect),
+        &plan,
+        "a relation folding onto an alias the unparser invents must be seen to capture",
+    );
+    Ok(())
+}
+
 /// Two relation names this dialect emits unquoted are one identifier by the time
 /// they bind, however the plan spells them.
 ///
@@ -4039,58 +4131,61 @@ fn test_unparse_left_semi_join_refuses_outer_reference_only_the_build_answers_to
 /// `SELECT T.d FROM T WHERE EXISTS (SELECT 1 FROM t WHERE (T.c > 0))`, whose
 /// `T.c` binds inside: the correlation is gone and the semi join keeps every
 /// probe row.
-#[test]
-fn test_unparse_left_semi_join_refuses_capture_by_case_folded_unquoted_relation()
--> Result<()> {
+/// Builds `LeftSemi Join: "T".c > 0` where the probe is `T` and the build is `t`
+/// — two relations that differ only in case, which is the axis the pair of tests
+/// around it varies against the dialect.
+fn case_distinct_relations_semi_join() -> Result<LogicalPlan> {
     let schema = exists_fetch_schema();
     let probe = table_scan(Some(r#""T""#), &schema, Some(vec![0, 1]))?.build()?;
     let build = table_scan(Some("t"), &schema, Some(vec![0]))?.build()?;
-    let plan = LogicalPlanBuilder::from(probe)
+    LogicalPlanBuilder::from(probe)
         .project(vec![col(r#""T".d"#)])?
         .join_on(
             build,
             datafusion_expr::JoinType::LeftSemi,
             vec![col(r#""T".c"#).gt(lit(0))],
         )?
-        .build()?;
+        .build()
+}
+
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_case_folded_unquoted_relation()
+-> Result<()> {
+    let plan = case_distinct_relations_semi_join()?;
 
     let dialect = CustomDialectBuilder::new().build();
-    let unparser = Unparser::new(&dialect);
-    let error = unparser
-        .plan_to_sql(&plan)
-        .expect_err("two relations this dialect emits unquoted must be seen to collide");
-    assert_snapshot!(
-        error.to_string(),
-        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&dialect),
+        &plan,
+        "two relations this dialect emits unquoted must be seen to collide",
     );
     Ok(())
 }
 
-/// A dialect that quotes its identifiers keeps those same two relations apart, so
-/// the pushdown must survive.
+/// The same two relations are refused on a quoting dialect too, and that is a
+/// deliberate over-refusal rather than the same finding twice.
 ///
-/// This is the other half of the case above: quoted, `"T"` and `"t"` are distinct
-/// identifiers, the body's `FROM "t"` does not answer to `"T"`, and the
-/// correlation binds outward exactly as written. Folding case for every dialect
-/// would refuse this.
+/// On PostgreSQL `"T"` and `"t"` really are distinct, the body's `FROM "t"` does
+/// not answer to `"T"`, and
+/// `SELECT "T"."d" FROM "T" WHERE EXISTS (SELECT 1 FROM "t" WHERE ("T"."c" > 0))`
+/// binds exactly as written — so refusing costs a pushdown that did not need to
+/// be spent.
+///
+/// It is spent because quoting does not say how the engine compares what was
+/// written: DuckDB matches identifiers case-insensitively even quoted, and
+/// BigQuery does so for column names while always emitting backticks. Keying on
+/// the quote style would therefore keep this pushdown and go on emitting the
+/// capture on those dialects, which is the trade the wrong way round. Asking the
+/// dialect properly is spiceai/spiceai#13474; until then the fold is
+/// unconditional, and this test is what records the price.
 #[test]
-fn test_unparse_left_semi_join_keeps_case_distinct_quoted_relations() -> Result<()> {
-    let schema = exists_fetch_schema();
-    let probe = table_scan(Some(r#""T""#), &schema, Some(vec![0, 1]))?.build()?;
-    let build = table_scan(Some("t"), &schema, Some(vec![0]))?.build()?;
-    let plan = LogicalPlanBuilder::from(probe)
-        .project(vec![col(r#""T".d"#)])?
-        .join_on(
-            build,
-            datafusion_expr::JoinType::LeftSemi,
-            vec![col(r#""T".c"#).gt(lit(0))],
-        )?
-        .build()?;
+fn test_unparse_left_semi_join_refuses_case_distinct_quoted_relations() -> Result<()> {
+    let plan = case_distinct_relations_semi_join()?;
 
-    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
-    assert_snapshot!(
-        unparser.plan_to_sql(&plan)?,
-        @r#"SELECT "T"."d" FROM "T" WHERE EXISTS (SELECT 1 FROM "t" WHERE ("T"."c" > 0))"#
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&UnparserPostgreSqlDialect {}),
+        &plan,
+        "the fold is unconditional, so a quoting dialect is refused as well",
     );
     Ok(())
 }
@@ -4129,13 +4224,10 @@ fn test_unparse_left_semi_join_refuses_capture_by_dialect_rewritten_column_name(
         )?
         .build()?;
 
-    let unparser = Unparser::new(&BigQueryDialect {});
-    let error = unparser.plan_to_sql(&plan).expect_err(
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&BigQueryDialect {}),
+        &plan,
         "a column name the dialect rewrites must be compared in its rewritten form",
-    );
-    assert_snapshot!(
-        error.to_string(),
-        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
     );
     Ok(())
 }
@@ -4177,13 +4269,10 @@ fn test_unparse_left_semi_join_refuses_rewritten_capture_by_derived_table_column
         )?
         .build()?;
 
-    let unparser = Unparser::new(&BigQueryDialect {});
-    let error = unparser.plan_to_sql(&plan).expect_err(
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&BigQueryDialect {}),
+        &plan,
         "a derived table carrying a column under its rewritten name must be seen to capture",
-    );
-    assert_snapshot!(
-        error.to_string(),
-        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
     );
     Ok(())
 }

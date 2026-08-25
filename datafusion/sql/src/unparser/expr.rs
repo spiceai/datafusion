@@ -875,22 +875,27 @@ impl Unparser<'_> {
 
     /// The form of `ident` to compare two emitted identifiers by.
     ///
-    /// An identifier this dialect emits unquoted is case-folded by the engine
-    /// that reads it — to lower case by PostgreSQL and DuckDB, to upper by
-    /// Oracle — so `T` and `t` emitted bare are one identifier by the time they
-    /// bind, however they were spelled in the plan. A quoted identifier keeps
-    /// its case and is compared as written.
+    /// Case is folded, so two identifiers differing only in case compare equal.
+    /// Both sides are folded the same way, which makes this a case-*insensitive*
+    /// comparison rather than a claim about which case any engine folds to —
+    /// PostgreSQL and DuckDB fold to lower and Oracle to upper, and none of that
+    /// changes the answer.
     ///
-    /// Folding case for the unquoted form errs toward calling two identifiers
+    /// Quoting is deliberately not consulted, though it looks like it should be:
+    /// quoting preserves an identifier's case in *some* dialects and not others
+    /// — DuckDB matches identifiers case-insensitively even when they are
+    /// quoted, and BigQuery does the same for column names despite always
+    /// emitting backticks — so the quote style the emitter chooses does not
+    /// decide how the engine will bind what it wrote. Asking properly needs the
+    /// dialect to say, which is spiceai/spiceai#13474.
+    ///
+    /// Until it can, folding unconditionally errs toward calling two identifiers
     /// the same. For a guard whose failure is letting an inner relation capture
-    /// an outer reference, that is the direction that costs a pushdown rather
-    /// than rows.
+    /// an outer reference, that is the direction that costs a pushdown — on a
+    /// case-sensitive dialect, given two relations spelled alike — rather than
+    /// rows.
     pub(crate) fn identifier_comparison_key(&self, ident: &str) -> String {
-        if self.dialect.identifier_quote_style(ident).is_some() {
-            ident.to_string()
-        } else {
-            ident.to_lowercase()
-        }
+        ident.to_lowercase()
     }
 
     /// [`Self::emitted_qualifier`] in the form two qualifiers are compared by.
@@ -898,20 +903,33 @@ impl Unparser<'_> {
         &self,
         table_ref: &TableReference,
     ) -> Vec<String> {
-        self.emitted_qualifier(table_ref)
+        self.qualifier_key(&self.emitted_qualifier(table_ref))
+    }
+
+    /// [`Self::emitted_qualifier_key`] for a qualifier already emitted.
+    ///
+    /// Split out so a caller that has to look at the emitted spelling first —
+    /// the invented-alias test does — keys that same value rather than building
+    /// it a second time.
+    pub(crate) fn qualifier_key(&self, emitted: &[String]) -> Vec<String> {
+        emitted
             .iter()
             .map(|part| self.identifier_comparison_key(part))
             .collect()
     }
 
+    /// The column name in the form two emitted references are compared by.
+    ///
+    /// The column counterpart of [`Self::emitted_qualifier_key`], composing the
+    /// dialect's rewrite with the comparison fold once — so a third
+    /// normalization added later has one place to go rather than every
+    /// comparison site.
+    pub(crate) fn emitted_column_key(&self, name: &str) -> Result<String> {
+        Ok(self.identifier_comparison_key(&self.emitted_column_name(name)?))
+    }
+
     pub fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
-        // Replace the column name if the dialect has an override
-        let col_name =
-            if let Some(rewritten_name) = self.dialect.col_alias_overrides(&col.name)? {
-                rewritten_name
-            } else {
-                col.name.to_string()
-            };
+        let col_name = self.emitted_column_name(&col.name)?;
 
         if let Some(table_ref) = &col.relation {
             let mut id = self.emitted_qualifier(table_ref);
