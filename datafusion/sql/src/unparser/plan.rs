@@ -2785,7 +2785,7 @@ impl Unparser<'_> {
             // Asked of every node before it is classified, so there is one
             // definition of which nodes this walk cannot read rather than one
             // per arm.
-            if Self::emits_unreadable_relation(node) {
+            if self.emits_unreadable_relation(node) {
                 unreadable = true;
                 return Ok(TreeNodeRecursion::Stop);
             }
@@ -2800,7 +2800,7 @@ impl Unparser<'_> {
                     Ok(TreeNodeRecursion::Continue)
                 }
                 LogicalPlan::SubqueryAlias(alias) => {
-                    if Self::introduces_unreadable_relation(&alias.input)? {
+                    if self.introduces_unreadable_relation(&alias.input)? {
                         unreadable = true;
                         return Ok(TreeNodeRecursion::Stop);
                     }
@@ -2847,7 +2847,7 @@ impl Unparser<'_> {
     /// Whether this node's emitted relation is decided outside the plan, so no
     /// walk over the plan can say what the `FROM` will answer to.
     ///
-    /// An extension node is the one such shape. Its
+    /// An extension node is one such shape. Its
     /// [`UserDefinedLogicalNodeUnparser`] is handed the `RelationBuilder` and
     /// decides the emitted `FROM` outright, so a walk is wrong in both
     /// directions at once: it collects the extension's inputs, which the
@@ -2855,13 +2855,31 @@ impl Unparser<'_> {
     /// descending once the unparser writes the relation — and misses whatever
     /// the unparser wrote, which it does name.
     ///
+    /// An `Unnest` is the other, on a dialect that emits Snowflake `LATERAL
+    /// FLATTEN`. That relation exposes the columns Snowflake defines for a
+    /// FLATTEN — `VALUE` among them — and the plan holds none of those names,
+    /// so `exposed` cannot contain them however the walk is read. A correlation
+    /// on an unqualified `VALUE` therefore binds to the FLATTEN. Its
+    /// *qualifier* is covered, by [`Self::is_unparser_derived_alias`]; the
+    /// column names are not, and enumerating them here would mean writing a
+    /// vendor's output schema into this walk and silently under-refusing when
+    /// that schema grows.
+    ///
     /// This is the one place that judgement lives, so the refinement it is
-    /// waiting for — a trait method by which an unparser declares the scope it
-    /// will emit — replaces one function rather than several match arms.
+    /// waiting for — reading the emitted `FROM` instead of predicting it,
+    /// spiceai/spiceai#13469, or a trait method by which an unparser declares
+    /// the scope it will emit — replaces one function rather than several match
+    /// arms. That both shapes here are cases the emitter knows about and this
+    /// walk has to be told about separately is the argument in
+    /// spiceai/spiceai#13480.
     ///
     /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
-    const fn emits_unreadable_relation(node: &LogicalPlan) -> bool {
-        matches!(node, LogicalPlan::Extension(_))
+    fn emits_unreadable_relation(&self, node: &LogicalPlan) -> bool {
+        match node {
+            LogicalPlan::Extension(_) => true,
+            LogicalPlan::Unnest(_) => self.dialect.unnest_as_lateral_flatten(),
+            _ => false,
+        }
     }
 
     /// Whether `plan` holds such a node anywhere below it.
@@ -2873,8 +2891,8 @@ impl Unparser<'_> {
     /// So the walk looks past an alias for this and for nothing else: the
     /// relations an alias really does shield are why it stops there at all,
     /// and collecting them would refuse references that bind correctly.
-    fn introduces_unreadable_relation(plan: &LogicalPlan) -> Result<bool> {
-        plan.exists(|node| Ok(Self::emits_unreadable_relation(node)))
+    fn introduces_unreadable_relation(&self, plan: &LogicalPlan) -> Result<bool> {
+        plan.exists(|node| Ok(self.emits_unreadable_relation(node)))
     }
 
     /// Whether `expr` carries a reference on its way out of this join.

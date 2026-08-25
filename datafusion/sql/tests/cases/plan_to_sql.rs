@@ -7745,3 +7745,95 @@ fn test_unparse_left_semi_join_keeps_shared_relation_column_beside_an_outer_refe
     assert_snapshot!(unparser.plan_to_sql(&plan)?);
     Ok(())
 }
+
+/// A `LeftSemi` join whose build side is a `UNNEST` planned by `SqlToRel`,
+/// correlated by an unqualified reference named `VALUE`.
+///
+/// The build side has to come from `SqlToRel` rather than `LogicalPlanBuilder`:
+/// the `LATERAL FLATTEN` path fires only for a projection carrying a
+/// `__unnest_placeholder` column, which `RecursiveUnnestRewriter` builds during
+/// SQL planning. A hand-built `Unnest` takes a different path and would pin
+/// nothing.
+///
+/// The correlation lives in `join.filter` and names only the probe, so every
+/// identifier the body emits binds — there is no dangling build-half reference
+/// to mask the capture behind a statement that would fail anyway.
+fn unnest_build_side_correlated_on_value() -> Result<LogicalPlan> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql("SELECT UNNEST([1,2,3])")?
+        .parse_statement()?;
+    let state = MockSessionState::default()
+        .with_scalar_function(make_array_udf())
+        .with_expr_planner(Arc::new(NestedFunctionPlanner))
+        .with_expr_planner(Arc::new(FieldAccessPlanner))
+        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()));
+    let build =
+        SqlToRel::new(&MockContextProvider { state }).sql_statement_to_plan(statement)?;
+
+    let probe_schema = Schema::new(vec![
+        Field::new("VALUE", DataType::Int32, false),
+        Field::new("d", DataType::Int32, false),
+    ]);
+    let probe = table_scan(Some("p"), &probe_schema, Some(vec![0, 1]))?
+        .project(vec![
+            Expr::Column(Column::new(Some(TableReference::bare("p")), "VALUE"))
+                .alias("VALUE"),
+            col("p.d").alias("d"),
+        ])?
+        .build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![Expr::Column(Column::new(None::<TableReference>, "VALUE")).gt(lit(0))],
+        )?
+        .build()
+}
+
+/// A Snowflake `LATERAL FLATTEN` relation exposes column names the plan does
+/// not hold, so the scope cannot be read off the plan at all.
+///
+/// `FLATTEN` presents its output as `VALUE` (and Snowflake's other FLATTEN
+/// columns), while the plan carries the unnest under its own generated name.
+/// Nothing a walk collects can contain `VALUE`, so an unqualified correlation on
+/// that name passes every check and then binds to the FLATTEN. Before this was
+/// caught, the plan unparsed to
+/// `SELECT "p"."VALUE" AS "VALUE", "p"."d" AS "d" FROM "p" WHERE EXISTS (SELECT 1 FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS "_unnest_1" WHERE ("VALUE" > 0))`,
+/// where `("VALUE" > 0)` was written against the probe's `p.VALUE` and binds to
+/// `_unnest_1.VALUE` instead. Every element of `[1, 2, 3]` is greater than zero,
+/// so the `EXISTS` is unconditionally true and the semi join keeps every probe
+/// row.
+///
+/// The *qualifier* `_unnest_1` was already covered, by the invented-alias list.
+/// It is the column names that are not, and listing them here would mean
+/// writing Snowflake's FLATTEN output schema into this walk — under-refusing the
+/// moment that schema grows. So the scope says it cannot be read.
+#[test]
+fn test_unparse_left_semi_join_refuses_correlation_captured_by_a_flatten_relation()
+-> Result<()> {
+    let plan = unnest_build_side_correlated_on_value()?;
+
+    assert_captured_correlation_refused_by(
+        &Unparser::new(&SnowflakeDialect::new()),
+        &plan,
+        "a correlation the FLATTEN relation's own columns answer to must be refused",
+    );
+    Ok(())
+}
+
+/// The other direction: the same plan on a dialect that emits `UNNEST` as a bare
+/// table factor keeps its pushdown.
+///
+/// BigQuery's `UNNEST([...])` introduces no name and no `VALUE` column, so the
+/// correlation has nothing in the body to collide with and binds outward as
+/// written. That is why the refusal is keyed on the dialect emitting `FLATTEN`
+/// rather than on the `Unnest` node alone.
+#[test]
+fn test_unparse_left_semi_join_keeps_unnest_build_side_without_flatten() -> Result<()> {
+    let plan = unnest_build_side_correlated_on_value()?;
+
+    let unparser = Unparser::new(&BigQueryDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
