@@ -858,6 +858,52 @@ impl Unparser<'_> {
         }
     }
 
+    /// The column name this dialect writes for a reference to `name`.
+    ///
+    /// [`Self::col_to_sql`] passes every column name through
+    /// [`Dialect::col_alias_overrides`] before emitting it — BigQuery rewrites
+    /// `min(a)` to `min_40a_41`, since the original is not a legal identifier
+    /// there. Anything reasoning about where an emitted reference binds has to
+    /// ask for the rewritten form, or it compares a name the statement does not
+    /// contain.
+    pub(crate) fn emitted_column_name(&self, name: &str) -> Result<String> {
+        Ok(self
+            .dialect
+            .col_alias_overrides(name)?
+            .unwrap_or_else(|| name.to_string()))
+    }
+
+    /// The form of `ident` to compare two emitted identifiers by.
+    ///
+    /// An identifier this dialect emits unquoted is case-folded by the engine
+    /// that reads it — to lower case by PostgreSQL and DuckDB, to upper by
+    /// Oracle — so `T` and `t` emitted bare are one identifier by the time they
+    /// bind, however they were spelled in the plan. A quoted identifier keeps
+    /// its case and is compared as written.
+    ///
+    /// Folding case for the unquoted form errs toward calling two identifiers
+    /// the same. For a guard whose failure is letting an inner relation capture
+    /// an outer reference, that is the direction that costs a pushdown rather
+    /// than rows.
+    pub(crate) fn identifier_comparison_key(&self, ident: &str) -> String {
+        if self.dialect.identifier_quote_style(ident).is_some() {
+            ident.to_string()
+        } else {
+            ident.to_lowercase()
+        }
+    }
+
+    /// [`Self::emitted_qualifier`] in the form two qualifiers are compared by.
+    pub(crate) fn emitted_qualifier_key(
+        &self,
+        table_ref: &TableReference,
+    ) -> Vec<String> {
+        self.emitted_qualifier(table_ref)
+            .iter()
+            .map(|part| self.identifier_comparison_key(part))
+            .collect()
+    }
+
     pub fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
         // Replace the column name if the dialect has an override
         let col_name =

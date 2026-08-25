@@ -3990,6 +3990,204 @@ fn test_unparse_left_semi_join_refuses_unqualified_capture_by_folded_rename() ->
     Ok(())
 }
 
+/// An outer reference only the build side answers to is captured, though the
+/// probe knows nothing about it.
+///
+/// A `join.filter` is asked against both scopes because an `Expr::Column` in one
+/// can only mean one of the join's own inputs, so a qualifier a single input owns
+/// is attributable. An `Expr::OuterReferenceColumn` is not: it reaches past this
+/// join to an enclosing query, and nothing about the probe can make it local.
+/// Here the probe is `p` and the build is `b`, which share nothing — so asking
+/// the probe as well answered "not captured" and emitted
+/// `SELECT "p"."d" FROM "p" WHERE EXISTS (SELECT 1 FROM "b" WHERE ("b"."c" > 0))`,
+/// where `"b"."c"` binds to the body's own `b`. The reference to the enclosing
+/// query is gone, `EXISTS` asks only whether `b` has a positive row, and the semi
+/// join keeps every probe row or none.
+///
+/// [`test_unparse_left_semi_join_refuses_shadowed_outer_reference`] covers the
+/// case where both sides answer to the qualifier, which the two-scope test
+/// already caught; this is the half it could not.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_only_the_build_answers_to()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("p"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("p.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![out_ref_col(DataType::Int32, "b.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference the build side alone answers to must be seen to capture",
+    );
+    Ok(())
+}
+
+/// Two relation names this dialect emits unquoted are one identifier by the time
+/// they bind, however the plan spells them.
+///
+/// The probe is `T` and the build is `t`. A dialect with no identifier quoting
+/// writes both bare, and an engine reading the statement case-folds an unquoted
+/// identifier — so the body's `FROM t` answers to the outer `T` as well.
+/// Comparing the qualifiers as written emitted
+/// `SELECT T.d FROM T WHERE EXISTS (SELECT 1 FROM t WHERE (T.c > 0))`, whose
+/// `T.c` binds inside: the correlation is gone and the semi join keeps every
+/// probe row.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_case_folded_unquoted_relation()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some(r#""T""#), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col(r#""T".d"#)])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col(r#""T".c"#).gt(lit(0))],
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::new().build();
+    let unparser = Unparser::new(&dialect);
+    let error = unparser
+        .plan_to_sql(&plan)
+        .expect_err("two relations this dialect emits unquoted must be seen to collide");
+    assert_snapshot!(
+        error.to_string(),
+        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
+    );
+    Ok(())
+}
+
+/// A dialect that quotes its identifiers keeps those same two relations apart, so
+/// the pushdown must survive.
+///
+/// This is the other half of the case above: quoted, `"T"` and `"t"` are distinct
+/// identifiers, the body's `FROM "t"` does not answer to `"T"`, and the
+/// correlation binds outward exactly as written. Folding case for every dialect
+/// would refuse this.
+#[test]
+fn test_unparse_left_semi_join_keeps_case_distinct_quoted_relations() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some(r#""T""#), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col(r#""T".d"#)])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col(r#""T".c"#).gt(lit(0))],
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "T"."d" FROM "T" WHERE EXISTS (SELECT 1 FROM "t" WHERE ("T"."c" > 0))"#
+    );
+    Ok(())
+}
+
+/// A column name the dialect rewrites is compared as it is written, not as the
+/// plan holds it.
+///
+/// `col_to_sql` passes every column name through `Dialect::col_alias_overrides`,
+/// and BigQuery rewrites `min(a)` — not a legal identifier there — to
+/// `min_40a_41`. The build relation `b` really has a column of that name, so the
+/// emitted unqualified reference binds inside the body. Comparing the plan's
+/// `min(a)` against the exposed `min_40a_41` reported no collision and emitted
+/// ``SELECT ... FROM `p` WHERE EXISTS (SELECT 1 FROM `b` WHERE (`min_40a_41` = `b`.`y`))``,
+/// where the correlation is lost and the semi join keeps every probe row.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_dialect_rewritten_column_name()
+-> Result<()> {
+    let probe = table_scan(Some("p"), &int32_schema(&["min(a)", "d"]), Some(vec![0, 1]))?
+        .project(vec![
+            col(r#"p."min(a)""#).alias("min(a)"),
+            col("p.d").alias("d"),
+        ])?
+        .build()?;
+    let build = table_scan(
+        Some("b"),
+        &int32_schema(&["min_40a_41", "y"]),
+        Some(vec![0, 1]),
+    )?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["min(a)"], vec!["b.y"]),
+            None,
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let error = unparser.plan_to_sql(&plan).expect_err(
+        "a column name the dialect rewrites must be compared in its rewritten form",
+    );
+    assert_snapshot!(
+        error.to_string(),
+        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
+    );
+    Ok(())
+}
+
+/// The same rewrite reaches the body's exposed names, not just the reference.
+///
+/// Here the build side renames a column to `min(a)` and stacks enough operators
+/// that the emitter wraps it, so the derived table carries that column under the
+/// name the dialect writes — `min_40a_41`, the same form the probe's reference
+/// takes. Comparing the reference only against the columns' *plan* names misses
+/// it and emits
+/// ``... EXISTS (SELECT 1 FROM (SELECT `b`.`x` AS `min_40a_41` FROM `b`) WHERE (`min_40a_41` = `min_40a_41`))``,
+/// both halves binding to the derived table: the inner tautology again.
+///
+/// This is why each exposed column is tested under both names — its own, which a
+/// relation emitted bare answers to, and the rewritten one a derived table
+/// carries it under. Which of the two the body will be is not known where the
+/// comparison happens.
+#[test]
+fn test_unparse_left_semi_join_refuses_rewritten_capture_by_derived_table_column()
+-> Result<()> {
+    let probe = table_scan(Some("p"), &int32_schema(&["min(a)", "d"]), Some(vec![0, 1]))?
+        .project(vec![
+            col(r#"p."min(a)""#).alias("min(a)"),
+            col("p.d").alias("d"),
+        ])?
+        .build()?;
+    let build = table_scan(Some("b"), &int32_schema(&["x", "y"]), Some(vec![0]))?
+        .project(vec![col("b.x").alias("min(a)")])?
+        .project(vec![col(r#""min(a)""#)])?
+        .distinct()?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["min(a)"], vec!["min(a)"]),
+            None,
+        )?
+        .build()?;
+
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let error = unparser.plan_to_sql(&plan).expect_err(
+        "a derived table carrying a column under its rewritten name must be seen to capture",
+    );
+    assert_snapshot!(
+        error.to_string(),
+        @"This feature is not implemented: Unparsing an EXISTS-style join is not supported when the subquery's own FROM would capture the correlation: the build side answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, so the reference binds inside the subquery instead of the outer query"
+    );
+    Ok(())
+}
+
 /// A relation the build side renames is not in the emitted scope under its own
 /// name, so a correlation naming it is not captured and must keep its pushdown.
 ///
