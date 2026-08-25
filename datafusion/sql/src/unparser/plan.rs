@@ -3112,16 +3112,24 @@ impl Unparser<'_> {
 
     /// The [`Subquery`] a subquery-bearing expression holds.
     ///
-    /// These are leaves to `Expr` traversal — `Expr::apply_children` returns
-    /// `Continue` for `Exists` and `ScalarSubquery` without descending — so a
-    /// walk over an expression never reaches the plan inside one, and never
-    /// sees the outer references that plan carries. Those are held separately,
-    /// on [`Subquery::outer_ref_columns`], and have to be asked for by name.
+    /// A subquery's plan is out of reach of `Expr` traversal, in one of two
+    /// ways: `Expr::apply_children` reports `Exists` and `ScalarSubquery` as
+    /// leaves outright, and for `InSubquery` and `SetComparison` it descends
+    /// into the compared expression only. Either way a walk over an expression
+    /// never reaches the plan inside one, and so never sees the outer
+    /// references that plan carries. Those are held separately, on
+    /// [`Subquery::outer_ref_columns`], and have to be asked for by name.
+    ///
+    /// Every subquery-bearing variant is answered for. Leaving one out is the
+    /// wrong-rows direction — the walk reports no capture for a reference it
+    /// never looked at — and the compiler cannot point at the omission, since
+    /// the catch-all arm this needs for the non-subquery variants absorbs it.
     const fn subquery_of(expr: &Expr) -> Option<&Subquery> {
         match expr {
             Expr::Exists(exists) => Some(&exists.subquery),
             Expr::ScalarSubquery(subquery) => Some(subquery),
             Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery),
+            Expr::SetComparison(set_comparison) => Some(&set_comparison.subquery),
             _ => None,
         }
     }

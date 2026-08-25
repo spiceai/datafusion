@@ -7994,14 +7994,6 @@ fn test_unparse_left_semi_join_refuses_unqualified_capture_behind_an_alias() -> 
 /// The other half of the same boundary: a name the aliased plan *renames into*
 /// the body, which no relation below the alias has at all.
 ///
-/// `t` holds `x` and `y`; the aliased side renames `x` to `c`, so the emitted
-/// derived table answers to `c` while `t` does not. Collecting only the scans
-/// below the alias would miss it, which is why the aliased subtree's own output
-/// schema is taken as well — the same pair of sources the top level already
-/// takes, for the same two reasons.
-/// The other half of the same boundary: a name the aliased plan *renames into*
-/// the body, which no relation below the alias has at all.
-///
 /// The alias deliberately is **not** the build plan's root — a rename above it
 /// puts `c` out of the root schema, which is otherwise collected at the top
 /// level and would cover this case for the wrong reason. `t` holds `x` and `y`;
@@ -8060,6 +8052,16 @@ fn test_unparse_left_semi_join_keeps_unqualified_name_absent_behind_an_alias()
 /// A semi join from `public.t` to `other.t` whose filter is a nested `EXISTS`
 /// carrying `outer_ref(<outer_relation>.c)`.
 fn nested_exists_outer_reference(outer_relation: &str) -> Result<LogicalPlan> {
+    nested_subquery_outer_reference(outer_relation, exists)
+}
+
+/// [`nested_exists_outer_reference`] for the other subquery-bearing expressions:
+/// `wrap` decides which one holds the subquery, and the reference the subquery
+/// carries is the same either way.
+fn nested_subquery_outer_reference(
+    outer_relation: &str,
+    wrap: impl FnOnce(Arc<LogicalPlan>) -> Expr,
+) -> Result<LogicalPlan> {
     let schema = int32_schema(&["c", "d"]);
     let probe = table_scan(
         Some(TableReference::partial("public", "t")),
@@ -8083,7 +8085,7 @@ fn nested_exists_outer_reference(outer_relation: &str) -> Result<LogicalPlan> {
         .join_on(
             build,
             datafusion_expr::JoinType::LeftSemi,
-            vec![exists(Arc::new(inner))],
+            vec![wrap(Arc::new(inner))],
         )?
         .build()
 }
@@ -8167,6 +8169,65 @@ fn test_unparse_left_semi_join_refuses_probe_shadowed_reference_in_a_key_subquer
     assert_captured_correlation_refused(
         &plan,
         "a subquery-held reference the probe's own FROM shadows must be refused",
+    );
+    Ok(())
+}
+
+/// The [`Subquery`] `scalar_subquery` builds for `plan`, whose
+/// `outer_ref_columns` it populates.
+///
+/// [`Expr::SetComparison`] has no constructor function that does that, and a
+/// hand-built `Subquery` with an empty `outer_ref_columns` would make the test
+/// below pass for the wrong reason — there would be no reference to find.
+///
+/// [`Subquery`]: datafusion_expr::Subquery
+fn populated_subquery(plan: Arc<LogicalPlan>) -> datafusion_expr::Subquery {
+    match scalar_subquery(plan) {
+        Expr::ScalarSubquery(subquery) => subquery,
+        other => panic!("scalar_subquery built {other}"),
+    }
+}
+
+/// `Expr::InSubquery` holds a subquery the same way `Exists` does, and the walk
+/// reaches neither: `Expr::apply_children` descends into the compared
+/// expression only, never into the subquery's plan.
+///
+/// The same shadowing as
+/// `test_unparse_left_semi_join_refuses_outer_reference_held_by_a_nested_subquery`,
+/// so what this adds is that the variant is answered for at all.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_held_by_a_nested_in_subquery()
+-> Result<()> {
+    let plan =
+        nested_subquery_outer_reference("public.t", |inner| in_subquery(lit(1), inner))?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference an IN subquery holds must be refused",
+    );
+    Ok(())
+}
+
+/// `Expr::SetComparison` — `= ANY`, `> ALL` — is the fourth subquery-bearing
+/// variant, and it is reached no more than the other three.
+///
+/// It is the one with no `expr_fn` constructor, so it is also the one most
+/// easily left out of a match written from that module's exports.
+#[test]
+fn test_unparse_left_semi_join_refuses_outer_reference_held_by_a_nested_set_comparison()
+-> Result<()> {
+    let plan = nested_subquery_outer_reference("public.t", |inner| {
+        Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+            Box::new(lit(1)),
+            populated_subquery(inner),
+            datafusion_expr::Operator::Gt,
+            datafusion_expr::expr::SetQuantifier::Any,
+        ))
+    })?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "an outer reference a set-comparison subquery holds must be refused",
     );
     Ok(())
 }
