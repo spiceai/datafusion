@@ -64,6 +64,7 @@ use arrow_schema::{ArrowError, DataType, SortOptions, TimeUnit};
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::hash_utils::RandomState;
 use datafusion_common::hash_utils::create_hashes;
+use datafusion_common::metadata::merge_join_metadata;
 use datafusion_common::stats::Precision;
 use datafusion_common::{
     DataFusionError, JoinSide, JoinType, NullEquality, Result, SharedResult,
@@ -317,20 +318,7 @@ pub fn build_join_schema(
         }
     };
 
-    let (schema1, schema2) = match join_type {
-        JoinType::Right
-        | JoinType::RightSemi
-        | JoinType::RightAnti
-        | JoinType::RightMark => (left, right),
-        _ => (right, left),
-    };
-
-    let metadata = schema1
-        .metadata()
-        .clone()
-        .into_iter()
-        .chain(schema2.metadata().clone())
-        .collect();
+    let metadata = merge_join_metadata(left.metadata(), right.metadata(), join_type);
 
     (fields.finish().with_metadata(metadata), column_indices)
 }
@@ -3720,6 +3708,17 @@ mod tests {
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "right".to_string())])
         );
+
+        // `Inner` preserves both inputs and is its own mirror under
+        // `JoinType::swap`, so it has no side to inherit a conflicting key
+        // from: it is dropped, and swapping the inputs (as `JoinSelection`
+        // does to pick a build side) leaves the output schema alone.
+        let (join_schema, _) =
+            build_join_schema(&left_schema, &right_schema, &JoinType::Inner);
+        assert!(join_schema.metadata().is_empty());
+        let (swapped_schema, _) =
+            build_join_schema(&right_schema, &left_schema, &JoinType::Inner);
+        assert_eq!(join_schema.metadata(), swapped_schema.metadata());
 
         Ok(())
     }

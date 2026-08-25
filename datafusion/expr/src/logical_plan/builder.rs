@@ -52,7 +52,7 @@ use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, Field, FieldRef, Fields, Schema, SchemaRef};
 use datafusion_common::display::ToStringifiedPlan;
 use datafusion_common::file_options::file_type::FileType;
-use datafusion_common::metadata::FieldMetadata;
+use datafusion_common::metadata::{FieldMetadata, merge_join_metadata};
 use datafusion_common::{
     Column, Constraints, DFSchema, DFSchemaRef, NullEquality, Result, ScalarValue,
     TableReference, ToDFSchema, UnnestOptions, exec_err,
@@ -1745,20 +1745,7 @@ pub fn build_join_schema(
         left.fields().len(),
     );
 
-    let (schema1, schema2) = match join_type {
-        JoinType::Right
-        | JoinType::RightSemi
-        | JoinType::RightAnti
-        | JoinType::RightMark => (left, right),
-        _ => (right, left),
-    };
-
-    let metadata = schema1
-        .metadata()
-        .clone()
-        .into_iter()
-        .chain(schema2.metadata().clone())
-        .collect();
+    let metadata = merge_join_metadata(left.metadata(), right.metadata(), join_type);
 
     let dfschema = DFSchema::new_with_metadata(qualified_fields, metadata)?;
     dfschema.with_functional_dependencies(func_dependencies)
@@ -2911,6 +2898,16 @@ mod tests {
             join_schema.metadata(),
             &HashMap::from([("key".to_string(), "right".to_string())])
         );
+
+        // `Inner` preserves both inputs and is its own mirror under
+        // `JoinType::swap`, so it has no side to inherit a conflicting key
+        // from: it is dropped, and swapping the inputs leaves the schema alone.
+        let join_schema =
+            build_join_schema(&left_schema, &right_schema, &JoinType::Inner)?;
+        assert!(join_schema.metadata().is_empty());
+        let swapped_schema =
+            build_join_schema(&right_schema, &left_schema, &JoinType::Inner)?;
+        assert_eq!(join_schema.metadata(), swapped_schema.metadata());
 
         Ok(())
     }

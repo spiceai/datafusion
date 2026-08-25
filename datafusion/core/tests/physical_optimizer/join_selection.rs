@@ -18,6 +18,7 @@
 use insta::assert_snapshot;
 use std::sync::Arc;
 use std::{
+    collections::HashMap,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -263,6 +264,64 @@ async fn test_join_with_swap() {
             .total_byte_size,
         Precision::Inexact(2097152)
     );
+}
+
+/// `JoinSelection` swaps a hash join's inputs to put the smaller one on the
+/// build side, then reorders the output columns back. That swap must leave the
+/// join's output schema alone — including the metadata contributed by the two
+/// inputs, which the optimizer compares before and after every rule that
+/// declares `schema_check`.
+///
+/// An `Inner` join is the case with nothing to anchor the metadata: unlike
+/// `Left`/`Right`, it is its own mirror under `JoinType::swap`, so a key both
+/// inputs define with different values has no side to be inherited from.
+#[tokio::test]
+async fn test_inner_join_swap_preserves_schema_metadata() {
+    let described = |name: &str, description: &str| {
+        Schema::new(vec![Field::new(name, DataType::Int32, false)]).with_metadata(
+            HashMap::from([("description".to_string(), description.to_string())]),
+        )
+    };
+
+    let big: Arc<dyn ExecutionPlan> = Arc::new(StatisticsExec::new(
+        big_statistics(),
+        described("big_col", "the big table"),
+    ));
+    let small: Arc<dyn ExecutionPlan> = Arc::new(StatisticsExec::new(
+        small_statistics(),
+        described("small_col", "the small table"),
+    ));
+
+    let join = Arc::new(
+        HashJoinExec::try_new(
+            Arc::clone(&big),
+            Arc::clone(&small),
+            vec![(
+                Arc::new(Column::new_with_schema("big_col", &big.schema()).unwrap()),
+                Arc::new(Column::new_with_schema("small_col", &small.schema()).unwrap()),
+            )],
+            None,
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap(),
+    );
+    let schema_before_swap = join.schema();
+
+    let optimized_join = JoinSelection::new()
+        .optimize(join, &ConfigOptions::new())
+        .unwrap();
+
+    // The inputs were swapped, so the columns come back through a projection...
+    optimized_join
+        .downcast_ref::<ProjectionExec>()
+        .expect("A proj is required to swap columns back to their original order");
+
+    // ...and the schema on the way out is the one the rule was handed.
+    assert_eq!(optimized_join.schema(), schema_before_swap);
 }
 
 #[tokio::test]

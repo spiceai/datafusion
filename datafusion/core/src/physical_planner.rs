@@ -3127,8 +3127,8 @@ impl<'a> OptimizationInvariantChecker<'a> {
             internal_err!(
                 "PhysicalOptimizer rule '{}' failed. Schema mismatch. Expected original schema: {}, got new schema: {}",
                 self.rule.name(),
-                previous_schema,
-                plan.schema()
+                describe_schema_change(previous_schema.as_ref()),
+                describe_schema_change(plan.schema().as_ref())
             )?
         }
 
@@ -3138,6 +3138,47 @@ impl<'a> OptimizationInvariantChecker<'a> {
 
         Ok(())
     }
+}
+
+/// Renders a schema for a schema-mismatch error.
+///
+/// [`is_allowed_schema_change`] compares metadata, which `Schema`'s `Display`
+/// does not print. Two schemas differing only in metadata would otherwise be
+/// reported as a mismatch between two identical-looking field lists, leaving
+/// nothing in the message to explain what actually differs.
+fn describe_schema_change(schema: &Schema) -> String {
+    let mut described = schema.to_string();
+
+    if !schema.metadata().is_empty() {
+        described.push_str(&format!(
+            ", schema metadata: {}",
+            format_metadata(schema.metadata())
+        ));
+    }
+
+    for field in schema.fields() {
+        if !field.metadata().is_empty() {
+            described.push_str(&format!(
+                ", metadata of field \"{}\": {}",
+                field.name(),
+                format_metadata(field.metadata())
+            ));
+        }
+    }
+
+    described
+}
+
+/// Formats a metadata map with its keys in a stable order, so that two
+/// renderings of the same metadata can be compared by eye.
+fn format_metadata(metadata: &HashMap<String, String>) -> String {
+    let mut entries: Vec<_> = metadata.iter().collect();
+    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    let entries: Vec<_> = entries
+        .into_iter()
+        .map(|(key, value)| format!("{key}: {value:?}"))
+        .collect();
+    format!("{{ {} }}", entries.join(", "))
 }
 
 /// Checks if the change from `old` schema to `new` is allowed or not.
@@ -4727,6 +4768,26 @@ digraph {
             .check(&ok_plan, &different_schema)
             .unwrap_err();
         assert!(expected_err.to_string().contains("PhysicalOptimizer rule 'OptimizerRuleWithSchemaCheck' failed. Schema mismatch. Expected original schema"));
+
+        // Test: a schema that differs only in metadata must say so. The fields
+        // render identically, so without the metadata there would be nothing in
+        // the message to tell the two schemas apart.
+        let schema_with_metadata = Arc::new(
+            ok_plan.schema().as_ref().clone().with_metadata(
+                [("description".to_string(), "a described table".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+        );
+        let expected_err = OptimizationInvariantChecker::new(&rule)
+            .check(&ok_plan, &schema_with_metadata)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            expected_err
+                .contains(r#"schema metadata: { description: "a described table" }"#),
+            "{expected_err}"
+        );
 
         // Test: should fail when extension node fails it's own invariant check
         let failing_node: Arc<dyn ExecutionPlan> = Arc::new(InvariantFailsExtensionNode);
