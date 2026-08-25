@@ -2801,7 +2801,23 @@ impl Unparser<'_> {
             }
             match node {
                 LogicalPlan::TableScan(scan) => {
-                    qualifiers.push(self.emitted_qualifier_key(&scan.table_name));
+                    let emitted = self.emitted_qualifier_key(&scan.table_name);
+                    // A qualified `FROM` introduces the bare table name as a
+                    // correlation name too: `FROM s.t` is addressed as `t` as
+                    // readily as `s.t`. Keeping only the full key misses a
+                    // correlation qualified by the bare name, which is then read
+                    // as reaching outward while the emitted SQL binds it here:
+                    // `... FROM s.t WHERE t.c = s.t.c` compares the inner row
+                    // with itself. The full key is kept alongside it, so `s1.t`
+                    // and `s2.t` are still told apart.
+                    //
+                    // Matching two components or more only skips a duplicate —
+                    // an unqualified name is already its own last component — so
+                    // it decides nothing this list is read for.
+                    if let [_, .., bare] = emitted.as_slice() {
+                        qualifiers.push(vec![bare.clone()]);
+                    }
+                    qualifiers.push(emitted);
                     // A relation emitted bare answers to every column it has,
                     // not just the projected ones — the same reason the
                     // qualifier is read from the `FROM` rather than from the

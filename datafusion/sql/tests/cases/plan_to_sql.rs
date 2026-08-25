@@ -8866,3 +8866,55 @@ fn test_unparse_left_semi_join_refuses_capture_beside_an_aliased_inner_join() ->
     );
     Ok(())
 }
+
+/// A schema-qualified `FROM` introduces the bare table name as a correlation
+/// name, so it captures a reference qualified that way.
+///
+/// `FROM s.t2` is addressed as `t2` as readily as `s.t2` — that is how SQL
+/// scopes a qualified relation, not a quirk of any one engine. Keying the scope
+/// off the emitted qualifier alone looks only for `s.t2`, so a correlation
+/// written against an *outer* `t2` matches nothing and reads as reaching
+/// outward:
+///
+/// ```sql
+/// SELECT t2.d FROM t2 WHERE EXISTS (SELECT 1 FROM s.t2 WHERE (t2.c = s.t2.c))
+/// ```
+///
+/// Valid SQL, and wrong: `t2.c` binds to the subquery's own `s.t2`, so the
+/// predicate compares the inner row with itself and the correlation is gone.
+///
+/// The full key is kept beside the bare one, so this does not merge `s1.t` with
+/// `s2.t` — a correlation naming one of those still fails to match the other.
+#[test]
+fn test_unparse_left_semi_join_refuses_capture_by_a_qualified_scans_bare_name()
+-> Result<()> {
+    let schema = exists_fetch_schema();
+    // The probe is named `t2`: the bare last component of the build's `s.t2`.
+    let probe = table_scan(Some("t2"), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(
+        Some(TableReference::partial("s", "t2")),
+        &schema,
+        Some(vec![0]),
+    )?
+    .build()?;
+
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t2.d")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t2.c").eq(col("s.t2.c"))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused_by(
+        &Unparser::new(
+            &CustomDialectBuilder::default()
+                .with_full_qualified_col(true)
+                .build(),
+        ),
+        &plan,
+        "a qualified scan's bare name must be seen to capture",
+    );
+    Ok(())
+}
