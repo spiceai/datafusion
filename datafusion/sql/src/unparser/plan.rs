@@ -2763,11 +2763,11 @@ impl Unparser<'_> {
     /// they appear nowhere in the plan, so no walk can find them. They are
     /// recognised by [`Self::is_unparser_derived_alias`] instead.
     ///
-    /// A node whose emitted relation the plan does not describe yields
-    /// [`EmittedScope::Unreadable`] — see
-    /// [`Self::emits_unreadable_relation`] for which those are and why, and
-    /// [`Self::introduces_unreadable_relation`] for why an enclosing alias does
-    /// not shield one.
+    /// A node whose emitted relation the plan does not describe costs the walk
+    /// either the whole scope or just its column names — see
+    /// [`Self::unreadable_part`] for which those are and why, and
+    /// [`Self::introduces_unreadable`] for why an enclosing alias shields
+    /// neither.
     ///
     /// Only the plan's own inputs are walked, never the plans inside an
     /// `Expr::ScalarSubquery` or `Expr::Exists`. That is what makes the model
@@ -2780,14 +2780,22 @@ impl Unparser<'_> {
         let mut qualifiers: Vec<Vec<String>> = Vec::new();
         let mut scans: Vec<SchemaRef> = Vec::new();
         let mut unreadable = false;
+        let mut columns_unreadable = false;
 
         plan.apply(|node| {
             // Asked of every node before it is classified, so there is one
-            // definition of which nodes this walk cannot read rather than one
-            // per arm.
-            if self.emits_unreadable_relation(node) {
-                unreadable = true;
-                return Ok(TreeNodeRecursion::Stop);
+            // definition of what this walk cannot read rather than one per arm.
+            match self.unreadable_part(node) {
+                // Nothing below can be worth collecting.
+                Some(Unreadable::Relation) => {
+                    unreadable = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                // The relation is still named where the walk can see it, so the
+                // qualifiers below are still worth having — only the column
+                // names are lost. Keep going.
+                Some(Unreadable::ColumnNames) => columns_unreadable = true,
+                None => {}
             }
             match node {
                 LogicalPlan::TableScan(scan) => {
@@ -2800,9 +2808,13 @@ impl Unparser<'_> {
                     Ok(TreeNodeRecursion::Continue)
                 }
                 LogicalPlan::SubqueryAlias(alias) => {
-                    if self.introduces_unreadable_relation(&alias.input)? {
-                        unreadable = true;
-                        return Ok(TreeNodeRecursion::Stop);
+                    match self.introduces_unreadable(&alias.input)? {
+                        Some(Unreadable::Relation) => {
+                            unreadable = true;
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
+                        Some(Unreadable::ColumnNames) => columns_unreadable = true,
+                        None => {}
                     }
                     qualifiers
                         .push(vec![self.identifier_comparison_key(alias.alias.table())]);
@@ -2833,11 +2845,19 @@ impl Unparser<'_> {
         // scan rather than the renamed one: there the outer reference does bind
         // outward and the refusal costs a pushdown it did not need to. That is
         // the same approximation, and the same fix, as spiceai/spiceai#13469.
-        let mut exposed = HashSet::new();
-        self.expose_columns(&mut exposed, plan.schema().inner())?;
-        for schema in &scans {
-            self.expose_columns(&mut exposed, schema)?;
-        }
+        // Skipped entirely when the emitted `FROM` presents column names the
+        // plan does not hold: a partial list is worse than none, because it
+        // reads like a list that can be trusted.
+        let exposed = if columns_unreadable {
+            None
+        } else {
+            let mut exposed = HashSet::new();
+            self.expose_columns(&mut exposed, plan.schema().inner())?;
+            for schema in &scans {
+                self.expose_columns(&mut exposed, schema)?;
+            }
+            Some(exposed)
+        };
         Ok(EmittedScope::Readable {
             qualifiers,
             exposed,
@@ -2855,44 +2875,65 @@ impl Unparser<'_> {
     /// descending once the unparser writes the relation — and misses whatever
     /// the unparser wrote, which it does name.
     ///
-    /// An `Unnest` is the other, on a dialect that emits Snowflake `LATERAL
-    /// FLATTEN`. That relation exposes the columns Snowflake defines for a
-    /// FLATTEN — `VALUE` among them — and the plan holds none of those names,
-    /// so `exposed` cannot contain them however the walk is read. A correlation
-    /// on an unqualified `VALUE` therefore binds to the FLATTEN. Its
-    /// *qualifier* is covered, by [`Self::is_unparser_derived_alias`]; the
-    /// column names are not, and enumerating them here would mean writing a
-    /// vendor's output schema into this walk and silently under-refusing when
-    /// that schema grows.
+    /// An `Unnest` on a dialect that emits Snowflake `LATERAL FLATTEN` keeps
+    /// less from the walk, and that difference is the whole of
+    /// [`Unreadable::ColumnNames`]. The FLATTEN relation presents the columns
+    /// Snowflake defines for it — `VALUE` among them — which the plan holds
+    /// none of, so no reading of the walk can put them in `exposed`, and an
+    /// unqualified correlation on such a name binds to the FLATTEN. Its *name*
+    /// is not a mystery at all: the emitter aliases it `_unnest_N`, which
+    /// [`Self::is_unparser_derived_alias`] already answers for, and no other
+    /// qualifier can reach it. So a qualified reference stays decidable and
+    /// keeps its pushdown; only the unqualified ones are refused.
     ///
-    /// This is the one place that judgement lives, so the refinement it is
+    /// Enumerating the FLATTEN columns instead would mean writing a vendor's
+    /// output schema into this walk, which under-refuses — the wrong-rows
+    /// direction — the moment that schema grows.
+    ///
+    /// This is the one place either judgement lives, so the refinement they are
     /// waiting for — reading the emitted `FROM` instead of predicting it,
     /// spiceai/spiceai#13469, or a trait method by which an unparser declares
     /// the scope it will emit — replaces one function rather than several match
-    /// arms. That both shapes here are cases the emitter knows about and this
-    /// walk has to be told about separately is the argument in
+    /// arms. That both shapes here are relations the emitter knows how to write
+    /// and this walk has to be told about separately is the argument in
     /// spiceai/spiceai#13480.
     ///
     /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
-    fn emits_unreadable_relation(&self, node: &LogicalPlan) -> bool {
+    fn unreadable_part(&self, node: &LogicalPlan) -> Option<Unreadable> {
         match node {
-            LogicalPlan::Extension(_) => true,
-            LogicalPlan::Unnest(_) => self.dialect.unnest_as_lateral_flatten(),
-            _ => false,
+            LogicalPlan::Extension(_) => Some(Unreadable::Relation),
+            LogicalPlan::Unnest(_) if self.dialect.unnest_as_lateral_flatten() => {
+                Some(Unreadable::ColumnNames)
+            }
+            _ => None,
         }
     }
 
-    /// Whether `plan` holds such a node anywhere below it.
+    /// The strongest [`Unreadable`] any node below `plan` reports.
     ///
-    /// Asked of a `SubqueryAlias`'s input, because an alias does not contain
-    /// one. The alias reaches the single relation the `RelationBuilder` holds,
+    /// Asked of a `SubqueryAlias`'s input, because an alias contains neither
+    /// kind. The alias reaches the single relation the `RelationBuilder` holds,
     /// while the same unparser is handed the `SelectBuilder` and can join a
-    /// second relation onto the same `FROM` — and that one keeps its own name.
-    /// So the walk looks past an alias for this and for nothing else: the
-    /// relations an alias really does shield are why it stops there at all,
-    /// and collecting them would refuse references that bind correctly.
-    fn introduces_unreadable_relation(&self, plan: &LogicalPlan) -> Result<bool> {
-        plan.exists(|node| Ok(self.emits_unreadable_relation(node)))
+    /// second relation onto the same `FROM` — and that one keeps its own name
+    /// and its own columns. So the walk looks past an alias for this and for
+    /// nothing else: the relations an alias really does shield are why it stops
+    /// there at all, and collecting them would refuse references that bind
+    /// correctly.
+    fn introduces_unreadable(&self, plan: &LogicalPlan) -> Result<Option<Unreadable>> {
+        let mut found = None;
+        plan.apply(|node| {
+            match self.unreadable_part(node) {
+                // Nothing outranks it, so there is no reason to keep looking.
+                Some(Unreadable::Relation) => {
+                    found = Some(Unreadable::Relation);
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Some(Unreadable::ColumnNames) => found = Some(Unreadable::ColumnNames),
+                None => {}
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(found)
     }
 
     /// Whether `expr` carries a reference on its way out of this join.
@@ -3031,8 +3072,15 @@ impl Unparser<'_> {
             // An unqualified reference names no relation to disagree with, so
             // it binds to whichever relation in the innermost scope exposes the
             // column — the `EXISTS` body's own, whenever that body exposes the
-            // name at all.
-            None => exposed.contains(&self.emitted_column_key(&column.name)?),
+            // name at all. With no list to ask, every such reference is a
+            // capture: the names that are missing are exactly the ones the plan
+            // never held.
+            None => match exposed {
+                Some(exposed) => {
+                    exposed.contains(&self.emitted_column_key(&column.name)?)
+                }
+                None => true,
+            },
         })
     }
 
@@ -3448,7 +3496,12 @@ impl From<BuilderError> for DataFusionError {
 enum EmittedScope {
     Readable {
         qualifiers: Vec<Vec<String>>,
-        exposed: HashSet<String>,
+        /// The column names an unqualified reference can collide with, or
+        /// `None` when the emitted `FROM` presents names the plan does not hold
+        /// — see [`Unreadable::ColumnNames`]. `None` rather than an empty set,
+        /// so that every read has to say what it does when the list is not
+        /// knowable instead of treating it as knowably empty.
+        exposed: Option<HashSet<String>>,
     },
     /// The emitted `FROM` holds a relation the plan does not describe, so
     /// nothing was learned by looking — see
@@ -3462,6 +3515,22 @@ enum EmittedScope {
     /// guard — then cannot consult a name list without first saying what it
     /// does when there is none.
     Unreadable,
+}
+
+/// What a node's emitted relation keeps [`Unparser::emitted_scope`] from
+/// knowing.
+///
+/// Ordered by how much is lost: `Relation` subsumes `ColumnNames`, which is why
+/// [`Unparser::introduces_unreadable`] stops at the first `Relation` it finds.
+#[derive(Clone, Copy)]
+enum Unreadable {
+    /// Its name and its columns both, so nothing collected about the side is
+    /// worth having.
+    Relation,
+    /// Only its column names: the relation is named where the walk can see it,
+    /// so a qualified reference stays decidable, but it presents columns the
+    /// plan does not hold.
+    ColumnNames,
 }
 
 /// Which of an expression's column references a capture check is being asked

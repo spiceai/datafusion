@@ -7758,7 +7758,7 @@ fn test_unparse_left_semi_join_keeps_shared_relation_column_beside_an_outer_refe
 /// The correlation lives in `join.filter` and names only the probe, so every
 /// identifier the body emits binds — there is no dangling build-half reference
 /// to mask the capture behind a statement that would fail anyway.
-fn unnest_build_side_correlated_on_value() -> Result<LogicalPlan> {
+fn unnest_build_side_correlated_by(correlation: Expr) -> Result<LogicalPlan> {
     let statement = Parser::new(&GenericDialect {})
         .try_with_sql("SELECT UNNEST([1,2,3])")?
         .parse_statement()?;
@@ -7786,7 +7786,7 @@ fn unnest_build_side_correlated_on_value() -> Result<LogicalPlan> {
         .join_on(
             build,
             datafusion_expr::JoinType::LeftSemi,
-            vec![Expr::Column(Column::new(None::<TableReference>, "VALUE")).gt(lit(0))],
+            vec![correlation],
         )?
         .build()
 }
@@ -7812,7 +7812,9 @@ fn unnest_build_side_correlated_on_value() -> Result<LogicalPlan> {
 #[test]
 fn test_unparse_left_semi_join_refuses_correlation_captured_by_a_flatten_relation()
 -> Result<()> {
-    let plan = unnest_build_side_correlated_on_value()?;
+    let plan = unnest_build_side_correlated_by(
+        Expr::Column(Column::new(None::<TableReference>, "VALUE")).gt(lit(0)),
+    )?;
 
     assert_captured_correlation_refused_by(
         &Unparser::new(&SnowflakeDialect::new()),
@@ -7831,9 +7833,38 @@ fn test_unparse_left_semi_join_refuses_correlation_captured_by_a_flatten_relatio
 /// rather than on the `Unnest` node alone.
 #[test]
 fn test_unparse_left_semi_join_keeps_unnest_build_side_without_flatten() -> Result<()> {
-    let plan = unnest_build_side_correlated_on_value()?;
+    let plan = unnest_build_side_correlated_by(
+        Expr::Column(Column::new(None::<TableReference>, "VALUE")).gt(lit(0)),
+    )?;
 
     let unparser = Unparser::new(&BigQueryDialect {});
+    assert_snapshot!(unparser.plan_to_sql(&plan)?);
+    Ok(())
+}
+
+/// The bound on the FLATTEN refusal: it costs the *unqualified* references
+/// only, and a qualified correlation over the same build side keeps its
+/// pushdown.
+///
+/// `LATERAL FLATTEN(...) AS "_unnest_1"` answers to exactly one name, and the
+/// emitter picks it — so a reference qualified by anything else cannot bind
+/// there, and one qualified by `_unnest_1` is caught by the invented-alias list
+/// instead. Only an unqualified reference is undecidable, because the FLATTEN's
+/// column names are the part the plan does not hold.
+///
+/// So `p.VALUE` binds outward as written even though the body contains a
+/// FLATTEN, and the scope is `Readable` with an unknown column list rather than
+/// unreadable outright — a distinction that costs nothing to keep and every
+/// qualified Snowflake semi join to lose.
+#[test]
+fn test_unparse_left_semi_join_keeps_qualified_correlation_over_a_flatten_relation()
+-> Result<()> {
+    let plan = unnest_build_side_correlated_by(
+        Expr::Column(Column::new(Some(TableReference::bare("p")), "VALUE")).gt(lit(0)),
+    )?;
+
+    let snowflake = SnowflakeDialect::new();
+    let unparser = Unparser::new(&snowflake);
     assert_snapshot!(unparser.plan_to_sql(&plan)?);
     Ok(())
 }
