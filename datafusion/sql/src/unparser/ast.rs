@@ -212,11 +212,11 @@ pub struct SelectBuilder {
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
-const FLATTEN_ALIAS_PREFIX: &str = "_unnest";
+pub(crate) const FLATTEN_ALIAS_PREFIX: &str = "_unnest";
 
 /// Prefix used for the auto-generated alias of a derived table that carries an
 /// aggregate stacked below the one its enclosing SELECT already expresses.
-const DERIVED_AGGREGATE_ALIAS_PREFIX: &str = "derived_aggregate";
+pub(crate) const DERIVED_AGGREGATE_ALIAS_PREFIX: &str = "derived_aggregate";
 
 impl SelectBuilder {
     /// Generate a unique alias for a LATERAL FLATTEN relation

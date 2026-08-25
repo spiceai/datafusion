@@ -3637,6 +3637,114 @@ fn test_unparse_left_semi_join_refuses_correlation_naming_an_invented_alias() ->
     Ok(())
 }
 
+/// Builds `LeftSemi Join` correlating `<probe_name>.c > 0` against an unrelated
+/// build side, so the only thing that can capture the reference is an alias the
+/// unparser invents for a derived table of its own.
+fn invented_alias_collision_semi_join(probe_name: &str) -> Result<LogicalPlan> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some(probe_name), &schema, Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?;
+
+    LogicalPlanBuilder::from(probe)
+        .project(vec![col(format!("{probe_name}.d"))])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col(format!("{probe_name}.c")).gt(lit(0))],
+        )?
+        .build()
+}
+
+/// The aliases the unparser numbers carry the number in the emitted SQL, so that
+/// is the name a correlation collides with.
+///
+/// `SelectBuilder::next_derived_aggregate_alias` emits `derived_aggregate_1`,
+/// `derived_aggregate_2`, … — never a bare `derived_aggregate` — so a build side
+/// stacking an aggregate writes `AS derived_aggregate_1`, and a relation a user
+/// named that is captured by it.
+#[test]
+fn test_unparse_left_semi_join_refuses_correlation_naming_a_numbered_alias() -> Result<()>
+{
+    let plan = invented_alias_collision_semi_join("derived_aggregate_1")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a correlation naming a numbered alias the unparser can invent must be refused",
+    );
+    Ok(())
+}
+
+/// The LATERAL FLATTEN aliases are numbered the same way and reach the emitted
+/// `FROM` the same way, so they are reserved on the same terms.
+#[test]
+fn test_unparse_left_semi_join_refuses_correlation_naming_a_numbered_flatten_alias()
+-> Result<()> {
+    let plan = invented_alias_collision_semi_join("_unnest_2")?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a correlation naming a numbered FLATTEN alias must be refused",
+    );
+    Ok(())
+}
+
+/// The other direction: the bare prefix is not a name the unparser ever emits,
+/// so a relation called `derived_aggregate` keeps its pushdown.
+///
+/// Reserving the prefix rather than the generated form gets this exactly
+/// backwards — it costs the pushdown here, where nothing can capture, while
+/// leaving `derived_aggregate_1` open, where something can.
+#[test]
+fn test_unparse_left_semi_join_keeps_correlation_naming_an_unnumbered_prefix()
+-> Result<()> {
+    let plan = invented_alias_collision_semi_join("derived_aggregate")?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "derived_aggregate"."d" FROM "derived_aggregate" WHERE EXISTS (SELECT 1 FROM "t2" WHERE ("derived_aggregate"."c" > 0))"#
+    );
+    Ok(())
+}
+
+/// An outer reference is emitted as the same qualified identifier as a plain
+/// column, so it is captured the same way and has to be refused the same way.
+///
+/// `Expr::OuterReferenceColumn` renders through `col_to_sql`, exactly as
+/// `Expr::Column` does, so `"t"."c" > 0` lands inside the `EXISTS` body either
+/// way and binds to the build side's own `t`. `Expr::column_refs` collects only
+/// the plain variant, so a guard built on it walks past this one.
+///
+/// The predicate is put in the join's filter because that is where
+/// `LogicalPlanBuilder` puts a predicate it cannot attribute to a side, and an
+/// outer reference names no column either side owns.
+#[test]
+fn test_unparse_left_semi_join_refuses_shadowed_outer_reference() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let probe = table_scan(Some("t1"), &schema, Some(vec![0, 1]))?
+        .join_on(
+            table_scan(Some("t"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.c").eq(col("t.c"))],
+        )?
+        .build()?;
+    let build = table_scan(Some("t"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .project(vec![col("t1.d"), col("t.c")])?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![out_ref_col(DataType::Int32, "t.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a shadowed outer reference must be refused, not emitted",
+    );
+    Ok(())
+}
+
 /// A relation the build side renames is not in the emitted scope under its own
 /// name, so a correlation naming it is not captured and must keep its pushdown.
 ///
