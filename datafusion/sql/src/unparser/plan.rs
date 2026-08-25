@@ -2806,7 +2806,14 @@ impl Unparser<'_> {
                     // not just the projected ones — the same reason the
                     // qualifier is read from the `FROM` rather than from the
                     // output schema.
-                    schemas.push(scan.source.schema());
+                    //
+                    // Not asked once the column names are already unknowable:
+                    // `TableSource::schema` is a trait call some
+                    // implementations build a `Schema` in, and the result would
+                    // be dropped unread.
+                    if !columns_unreadable {
+                        schemas.push(scan.source.schema());
+                    }
                     Ok(TreeNodeRecursion::Continue)
                 }
                 LogicalPlan::SubqueryAlias(alias) => {
@@ -2912,6 +2919,14 @@ impl Unparser<'_> {
     /// output schema into this walk, which under-refuses — the wrong-rows
     /// direction — the moment that schema grows.
     ///
+    /// BigQuery's `UNNEST(...)` table factor is the same shape and is
+    /// deliberately not here: the unparser emits it unaliased and never calls
+    /// `with_offset`, and BigQuery gives no way to reference an unaliased
+    /// `UNNEST` column, so nothing it presents can be collided with. That is a
+    /// judgement about a second dialect rather than a difference in kind, which
+    /// is why it is written down instead of left as an asymmetry between two
+    /// arms.
+    ///
     /// This is the one place either judgement lives, so the refinement they are
     /// waiting for — reading the emitted `FROM` instead of predicting it,
     /// spiceai/spiceai#13469, or a trait method by which an unparser declares
@@ -2924,6 +2939,11 @@ impl Unparser<'_> {
     fn unreadable_part(&self, node: &LogicalPlan) -> Option<UnreadablePart> {
         match node {
             LogicalPlan::Extension(_) => Some(UnreadablePart::Relation),
+            // Wider than the emitter's own gates, which also require an
+            // unnest input type and an unset relation: this asks only the
+            // dialect, so it answers for every `Unnest` on one. Over-refusing
+            // is the safe direction, and predicting those gates from here is
+            // the mistake the rest of this walk keeps paying for.
             LogicalPlan::Unnest(_) if self.dialect.unnest_as_lateral_flatten() => {
                 Some(UnreadablePart::ColumnNames)
             }
@@ -3212,7 +3232,7 @@ impl Unparser<'_> {
         {
             if self.references_captured_scope(
                 correlated,
-                ReferenceKind::Any,
+                ReferenceKind::Every,
                 &build_scope,
                 None,
             )? {
@@ -3239,7 +3259,7 @@ impl Unparser<'_> {
         if !captured {
             let mut needs_probe_scope: Vec<(&Expr, ReferenceKind)> = Vec::new();
             if let Some(filter) = &join.filter {
-                needs_probe_scope.push((filter, ReferenceKind::Any));
+                needs_probe_scope.push((filter, ReferenceKind::Every));
             }
             for half in join.on.iter().flat_map(|(left, right)| [left, right]) {
                 if half.contains_outer() {
@@ -3567,7 +3587,7 @@ enum UnreadablePart {
 #[derive(Clone, Copy, Debug)]
 enum ReferenceKind {
     /// Every reference the expression carries.
-    Any,
+    Every,
     /// Only [`Expr::OuterReferenceColumn`], which belongs to neither of the
     /// join's inputs and so cannot be attributed by the side it was written on.
     ReachingPastTheJoin,
