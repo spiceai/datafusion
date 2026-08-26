@@ -18,8 +18,11 @@
 use super::{
     Unparser,
     ast::{
-        BuilderError, DerivedRelationBuilder, QueryBuilder, RelationBuilder,
-        SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
+        BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
+        DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_TABLE_ALIASES,
+        DERIVED_UNION_ALIAS, DERIVED_UNNEST_ALIAS, DERIVED_WINDOW_INPUT_ALIAS,
+        DerivedRelationBuilder, QueryBuilder, RelationBuilder, SelectBuilder,
+        TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
@@ -43,6 +46,7 @@ use crate::unparser::{
     ast::FlattenRelationBuilder, ast::UnnestRelationBuilder, rewrite::rewrite_qualify,
 };
 use crate::utils::UNNEST_PLACEHOLDER;
+use arrow::datatypes::SchemaRef;
 use datafusion_common::{
     Column, DataFusionError, Result, ScalarValue, TableReference, assert_or_internal_err,
     internal_datafusion_err, internal_err, not_impl_err,
@@ -51,7 +55,7 @@ use datafusion_common::{
 use datafusion_expr::expr::{OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
-    LogicalPlanBuilder, Operator, Projection, SortExpr, TableScan, Unnest,
+    LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
     UserDefinedLogicalNode, Window, expr::Alias,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
@@ -843,7 +847,7 @@ impl Unparser<'_> {
         select: &mut SelectBuilder,
         relation: &mut RelationBuilder,
     ) -> Result<()> {
-        let input_alias = "derived_window_input";
+        let input_alias = DERIVED_WINDOW_INPUT_ALIAS;
         self.derive(
             window.input.as_ref(),
             relation,
@@ -966,7 +970,7 @@ impl Unparser<'_> {
                 // Projection can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_projection",
+                        DERIVED_PROJECTION_ALIAS,
                         plan,
                         relation,
                         unnest_input_type
@@ -1048,7 +1052,7 @@ impl Unparser<'_> {
                 // Limit can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_limit",
+                        DERIVED_LIMIT_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1093,7 +1097,7 @@ impl Unparser<'_> {
                 // Sort can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_sort",
+                        DERIVED_SORT_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1246,7 +1250,7 @@ impl Unparser<'_> {
                 // Distinct can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_distinct",
+                        DERIVED_DISTINCT_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1689,7 +1693,7 @@ impl Unparser<'_> {
                 // Covers cases where the UNION is a subquery and the projection is at the top level
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
-                        "derived_union",
+                        DERIVED_UNION_ALIAS,
                         plan,
                         relation,
                         false,
@@ -1866,7 +1870,7 @@ impl Unparser<'_> {
                     )
                 } else {
                     self.derive_with_dialect_alias(
-                        "derived_unnest",
+                        DERIVED_UNNEST_ALIAS,
                         subquery.subquery.as_ref(),
                         relation,
                         true,
@@ -2396,14 +2400,7 @@ impl Unparser<'_> {
             Expr::Alias(Alias { expr, name, .. }) => {
                 let inner = self.expr_to_sql(expr)?;
 
-                // Determine the alias name to use
-                let col_name = if let Some(rewritten_name) =
-                    self.dialect.col_alias_overrides(name)?
-                {
-                    rewritten_name.to_string()
-                } else {
-                    name.to_string()
-                };
+                let col_name = self.emitted_column_name(name)?;
 
                 Ok(ast::SelectItem::ExprWithAlias {
                     expr: inner,
@@ -2615,6 +2612,11 @@ impl Unparser<'_> {
         right_plan: &LogicalPlan,
         join: &Join,
     ) -> Result<ast::Query> {
+        // Checked before any of the body is built: this refusal is about the
+        // correlation's qualifiers alone, and holds whether or not a bound is
+        // found below.
+        self.ensure_exists_correlation_not_shadowed(join)?;
+
         let mut query_builder = Some(QueryBuilder::default());
         let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
         let mut query_builder = query_builder.unwrap();
@@ -2737,6 +2739,1000 @@ impl Unparser<'_> {
         matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
     }
 
+    /// Whether `qualifier`, as the emitted SQL spells it, is a name the unparser
+    /// can invent for a derived table of its own.
+    ///
+    /// A derived table's alias is a single identifier, so a qualifier a dialect
+    /// spells with a schema or catalog is not one of these however its last
+    /// component reads — that reference names a relation the alias cannot answer
+    /// to.
+    fn is_unparser_derived_alias(qualifier: &[String]) -> bool {
+        let [name] = qualifier else {
+            return false;
+        };
+        DERIVED_TABLE_ALIASES.contains(&name.as_str()) || is_numbered_alias(name)
+    }
+
+    /// What the `EXISTS` body's `FROM` will answer to: its relation names, and the
+    /// column names a reference inside it can collide with — including one the
+    /// body renames, which no relation exposes.
+    ///
+    /// The qualifiers are read from the relations the `FROM` introduces rather
+    /// than from `plan`'s output schema, which is a proxy that is wrong in both
+    /// directions:
+    ///
+    /// * A projection pruning every column of a relation leaves it with no
+    ///   qualified output field, while it is still named in the `FROM` and still
+    ///   captures a reference using its name.
+    /// * A `SubqueryAlias` puts its alias on the schema as the whole
+    ///   [`TableReference`] it was built from, but a derived table's alias is a
+    ///   single identifier, so only `table()` is emitted — and dialect-independently
+    ///   so, unlike a scanned relation. Keying an alias `s.a` off the schema would
+    ///   miss an outer `a.c` that `AS a` really does capture, and refuse an outer
+    ///   `s.a.c` that it does not.
+    ///
+    /// The column names take both: the relations the walk finds expose every
+    /// column they have rather than the projected ones, and the output schema
+    /// carries names no relation in the plan has, because a rename names a
+    /// column something. Neither alone is the set an unqualified reference can
+    /// collide with. The seed below says where each of those lands in the
+    /// emitted SQL.
+    ///
+    /// The walk stops at a `SubqueryAlias`: an alias replaces the name it is given
+    /// to, so the relations it encloses are not addressable through it and
+    /// collecting them would refuse references that bind correctly.
+    ///
+    /// Aliases the unparser invents for derived tables of its own are not here —
+    /// they appear nowhere in the plan, so no walk can find them. They are
+    /// recognised by [`Self::is_unparser_derived_alias`] instead.
+    ///
+    /// A node whose emitted relation the plan does not describe costs the walk
+    /// either the whole scope or just its column names — see
+    /// [`Self::unreadable_part`] for which those are and why, and
+    /// [`Self::introduces_unreadable`] for why an enclosing alias shields
+    /// neither.
+    ///
+    /// Only the plan's own inputs are walked, never the plans inside an
+    /// `Expr::ScalarSubquery` or `Expr::Exists`. That is what makes the model
+    /// hold: a relation in a nested subquery's `FROM` is not in scope for a
+    /// predicate emitted at this body's level, so it cannot capture one.
+    fn emitted_scope(&self, plan: &LogicalPlan) -> Result<EmittedScope> {
+        // Collected during the walk and keyed after it: the walk's closure
+        // reports a `DataFusionError`, while keying a name asks the dialect and
+        // can fail with one of its own.
+        let mut qualifiers: Vec<Vec<String>> = Vec::new();
+        // Every schema whose column names the emitted `FROM` can answer to,
+        // keyed after the walk rather than during it.
+        let mut schemas: Vec<SchemaRef> = Vec::new();
+        let mut unreadable = false;
+        let mut columns_unreadable = false;
+
+        plan.apply(|node| {
+            // Asked of every node before it is classified, so there is one
+            // definition of what this walk cannot read rather than one per arm.
+            match self.unreadable_part(node) {
+                // Nothing below can be worth collecting.
+                Some(UnreadablePart::Relation) => {
+                    unreadable = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                // The relation is still named where the walk can see it, so the
+                // qualifiers below are still worth having — only the column
+                // names are lost. Keep going.
+                Some(UnreadablePart::ColumnNames) => columns_unreadable = true,
+                None => {}
+            }
+            match node {
+                LogicalPlan::TableScan(scan) => {
+                    let emitted = self.emitted_qualifier_key(&scan.table_name);
+                    // A qualified `FROM` introduces the bare table name as a
+                    // correlation name too: `FROM s.t` is addressed as `t` as
+                    // readily as `s.t`. Keeping only the full key misses a
+                    // correlation qualified by the bare name, which is then read
+                    // as reaching outward while the emitted SQL binds it here:
+                    // `... FROM s.t WHERE t.c = s.t.c` compares the inner row
+                    // with itself. The full key is kept alongside it, so `s1.t`
+                    // and `s2.t` are still told apart.
+                    //
+                    // Matching two components or more only skips a duplicate —
+                    // an unqualified name is already its own last component — so
+                    // it decides nothing this list is read for.
+                    if let [_, .., bare] = emitted.as_slice() {
+                        qualifiers.push(vec![bare.clone()]);
+                    }
+                    qualifiers.push(emitted);
+                    // A relation emitted bare answers to every column it has,
+                    // not just the projected ones — the same reason the
+                    // qualifier is read from the `FROM` rather than from the
+                    // output schema.
+                    //
+                    // Not asked once the column names are already unknowable:
+                    // `TableSource::schema` is a trait call some
+                    // implementations build a `Schema` in, and the result would
+                    // be dropped unread.
+                    if !columns_unreadable {
+                        schemas.push(scan.source.schema());
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                }
+                LogicalPlan::SubqueryAlias(alias) => {
+                    match self.introduces_unreadable(&alias.input)? {
+                        Some(UnreadablePart::Relation) => {
+                            unreadable = true;
+                            return Ok(TreeNodeRecursion::Stop);
+                        }
+                        Some(UnreadablePart::ColumnNames) => columns_unreadable = true,
+                        None => {}
+                    }
+                    qualifiers
+                        .push(vec![self.identifier_comparison_key(alias.alias.table())]);
+
+                    // An alias replaces the *names* below it, which is why the
+                    // walk stops here — but it does not replace the *columns*.
+                    // The relation it introduces answers to whatever it
+                    // exposes, and the emitter writes it either as an aliased
+                    // scan (`FROM "t" AS "a"`, exposing every column `t` has)
+                    // or as a derived table (exposing the ones it selects).
+                    // Which of the two is not decided until the body is built,
+                    // so both are taken, in the direction that refuses.
+                    //
+                    // Jumping without this lost the whole set: `exposed` is
+                    // otherwise collected at the plan's root and at its leaf
+                    // scans, and an alias is a relation boundary in between.
+                    schemas.push(Arc::clone(alias.input.schema().inner()));
+
+                    alias.input.apply(|inner| {
+                        if let LogicalPlan::TableScan(scan) = inner {
+                            schemas.push(scan.source.schema());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                    // The names below are hidden by the alias only while there
+                    // is a single relation for it to replace. `FROM "t" AS "derived"`
+                    // really does put `"t"` out of reach — the pushdown that
+                    // depends on it is pinned by
+                    // `test_unparse_left_semi_join_keeps_relation_enclosed_by_build_side_alias`.
+                    //
+                    // An alias over a *join* is the other shape. SQL has no way
+                    // to name a join, so unless the emitter wraps it in a
+                    // derived table — which `requires_derived_subquery` declines
+                    // to do for inner, outer and cross joins — `relation.alias`
+                    // renames the primary relation alone and every relation
+                    // joined to it keeps the name it was scanned under, still
+                    // addressable beside the alias: `FROM "safe" AS "a" CROSS
+                    // JOIN "t"`. Recording only `"a"` there leaves a correlated
+                    // `"t"."c"` matching no name in this scope, so the guard
+                    // reads a capture as a reference that reaches outward and
+                    // emits SQL binding it to the inner `"t"` — valid, silent,
+                    // and answering from the wrong rows.
+                    //
+                    // Which relation the emitter renames is not decided here, so
+                    // all of them are taken, including the one that will be
+                    // replaced — and so is the join wrapped in a derived table
+                    // after all, whose names really are hidden. These are read
+                    // only to refuse, so a name too many costs a pushdown and
+                    // never a row.
+                    if Self::alias_input_holds_a_join(&alias.input) {
+                        alias.input.apply(|inner| {
+                            match inner {
+                                LogicalPlan::TableScan(scan) => {
+                                    qualifiers.push(
+                                        self.emitted_qualifier_key(&scan.table_name),
+                                    );
+                                    Ok(TreeNodeRecursion::Continue)
+                                }
+                                LogicalPlan::SubqueryAlias(inner_alias) => {
+                                    qualifiers.push(vec![
+                                        self.identifier_comparison_key(
+                                            inner_alias.alias.table(),
+                                        ),
+                                    ]);
+                                    // Its own input is hidden behind it, on the
+                                    // same terms this arm is deciding.
+                                    Ok(TreeNodeRecursion::Jump)
+                                }
+                                _ => Ok(TreeNodeRecursion::Continue),
+                            }
+                        })?;
+                    }
+                    Ok(TreeNodeRecursion::Jump)
+                }
+                _ => Ok(TreeNodeRecursion::Continue),
+            }
+        })?;
+
+        // Nothing collected above can be read once the scope is unreadable, so
+        // it is not built: the naming below is the expensive half of this walk,
+        // and a list that cannot be consulted is a list a later reader can
+        // consult by mistake.
+        if unreadable {
+            return Ok(EmittedScope::Unreadable);
+        }
+
+        // The build side's own output names, which no walk above can find: a
+        // rename names a column something the plan holds no relation for. Both
+        // ways the body is emitted put these names where an unqualified
+        // correlation collides with them — as the columns of a derived table
+        // when the emitter wraps the body, and as bare names that escape
+        // outward, to be compared with the outer query's own column, when it
+        // folds the projection into the `SELECT 1` instead.
+        //
+        // Taken unconditionally, which over-approximates the case where the
+        // body folds and the correlation's build half names a column of the
+        // scan rather than the renamed one: there the outer reference does bind
+        // outward and the refusal costs a pushdown it did not need to. That is
+        // the same approximation, and the same fix, as spiceai/spiceai#13469.
+        // Skipped entirely when the emitted `FROM` presents column names the
+        // plan does not hold — see the field's own doc for why that is `None`
+        // and not a partial list.
+        let exposed = if columns_unreadable {
+            None
+        } else {
+            let mut exposed = HashSet::new();
+            self.expose_columns(&mut exposed, plan.schema().inner())?;
+            for schema in &schemas {
+                self.expose_columns(&mut exposed, schema)?;
+            }
+            Some(exposed)
+        };
+        Ok(EmittedScope::Readable {
+            addressable: self.addressable_relations(plan),
+            qualifiers,
+            exposed,
+        })
+    }
+
+    /// Whether an alias's input puts more than one relation in the emitted
+    /// `FROM`, so the alias cannot replace all of them.
+    ///
+    /// Asked as "is there a join here" rather than by counting relations,
+    /// because a join is the only thing that puts a second one there and the
+    /// count is the fragile half: it would have to enumerate every node the
+    /// emitter can write as a table factor — a scan, a nested alias, an `UNNEST`
+    /// — and a factor left off that list reads as one relation, which is the
+    /// answer that declines to collect. A join present is enough to know the
+    /// alias renames one side and leaves the other named as it was.
+    ///
+    /// A nested `SubqueryAlias` ends the descent: whatever it holds is its own
+    /// boundary, decided on these same terms when the walk reaches it.
+    fn alias_input_holds_a_join(plan: &LogicalPlan) -> bool {
+        let mut pending = vec![plan];
+        while let Some(node) = pending.pop() {
+            match node {
+                LogicalPlan::Join(_) => return true,
+                LogicalPlan::SubqueryAlias(_) => {}
+                _ => pending.extend(node.inputs()),
+            }
+        }
+        false
+    }
+
+    fn addressable_relations(&self, plan: &LogicalPlan) -> Vec<Vec<String>> {
+        let mut addressable = Vec::new();
+        let mut pending = vec![plan];
+        // A worklist rather than recursion: this is reached for every scope
+        // built, and plan depth is not bounded by anything the unparser owns.
+        while let Some(node) = pending.pop() {
+            match node {
+                LogicalPlan::TableScan(scan) => {
+                    addressable.push(scan.table_name.to_vec());
+                }
+                LogicalPlan::SubqueryAlias(alias) => {
+                    addressable.push(vec![alias.alias.table().to_string()]);
+                }
+                LogicalPlan::Filter(_) | LogicalPlan::Join(_) => {
+                    pending.extend(node.inputs());
+                }
+                _ => {}
+            }
+        }
+        addressable
+    }
+
+    /// Whether this node's emitted relation is decided outside the plan, so no
+    /// walk over the plan can say what the `FROM` will answer to.
+    ///
+    /// An extension node is one such shape. Its
+    /// [`UserDefinedLogicalNodeUnparser`] is handed the `RelationBuilder` and
+    /// decides the emitted `FROM` outright, so a walk is wrong in both
+    /// directions at once: it collects the extension's inputs, which the
+    /// emitted SQL does not name — `select_to_sql_recursively` returns without
+    /// descending once the unparser writes the relation — and misses whatever
+    /// the unparser wrote, which it does name.
+    ///
+    /// An `Unnest` on a dialect that emits Snowflake `LATERAL FLATTEN` keeps
+    /// less from the walk, and that difference is the whole of
+    /// [`UnreadablePart::ColumnNames`]. The FLATTEN relation presents the columns
+    /// Snowflake defines for it — `VALUE` among them — which the plan holds
+    /// none of, so no reading of the walk can put them in `exposed`, and an
+    /// unqualified correlation on such a name binds to the FLATTEN. Its *name*
+    /// is not a mystery at all: the emitter aliases it `_unnest_N`, which
+    /// [`Self::is_unparser_derived_alias`] already answers for, and no other
+    /// qualifier can reach it. So a qualified reference stays decidable and
+    /// keeps its pushdown; only the unqualified ones are refused.
+    ///
+    /// Enumerating the FLATTEN columns instead would mean writing a vendor's
+    /// output schema into this walk, which under-refuses — the wrong-rows
+    /// direction — the moment that schema grows.
+    ///
+    /// BigQuery's `UNNEST(...)` table factor is the same shape and is
+    /// deliberately not here: the unparser emits it unaliased and never calls
+    /// `with_offset`, and BigQuery gives no way to reference an unaliased
+    /// `UNNEST` column, so nothing it presents can be collided with. That is a
+    /// judgement about a second dialect rather than a difference in kind, which
+    /// is why it is written down instead of left as an asymmetry between two
+    /// arms.
+    ///
+    /// This is the one place either judgement lives, so the refinement they are
+    /// waiting for — reading the emitted `FROM` instead of predicting it,
+    /// spiceai/spiceai#13469, or a trait method by which an unparser declares
+    /// the scope it will emit — replaces one function rather than several match
+    /// arms. That both shapes here are relations the emitter knows how to write
+    /// and this walk has to be told about separately is the argument in
+    /// spiceai/spiceai#13480.
+    ///
+    /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
+    fn unreadable_part(&self, node: &LogicalPlan) -> Option<UnreadablePart> {
+        match node {
+            LogicalPlan::Extension(_) => Some(UnreadablePart::Relation),
+            // Wider than the emitter's own gates, which also require an
+            // unnest input type and an unset relation: this asks only the
+            // dialect, so it answers for every `Unnest` on one. Over-refusing
+            // is the safe direction, and predicting those gates from here is
+            // the mistake the rest of this walk keeps paying for.
+            LogicalPlan::Unnest(_) if self.dialect.unnest_as_lateral_flatten() => {
+                Some(UnreadablePart::ColumnNames)
+            }
+            _ => None,
+        }
+    }
+
+    /// The strongest [`UnreadablePart`] any node below `plan` reports.
+    ///
+    /// Asked of a `SubqueryAlias`'s input, because an alias contains neither
+    /// kind. The alias reaches the single relation the `RelationBuilder` holds,
+    /// while the same unparser is handed the `SelectBuilder` and can join a
+    /// second relation onto the same `FROM` — and that one keeps its own name
+    /// and its own columns. So the walk looks past an alias for this and for
+    /// nothing else: the relations an alias really does shield are why it stops
+    /// there at all, and collecting them would refuse references that bind
+    /// correctly.
+    fn introduces_unreadable(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<Option<UnreadablePart>> {
+        let mut found = None;
+        plan.apply(|node| {
+            match self.unreadable_part(node) {
+                // Nothing outranks it, so there is no reason to keep looking.
+                Some(UnreadablePart::Relation) => {
+                    found = Some(UnreadablePart::Relation);
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Some(UnreadablePart::ColumnNames) => {
+                    found = Some(UnreadablePart::ColumnNames)
+                }
+                None => {}
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(found)
+    }
+
+    /// Adds every name `schema`'s columns let the body answer to.
+    ///
+    /// Each column is exposed under two names: its own, which a relation emitted
+    /// bare answers to, and the one this dialect would rewrite it to, which is
+    /// what a derived table carries it under. Which of the two the body will be
+    /// is not decided here — that is the approximation tracked by
+    /// spiceai/spiceai#13469 — so both are taken, in the direction that refuses
+    /// rather than emits.
+    fn expose_columns(
+        &self,
+        exposed: &mut HashSet<String>,
+        schema: &SchemaRef,
+    ) -> Result<()> {
+        for field in schema.fields() {
+            exposed.insert(self.identifier_comparison_key(field.name()));
+            exposed.insert(self.emitted_column_key(field.name())?);
+        }
+        Ok(())
+    }
+
+    /// Whether any column in `expr` emits a reference the `EXISTS` body captures.
+    ///
+    /// Both column variants are walked. [`Expr::column_refs`] collects only
+    /// [`Expr::Column`], but [`Self::col_to_sql`] renders
+    /// [`Expr::OuterReferenceColumn`] through that same path, so the two are
+    /// emitted as the same qualified identifier and bind by the same rules. A
+    /// guard that reasons about where an emitted reference resolves has to see
+    /// both, or the variant it does not walk goes on being captured.
+    ///
+    /// What separates them is *attribution*, which is why `probe_scope` is
+    /// asked for one and not the other:
+    ///
+    /// * An [`Expr::Column`] in a `join.filter` carries no split by side, but it
+    ///   can only mean one of the join's own two inputs — so a name or qualifier
+    ///   a single input owns is attributable after all and binds where it was
+    ///   meant to. Only what *both* answer to is ambiguous, which is what asking
+    ///   the probe scope as well says. For the `on` pairs the split is already
+    ///   made by the caller, so there is no probe scope to ask.
+    /// * An [`Expr::OuterReferenceColumn`] names neither input by construction:
+    ///   it reaches past this join to an enclosing query. Nothing about the
+    ///   probe can make it a local reference, so the two scopes stop excusing
+    ///   each other and start adding up — the reference passes *through* the
+    ///   probe's scope on its way out, so either scope answering to it is a
+    ///   capture. Requiring both hides one; requiring only the build hides the
+    ///   other.
+    fn references_captured_scope(
+        &self,
+        expr: &Expr,
+        kind: ReferenceKind,
+        build_scope: &EmittedScope,
+        probe_scope: Option<&EmittedScope>,
+    ) -> Result<bool> {
+        expr.exists(|node| {
+            // A subquery is a leaf here, so the outer references it carries have
+            // to be reached for explicitly — and at every depth, since the list
+            // one subquery holds leaves out the references a subquery nested
+            // inside it holds.
+            if let Some(subquery) = Self::subquery_of(node) {
+                return self.subquery_reaches_captured_scope(
+                    subquery,
+                    &[],
+                    build_scope,
+                    probe_scope,
+                );
+            }
+
+            let (column, reaches_past_the_join) = match node {
+                Expr::Column(column) => (column, false),
+                Expr::OuterReferenceColumn(_, column) => (column, true),
+                _ => return Ok(false),
+            };
+
+            // Asked before anything else, including the invented-alias answer
+            // below: a caller that narrowed to the references reaching past the
+            // join has already asked about the rest under the other rule, and
+            // answering for them here would apply this one twice.
+            if matches!(kind, ReferenceKind::ReachingPastTheJoin)
+                && !reaches_past_the_join
+            {
+                return Ok(false);
+            }
+
+            // An alias the unparser invents is in the emitted `FROM` whatever
+            // the plan holds, so no scope can claim it. Asked of the keyed
+            // spelling, since a relation a user named `DERIVED_PROJECTION` is
+            // the alias `derived_projection` once a dialect that folds case has
+            // emitted them both.
+            let names_invented_alias = match column.relation.as_ref() {
+                Some(relation) => {
+                    let emitted = self.emitted_qualifier(relation);
+                    Self::is_unparser_derived_alias(&self.qualifier_key(&emitted))
+                }
+                None => false,
+            };
+
+            // Counted as the build side answering rather than answered on its
+            // own, so the attribution below still applies. Returning early here
+            // would refuse a *build-local* reference to a relation the user
+            // happened to name `derived_limit`, which binds inside the body on
+            // purpose — the same reference the side split exists to allow.
+            let captured_by_build =
+                names_invented_alias || self.scope_answers(build_scope, column)?;
+            Ok(match probe_scope {
+                // An outer reference passes *through* the probe's scope on its
+                // way out, so the probe shadowing it is as much a capture as the
+                // build shadowing it. Neither can be excused by the other.
+                Some(probe) if reaches_past_the_join => {
+                    captured_by_build || self.scope_answers(probe, column)?
+                }
+                // A plain column can only mean one of the join's own two inputs,
+                // so a name or qualifier a single input owns is attributable
+                // after all and binds where it was meant to. Only what both
+                // answer to is ambiguous.
+                Some(probe) => captured_by_build && self.scope_answers(probe, column)?,
+                // The caller already split this reference by side, so there is
+                // no other scope to attribute it to.
+                None => captured_by_build,
+            })
+        })
+    }
+
+    /// The [`Subquery`] a subquery-bearing expression holds.
+    ///
+    /// A subquery's plan is out of reach of `Expr` traversal, in one of two
+    /// ways: `Expr::apply_children` reports `Exists` and `ScalarSubquery` as
+    /// leaves outright, and for `InSubquery` and `SetComparison` it descends
+    /// into the compared expression only. Either way a walk over an expression
+    /// never reaches the plan inside one, and so never sees the outer
+    /// references that plan carries. Those are held separately, on
+    /// [`Subquery::outer_ref_columns`], and have to be asked for by name.
+    ///
+    /// Every subquery-bearing variant is answered for. Leaving one out is the
+    /// wrong-rows direction — the walk reports no capture for a reference it
+    /// never looked at — and the compiler cannot point at the omission, since
+    /// the catch-all arm this needs for the non-subquery variants absorbs it.
+    const fn subquery_of(expr: &Expr) -> Option<&Subquery> {
+        match expr {
+            Expr::Exists(exists) => Some(&exists.subquery),
+            Expr::ScalarSubquery(subquery) => Some(subquery),
+            Expr::InSubquery(in_subquery) => Some(&in_subquery.subquery),
+            Expr::SetComparison(set_comparison) => Some(&set_comparison.subquery),
+            _ => None,
+        }
+    }
+
+    /// Whether `expr` carries a reference that reaches past this join, counting
+    /// the ones held by a nested subquery.
+    ///
+    /// [`Expr::contains_outer`] cannot see those, for the reason
+    /// [`Self::subquery_of`] gives, so asking it alone would leave the probe
+    /// scope unbuilt and the reference unexamined.
+    fn carries_outer_reference(expr: &Expr) -> Result<bool> {
+        Ok(expr.contains_outer()
+            || expr.exists(|node| Ok(Self::subquery_of(node).is_some()))?)
+    }
+
+    /// Whether an outer reference `subquery` carries at any depth is captured by
+    /// one of the scopes this join emits.
+    ///
+    /// `enclosing` holds the bodies between `subquery` and this join, innermost
+    /// first; it is empty for a subquery written directly into the predicate,
+    /// which is what makes that case identical to asking about its own list
+    /// alone. A reference one of those bodies resolves — bound there or captured
+    /// there — never reaches this join, and [`Self::outward_reference`] says
+    /// which. Only what survives the whole chain reaches the join, and that
+    /// follows the same rule as an `OuterReferenceColumn` written directly into
+    /// the predicate: whichever scope the join emits shadows one captures it.
+    /// Recursion depth here is the plan's subquery nesting depth, which no part of
+    /// the unparser bounds, so it grows the stack the same way
+    /// `select_to_sql_recursively` does.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn subquery_reaches_captured_scope(
+        &self,
+        subquery: &Subquery,
+        enclosing: &[&EmittedScope],
+        build_scope: &EmittedScope,
+        probe_scope: Option<&EmittedScope>,
+    ) -> Result<bool> {
+        for outer in &subquery.outer_ref_columns {
+            match self.outward_reference(outer, enclosing)? {
+                OutwardReference::BindsToAnEnclosingBody => continue,
+                OutwardReference::CapturedByAnEnclosingBody => return Ok(true),
+                OutwardReference::ReachesTheJoin => {}
+            }
+            if self.references_captured_scope(
+                outer,
+                ReferenceKind::ReachingPastTheJoin,
+                build_scope,
+                probe_scope,
+            )? {
+                return Ok(true);
+            }
+        }
+
+        self.nested_subqueries_reach_captured_scope(
+            &subquery.subquery,
+            enclosing,
+            build_scope,
+            probe_scope,
+        )
+    }
+
+    /// [`Self::subquery_reaches_captured_scope`] for the subqueries `plan`'s own
+    /// expressions hold — the ones its [`Subquery::outer_ref_columns`] leaves out.
+    ///
+    /// Every site that builds that list uses [`LogicalPlan::all_out_ref_exprs`],
+    /// which collects over `apply_expressions` and `inputs()`. `inputs()`
+    /// documents itself as not including subqueries, and `Expr` traversal reports
+    /// a subquery-bearing expression as a leaf (see [`Self::subquery_of`]), so a
+    /// reference held two levels down appears on no list at all:
+    /// `EXISTS (S1 WHERE EXISTS (S2 WHERE outer_ref(p.c)))` leaves S1's list
+    /// empty and `p.c` unexamined, and an emitted `FROM` that shadows `p` then
+    /// captures it. Reaching it needs this descent.
+    ///
+    /// Each level contributes one scope to the chain — the body's own, built once
+    /// here rather than per node holding a subquery. A body whose emitted form is
+    /// a single `SELECT` has one `FROM`, so every correlation inside it is emitted
+    /// against the same relations; a set-operation body is emitted as one `SELECT`
+    /// per branch, and [`Self::set_operation_branches`] scopes those separately.
+    fn nested_subqueries_reach_captured_scope(
+        &self,
+        plan: &LogicalPlan,
+        enclosing: &[&EmittedScope],
+        build_scope: &EmittedScope,
+        probe_scope: Option<&EmittedScope>,
+    ) -> Result<bool> {
+        // Asked before the scope below is built, which walks the plan again and
+        // collects two sets of names: most subqueries hold no further subquery,
+        // and for those there is nothing the scope would be asked about.
+        if !Self::holds_subquery(plan)? {
+            return Ok(false);
+        }
+        // Each branch is emitted as its own `SELECT` with its own `FROM`, so a
+        // relation named in one branch never answers a correlation held in
+        // another. Scoping the branches together would read such a pairing as a
+        // capture and refuse a query the emitter renders correctly.
+        if let Some(branches) = Self::set_operation_branches(plan) {
+            for branch in branches {
+                if self.nested_subqueries_reach_captured_scope(
+                    branch,
+                    enclosing,
+                    build_scope,
+                    probe_scope,
+                )? {
+                    return Ok(true);
+                }
+            }
+            return Ok(false);
+        }
+        let scope = self.emitted_scope(plan)?;
+        let mut chain = Vec::with_capacity(enclosing.len() + 1);
+        chain.push(&scope);
+        chain.extend_from_slice(enclosing);
+
+        let mut captured = false;
+        plan.apply(|node| {
+            node.apply_expressions(|expr| {
+                expr.apply(|node| {
+                    let Some(nested) = Self::subquery_of(node) else {
+                        return Ok(TreeNodeRecursion::Continue);
+                    };
+                    if self.subquery_reaches_captured_scope(
+                        nested,
+                        &chain,
+                        build_scope,
+                        probe_scope,
+                    )? {
+                        captured = true;
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })?;
+        Ok(captured)
+    }
+
+    /// The bodies a set-operation `plan` is emitted as, or `None` when `plan` is
+    /// emitted as a single `SELECT`.
+    ///
+    /// Mirrors what `select_to_sql_recursively` writes: its [`LogicalPlan::Union`]
+    /// arm emits every input as its own `SetExpr`, and its [`Distinct::All`] arm
+    /// delegates a distinct union straight to that same arm, so both shapes reach
+    /// the reader as one `SELECT` per branch.
+    ///
+    /// Only a set operation standing as the body itself is reported. Below a
+    /// [`LogicalPlan::SubqueryAlias`] there is nothing to report:
+    /// `requires_derived_subquery` sends a union there to a derived table, and the
+    /// name a correlation can reach is that alias, which [`Self::emitted_scope`]
+    /// records as it stops. A union buried under any other node is left to the
+    /// single-scope path, which reads its branches together — an
+    /// over-approximation that costs a refusal rather than a wrong emission, and
+    /// which splitting here would not fix, since the derived table's own alias is
+    /// the name that path is missing.
+    fn set_operation_branches(plan: &LogicalPlan) -> Option<&[Arc<LogicalPlan>]> {
+        match plan {
+            LogicalPlan::Union(union) => Some(&union.inputs),
+            LogicalPlan::Distinct(Distinct::All(input)) => match input.as_ref() {
+                LogicalPlan::Union(union) => Some(&union.inputs),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Whether any expression anywhere in `plan` carries a subquery.
+    fn holds_subquery(plan: &LogicalPlan) -> Result<bool> {
+        let mut found = false;
+        plan.apply(|node| {
+            node.apply_expressions(|expr| {
+                found =
+                    found || expr.exists(|node| Ok(Self::subquery_of(node).is_some()))?;
+                Ok(if found {
+                    TreeNodeRecursion::Stop
+                } else {
+                    TreeNodeRecursion::Continue
+                })
+            })
+        })?;
+        Ok(found)
+    }
+
+    /// What becomes of the reference `outer` emits on its way out to this join,
+    /// given the bodies `enclosing` between the two, innermost first.
+    ///
+    /// A nested subquery's outer references are relative to the scope enclosing
+    /// *it*, which is usually the body one level out rather than anything past
+    /// this join, so the scopes in between have to be asked before the join's own
+    /// are. In
+    /// `EXISTS (SELECT 1 FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.a = t1.b))`
+    /// the inner list holds `t1.b`, which binds against `FROM t1` and reaches
+    /// nothing this join emits: taking every nested reference straight to the
+    /// join's scopes would refuse it, and a refusal is a hard error rather than a
+    /// different emission, so that trades wrong SQL for a wrong error.
+    ///
+    /// SQL resolves the reference at the first scope its emitted qualifier
+    /// collides with, so a colliding body ends the journey either way; what the
+    /// two answers separate is whether that body is the relation the plan named.
+    /// Collapsing them into "a colliding body consumes it" is the wrong-rows
+    /// direction, and not hypothetically: on a dialect that does not spell
+    /// columns in full, a body selecting from `mid.t` collides with a reference
+    /// to `public.t`, and reading that as arrival drops the reference unexamined
+    /// and emits the capture.
+    ///
+    /// The two questions consult different halves of a scope, because the two
+    /// errors they can make are not equally bad: arrival is asked of the
+    /// relations the emitted `FROM` can address, collision of every relation the
+    /// plan mentions. [`Self::addressable_relations`] is where that asymmetry is
+    /// stated.
+    fn outward_reference(
+        &self,
+        outer: &Expr,
+        enclosing: &[&EmittedScope],
+    ) -> Result<OutwardReference> {
+        // Only a reference this can place is placed. Anything else is left to
+        // `references_captured_scope`, which walks the expression itself.
+        let Expr::OuterReferenceColumn(_, column) = outer else {
+            return Ok(OutwardReference::ReachesTheJoin);
+        };
+        for scope in enclosing {
+            if self.scope_names_relation(scope, column) {
+                return Ok(OutwardReference::BindsToAnEnclosingBody);
+            }
+            if self.scope_answers(scope, column)? {
+                return Ok(OutwardReference::CapturedByAnEnclosingBody);
+            }
+        }
+        Ok(OutwardReference::ReachesTheJoin)
+    }
+
+    /// Whether `scope` names the very relation `column` names, *and* the emitted
+    /// `FROM` can address it — so the reference resolves there, as the plan
+    /// intends, rather than merely colliding with something spelled alike.
+    ///
+    /// Asked of [`Self::addressable_relations`] and not of the scope's full list,
+    /// for the reason that function gives: this is the answer that ends the
+    /// enquiry into a reference, so a relation it wrongly credits is a reference
+    /// dropped unexamined.
+    ///
+    /// Compared exactly, and it is the one comparison in this guard that is —
+    /// everywhere else identifiers are folded through
+    /// [`Self::identifier_comparison_key`], which errs toward calling two of
+    /// them the same. That direction refuses, and refusing is what the rest of
+    /// the guard wants; here it *permits*, so the same fold would end the
+    /// enquiry into a reference the emitted SQL never binds where this claims.
+    /// On PostgreSQL a body scanning `"t"` does not resolve a reference to
+    /// `"T"`, yet folded they are one relation, and the scopes past this one —
+    /// which may genuinely capture it — would never be asked. An exact
+    /// comparison declines to credit the arrival instead, and the reference goes
+    /// on to [`Self::scope_answers`], whose folded reading refuses it. The cost
+    /// runs the other way, on a dialect that really does bind them alike: a
+    /// pushdown, not a row. Asking the dialect rather than guessing is
+    /// spiceai/spiceai#13474.
+    ///
+    /// An unqualified reference names no relation, so nothing can be said to be
+    /// it: such a reference binds to whichever relation in the colliding scope
+    /// exposes the column, and which one the plan meant is not recoverable —
+    /// least of all from `exposed`, which is deliberately over-collected in the
+    /// refusing direction and so cannot be read as an arrival. That is answered
+    /// `false`, the same stance [`Self::scope_answers`] takes on an unqualified
+    /// reference against the join's own scopes.
+    fn scope_names_relation(&self, scope: &EmittedScope, column: &Column) -> bool {
+        let EmittedScope::Readable { addressable, .. } = scope else {
+            return false;
+        };
+        let Some(relation) = column.relation.as_ref() else {
+            return false;
+        };
+        addressable.contains(&relation.to_vec())
+    }
+
+    /// Whether `scope` answers to the reference `column` emits.
+    ///
+    /// Both halves are asked in the emitted, keyed form — the qualifier through
+    /// [`Self::emitted_qualifier_key`] and the name through
+    /// [`Self::emitted_column_key`] — against a scope that already holds only
+    /// that form.
+    ///
+    /// A scope whose names are not knowable — an [`EmittedScope::Unreadable`]
+    /// one, or a `Readable` one whose column list is `None` — answers to
+    /// everything, so neither half is asked, and neither exists to ask: a
+    /// reference cannot be cleared against a name nobody knows. Both callers need
+    /// that reading, for opposite-looking reasons that come to the same thing —
+    /// see [`OutwardReference::CapturedByAnEnclosingBody`].
+    fn scope_answers(&self, scope: &EmittedScope, column: &Column) -> Result<bool> {
+        let EmittedScope::Readable {
+            qualifiers,
+            exposed,
+            ..
+        } = scope
+        else {
+            return Ok(true);
+        };
+        Ok(match column.relation.as_ref() {
+            Some(relation) => qualifiers.contains(&self.emitted_qualifier_key(relation)),
+            // An unqualified reference names no relation to disagree with, so
+            // it binds to whichever relation in the innermost scope exposes the
+            // column — the `EXISTS` body's own, whenever that body exposes the
+            // name at all. The names missing from a list that is not knowable
+            // are exactly the ones the plan never held, so nothing about such a
+            // reference can be settled by looking.
+            None => match exposed {
+                Some(exposed) => {
+                    exposed.contains(&self.emitted_column_key(&column.name)?)
+                }
+                None => true,
+            },
+        })
+    }
+
+    /// Refuses a correlation that the `EXISTS` body's own `FROM` would capture.
+    ///
+    /// The correlated predicates are emitted inside the subquery, so every
+    /// reference in them binds to the innermost scope answering to its qualifier.
+    /// A reference meant for the outer query whose qualifier the build side also
+    /// answers to therefore binds to the subquery's own relation instead: the
+    /// correlation becomes a comparison of an inner row with itself, `EXISTS`
+    /// degenerates to "this relation has a row", and a semi or mark join then
+    /// keeps every probe row while an anti join drops every one. That is valid
+    /// SQL, so a database runs it and returns those wrong rows.
+    ///
+    /// SQL's scoping rules decide it on their own, so the capture does not need a
+    /// row bound to happen. Refusing costs the pushdown, which is the trade
+    /// [`Self::exists_scope_name`] already makes for output that binds and runs
+    /// rather than failing.
+    ///
+    /// Every part of this compares *what the statement will say*, not what the
+    /// plan holds, and each one costs correctness one way and pushdown the other:
+    ///
+    /// * **Ask how the qualifier will be spelled**, via
+    ///   [`Self::emitted_qualifier`], rather than comparing the
+    ///   [`TableReference`]. A dialect that elides the prefix emits `s1.t` and
+    ///   `s2.t` alike as `t`, so distinct references collide; a dialect that
+    ///   spells columns in full keeps them apart, and refusing there would cost
+    ///   the pushdown on SQL that binds correctly. Neither is inferable from the
+    ///   reference alone.
+    /// * **Ask how the column name will be spelled**, via
+    ///   [`Self::emitted_column_name`]. A dialect may rewrite a name it cannot
+    ///   spell — BigQuery writes `min(a)` as `min_40a_41` — and a build relation
+    ///   with a column of the rewritten name then captures the reference while
+    ///   the two plan names look nothing alike.
+    /// * **Compare identifiers the way the engine will resolve them**, via
+    ///   [`Self::identifier_comparison_key`], which folds case
+    ///   *unconditionally*. An identifier emitted unquoted is case-folded
+    ///   before it binds, so `T` and `t` written bare are one name. Keying that
+    ///   on the quote style instead would be false in both directions — DuckDB
+    ///   folds even a quoted identifier, and BigQuery folds a column name
+    ///   despite the backticks — so the fold does not ask. The price is a
+    ///   PostgreSQL build side whose `"T"` and `"t"` really are two relations:
+    ///   that correlation binds correctly and is refused anyway, which
+    ///   `refuses_case_distinct_quoted_relations` pins and spiceai/spiceai#13474
+    ///   tracks. Do not reintroduce the quote-style heuristic to buy it back.
+    /// * **Attribute an `Expr::Column` by side, and an
+    ///   `Expr::OuterReferenceColumn` not at all.** The two follow opposite
+    ///   rules, and collapsing either into the other is a defect in one
+    ///   direction or the other:
+    ///   * An `Expr::Column` belongs to one of the join's own inputs. In an
+    ///     `on` pair the split says which: only the probe half is the
+    ///     correlated reference, and a build half naming a build relation is an
+    ///     ordinary local reference that binds inside on purpose — testing both
+    ///     halves refuses every join whose build side shares a qualifier with
+    ///     its probe, including the correct ones, which
+    ///     `keeps_build_side_key_on_shared_relation` pins. `join.filter` has no
+    ///     such split, so there a qualifier *both* sides answer to is what is
+    ///     refused, which no reference to a distinct relation can be.
+    ///   * An `Expr::OuterReferenceColumn` belongs to neither input — it is on
+    ///     its way out of both. So the half it was written on says nothing, both
+    ///     halves of every pair are asked, and *either* scope shadowing it is a
+    ///     capture. Asking with the `Expr::Column` rule instead would let a
+    ///     reference through whenever one side alone shadows it.
+    ///
+    ///   [`Self::references_captured_scope`] holds both rules; the caller
+    ///   selects which references to ask about with [`ReferenceKind`].
+    /// * **Ask what the body exposes, not only what it is called.** An
+    ///   unqualified reference names no relation to collide with, so it is a
+    ///   column name that decides where it binds. Comparing qualifiers alone
+    ///   lets two sides that share no relation at all emit a correlation the
+    ///   body captures.
+    ///
+    /// One gap is left to the qualifier rewrite tracked by spiceai/spiceai#12840:
+    /// a relation reached through a `SubqueryAlias`, whose own name the emitted
+    /// SQL replaces with the alias. The alias is what this compares, which is
+    /// right for a reference written against it, but a correlated reference
+    /// still qualified by the enclosed relation is a shape the rewrite has to
+    /// requalify rather than refuse.
+    ///
+    /// It over-refuses in the other direction as well, tracked by
+    /// spiceai/spiceai#13469: the walk collects relations the emitter will bury
+    /// inside a derived table of its own, which the emitted SQL cannot address.
+    /// That costs the pushdown on correct SQL, which is the safe way round for
+    /// a guard whose other failure is wrong rows.
+    ///
+    /// A build or probe side whose emitted `FROM` the plan does not describe —
+    /// [`Self::unreadable_part`] — is refused wholesale on the same
+    /// trade. This runs before any of the body is built, so there is no emitted
+    /// `FROM` to read instead; narrowing it is the trait change noted there.
+    fn ensure_exists_correlation_not_shadowed(&self, join: &Join) -> Result<()> {
+        let swapped = Self::swaps_join_inputs(join.join_type);
+        let (probe_plan, build_plan) = if swapped {
+            (&join.right, &join.left)
+        } else {
+            (&join.left, &join.right)
+        };
+
+        let build_scope = self.emitted_scope(build_plan)?;
+        let mut captured = false;
+
+        // The probe half of each pair, and every reference in it: that half is
+        // the correlated one, so the build side answering to it is enough.
+        for correlated in join
+            .on
+            .iter()
+            .map(|(left, right)| if swapped { right } else { left })
+        {
+            if self.references_captured_scope(
+                correlated,
+                ReferenceKind::Every,
+                &build_scope,
+                None,
+            )? {
+                captured = true;
+                break;
+            }
+        }
+
+        // What the probe's own scope has to be asked about as well. Two sources,
+        // for the same reason: a reference that cannot be attributed to one side
+        // by where it was written.
+        //
+        // * `join.filter` is not split into halves at all, so an
+        //   `Expr::Column` in it could have come from either input.
+        // * Both halves of every `on` pair, for the references that reach past
+        //   the join — the rule for those is on `ReferenceKind`. One gets into a
+        //   pair at all whenever the expression also carries a local column,
+        //   because `find_valid_equijoin_key_pair` decides ownership from
+        //   `Expr::column_refs`, which collects only `Expr::Column`.
+        //
+        // Collected first so the probe scope is named only when something will
+        // ask it. Most joins carry no filter and no outer reference in a key,
+        // and naming a scope walks every column the side exposes.
+        if !captured {
+            let mut needs_probe_scope: Vec<(&Expr, ReferenceKind)> = Vec::new();
+            if let Some(filter) = &join.filter {
+                needs_probe_scope.push((filter, ReferenceKind::Every));
+            }
+            for half in join.on.iter().flat_map(|(left, right)| [left, right]) {
+                if Self::carries_outer_reference(half)? {
+                    needs_probe_scope.push((half, ReferenceKind::ReachingPastTheJoin));
+                }
+            }
+            if !needs_probe_scope.is_empty() {
+                let probe_scope = self.emitted_scope(probe_plan)?;
+                for (expr, kind) in needs_probe_scope {
+                    if self.references_captured_scope(
+                        expr,
+                        kind,
+                        &build_scope,
+                        Some(&probe_scope),
+                    )? {
+                        captured = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if captured {
+            return not_impl_err!(
+                "Unparsing an EXISTS-style join is not supported when a FROM the emitted SQL introduces would capture the correlation: it answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, or is a relation this unparser cannot read at all, so the reference binds there instead of in the query it was written against"
+            );
+        }
+        Ok(())
+    }
+
     /// The name a scope around the `EXISTS` build side has to answer to, so the
     /// correlated predicates still resolve against it.
     ///
@@ -2803,13 +3799,18 @@ impl Unparser<'_> {
         match relations.as_slice() {
             // Nothing to preserve, so any name will do — but only once the
             // correlation has been shown to name nothing.
-            [] if !names_a_probe_relation => Ok("derived_limit".to_string()),
+            [] if !names_a_probe_relation => Ok(DERIVED_LIMIT_ALIAS.to_string()),
             // A qualifier the probe side also answers to can be a build-side
             // reference on a self-join, where naming the scope anything else
-            // rebinds it to the probe. Both readings are wrong: the body's own
-            // relation already shadows the outer one, so the correlation is lost
-            // whatever the bound does, and renaming would only swap that wrong
-            // answer for a different one.
+            // rebinds it to the probe.
+            //
+            // Where the build side answers to that qualifier too — the self-join
+            // proper — `ensure_exists_correlation_not_shadowed` has already
+            // refused the plan, bound or not. What reaches here is the residue:
+            // a correlation qualified only by a probe relation the build side
+            // does not share, so nothing is captured, but there is also no
+            // build-side name for the scope to keep bound. Renaming it would
+            // rebind the reference to the probe, so this refuses instead.
             [] => {
                 not_impl_err!(
                     "Unparsing a row bound on an EXISTS-style join's build side is not supported when the correlation's only qualifier is one the probe side also answers to"
@@ -2954,6 +3955,121 @@ impl From<BuilderError> for DataFusionError {
     fn from(e: BuilderError) -> Self {
         DataFusionError::External(Box::new(e))
     }
+}
+
+/// What an `EXISTS` body's emitted `FROM` will answer to.
+///
+/// A reference inside the body binds to the innermost scope that answers to it,
+/// and it can be addressed two ways, so both are collected:
+///
+/// * `qualifiers` — the relation names the `FROM` introduces, spelled the way
+///   this dialect will spell a column's qualifier.
+/// * `exposed` — the column names the body can answer to, which is more than
+///   the emitted relations expose: a rename names a column something no relation
+///   has. An unqualified reference carries no relation to compare, so a name
+///   being found here is the only thing that decides whether the body captures
+///   it.
+///
+/// Both of those answer *whether the body could capture a reference*, and are
+/// over-collected on purpose, because there the doubtful case has to refuse. A
+/// scope is also asked the opposite question — whether a reference has *arrived*
+/// — which cannot be answered from an over-collected list at all, so
+/// `addressable` is collected separately and under the opposite rule.
+///
+/// All three are held in the form [`Unparser::identifier_comparison_key`] gives,
+/// put there once by [`Unparser::emitted_scope`] rather than derived again at
+/// each comparison. That is what keeps the normalization from being forgotten:
+/// the plan's own *spelling* is not in the variant, so a comparison site has
+/// nothing to compare wrongly.
+#[derive(Debug)]
+enum EmittedScope {
+    Readable {
+        qualifiers: Vec<Vec<String>>,
+        /// The relations the emitted `FROM` at this level can actually name, each
+        /// as its own path rather than as the qualifier this dialect will spell
+        /// for it — see [`Unparser::addressable_relations`] for why this is not
+        /// the same list as `qualifiers`, and why only one of the two questions
+        /// asked of a scope may consult it.
+        addressable: Vec<Vec<String>>,
+        /// The column names an unqualified reference can collide with, or
+        /// `None` when the emitted `FROM` presents names the plan does not hold
+        /// — see [`UnreadablePart::ColumnNames`]. `None` rather than an empty set,
+        /// so that every read has to say what it does when the list is not
+        /// knowable instead of treating it as knowably empty.
+        exposed: Option<HashSet<String>>,
+    },
+    /// The emitted `FROM` holds a relation the plan does not describe, so
+    /// nothing was learned by looking — see
+    /// [`UnreadablePart::Relation`].
+    ///
+    /// This carries no lists rather than empty or unread ones. A scope that
+    /// answers to every reference is only safe while nothing reads *past* that
+    /// answer, and the one enforcement that cannot be forgotten is for the
+    /// names not to be there: the next reader of a scope — the qualifier
+    /// rewrite spiceai/spiceai#12840 is waiting for, or any narrowing of this
+    /// guard — then cannot consult a name list without first saying what it
+    /// does when there is none.
+    Unreadable,
+}
+
+/// What becomes of a nested subquery's outer reference on its way out to a join
+/// whose `EXISTS`-style body is being emitted.
+///
+/// The three are distinct because "which scope resolves this reference" and
+/// "which scope was it sent to" are different questions, and a two-valued answer
+/// has to fold one into the other — either refusing references that bind
+/// correctly, or emitting captures unexamined.
+#[derive(Clone, Copy, Debug)]
+enum OutwardReference {
+    /// A body between the reference and the join emits a `FROM` that can address
+    /// the very relation the reference names, so the reference resolves there, as
+    /// the plan intends, and this join never sees it.
+    BindsToAnEnclosingBody,
+    /// A body between the two answers to the reference without that being where
+    /// the plan sent it, so the reference resolves there instead. Either the body
+    /// names a different relation this dialect spells the same way, or it holds
+    /// the right one behind a derived table of the emitter's own and so cannot
+    /// address it. The capture is decided whatever the join goes on to emit.
+    CapturedByAnEnclosingBody,
+    /// Nothing between the two answers to the reference, so it reaches the join
+    /// and the scopes the join emits decide it.
+    ReachesTheJoin,
+}
+
+/// What a node's emitted relation keeps [`Unparser::emitted_scope`] from
+/// knowing.
+///
+/// Ordered by how much is lost: `Relation` subsumes `ColumnNames`, which is why
+/// [`Unparser::introduces_unreadable`] stops at the first `Relation` it finds.
+///
+/// Named for the *part* rather than the state, because the two do not line up:
+/// `Relation` yields [`EmittedScope::Unreadable`], while `ColumnNames` yields a
+/// `Readable` scope whose column list is simply not knowable.
+#[derive(Clone, Copy, Debug)]
+enum UnreadablePart {
+    /// Its name and its columns both, so nothing collected about the side is
+    /// worth having.
+    Relation,
+    /// Only its column names: the relation is named where the walk can see it,
+    /// so a qualified reference stays decidable, but it presents columns the
+    /// plan does not hold.
+    ColumnNames,
+}
+
+/// Which of an expression's column references a capture check is being asked
+/// about.
+///
+/// The two kinds follow opposite rules — see
+/// [`Unparser::ensure_exists_correlation_not_shadowed`] — so an expression that
+/// carries both is asked twice, once under each, rather than once under
+/// whichever rule happens to be looser.
+#[derive(Clone, Copy, Debug)]
+enum ReferenceKind {
+    /// Every reference the expression carries.
+    Every,
+    /// Only [`Expr::OuterReferenceColumn`], which belongs to neither of the
+    /// join's inputs and so cannot be attributed by the side it was written on.
+    ReachingPastTheJoin,
 }
 
 /// The type of the input to the UNNEST table factor.

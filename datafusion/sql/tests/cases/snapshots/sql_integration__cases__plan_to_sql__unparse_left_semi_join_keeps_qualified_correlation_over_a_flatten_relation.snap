@@ -1,0 +1,5 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: unparser.plan_to_sql(&plan)?
+---
+SELECT "p"."VALUE" AS "VALUE", "p"."d" AS "d" FROM "p" WHERE EXISTS (SELECT 1 FROM LATERAL FLATTEN(INPUT => [1, 2, 3]) AS "_unnest_1" WHERE ("p"."VALUE" > 0))

@@ -1,0 +1,5 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: unparser.plan_to_sql(&plan)?
+---
+SELECT `p`.`VALUE` AS `VALUE`, `p`.`d` AS `d` FROM `p` WHERE EXISTS (SELECT 1 FROM UNNEST([1, 2, 3]) WHERE (`VALUE` > 0))

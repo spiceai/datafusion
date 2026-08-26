@@ -45,8 +45,9 @@ use arrow::datatypes::{
 };
 use arrow::util::display::array_value_to_string;
 use datafusion_common::{
-    Column, Result, ScalarValue, assert_eq_or_internal_err, assert_or_internal_err,
-    internal_datafusion_err, internal_err, not_impl_err, plan_err,
+    Column, Result, ScalarValue, TableReference, assert_eq_or_internal_err,
+    assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
+    plan_err,
 };
 use datafusion_expr::{
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator, TryCast,
@@ -841,21 +842,104 @@ impl Unparser<'_> {
         }
     }
 
+    /// The identifier components this dialect spells a column's qualifier with.
+    ///
+    /// A dialect that does not spell columns in full writes only the relation's
+    /// last component, so two relations distinguished by schema or catalog are
+    /// emitted — and therefore bound — identically. Anything reasoning about how a
+    /// reference will resolve has to ask this rather than read the
+    /// [`TableReference`], or it will disagree with what
+    /// [`Self::col_to_sql`] actually writes.
+    pub(crate) fn emitted_qualifier(&self, table_ref: &TableReference) -> Vec<String> {
+        if self.dialect.full_qualified_col() {
+            table_ref.to_vec()
+        } else {
+            vec![table_ref.table().to_string()]
+        }
+    }
+
+    /// The column name this dialect writes for a reference to `name`.
+    ///
+    /// [`Self::col_to_sql`] passes every column name through
+    /// [`super::dialect::Dialect::col_alias_overrides`] before emitting it — BigQuery rewrites
+    /// `min(a)` to `min_40a_41`, since the original is not a legal identifier
+    /// there. Anything reasoning about where an emitted reference binds has to
+    /// ask for the rewritten form, or it compares a name the statement does not
+    /// contain.
+    pub(crate) fn emitted_column_name(&self, name: &str) -> Result<String> {
+        Ok(self
+            .dialect
+            .col_alias_overrides(name)?
+            .unwrap_or_else(|| name.to_string()))
+    }
+
+    /// The form of `ident` to compare two emitted identifiers by.
+    ///
+    /// Case is folded, so two identifiers differing only in case compare equal.
+    /// Both sides are folded the same way, which makes this a case-*insensitive*
+    /// comparison rather than a claim about which case any engine folds to —
+    /// PostgreSQL and DuckDB fold to lower and Oracle to upper, and none of that
+    /// changes the answer.
+    ///
+    /// Quoting is deliberately not consulted, though it looks like it should be:
+    /// quoting preserves an identifier's case in *some* dialects and not others
+    /// — DuckDB matches identifiers case-insensitively even when they are
+    /// quoted, and BigQuery does the same for column names despite always
+    /// emitting backticks — so the quote style the emitter chooses does not
+    /// decide how the engine will bind what it wrote. Asking properly needs the
+    /// dialect to say, which is spiceai/spiceai#13474.
+    ///
+    /// Until it can, folding unconditionally errs toward calling two identifiers
+    /// the same. For a guard whose failure is letting an inner relation capture
+    /// an outer reference, that is the direction that costs a pushdown — on a
+    /// case-sensitive dialect, given two relations spelled alike — rather than
+    /// rows.
+    ///
+    /// That holds only where treating two identifiers as one *refuses*, which is
+    /// every comparison in the guard but one: deciding that a reference arrives
+    /// at an enclosing body permits, and ends the enquiry, so folding there would
+    /// drop unexamined a reference the emitted SQL binds elsewhere. That one
+    /// comparison is exact and must stay so — see
+    /// `Unparser::scope_names_relation`.
+    pub(crate) fn identifier_comparison_key(&self, ident: &str) -> String {
+        ident.to_lowercase()
+    }
+
+    /// [`Self::emitted_qualifier`] in the form two qualifiers are compared by.
+    pub(crate) fn emitted_qualifier_key(
+        &self,
+        table_ref: &TableReference,
+    ) -> Vec<String> {
+        self.qualifier_key(&self.emitted_qualifier(table_ref))
+    }
+
+    /// [`Self::emitted_qualifier_key`] for a qualifier already emitted.
+    ///
+    /// Split out so a caller that has to look at the emitted spelling first —
+    /// the invented-alias test does — keys that same value rather than building
+    /// it a second time.
+    pub(crate) fn qualifier_key(&self, emitted: &[String]) -> Vec<String> {
+        emitted
+            .iter()
+            .map(|part| self.identifier_comparison_key(part))
+            .collect()
+    }
+
+    /// The column name in the form two emitted references are compared by.
+    ///
+    /// The column counterpart of [`Self::emitted_qualifier_key`], composing the
+    /// dialect's rewrite with the comparison fold once — so a third
+    /// normalization added later has one place to go rather than every
+    /// comparison site.
+    pub(crate) fn emitted_column_key(&self, name: &str) -> Result<String> {
+        Ok(self.identifier_comparison_key(&self.emitted_column_name(name)?))
+    }
+
     pub fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
-        // Replace the column name if the dialect has an override
-        let col_name =
-            if let Some(rewritten_name) = self.dialect.col_alias_overrides(&col.name)? {
-                rewritten_name
-            } else {
-                col.name.to_string()
-            };
+        let col_name = self.emitted_column_name(&col.name)?;
 
         if let Some(table_ref) = &col.relation {
-            let mut id = if self.dialect.full_qualified_col() {
-                table_ref.to_vec()
-            } else {
-                vec![table_ref.table().to_string()]
-            };
+            let mut id = self.emitted_qualifier(table_ref);
             id.push(col_name);
             return Ok(ast::Expr::CompoundIdentifier(
                 id.iter()

@@ -1,0 +1,5 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: unparser.plan_to_sql(&plan)?
+---
+SELECT "p"."c" AS "c", "p"."d" AS "d" FROM "p" WHERE EXISTS (SELECT 1 FROM (SELECT "a"."x", "a"."y" FROM "t" AS "a") AS "a" WHERE ("c" > 0))

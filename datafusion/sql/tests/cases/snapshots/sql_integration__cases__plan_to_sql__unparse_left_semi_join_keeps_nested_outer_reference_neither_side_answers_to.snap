@@ -1,0 +1,5 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: unparser.plan_to_sql(&plan)?
+---
+SELECT "c", "d" FROM "public"."t" WHERE EXISTS (SELECT 1 FROM "other"."t" WHERE EXISTS (SELECT "z"."k" FROM "z" WHERE ("z"."k" = "elsewhere"."c")))
