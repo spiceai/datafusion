@@ -7734,6 +7734,42 @@ fn test_derived_computed_distinct_on_output_is_named() -> Result<()> {
 }
 
 #[test]
+fn test_distinct_on_output_is_not_named_over_its_own_key() -> Result<()> {
+    // Naming an output must not change what another clause resolves to. PostgreSQL
+    // resolves a bare name in `DISTINCT ON` and `ORDER BY` against the output list
+    // before the input columns, so aliasing this output to "a + b" would rebind
+    // `DISTINCT ON ("a + b")` from the input column (t.c) to the sum — the same rows
+    // grouped by a different key. Leaving it unnamed keeps the enclosing reference
+    // unbound, which is the pre-existing bug rather than a new wrong answer. Fixing
+    // both needs the key emitted unambiguously: spiceai/spiceai#13444.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("a + b"),
+        ])?
+        .distinct_on(
+            vec![col("a + b")],
+            vec![col("a").add(col("b"))],
+            Some(vec![col("a + b").sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        .project(vec![col("a + b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a + b" FROM (SELECT DISTINCT ON ("a + b") (a + b) FROM (SELECT t.a AS a, t.b AS b, t.c AS "a + b" FROM t) ORDER BY "a + b" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     // An alias and a bare column already carry the name the enclosing scope
     // uses, so neither is renamed and neither picks up a redundant alias.
