@@ -7847,6 +7847,48 @@ fn test_distinct_on_output_is_named_over_a_qualified_key() -> Result<()> {
 }
 
 #[test]
+fn test_distinct_on_output_is_not_named_over_a_correlated_key() -> Result<()> {
+    // The same capture, reached by the other expression that emits a bare name. A
+    // correlated key is an `Expr::OuterReferenceColumn`, which unparses through the
+    // very same `col_to_sql` as `Expr::Column` and so emits `"a + b"` with nothing to
+    // distinguish it — leaving the enclosing scope's resolution just as free to bind
+    // the key to an output aliased that way. Reserving only `Expr::Column` would let
+    // the alias back in through this variant.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    let key = Expr::OuterReferenceColumn(
+        Arc::new(Field::new("a + b", DataType::Int32, false)),
+        Column::new_unqualified("a + b"),
+    );
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("a + b"),
+        ])?
+        .distinct_on(
+            vec![key.clone()],
+            vec![col("a").add(col("b"))],
+            Some(vec![key.clone().sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        // As in the sibling tests, this enclosing projection is what makes the
+        // `DISTINCT ON` a derived table, which is the only shape the naming pass runs
+        // on at all.
+        .project(vec![Expr::Column(Column::new_unqualified("a + b"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a + b" FROM (SELECT DISTINCT ON ("a + b") (a + b) FROM (SELECT t.a AS a, t.b AS b, t.c AS "a + b" FROM t) ORDER BY "a + b" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     // An alias and a bare column already carry the name the enclosing scope
     // uses, so neither is renamed and neither picks up a redundant alias.

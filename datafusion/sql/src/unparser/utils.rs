@@ -460,7 +460,11 @@ fn name_distinct_on_outputs(distinct_on: &DistinctOn) -> Option<Vec<Expr>> {
                 .map(|sort| &sort.expr),
         )
         .filter_map(|expr| match expr {
-            Expr::Column(column) if column.relation.is_none() => {
+            // Both variants unparse through the same `col_to_sql`, so an unqualified
+            // one of either emits a bare name that an output alias can capture.
+            Expr::Column(column) | Expr::OuterReferenceColumn(_, column)
+                if column.relation.is_none() =>
+            {
                 Some(column.name.to_lowercase())
             }
             _ => None,
