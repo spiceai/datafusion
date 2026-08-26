@@ -7770,6 +7770,41 @@ fn test_distinct_on_output_is_not_named_over_its_own_key() -> Result<()> {
 }
 
 #[test]
+fn test_distinct_on_output_is_named_over_a_qualified_key() -> Result<()> {
+    // The counterpart to the test above, and the assumption that keeps its skip
+    // narrow: only a *bare* key can be captured by an output alias. A qualified one
+    // survives emission as `d."a + b"`, which resolves to the relation in both
+    // clauses whatever the output list holds — so naming still applies here.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    let key = Expr::Column(Column::new(Some(TableReference::bare("d")), "a + b"));
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("a + b"),
+        ])?
+        .alias("d")?
+        .distinct_on(
+            vec![key.clone()],
+            vec![col("d.a").add(col("d.b"))],
+            Some(vec![key.sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        .project(vec![col("d.a + d.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "d.a + d.b" FROM (SELECT DISTINCT ON (d."a + b") (d.a + d.b) AS "d.a + d.b" FROM (SELECT d.a AS a, d.b AS b, d.c AS "a + b" FROM t AS d) AS d ORDER BY d."a + b" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     // An alias and a bare column already carry the name the enclosing scope
     // uses, so neither is renamed and neither picks up a redundant alias.
