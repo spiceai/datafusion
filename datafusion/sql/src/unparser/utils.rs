@@ -438,8 +438,18 @@ fn name_projection_outputs(projection: &Projection) -> Result<Option<LogicalPlan
 ///
 /// Only a *bare* reference is at risk: a qualified `t."a + b"` resolves to the relation,
 /// and a name inside a larger expression resolves to the input columns, in both clauses.
+///
+/// Names are compared case-folded, because quoting does not say how the engine compares
+/// what was written: DuckDB matches identifiers case-insensitively even quoted. Comparing
+/// byte-for-byte would leave a key spelled `a + b` unmatched against an output named
+/// `A + B`, emit `AS "A + B"`, and capture the key on exactly those dialects — the
+/// failure this guard exists to prevent. Folding instead over-refuses on a
+/// case-sensitive dialect, which costs an unbound reference rather than rows, and is the
+/// same trade and the same unconditional fold as
+/// [`Unparser::identifier_comparison_key`]; asking the dialect properly is
+/// spiceai/spiceai#13474.
 fn name_distinct_on_outputs(distinct_on: &DistinctOn) -> Option<Vec<Expr>> {
-    let key_names: Vec<&str> = distinct_on
+    let key_names: Vec<String> = distinct_on
         .on_expr
         .iter()
         .chain(
@@ -451,14 +461,14 @@ fn name_distinct_on_outputs(distinct_on: &DistinctOn) -> Option<Vec<Expr>> {
         )
         .filter_map(|expr| match expr {
             Expr::Column(column) if column.relation.is_none() => {
-                Some(column.name.as_str())
+                Some(column.name.to_lowercase())
             }
             _ => None,
         })
         .collect();
 
     name_unnamed_outputs(&distinct_on.select_expr, &distinct_on.schema, |name| {
-        key_names.contains(&name)
+        key_names.contains(&name.to_lowercase())
     })
 }
 

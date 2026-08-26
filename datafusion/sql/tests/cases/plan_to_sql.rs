@@ -7770,6 +7770,48 @@ fn test_distinct_on_output_is_not_named_over_its_own_key() -> Result<()> {
 }
 
 #[test]
+fn test_distinct_on_output_is_not_named_over_a_case_folded_key() -> Result<()> {
+    // The same capture, reached by a spelling the key does not match byte-for-byte.
+    // Quoting does not say how the engine compares what was written — DuckDB matches
+    // identifiers case-insensitively even quoted — so naming this output "a + b" over a
+    // key spelled "A + B" rebinds `DISTINCT ON ("A + B")` there just as an exact match
+    // would. The comparison folds for that reason; on a case-sensitive dialect it
+    // over-refuses, which costs an unbound reference rather than rows.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    // Built rather than parsed: `col()` lowercases an unquoted identifier, which would
+    // erase the very case difference under test.
+    let key = Expr::Column(Column::new_unqualified("A + B"));
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("A + B"),
+        ])?
+        .distinct_on(
+            vec![key.clone()],
+            vec![col("a").add(col("b"))],
+            Some(vec![key.clone().sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        // The enclosing projection is what makes the `DISTINCT ON` a derived table whose
+        // outputs another scope binds, which is the only shape the naming pass runs on. It
+        // binds the sum by the name the node's schema gives it — the very name an alias
+        // would spell, and the one a case-folding engine matches the key against.
+        .project(vec![Expr::Column(Column::new_unqualified("a + b"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a + b" FROM (SELECT DISTINCT ON ("A + B") (a + b) FROM (SELECT t.a AS a, t.b AS b, t.c AS "A + B" FROM t) ORDER BY "A + B" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_distinct_on_output_is_named_over_a_qualified_key() -> Result<()> {
     // The counterpart to the test above, and the assumption that keeps its skip
     // narrow: only a *bare* key can be captured by an output alias. A qualified one
@@ -7791,7 +7833,7 @@ fn test_distinct_on_output_is_named_over_a_qualified_key() -> Result<()> {
         .distinct_on(
             vec![key.clone()],
             vec![col("d.a").add(col("d.b"))],
-            Some(vec![key.sort(true, false)]),
+            Some(vec![key.clone().sort(true, false)]),
         )?
         .limit(0, Some(5))?
         .project(vec![col("d.a + d.b")])?
