@@ -975,6 +975,123 @@ fn roundtrip_statement_with_dialect_special_char_alias() -> Result<(), DataFusio
 }
 
 #[test]
+fn bigquery_unparses_distinct_and_all_unions_explicitly() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+    let scan = |name: &'static str| {
+        table_scan(Some(name), &schema, None)?
+            .project(vec![col(format!("{name}.id"))])?
+            .build()
+    };
+
+    let left = scan("left_table")?;
+    let right = scan("right_table")?;
+    let distinct = LogicalPlanBuilder::from(left.clone())
+        .union_distinct(right.clone())?
+        .build()?;
+    let all = LogicalPlanBuilder::from(left).union(right)?.build()?;
+
+    let dialect = BigQueryDialect::new();
+    let distinct_sql = Unparser::new(&dialect).plan_to_sql(&distinct)?.to_string();
+    let all_sql = Unparser::new(&dialect).plan_to_sql(&all)?.to_string();
+
+    assert!(
+        distinct_sql.contains(" UNION DISTINCT "),
+        "BigQuery requires an explicit DISTINCT quantifier: {distinct_sql}"
+    );
+    assert!(
+        all_sql.contains(" UNION ALL "),
+        "a logical UNION ALL must retain duplicate rows: {all_sql}"
+    );
+    assert!(
+        !all_sql.contains(" UNION DISTINCT "),
+        "UNION ALL must not be rewritten as distinct: {all_sql}"
+    );
+
+    let default_sql = Unparser::new(&UnparserDefaultDialect {})
+        .plan_to_sql(&distinct)?
+        .to_string();
+    assert!(
+        default_sql.contains(" UNION SELECT "),
+        "dialects that accept implicit DISTINCT should retain their rendering: {default_sql}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn bigquery_omits_numbering_frames_and_retains_aggregate_frames() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+    let input = table_scan(Some("window_values"), &schema, None)?.build()?;
+    let order_by = vec![col("window_values.id").sort(true, true)];
+    let row_number = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        params: WindowFunctionParams {
+            args: vec![],
+            partition_by: vec![],
+            order_by: order_by.clone(),
+            window_frame: WindowFrame::new(Some(false)),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }))
+    .alias("row_num");
+    let running_sum = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+        params: WindowFunctionParams {
+            args: vec![col("window_values.id")],
+            partition_by: vec![],
+            order_by,
+            window_frame: WindowFrame::new(Some(true)),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }))
+    .alias("running_sum");
+    let plan = LogicalPlanBuilder::from(input)
+        .window(vec![row_number, running_sum])?
+        .build()?;
+
+    let dialect = BigQueryDialect::new();
+    let sql = Unparser::new(&dialect).plan_to_sql(&plan)?.to_string();
+    assert!(
+        sql.contains(
+            "row_number() OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST) AS `row_num`"
+        ),
+        "BigQuery rejects a window frame on ROW_NUMBER: {sql}"
+    );
+    assert!(
+        sql.contains(
+            "sum(`window_values`.`id`) OVER (ORDER BY `window_values`.`id` ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS `running_sum`"
+        ),
+        "aggregate window frames change which rows contribute and must be retained: {sql}"
+    );
+
+    let start = sqlparser::ast::WindowFrameBound::Preceding(None);
+    let end = sqlparser::ast::WindowFrameBound::CurrentRow;
+    for function in [
+        "row_number",
+        "rank",
+        "dense_rank",
+        "percent_rank",
+        "cume_dist",
+        "ntile",
+    ] {
+        assert!(
+            !dialect.window_func_support_window_frame(function, &start, &end),
+            "BigQuery does not allow a frame on numbering function {function}"
+        );
+    }
+    assert!(
+        dialect.window_func_support_window_frame("sum", &start, &end),
+        "aggregate functions must retain their frames"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_unnest_logical_plan() -> Result<()> {
     let query = "select unnest(struct_col), unnest(array_col), struct_col, array_col from unnest_table";
 

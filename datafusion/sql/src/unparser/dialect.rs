@@ -217,6 +217,16 @@ pub trait Dialect: Send + Sync {
         true
     }
 
+    /// The set quantifier to emit for a logical `UNION DISTINCT`.
+    ///
+    /// Most dialects accept an omitted quantifier as distinct. Dialects whose
+    /// grammar requires the choice to be explicit can override this method.
+    /// Wrapper dialects must delegate this hook to preserve the inner
+    /// dialect's grammar.
+    fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
+        ast::SetQuantifier::None
+    }
+
     /// Extends the dialect's default rules for unparsing scalar functions.
     /// This is useful for supporting application-specific UDFs or custom engine extensions.
     fn with_custom_scalar_overrides(
@@ -893,6 +903,28 @@ impl Dialect for BigQueryDialect {
 
     fn interval_style(&self) -> IntervalStyle {
         IntervalStyle::SQLStandard
+    }
+
+    fn window_func_support_window_frame(
+        &self,
+        func_name: &str,
+        _start_bound: &WindowFrameBound,
+        _end_bound: &WindowFrameBound,
+    ) -> bool {
+        ![
+            "row_number",
+            "rank",
+            "dense_rank",
+            "percent_rank",
+            "cume_dist",
+            "ntile",
+        ]
+        .iter()
+        .any(|numbering_function| func_name.eq_ignore_ascii_case(numbering_function))
+    }
+
+    fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
+        ast::SetQuantifier::Distinct
     }
 
     fn scalar_function_to_sql_overrides(

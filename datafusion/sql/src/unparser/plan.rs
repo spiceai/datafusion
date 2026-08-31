@@ -1714,9 +1714,7 @@ impl Unparser<'_> {
 
                 let set_quantifier =
                     if query.as_ref().is_some_and(|q| q.is_distinct_union()) {
-                        // Setting the SetQuantifier to None will unparse as a `UNION`
-                        // rather than a `UNION ALL`.
-                        ast::SetQuantifier::None
+                        self.dialect.union_distinct_set_quantifier()
                     } else {
                         ast::SetQuantifier::All
                     };
