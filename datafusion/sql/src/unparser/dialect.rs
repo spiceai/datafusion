@@ -221,6 +221,8 @@ pub trait Dialect: Send + Sync {
     ///
     /// Most dialects accept an omitted quantifier as distinct. Dialects whose
     /// grammar requires the choice to be explicit can override this method.
+    /// Wrapper dialects must delegate this hook to preserve the inner
+    /// dialect's grammar.
     fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
         ast::SetQuantifier::None
     }
