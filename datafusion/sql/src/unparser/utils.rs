@@ -27,8 +27,8 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::{
-    Aggregate, Distinct, Expr, LogicalPlan, LogicalPlanBuilder, Projection, SortExpr,
-    Unnest, Window, expr, utils::grouping_set_to_exprlist,
+    Aggregate, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Projection,
+    SortExpr, Unnest, Window, expr, utils::grouping_set_to_exprlist,
 };
 
 use indexmap::IndexSet;
@@ -366,17 +366,15 @@ fn name_scope_projection_outputs(plan: &LogicalPlan) -> Result<Option<LogicalPla
             with_named_input(input, |input| LogicalPlan::Distinct(Distinct::All(input)))
         }
         // A `DISTINCT ON` is the one node here that emits its own `SELECT` list:
-        // `select_expr` becomes the projection, and the projection beneath it is
-        // flattened into the same `SELECT` rather than exposed. So the outputs the
-        // enclosing scope binds are `select_expr`, and naming only the input misses
-        // a computed one — `DISTINCT ON (a) a + b` straight off a scan emits
-        // `(t.a + t.b)` for the engine to name. Both are named: `select_expr` for
-        // the outputs themselves, and the input for the case where they are bare
-        // columns carrying an inner projection's names out.
+        // `select_expr` becomes the projection, so those — not the projection
+        // below — are the outputs the enclosing scope binds. Naming only the input
+        // therefore misses a computed one: `DISTINCT ON (a) a + b` straight off a
+        // scan emits `(t.a + t.b)` for the engine to name. Both are named, since
+        // the input is emitted as its own derived table (the projection beneath
+        // sees `already_projected()`) and an enclosing scope can reach either.
         LogicalPlan::Distinct(Distinct::On(distinct_on)) => {
             let named_input = name_scope_projection_outputs(&distinct_on.input)?;
-            let named_select =
-                name_unnamed_outputs(&distinct_on.select_expr, &distinct_on.schema);
+            let named_select = name_distinct_on_outputs(distinct_on);
             if named_input.is_none() && named_select.is_none() {
                 return Ok(None);
             }
@@ -410,21 +408,95 @@ fn with_named_input(
 
 /// The projection with each unnamed output aliased to the name its schema reports.
 fn name_projection_outputs(projection: &Projection) -> Result<Option<LogicalPlan>> {
-    let Some(named) = name_unnamed_outputs(&projection.expr, &projection.schema) else {
+    let Some(named) =
+        name_unnamed_outputs(&projection.expr, &projection.schema, |_| false)
+    else {
         return Ok(None);
     };
     Projection::try_new(named, Arc::clone(&projection.input))
         .map(|projection| Some(LogicalPlan::Projection(projection)))
 }
 
+/// The `select_expr` of a `DISTINCT ON` with each unnamed output aliased, or `None`
+/// where none needs it.
+///
+/// Skips any output whose name the node's own `ON` or `ORDER BY` already spells as a
+/// bare column, because an output alias would silently capture that reference. In
+/// PostgreSQL both clauses resolve a bare name against the output list *first*, so for
+///
+/// ```text
+/// on_expr:     col("a + b")            // the input column of that name
+/// select_expr: col("a") + col("b")     // logical name, also "a + b"
+/// ```
+///
+/// aliasing the output rebinds `DISTINCT ON ("a + b")` from the input column to the sum
+/// — the same rows grouped by a different key. Leaving that output unnamed keeps the
+/// enclosing reference unbound, which is the pre-existing bug rather than a new wrong
+/// answer, so it is the safe side to fail to. Emitting the key qualified (or naming the
+/// derived table through a column-alias list) would fix both; see
+/// spiceai/spiceai#13444.
+///
+/// Only a *bare* reference is at risk: a qualified `t."a + b"` resolves to the relation,
+/// and a name inside a larger expression resolves to the input columns, in both clauses.
+///
+/// Names are compared case-folded, because quoting does not say how the engine compares
+/// what was written: DuckDB matches identifiers case-insensitively even quoted. Comparing
+/// byte-for-byte would leave a key spelled `a + b` unmatched against an output named
+/// `A + B`, emit `AS "A + B"`, and capture the key on exactly those dialects — the
+/// failure this guard exists to prevent. Folding instead over-refuses on a
+/// case-sensitive dialect, which costs an unbound reference rather than rows, and is the
+/// same trade and the same unconditional fold as
+/// [`Unparser::identifier_comparison_key`]; asking the dialect properly is
+/// spiceai/spiceai#13474.
+fn name_distinct_on_outputs(distinct_on: &DistinctOn) -> Option<Vec<Expr>> {
+    let key_names: Vec<String> = distinct_on
+        .on_expr
+        .iter()
+        .chain(
+            distinct_on
+                .sort_expr
+                .iter()
+                .flatten()
+                .map(|sort| &sort.expr),
+        )
+        .filter_map(|expr| match expr {
+            // Both variants unparse through the same `col_to_sql`, so an unqualified
+            // one of either emits a bare name that an output alias can capture.
+            Expr::Column(column) | Expr::OuterReferenceColumn(_, column)
+                if column.relation.is_none() =>
+            {
+                Some(column.name.to_lowercase())
+            }
+            _ => None,
+        })
+        .collect();
+
+    name_unnamed_outputs(&distinct_on.select_expr, &distinct_on.schema, |name| {
+        key_names.contains(&name.to_lowercase())
+    })
+}
+
 /// `exprs` with each unnamed output aliased to the name `schema` reports for it, or
-/// `None` where every output is already named.
+/// `None` where no output is both unnamed and nameable.
 ///
 /// `schema` is the schema the expressions produce, so its fields are positionally
 /// aligned with them — true of a [`Projection`] and of a `DISTINCT ON`, whose schema is
 /// likewise built from its `select_expr` alone.
-fn name_unnamed_outputs(exprs: &[Expr], schema: &DFSchema) -> Option<Vec<Expr>> {
-    if !exprs.iter().any(output_is_unnamed) {
+///
+/// `is_reserved` names the outputs that must be left alone even when unnamed, for a
+/// caller where introducing the alias would change what another clause resolves to.
+fn name_unnamed_outputs(
+    exprs: &[Expr],
+    schema: &DFSchema,
+    is_reserved: impl Fn(&str) -> bool,
+) -> Option<Vec<Expr>> {
+    let nameable =
+        |expr: &Expr, name: &str| output_is_unnamed(expr) && !is_reserved(name);
+    if !exprs
+        .iter()
+        .zip(schema.fields())
+        .any(|(expr, field)| nameable(expr, field.name()))
+    {
         return None;
     }
     Some(
@@ -432,7 +504,7 @@ fn name_unnamed_outputs(exprs: &[Expr], schema: &DFSchema) -> Option<Vec<Expr>> 
             .iter()
             .zip(schema.fields())
             .map(|(expr, field)| {
-                if output_is_unnamed(expr) {
+                if nameable(expr, field.name()) {
                     // The schema's name for the output, rather than a second derivation
                     // of it: this is the name the enclosing scope refers to it by.
                     expr.clone().alias(field.name().clone())

@@ -7851,6 +7851,161 @@ fn test_derived_computed_distinct_on_output_is_named() -> Result<()> {
 }
 
 #[test]
+fn test_distinct_on_output_is_not_named_over_its_own_key() -> Result<()> {
+    // Naming an output must not change what another clause resolves to. PostgreSQL
+    // resolves a bare name in `DISTINCT ON` and `ORDER BY` against the output list
+    // before the input columns, so aliasing this output to "a + b" would rebind
+    // `DISTINCT ON ("a + b")` from the input column (t.c) to the sum — the same rows
+    // grouped by a different key. Leaving it unnamed keeps the enclosing reference
+    // unbound, which is the pre-existing bug rather than a new wrong answer. Fixing
+    // both needs the key emitted unambiguously: spiceai/spiceai#13444.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("a + b"),
+        ])?
+        .distinct_on(
+            vec![col("a + b")],
+            vec![col("a").add(col("b"))],
+            Some(vec![col("a + b").sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        .project(vec![col("a + b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a + b" FROM (SELECT DISTINCT ON ("a + b") (a + b) FROM (SELECT t.a AS a, t.b AS b, t.c AS "a + b" FROM t) ORDER BY "a + b" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_distinct_on_output_is_not_named_over_a_case_folded_key() -> Result<()> {
+    // The same capture, reached by a spelling the key does not match byte-for-byte.
+    // Quoting does not say how the engine compares what was written — DuckDB matches
+    // identifiers case-insensitively even quoted — so naming this output "a + b" over a
+    // key spelled "A + B" rebinds `DISTINCT ON ("A + B")` there just as an exact match
+    // would. The comparison folds for that reason; on a case-sensitive dialect it
+    // over-refuses, which costs an unbound reference rather than rows.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    // Built rather than parsed: `col()` lowercases an unquoted identifier, which would
+    // erase the very case difference under test.
+    let key = Expr::Column(Column::new_unqualified("A + B"));
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("A + B"),
+        ])?
+        .distinct_on(
+            vec![key.clone()],
+            vec![col("a").add(col("b"))],
+            Some(vec![key.clone().sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        // The enclosing projection is what makes the `DISTINCT ON` a derived table whose
+        // outputs another scope binds, which is the only shape the naming pass runs on. It
+        // binds the sum by the name the node's schema gives it — the very name an alias
+        // would spell, and the one a case-folding engine matches the key against.
+        .project(vec![Expr::Column(Column::new_unqualified("a + b"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a + b" FROM (SELECT DISTINCT ON ("A + B") (a + b) FROM (SELECT t.a AS a, t.b AS b, t.c AS "A + B" FROM t) ORDER BY "A + B" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_distinct_on_output_is_named_over_a_qualified_key() -> Result<()> {
+    // The counterpart to the test above, and the assumption that keeps its skip
+    // narrow: only a *bare* key can be captured by an output alias. A qualified one
+    // survives emission as `d."a + b"`, which resolves to the relation in both
+    // clauses whatever the output list holds — so naming still applies here.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    let key = Expr::Column(Column::new(Some(TableReference::bare("d")), "a + b"));
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("a + b"),
+        ])?
+        .alias("d")?
+        .distinct_on(
+            vec![key.clone()],
+            vec![col("d.a").add(col("d.b"))],
+            Some(vec![key.clone().sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        .project(vec![col("d.a + d.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "d.a + d.b" FROM (SELECT DISTINCT ON (d."a + b") (d.a + d.b) AS "d.a + d.b" FROM (SELECT d.a AS a, d.b AS b, d.c AS "a + b" FROM t AS d) AS d ORDER BY d."a + b" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_distinct_on_output_is_not_named_over_a_correlated_key() -> Result<()> {
+    // The same capture, reached by the other expression that emits a bare name. A
+    // correlated key is an `Expr::OuterReferenceColumn`, which unparses through the
+    // very same `col_to_sql` as `Expr::Column` and so emits `"a + b"` with nothing to
+    // distinguish it — leaving the enclosing scope's resolution just as free to bind
+    // the key to an output aliased that way. Reserving only `Expr::Column` would let
+    // the alias back in through this variant.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+        Field::new("c", DataType::Int32, false),
+    ]);
+    let key = Expr::OuterReferenceColumn(
+        Arc::new(Field::new("a + b", DataType::Int32, false)),
+        Column::new_unqualified("a + b"),
+    );
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1, 2]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("a + b"),
+        ])?
+        .distinct_on(
+            vec![key.clone()],
+            vec![col("a").add(col("b"))],
+            Some(vec![key.clone().sort(true, false)]),
+        )?
+        .limit(0, Some(5))?
+        // As in the sibling tests, this enclosing projection is what makes the
+        // `DISTINCT ON` a derived table, which is the only shape the naming pass runs
+        // on at all.
+        .project(vec![Expr::Column(Column::new_unqualified("a + b"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a + b" FROM (SELECT DISTINCT ON ("a + b") (a + b) FROM (SELECT t.a AS a, t.b AS b, t.c AS "a + b" FROM t) ORDER BY "a + b" ASC NULLS LAST LIMIT 5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_named_derived_projection_outputs_are_unchanged() -> Result<()> {
     // An alias and a bare column already carry the name the enclosing scope
     // uses, so neither is renamed and neither picks up a redundant alias.
