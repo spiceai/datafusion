@@ -9492,3 +9492,537 @@ fn test_unparse_left_semi_join_refuses_nested_reference_a_case_distinct_body_onl
     );
     Ok(())
 }
+
+/// The `Projection` over `Aggregate` shape a grouped card plans to: group by a
+/// truncated timestamp, then project a *wrapped* form of that same grouping
+/// expression. The projection reads the aggregate's own output columns, whose names
+/// come from the schema rather than being spelled here.
+fn projection_wrapping_a_grouping_expr() -> Result<LogicalPlan> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "funded_ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("tok", DataType::Utf8, true),
+    ]);
+    let grouped = table_scan(Some("advances"), &schema, None)?
+        .aggregate(
+            vec![datafusion_functions::expr_fn::date_trunc(
+                lit("week"),
+                col("advances.funded_ts"),
+            )],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let mut outputs = grouped.schema().columns().into_iter();
+    let group_output = outputs.next().expect("the grouping expression's output");
+    let count_output = outputs.next().expect("the aggregate's output");
+    LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            cast(
+                cast(Expr::Column(group_output), DataType::Date32),
+                DataType::Utf8,
+            )
+            .alias("week_start"),
+            Expr::Column(count_output).alias("advances_funded"),
+        ])?
+        .build()
+}
+
+/// A dialect that resolves `GROUP BY` against whole select items only gets the
+/// aggregate in a scope of its own.
+///
+/// Flattened, the statement puts the grouping expression bare in `GROUP BY` and
+/// wrapped in the select list, and `GoogleSQL` refuses it outright: "SELECT list
+/// expression references column funded_ts which is neither grouped nor
+/// aggregated". The whole statement fails, not one row of it.
+///
+/// The scope is asserted, not just that a statement comes out, because the two
+/// cheaper renderings parse and return the wrong rows. `GROUP BY <output alias>`
+/// and `GROUP BY <ordinal>` group by the value the projection computes, so a
+/// projection that is not injective over the grouping expression collapses
+/// distinct groups into one and sums their aggregates.
+#[test]
+fn test_projection_wrapping_a_grouping_expr_scopes_the_aggregate() -> Result<()> {
+    let plan = projection_wrapping_a_grouping_expr()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert!(
+        depth >= 1,
+        "the grouping has to be a scope of its own for this dialect: {sql}"
+    );
+    // The grouping expression must be rendered only inside the scope. Asserted on
+    // the rendered call rather than on the base column, because the dialect
+    // sanitises the derived output's alias out of the schema name, which spells the
+    // base column inside it.
+    let outer_select = &sql[..sql.find("FROM").expect("a FROM in: {sql}")];
+    assert!(
+        !outer_select.contains("TIMESTAMP_TRUNC"),
+        "the outer select list still re-derives the grouping expression, which is what \
+         this dialect cannot bind against its GROUP BY: {sql}"
+    );
+    // Non-vacuity: a scope that dropped the grouping or the aggregate would satisfy
+    // both assertions above.
+    assert!(
+        sql[grouping_at..].contains("ISOWEEK") || sql.contains("TIMESTAMP_TRUNC"),
+        "the scope has to carry the grouping expression: {sql}"
+    );
+    assert!(
+        sql.to_uppercase().contains("COUNT("),
+        "the scope has to carry the aggregate: {sql}"
+    );
+    Ok(())
+}
+
+/// A dialect that does resolve `GROUP BY` against sub-expressions keeps the single
+/// `SELECT`, so the scope above is not paid where it buys nothing.
+#[test]
+fn test_projection_wrapping_a_grouping_expr_stays_flat_where_it_binds() -> Result<()> {
+    let plan = projection_wrapping_a_grouping_expr()?;
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert_eq!(depth, 0, "PostgreSQL binds the wrapped select item: {sql}");
+    Ok(())
+}
+
+/// A grouping expression that is a bare column needs no scope, in any dialect: a
+/// column reference is matched wherever it appears. Without this the scope would be
+/// paid on most grouped statements a `BigQuery` connector emits.
+#[test]
+fn test_projection_wrapping_a_grouped_column_stays_flat() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("tok", DataType::Utf8, true)]);
+    let grouped = table_scan(Some("advances"), &schema, None)?
+        .aggregate(vec![col("advances.tok")], vec![count(lit(1i64))])?
+        .build()?;
+    let mut outputs = grouped.schema().columns().into_iter();
+    let group_output = outputs.next().expect("the grouped column's output");
+    let count_output = outputs.next().expect("the aggregate's output");
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            cast(Expr::Column(group_output), DataType::Utf8).alias("k"),
+            Expr::Column(count_output).alias("n"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert_eq!(
+        depth, 0,
+        "a grouped column reference is matched nested, so no scope is needed: {sql}"
+    );
+    Ok(())
+}
+
+/// A wrapped *aggregate* is legal in every dialect — `CAST(min(t) AS DATE)` is not
+/// an ungrouped column reference — so it must not trigger the scope either.
+#[test]
+fn test_projection_wrapping_an_aggregate_stays_flat() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "funded_ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("tok", DataType::Utf8, true),
+    ]);
+    let grouped = table_scan(Some("advances"), &schema, None)?
+        .aggregate(
+            vec![col("advances.tok")],
+            vec![datafusion_functions_aggregate::expr_fn::min(col(
+                "advances.funded_ts",
+            ))],
+        )?
+        .build()?;
+    let mut outputs = grouped.schema().columns().into_iter();
+    let group_output = outputs.next().expect("the grouped column's output");
+    let min_output = outputs.next().expect("the aggregate's output");
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            Expr::Column(group_output).alias("tok"),
+            cast(Expr::Column(min_output), DataType::Date32).alias("first_day"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert_eq!(depth, 0, "a wrapped aggregate needs no scope: {sql}");
+    Ok(())
+}
+
+/// `SUM(v) OVER (ORDER BY k …)` with the frame `frame` and the NULL placement
+/// `asc`/`nulls_first`. `k` is nullable, which is the case the placement decides.
+fn windowed_sum(frame: WindowFrame, asc: bool, nulls_first: bool) -> Result<LogicalPlan> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let windowed = Expr::from(WindowFunction {
+        fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+        params: WindowFunctionParams {
+            args: vec![col("t.v")],
+            partition_by: vec![],
+            order_by: vec![datafusion_expr::expr::Sort::new(
+                col("t.k"),
+                asc,
+                nulls_first,
+            )],
+            window_frame: frame,
+            null_treatment: None,
+            filter: None,
+            distinct: false,
+        },
+    });
+    table_scan(Some("t"), &schema, None)?
+        .window(vec![windowed])?
+        .build()
+}
+
+/// A dialect that accepts only its own NULL placement inside a `RANGE` frame gets
+/// the placement as a leading `IS NULL` key, and keeps the rows the plan asked for.
+///
+/// `GoogleSQL` rejects `NULLS LAST` with `ASC` and `NULLS FIRST` with `DESC` there,
+/// and an `ORDER BY` with no explicit frame implies `RANGE` for an aggregate — so
+/// the plain `SUM(x) OVER (ORDER BY x)` a plan normalizes to `ASC NULLS LAST` was
+/// refused outright.
+///
+/// Dropping the clause is not the fix and is worse than the failure: `GoogleSQL`
+/// defaults to NULLs *first* ascending where `DataFusion` defaults to last, so a
+/// dropped clause moves the NULL rows to the other end of the ordering and changes
+/// which rows each frame covers. Measured against real BigQuery on
+/// `k ∈ {1, 2, NULL, 3}`, `v ∈ {10, 20, 7, 5}`: the placement the plan asks for
+/// gives `(NULL,42) (1,10) (2,30) (3,35)`, and dropping it gives
+/// `(NULL,7) (1,17) (2,37) (3,42)`.
+#[test]
+fn test_range_window_nulls_placement_becomes_a_leading_key() -> Result<()> {
+    for (asc, nulls_first, direction) in [(true, false, "ASC"), (false, true, "DESC")] {
+        let plan = windowed_sum(WindowFrame::new(Some(false)), asc, nulls_first)?;
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+
+        assert!(
+            sql.contains(&format!("`k` IS NULL {direction}")),
+            "the NULL placement has to be spelled as a leading key ordered \
+             {direction}: {sql}"
+        );
+        assert!(
+            !sql.contains("NULLS LAST") && !sql.contains("NULLS FIRST"),
+            "no NULLS clause may survive inside the RANGE frame, which is what \
+             BigQuery refuses: {sql}"
+        );
+        // Non-vacuity: the key itself, its direction and the frame all have to
+        // remain, or the statement orders or frames differently.
+        assert!(
+            sql.contains(&format!(
+                "`k` {direction} RANGE BETWEEN UNBOUNDED PRECEDING"
+            )) || sql.contains(&format!("`k` {direction} RANGE")),
+            "the ordering key and its frame have to survive: {sql}"
+        );
+    }
+    Ok(())
+}
+
+/// The placement is rewritten only where the dialect would refuse it. Four
+/// controls: its own default placement, a `ROWS` frame, a dialect that accepts any
+/// placement, and a `RANGE` frame carrying an offset bound — the last cannot take a
+/// second `ORDER BY` key at all ("a RANGE-based window with OFFSET PRECEDING or
+/// OFFSET FOLLOWING boundaries must have exactly one ORDER BY key").
+#[test]
+fn test_range_window_nulls_placement_left_alone_where_it_binds() -> Result<()> {
+    let range = WindowFrame::new(Some(false));
+    let rows = WindowFrame::new_bounds(
+        datafusion_expr::window_frame::WindowFrameUnits::Rows,
+        datafusion_expr::window_frame::WindowFrameBound::Preceding(
+            datafusion_common::ScalarValue::UInt64(None),
+        ),
+        datafusion_expr::window_frame::WindowFrameBound::CurrentRow,
+    );
+    let offset_range = WindowFrame::new_bounds(
+        datafusion_expr::window_frame::WindowFrameUnits::Range,
+        datafusion_expr::window_frame::WindowFrameBound::Preceding(
+            datafusion_common::ScalarValue::UInt64(Some(1)),
+        ),
+        datafusion_expr::window_frame::WindowFrameBound::CurrentRow,
+    );
+
+    // BigQuery's own default placement, a ROWS frame, and an offset RANGE frame.
+    for (label, frame, asc, nulls_first) in [
+        ("its own default placement", range.clone(), true, true),
+        ("a ROWS frame", rows, true, false),
+        ("an offset RANGE frame", offset_range, true, false),
+    ] {
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&windowed_sum(frame, asc, nulls_first)?)?
+            .to_string();
+        assert!(
+            !sql.contains("IS NULL"),
+            "{label}: no leading key is needed here, and adding one to an offset \
+             RANGE frame is rejected outright: {sql}"
+        );
+    }
+
+    // A dialect that accepts any placement keeps the clause it was given.
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&windowed_sum(range, true, false)?)?
+        .to_string();
+    assert!(
+        sql.contains("NULLS LAST") && !sql.contains("IS NULL"),
+        "a dialect that can spell the placement must keep spelling it: {sql}"
+    );
+    Ok(())
+}
+
+/// Grouping on a bare column as well as a computed expression: the projection
+/// reads the bare column *qualified*, and that qualifier names a relation the new
+/// scope encloses. It has to be requalified onto the scope, or the reference binds
+/// to nothing.
+#[test]
+fn test_a_scoped_aggregate_requalifies_a_qualified_group_output() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]);
+    let grouped = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![
+                col("t.a"),
+                datafusion_functions::expr_fn::date_trunc(lit("week"), col("t.ts")),
+            ],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = grouped.schema().columns();
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            Expr::Column(outputs[0].clone()).alias("a"),
+            cast(Expr::Column(outputs[1].clone()), DataType::Date32).alias("wk"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let outer_select = &sql[..sql.find("FROM").expect("a FROM in: {sql}")];
+    assert!(
+        !outer_select.contains("`t`.`a`"),
+        "the outer select still names the enclosed relation, which binds to \
+         nothing: {sql}"
+    );
+    assert!(
+        outer_select.contains("`a`"),
+        "the grouped column still has to be selected: {sql}"
+    );
+    Ok(())
+}
+
+/// Shapes the scope cannot describe keep the rendering they have today rather than
+/// being paired up wrongly or failing to build. Both were found by review and
+/// confirmed by rendering them.
+#[test]
+fn test_the_aggregate_scope_declines_shapes_it_cannot_name() -> Result<()> {
+    // A ROLLUP is one `Expr::GroupingSet` covering several outputs, and adds an
+    // internal grouping-id output, so the scope's positional pairing does not
+    // describe it: it recorded the wrong output as the computed one.
+    let rollup_schema = Schema::new(vec![
+        Field::new("a", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]);
+    let rollup = table_scan(Some("t"), &rollup_schema, None)?
+        .aggregate(
+            vec![Expr::GroupingSet(datafusion_expr::GroupingSet::Rollup(
+                vec![
+                    col("t.a"),
+                    datafusion_functions::expr_fn::date_trunc(lit("week"), col("t.ts")),
+                ],
+            ))],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = rollup.schema().columns();
+    let plan = LogicalPlanBuilder::from(rollup)
+        .project(vec![
+            cast(Expr::Column(outputs[1].clone()), DataType::Date32).alias("wk"),
+        ])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("derived_aggregate") && sql.contains("ROLLUP"),
+        "a grouping set has to keep its flat rendering: {sql}"
+    );
+
+    // Grouping a join by two outputs the schema tells apart only by qualifier: the
+    // scope names its outputs by the name the schema reports, which drops the
+    // qualifier, so naming both would collide and the rewrite would fail to build.
+    let left = table_scan(
+        Some("l"),
+        &Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]),
+        None,
+    )?;
+    let right = table_scan(
+        Some("r"),
+        &Schema::new(vec![Field::new("id", DataType::Int64, true)]),
+        None,
+    )?
+    .build()?;
+    let joined = left
+        .cross_join(right)?
+        .aggregate(
+            vec![
+                col("l.id"),
+                col("r.id"),
+                datafusion_functions::expr_fn::date_trunc(lit("week"), col("l.ts")),
+            ],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = joined.schema().columns();
+    let plan = LogicalPlanBuilder::from(joined)
+        .project(vec![
+            cast(Expr::Column(outputs[2].clone()), DataType::Date32).alias("wk"),
+        ])?
+        .build()?;
+    // Before the guard this returned "Schema contains duplicate unqualified field
+    // name id" — a query that rendered before stopped rendering at all.
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("derived_aggregate"),
+        "duplicate output names have to keep the flat rendering: {sql}"
+    );
+    Ok(())
+}
+
+/// A volatile window sort key is left alone: the leading key would evaluate it a
+/// second time, and could then order by a different value than the key it is
+/// placing NULLs within.
+#[test]
+fn test_a_volatile_range_window_key_keeps_its_nulls_clause() -> Result<()> {
+    let plan = {
+        let schema = Schema::new(vec![Field::new("v", DataType::Int64, true)]);
+        let windowed = Expr::from(WindowFunction {
+            fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+            params: WindowFunctionParams {
+                args: vec![col("t.v")],
+                partition_by: vec![],
+                order_by: vec![datafusion_expr::expr::Sort::new(
+                    datafusion_functions::expr_fn::random(),
+                    true,
+                    false,
+                )],
+                window_frame: WindowFrame::new(Some(false)),
+                null_treatment: None,
+                filter: None,
+                distinct: false,
+            },
+        });
+        table_scan(Some("t"), &schema, None)?
+            .window(vec![windowed])?
+            .build()?
+    };
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("IS NULL"),
+        "a volatile key must not be evaluated twice: {sql}"
+    );
+    Ok(())
+}
+
+/// A `HAVING` already on this `SELECT` was classified against the aggregate below
+/// and names an expression only the `SELECT` that computes it can name, so the
+/// scope is declined rather than stranding it.
+///
+/// Found by review and confirmed by rendering: before the guard this emitted
+/// `… FROM (SELECT … GROUP BY …) AS derived_aggregate_1 HAVING (count(1) > 1)` — a
+/// `HAVING` on a `SELECT` that no longer aggregates.
+#[test]
+fn test_a_having_above_the_projection_declines_the_aggregate_scope() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        true,
+    )]);
+    let grouped = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![datafusion_functions::expr_fn::date_trunc(
+                lit("week"),
+                col("t.ts"),
+            )],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = grouped.schema().columns();
+    let aggregate_output = outputs[1].name.clone();
+    // The aggregate output is passed through unaliased, so the `Filter` above can
+    // unproject it into a `HAVING` before this projection is reached.
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            cast(Expr::Column(outputs[0].clone()), DataType::Date32).alias("wk"),
+            Expr::Column(outputs[1].clone()),
+        ])?
+        .filter(col(aggregate_output).gt(lit(1i64)))?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("HAVING"),
+        "the grouped predicate has to survive: {sql}"
+    );
+    assert!(
+        !sql.contains("derived_aggregate"),
+        "the aggregate must stay in the SELECT its HAVING names: {sql}"
+    );
+    Ok(())
+}

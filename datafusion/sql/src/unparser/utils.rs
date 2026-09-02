@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{cmp::Ordering, sync::Arc, vec};
+use std::{cmp::Ordering, collections::HashSet, sync::Arc, vec};
 
 use super::{
     Unparser, dialect::CharacterLengthStyle, dialect::DateFieldExtractStyle,
@@ -243,6 +243,104 @@ pub(crate) fn unproject_agg_exprs(
             }
         })
         .map(|e| e.data)
+}
+
+/// The expression an `Alias`, however many layers of it, finally names.
+fn strip_aliases(expr: &Expr) -> &Expr {
+    let mut expr = expr;
+    while let Expr::Alias(alias) = expr {
+        expr = alias.expr.as_ref();
+    }
+    expr
+}
+
+/// Whether any select item *wraps* a computed grouping expression — reaches one
+/// through a wrapper rather than being that reference itself.
+///
+/// This is the shape a dialect that resolves `GROUP BY` against whole select items
+/// cannot bind (see
+/// [`Dialect::group_by_matches_select_subexpressions`](super::dialect::Dialect::group_by_matches_select_subexpressions)).
+/// Two shapes are deliberately not it:
+///
+/// * a grouping expression that is a bare column, because a column reference is
+///   matched wherever it appears, nested or not;
+/// * a wrapped *aggregate*, which every dialect accepts — `CAST(min(t) AS DATE)`
+///   is not a grouped column reference.
+///
+/// A bare copy of the grouping expression elsewhere in the select list does not
+/// rescue a wrapped one, so this asks whether *any* item wraps, not whether all of
+/// them do.
+pub(crate) fn select_list_wraps_a_grouping_expr(exprs: &[Expr], agg: &Aggregate) -> bool {
+    // A `ROLLUP`/`CUBE`/`GROUPING SETS` is one `Expr::GroupingSet` covering several
+    // grouping outputs, and adds an internal grouping-id output of its own, so the
+    // positional pairing below does not describe it. Such a plan keeps the flat
+    // rendering it has today rather than being paired up wrongly.
+    if agg
+        .group_expr
+        .iter()
+        .any(|expr| matches!(strip_aliases(expr), Expr::GroupingSet(_)))
+    {
+        return false;
+    }
+    // The scope names its outputs by the name its schema reports, which drops the
+    // qualifier, so two outputs the schema tells apart only by qualifier — grouping
+    // a join by `left.id` and `right.id` — would collide into one name and the
+    // rewrite would fail to build. Leave that shape as it renders today.
+    let mut names = HashSet::new();
+    if !agg
+        .schema
+        .fields()
+        .iter()
+        .all(|field| names.insert(field.name()))
+    {
+        return false;
+    }
+    // An Aggregate's schema reports its grouping outputs first, so zipping pairs
+    // each group expression with the field the projection refers to it by.
+    let computed_group_outputs: HashSet<Column> = agg
+        .group_expr
+        .iter()
+        .zip(agg.schema.iter())
+        .filter(|(group_expr, _)| !matches!(strip_aliases(group_expr), Expr::Column(_)))
+        .map(|(_, (qualifier, field))| Column::new(qualifier.cloned(), field.name()))
+        .collect();
+    if computed_group_outputs.is_empty() {
+        return false;
+    }
+
+    exprs.iter().any(|expr| {
+        let item = strip_aliases(expr);
+        // The item *is* the reference, so nothing wraps it.
+        if matches!(item, Expr::Column(_)) {
+            return false;
+        }
+        item.exists(|sub| {
+            Ok(matches!(sub, Expr::Column(column) if computed_group_outputs.contains(column)))
+        })
+        .unwrap_or(false)
+    })
+}
+
+/// `plan` with a projection that names every one of its outputs, so an enclosing
+/// scope can address them.
+///
+/// A derived table is referred to by the names its schema reports, and an
+/// `Aggregate` leaves every computed output for the engine to name. The names go
+/// into a projection *above* the plan rather than into the `Aggregate` itself,
+/// because `aggr_expr` has to stay aggregate expressions.
+///
+/// Each alias is the name the schema already reports, so the enclosing scope's
+/// references still resolve.
+pub(crate) fn name_scope_outputs(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    let exprs = plan
+        .schema()
+        .iter()
+        .map(|(qualifier, field)| {
+            Expr::Column(Column::new(qualifier.cloned(), field.name()))
+                .alias(field.name().clone())
+        })
+        .collect::<Vec<_>>();
+    Projection::try_new(exprs, Arc::new(plan.clone())).map(LogicalPlan::Projection)
 }
 
 /// Recursively identify all Column expressions and transform them into the appropriate

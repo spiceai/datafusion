@@ -33,8 +33,10 @@ use super::{
     utils::{
         find_agg_node_within_select, find_projection_node_within_select,
         find_unnest_node_within_select, find_window_nodes_within_select,
-        name_derived_scope_outputs, try_transform_to_simple_table_scan_with_filters,
-        unproject_sort_expr, unproject_unnamed_projection_exprs, unproject_unnest_expr,
+        name_derived_scope_outputs, name_scope_outputs,
+        select_list_wraps_a_grouping_expr,
+        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
+        unproject_unnamed_projection_exprs, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
     },
 };
@@ -411,6 +413,71 @@ impl Unparser<'_> {
                 select.projection(items);
             }
         }
+        Ok(())
+    }
+
+    /// Unparses a `Projection` over an `Aggregate` as two scopes: this `SELECT`'s
+    /// list reads the aggregate's outputs, and the aggregate becomes a derived
+    /// table.
+    ///
+    /// The rendering a dialect needs when it will not resolve `GROUP BY` against a
+    /// select item's sub-expressions. It is also the only rendering that keeps the
+    /// plan's grouping for every projection: the cheaper `GROUP BY <output alias>`
+    /// and `GROUP BY <ordinal>` group by the value the projection computes, so a
+    /// projection that is not injective over the grouping expression returns one
+    /// row where the plan has several, with their aggregates summed.
+    fn projection_over_scoped_aggregate(
+        &self,
+        p: &Projection,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        // The projection already reads the aggregate's output columns, so its
+        // expressions go out as they stand: no unprojection, which is what would
+        // substitute the grouping expression back into the select item, and no
+        // GROUP BY on this SELECT, which now groups nothing.
+        let items = p
+            .expr
+            .iter()
+            .map(|expr| self.select_item_to_sql(expr))
+            .collect::<Result<Vec<_>>>()?;
+        select.projection(items);
+
+        // The derived table always carries an alias, even for a dialect that would
+        // not require one, so this SELECT has a name to address its columns
+        // through, and it carries a projection that names its outputs so there is
+        // something to address.
+        //
+        // The alias is numbered per SELECT for the reason the stacked-aggregate
+        // scope numbers its own: a join walks both of its sides with one builder,
+        // and each side requalifies its own references onto its own alias.
+        let named_input = name_scope_outputs(p.input.as_ref())?;
+        let alias_name = select.next_derived_aggregate_alias();
+        let alias = self.new_ident_quoted_if_needs(alias_name.clone());
+        self.derive(
+            &named_input,
+            relation,
+            Some(self.new_table_alias(alias_name, vec![])),
+            false,
+        )?;
+
+        // This SELECT now reads those columns from the derived table, so a
+        // reference still qualified by a relation the derived table encloses binds
+        // to nothing. DataFusion re-plans such SQL, but a stricter remote binder
+        // rejects it, which is what breaks a federated pushdown.
+        let derived_qualifiers: HashSet<String> = p
+            .input
+            .schema()
+            .iter()
+            .filter_map(|(qualifier, _)| qualifier)
+            .flat_map(|qualifier| [qualifier.to_string(), qualifier.table().to_string()])
+            .collect();
+        select.visit_expressions_in_clauses_mut(|expr| {
+            if let ast::Expr::CompoundIdentifier(idents) = expr {
+                requalify_column_onto_derived_table(idents, &derived_qualifiers, &alias);
+            }
+        });
+
         Ok(())
     }
 
@@ -996,6 +1063,29 @@ impl Unparser<'_> {
                 // SubqueryAlias handler runs.
                 if self.dialect.unnest_as_lateral_flatten() {
                     Self::collect_flatten_aliases(p.input.as_ref(), select);
+                }
+                // A dialect that resolves GROUP BY against whole select items and
+                // column references only cannot be handed a select list that wraps a
+                // computed grouping expression: it reports the columns inside the
+                // wrapper as neither grouped nor aggregated and refuses the
+                // statement. The aggregate needs a scope of its own — and only a
+                // scope, since grouping by the output alias or the ordinal groups by
+                // the *wrapped* value and merges groups a non-injective wrapper
+                // collides.
+                //
+                // `find_agg_node_within_select` is asked the same question
+                // `reconstruct_select_statement` asks below, so the aggregate scoped
+                // here is exactly the one that would otherwise fold into this SELECT.
+                // A `HAVING`/`QUALIFY` already on this SELECT was classified against
+                // the aggregate below, and names an expression only the SELECT that
+                // computes it can name. Moving the aggregate into a scope would
+                // strand it on a SELECT that no longer aggregates.
+                if !self.dialect.group_by_matches_select_subexpressions()
+                    && !select.has_grouped_predicate()
+                    && let Some(agg) = find_agg_node_within_select(plan, true)
+                    && select_list_wraps_a_grouping_expr(&p.expr, agg)
+                {
+                    return self.projection_over_scoped_aggregate(p, select, relation);
                 }
                 self.reconstruct_select_statement(plan, p, select)?;
                 self.select_to_sql_recursively(p.input.as_ref(), query, select, relation)

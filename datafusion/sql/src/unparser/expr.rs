@@ -253,19 +253,43 @@ impl Unparser<'_> {
                     }
                 };
 
-                let order_by = order_by
-                    .iter()
-                    .map(|sort_expr| self.sort_to_sql(sort_expr))
-                    .collect::<Result<Vec<_>>>()?;
-
                 let start_bound = self.convert_bound(&window_frame.start_bound)?;
                 let end_bound = self.convert_bound(&window_frame.end_bound)?;
 
-                let window_frame = if self.dialect.window_func_support_window_frame(
+                let frame_applies = self.dialect.window_func_support_window_frame(
                     func_name,
                     &start_bound,
                     &end_bound,
-                ) {
+                );
+
+                // A dialect that accepts only its own NULL placement inside a
+                // `RANGE` frame needs the placement spelled as a leading key
+                // instead. Three conditions narrow this to the statements such a
+                // dialect would otherwise refuse:
+                //
+                // * `RANGE` only — any placement is accepted in a `ROWS` frame;
+                // * the frame has to apply to this function — a numbering function
+                //   takes no frame, so its `ORDER BY` carries no `RANGE` clause to
+                //   be refused, whether or not one is emitted;
+                // * neither bound may carry an offset — a `RANGE` frame with
+                //   `OFFSET PRECEDING`/`FOLLOWING` accepts exactly one `ORDER BY`
+                //   key, so a second one cannot be added.
+                let nulls_via_leading_key = frame_applies
+                    && matches!(units, ast::WindowFrameUnits::Range)
+                    && !Self::bound_carries_offset(&start_bound)
+                    && !Self::bound_carries_offset(&end_bound);
+
+                let order_by = order_by
+                    .iter()
+                    .map(|sort_expr| {
+                        self.window_sort_to_sql(sort_expr, nulls_via_leading_key)
+                    })
+                    .collect::<Result<Vec<_>>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+
+                let window_frame = if frame_applies {
                     Some(ast::WindowFrame {
                         units,
                         start_bound,
@@ -808,6 +832,64 @@ impl Unparser<'_> {
             .collect();
 
         Ok(ast::Expr::Map(ast::Map { entries }))
+    }
+
+    /// Whether this frame bound is an offset rather than `UNBOUNDED`/`CURRENT ROW`.
+    fn bound_carries_offset(bound: &ast::WindowFrameBound) -> bool {
+        matches!(
+            bound,
+            ast::WindowFrameBound::Preceding(Some(_))
+                | ast::WindowFrameBound::Following(Some(_))
+        )
+    }
+
+    /// One `ORDER BY` item for an analytic function, or two where the dialect
+    /// cannot spell this NULL placement inside the frame it is being emitted in.
+    ///
+    /// `<expr> IS NULL` is false before true, so ordering it ascending puts NULLs
+    /// last and descending puts them first — the key's own direction does not
+    /// enter into it. The extra key cannot change which rows are peers, and so
+    /// cannot change what a `RANGE` frame covers: it is derived from the same
+    /// expression, so two rows agree on it whenever they agree on the key.
+    fn window_sort_to_sql(
+        &self,
+        sort: &Sort,
+        nulls_via_leading_key: bool,
+    ) -> Result<Vec<ast::OrderByExpr>> {
+        let item = self.sort_to_sql(sort)?;
+        // The leading key evaluates the sort expression a second time, so a volatile
+        // one could order by a different value than the key it is meant to place
+        // NULLs within. Leave it as it renders today, which such a dialect refuses
+        // loudly, rather than reorder the frame silently.
+        if !nulls_via_leading_key || sort.expr.is_volatile() {
+            return Ok(vec![item]);
+        }
+        let Some(dialect_default) =
+            self.dialect.range_window_default_nulls_first(sort.asc)
+        else {
+            return Ok(vec![item]);
+        };
+        if sort.nulls_first == dialect_default {
+            return Ok(vec![item]);
+        }
+
+        let nullness = ast::OrderByExpr {
+            expr: ast::Expr::IsNull(Box::new(self.expr_to_sql(&sort.expr)?)),
+            options: OrderByOptions {
+                asc: Some(!sort.nulls_first),
+                nulls_first: None,
+            },
+            with_fill: None,
+        };
+        let key = ast::OrderByExpr {
+            expr: item.expr,
+            options: OrderByOptions {
+                asc: item.options.asc,
+                nulls_first: None,
+            },
+            with_fill: item.with_fill,
+        };
+        Ok(vec![nullness, key])
     }
 
     pub fn sort_to_sql(&self, sort: &Sort) -> Result<ast::OrderByExpr> {
