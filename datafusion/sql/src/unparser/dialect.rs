@@ -324,6 +324,37 @@ pub trait Dialect: Send + Sync {
     fn string_literal_to_sql(&self, _s: &str) -> Option<ast::Expr> {
         None
     }
+
+    /// Whether the dialect resolves a `GROUP BY` expression against
+    /// sub-expressions of the `SELECT` list, or only against a whole select item.
+    ///
+    /// A `Projection` over an `Aggregate` is unparsed into one `SELECT`, which
+    /// puts the grouping expression bare in `GROUP BY` and, where the projection
+    /// wraps it, nested inside a select item:
+    ///
+    /// ```sql
+    /// SELECT CAST(date_trunc('week', ts) AS DATE), count(*)
+    /// FROM t GROUP BY date_trunc('week', ts)
+    /// ```
+    ///
+    /// PostgreSQL stops descending a target-list expression once a sub-expression
+    /// matches a grouping expression, so that binds. `GoogleSQL` matches a whole
+    /// select item and a column reference, and nothing in between: it reports the
+    /// columns inside the wrapper as "neither grouped nor aggregated" and refuses
+    /// the statement.
+    ///
+    /// A dialect returning `false` gets the `Aggregate` in a scope of its own
+    /// whenever a select item wraps a *computed* grouping expression. A grouping
+    /// expression that is a bare column needs nothing, because a column reference
+    /// is matched wherever it appears.
+    ///
+    /// Only a scope will do. `GROUP BY <output alias>` and `GROUP BY <ordinal>`
+    /// both group by the *wrapped* value, so a wrapper that is not injective over
+    /// the grouping expression merges groups and sums their aggregates — fewer
+    /// rows than the plan asked for, with no error.
+    fn group_by_matches_select_subexpressions(&self) -> bool {
+        true
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -835,6 +866,10 @@ pub struct BigQueryDialect {}
 impl Dialect for BigQueryDialect {
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
+    }
+
+    fn group_by_matches_select_subexpressions(&self) -> bool {
+        false
     }
 
     fn col_alias_overrides(&self, alias: &str) -> Result<Option<String>> {

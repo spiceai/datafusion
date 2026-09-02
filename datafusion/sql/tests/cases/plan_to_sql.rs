@@ -9492,3 +9492,190 @@ fn test_unparse_left_semi_join_refuses_nested_reference_a_case_distinct_body_onl
     );
     Ok(())
 }
+
+/// The `Projection` over `Aggregate` shape a grouped card plans to: group by a
+/// truncated timestamp, then project a *wrapped* form of that same grouping
+/// expression. The projection reads the aggregate's own output columns, whose names
+/// come from the schema rather than being spelled here.
+fn projection_wrapping_a_grouping_expr() -> Result<LogicalPlan> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "funded_ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("tok", DataType::Utf8, true),
+    ]);
+    let grouped = table_scan(Some("advances"), &schema, None)?
+        .aggregate(
+            vec![datafusion_functions::expr_fn::date_trunc(
+                lit("week"),
+                col("advances.funded_ts"),
+            )],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let mut outputs = grouped.schema().columns().into_iter();
+    let group_output = outputs.next().expect("the grouping expression's output");
+    let count_output = outputs.next().expect("the aggregate's output");
+    LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            cast(
+                cast(Expr::Column(group_output), DataType::Date32),
+                DataType::Utf8,
+            )
+            .alias("week_start"),
+            Expr::Column(count_output).alias("advances_funded"),
+        ])?
+        .build()
+}
+
+/// A dialect that resolves `GROUP BY` against whole select items only gets the
+/// aggregate in a scope of its own.
+///
+/// Flattened, the statement puts the grouping expression bare in `GROUP BY` and
+/// wrapped in the select list, and `GoogleSQL` refuses it outright: "SELECT list
+/// expression references column funded_ts which is neither grouped nor
+/// aggregated". The whole statement fails, not one row of it.
+///
+/// The scope is asserted, not just that a statement comes out, because the two
+/// cheaper renderings parse and return the wrong rows. `GROUP BY <output alias>`
+/// and `GROUP BY <ordinal>` group by the value the projection computes, so a
+/// projection that is not injective over the grouping expression collapses
+/// distinct groups into one and sums their aggregates.
+#[test]
+fn test_projection_wrapping_a_grouping_expr_scopes_the_aggregate() -> Result<()> {
+    let plan = projection_wrapping_a_grouping_expr()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert!(
+        depth >= 1,
+        "the grouping has to be a scope of its own for this dialect: {sql}"
+    );
+    // The grouping expression must be rendered only inside the scope. Asserted on
+    // the rendered call rather than on the base column, because the dialect
+    // sanitises the derived output's alias out of the schema name, which spells the
+    // base column inside it.
+    let outer_select = &sql[..sql.find("FROM").expect("a FROM in: {sql}")];
+    assert!(
+        !outer_select.contains("TIMESTAMP_TRUNC"),
+        "the outer select list still re-derives the grouping expression, which is what \
+         this dialect cannot bind against its GROUP BY: {sql}"
+    );
+    // Non-vacuity: a scope that dropped the grouping or the aggregate would satisfy
+    // both assertions above.
+    assert!(
+        sql[grouping_at..].contains("ISOWEEK") || sql.contains("TIMESTAMP_TRUNC"),
+        "the scope has to carry the grouping expression: {sql}"
+    );
+    assert!(
+        sql.to_uppercase().contains("COUNT("),
+        "the scope has to carry the aggregate: {sql}"
+    );
+    Ok(())
+}
+
+/// A dialect that does resolve `GROUP BY` against sub-expressions keeps the single
+/// `SELECT`, so the scope above is not paid where it buys nothing.
+#[test]
+fn test_projection_wrapping_a_grouping_expr_stays_flat_where_it_binds() -> Result<()> {
+    let plan = projection_wrapping_a_grouping_expr()?;
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert_eq!(depth, 0, "PostgreSQL binds the wrapped select item: {sql}");
+    Ok(())
+}
+
+/// A grouping expression that is a bare column needs no scope, in any dialect: a
+/// column reference is matched wherever it appears. Without this the scope would be
+/// paid on most grouped statements a `BigQuery` connector emits.
+#[test]
+fn test_projection_wrapping_a_grouped_column_stays_flat() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("tok", DataType::Utf8, true)]);
+    let grouped = table_scan(Some("advances"), &schema, None)?
+        .aggregate(vec![col("advances.tok")], vec![count(lit(1i64))])?
+        .build()?;
+    let mut outputs = grouped.schema().columns().into_iter();
+    let group_output = outputs.next().expect("the grouped column's output");
+    let count_output = outputs.next().expect("the aggregate's output");
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            cast(Expr::Column(group_output), DataType::Utf8).alias("k"),
+            Expr::Column(count_output).alias("n"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert_eq!(
+        depth, 0,
+        "a grouped column reference is matched nested, so no scope is needed: {sql}"
+    );
+    Ok(())
+}
+
+/// A wrapped *aggregate* is legal in every dialect — `CAST(min(t) AS DATE)` is not
+/// an ungrouped column reference — so it must not trigger the scope either.
+#[test]
+fn test_projection_wrapping_an_aggregate_stays_flat() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "funded_ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+        Field::new("tok", DataType::Utf8, true),
+    ]);
+    let grouped = table_scan(Some("advances"), &schema, None)?
+        .aggregate(
+            vec![col("advances.tok")],
+            vec![datafusion_functions_aggregate::expr_fn::min(col(
+                "advances.funded_ts",
+            ))],
+        )?
+        .build()?;
+    let mut outputs = grouped.schema().columns().into_iter();
+    let group_output = outputs.next().expect("the grouped column's output");
+    let min_output = outputs.next().expect("the aggregate's output");
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            Expr::Column(group_output).alias("tok"),
+            cast(Expr::Column(min_output), DataType::Date32).alias("first_day"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let grouping_at = sql.find("GROUP BY").expect("a GROUP BY in: {sql}");
+    let depth = sql[..grouping_at].chars().fold(0i32, |d, c| match c {
+        '(' => d + 1,
+        ')' => d - 1,
+        _ => d,
+    });
+    assert_eq!(depth, 0, "a wrapped aggregate needs no scope: {sql}");
+    Ok(())
+}
