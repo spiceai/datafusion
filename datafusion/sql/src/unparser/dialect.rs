@@ -355,6 +355,28 @@ pub trait Dialect: Send + Sync {
     fn group_by_matches_select_subexpressions(&self) -> bool {
         true
     }
+
+    /// The NULL placement this dialect applies to an `ORDER BY` inside an analytic
+    /// function's `RANGE` frame when the statement does not spell one, or `None`
+    /// where the dialect accepts any placement spelled there.
+    ///
+    /// `GoogleSQL` accepts none but its own: `NULLS LAST` with `ASC` and `NULLS
+    /// FIRST` with `DESC` are both rejected in a `RANGE` clause ("NULLS LAST not
+    /// supported with ascending sort order in RANGE clauses of analytic
+    /// functions"), and an `ORDER BY` with no explicit frame implies `RANGE` for an
+    /// aggregate, so the plain `SUM(x) OVER (ORDER BY x)` a plan normalizes to
+    /// `ASC NULLS LAST` is refused as well.
+    ///
+    /// The clause cannot simply be dropped for such a dialect, because its default
+    /// is the opposite of `DataFusion`'s — NULLs first for `ASC`, last for `DESC`
+    /// — so dropping it moves the NULL rows to the other end of the ordering and
+    /// changes which rows every frame covers. Reporting the default here lets the
+    /// unparser spell the placement as a leading `<expr> IS NULL` key instead,
+    /// which needs no clause and orders identically, and only for the placements
+    /// the dialect would otherwise refuse.
+    fn range_window_default_nulls_first(&self, _asc: bool) -> Option<bool> {
+        None
+    }
 }
 
 /// `IntervalStyle` to use for unparsing
@@ -870,6 +892,11 @@ impl Dialect for BigQueryDialect {
 
     fn group_by_matches_select_subexpressions(&self) -> bool {
         false
+    }
+
+    fn range_window_default_nulls_first(&self, asc: bool) -> Option<bool> {
+        // NULLs first ascending, last descending.
+        Some(asc)
     }
 
     fn col_alias_overrides(&self, alias: &str) -> Result<Option<String>> {

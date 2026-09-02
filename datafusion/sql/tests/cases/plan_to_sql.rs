@@ -9679,3 +9679,126 @@ fn test_projection_wrapping_an_aggregate_stays_flat() -> Result<()> {
     assert_eq!(depth, 0, "a wrapped aggregate needs no scope: {sql}");
     Ok(())
 }
+
+/// `SUM(v) OVER (ORDER BY k …)` with the frame `frame` and the NULL placement
+/// `asc`/`nulls_first`. `k` is nullable, which is the case the placement decides.
+fn windowed_sum(frame: WindowFrame, asc: bool, nulls_first: bool) -> Result<LogicalPlan> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let windowed = Expr::from(WindowFunction {
+        fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+        params: WindowFunctionParams {
+            args: vec![col("t.v")],
+            partition_by: vec![],
+            order_by: vec![datafusion_expr::expr::Sort::new(
+                col("t.k"),
+                asc,
+                nulls_first,
+            )],
+            window_frame: frame,
+            null_treatment: None,
+            filter: None,
+            distinct: false,
+        },
+    });
+    table_scan(Some("t"), &schema, None)?
+        .window(vec![windowed])?
+        .build()
+}
+
+/// A dialect that accepts only its own NULL placement inside a `RANGE` frame gets
+/// the placement as a leading `IS NULL` key, and keeps the rows the plan asked for.
+///
+/// `GoogleSQL` rejects `NULLS LAST` with `ASC` and `NULLS FIRST` with `DESC` there,
+/// and an `ORDER BY` with no explicit frame implies `RANGE` for an aggregate — so
+/// the plain `SUM(x) OVER (ORDER BY x)` a plan normalizes to `ASC NULLS LAST` was
+/// refused outright.
+///
+/// Dropping the clause is not the fix and is worse than the failure: `GoogleSQL`
+/// defaults to NULLs *first* ascending where `DataFusion` defaults to last, so a
+/// dropped clause moves the NULL rows to the other end of the ordering and changes
+/// which rows each frame covers. Measured against real BigQuery on
+/// `k ∈ {1, 2, NULL, 3}`, `v ∈ {10, 20, 7, 5}`: the placement the plan asks for
+/// gives `(NULL,42) (1,10) (2,30) (3,35)`, and dropping it gives
+/// `(NULL,7) (1,17) (2,37) (3,42)`.
+#[test]
+fn test_range_window_nulls_placement_becomes_a_leading_key() -> Result<()> {
+    for (asc, nulls_first, direction) in [(true, false, "ASC"), (false, true, "DESC")] {
+        let plan = windowed_sum(WindowFrame::new(Some(false)), asc, nulls_first)?;
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+
+        assert!(
+            sql.contains(&format!("`k` IS NULL {direction}")),
+            "the NULL placement has to be spelled as a leading key ordered \
+             {direction}: {sql}"
+        );
+        assert!(
+            !sql.contains("NULLS LAST") && !sql.contains("NULLS FIRST"),
+            "no NULLS clause may survive inside the RANGE frame, which is what \
+             BigQuery refuses: {sql}"
+        );
+        // Non-vacuity: the key itself, its direction and the frame all have to
+        // remain, or the statement orders or frames differently.
+        assert!(
+            sql.contains(&format!(
+                "`k` {direction} RANGE BETWEEN UNBOUNDED PRECEDING"
+            )) || sql.contains(&format!("`k` {direction} RANGE")),
+            "the ordering key and its frame have to survive: {sql}"
+        );
+    }
+    Ok(())
+}
+
+/// The placement is rewritten only where the dialect would refuse it. Four
+/// controls: its own default placement, a `ROWS` frame, a dialect that accepts any
+/// placement, and a `RANGE` frame carrying an offset bound — the last cannot take a
+/// second `ORDER BY` key at all ("a RANGE-based window with OFFSET PRECEDING or
+/// OFFSET FOLLOWING boundaries must have exactly one ORDER BY key").
+#[test]
+fn test_range_window_nulls_placement_left_alone_where_it_binds() -> Result<()> {
+    let range = WindowFrame::new(Some(false));
+    let rows = WindowFrame::new_bounds(
+        datafusion_expr::window_frame::WindowFrameUnits::Rows,
+        datafusion_expr::window_frame::WindowFrameBound::Preceding(
+            datafusion_common::ScalarValue::UInt64(None),
+        ),
+        datafusion_expr::window_frame::WindowFrameBound::CurrentRow,
+    );
+    let offset_range = WindowFrame::new_bounds(
+        datafusion_expr::window_frame::WindowFrameUnits::Range,
+        datafusion_expr::window_frame::WindowFrameBound::Preceding(
+            datafusion_common::ScalarValue::UInt64(Some(1)),
+        ),
+        datafusion_expr::window_frame::WindowFrameBound::CurrentRow,
+    );
+
+    // BigQuery's own default placement, a ROWS frame, and an offset RANGE frame.
+    for (label, frame, asc, nulls_first) in [
+        ("its own default placement", range.clone(), true, true),
+        ("a ROWS frame", rows, true, false),
+        ("an offset RANGE frame", offset_range, true, false),
+    ] {
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&windowed_sum(frame, asc, nulls_first)?)?
+            .to_string();
+        assert!(
+            !sql.contains("IS NULL"),
+            "{label}: no leading key is needed here, and adding one to an offset \
+             RANGE frame is rejected outright: {sql}"
+        );
+    }
+
+    // A dialect that accepts any placement keeps the clause it was given.
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&windowed_sum(range, true, false)?)?
+        .to_string();
+    assert!(
+        sql.contains("NULLS LAST") && !sql.contains("IS NULL"),
+        "a dialect that can spell the placement must keep spelling it: {sql}"
+    );
+    Ok(())
+}
