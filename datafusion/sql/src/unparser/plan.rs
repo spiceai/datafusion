@@ -31,9 +31,9 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        chain_to_aggregate_is_sorted, find_agg_node_within_select,
-        find_projection_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, name_derived_scope_outputs, name_scope_outputs,
+        find_agg_node_within_select, find_projection_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        name_derived_scope_outputs, name_scope_outputs,
         select_list_wraps_a_grouping_expr,
         try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
         unproject_unnamed_projection_exprs, unproject_unnest_expr,
@@ -1079,7 +1079,6 @@ impl Unparser<'_> {
                 if !self.dialect.group_by_matches_select_subexpressions()
                     && let Some(agg) = find_agg_node_within_select(plan, true)
                     && select_list_wraps_a_grouping_expr(&p.expr, agg)
-                    && !chain_to_aggregate_is_sorted(p.input.as_ref())
                 {
                     return self.projection_over_scoped_aggregate(p, select, relation);
                 }

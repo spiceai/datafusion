@@ -9802,3 +9802,50 @@ fn test_range_window_nulls_placement_left_alone_where_it_binds() -> Result<()> {
     );
     Ok(())
 }
+
+/// Grouping on a bare column as well as a computed expression: the projection
+/// reads the bare column *qualified*, and that qualifier names a relation the new
+/// scope encloses. It has to be requalified onto the scope, or the reference binds
+/// to nothing.
+#[test]
+fn test_a_scoped_aggregate_requalifies_a_qualified_group_output() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]);
+    let grouped = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![
+                col("t.a"),
+                datafusion_functions::expr_fn::date_trunc(lit("week"), col("t.ts")),
+            ],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = grouped.schema().columns();
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            Expr::Column(outputs[0].clone()).alias("a"),
+            cast(Expr::Column(outputs[1].clone()), DataType::Date32).alias("wk"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let outer_select = &sql[..sql.find("FROM").expect("a FROM in: {sql}")];
+    assert!(
+        !outer_select.contains("`t`.`a`"),
+        "the outer select still names the enclosed relation, which binds to \
+         nothing: {sql}"
+    );
+    assert!(
+        outer_select.contains("`a`"),
+        "the grouped column still has to be selected: {sql}"
+    );
+    Ok(())
+}

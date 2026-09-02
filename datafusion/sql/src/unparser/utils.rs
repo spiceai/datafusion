@@ -319,28 +319,6 @@ pub(crate) fn name_scope_outputs(plan: &LogicalPlan) -> Result<LogicalPlan> {
     Projection::try_new(exprs, Arc::new(plan.clone())).map(LogicalPlan::Projection)
 }
 
-/// Whether a `Sort` stands between a `Projection` and the `Aggregate` that would
-/// otherwise fold into its `SELECT`.
-///
-/// Moving such a chain into a derived table would move its `ORDER BY` in with it,
-/// and SQL does not carry a derived table's row order out to the query selecting
-/// from it. Declining to scope that shape leaves it rendering as it does today,
-/// which a dialect that cannot bind it rejects outright — a loud failure rather
-/// than silently reordered rows.
-pub(crate) fn chain_to_aggregate_is_sorted(plan: &LogicalPlan) -> bool {
-    match plan {
-        LogicalPlan::Aggregate(_) => false,
-        LogicalPlan::Sort(_) => true,
-        _ => {
-            let inputs = plan.inputs();
-            inputs.len() == 1
-                && inputs
-                    .first()
-                    .is_some_and(|input| chain_to_aggregate_is_sorted(input))
-        }
-    }
-}
-
 /// Recursively identify all Column expressions and transform them into the appropriate
 /// window expression contained in window.
 ///
