@@ -9977,3 +9977,52 @@ fn test_a_volatile_range_window_key_keeps_its_nulls_clause() -> Result<()> {
     );
     Ok(())
 }
+
+/// A `HAVING` already on this `SELECT` was classified against the aggregate below
+/// and names an expression only the `SELECT` that computes it can name, so the
+/// scope is declined rather than stranding it.
+///
+/// Found by review and confirmed by rendering: before the guard this emitted
+/// `… FROM (SELECT … GROUP BY …) AS derived_aggregate_1 HAVING (count(1) > 1)` — a
+/// `HAVING` on a `SELECT` that no longer aggregates.
+#[test]
+fn test_a_having_above_the_projection_declines_the_aggregate_scope() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "ts",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        true,
+    )]);
+    let grouped = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![datafusion_functions::expr_fn::date_trunc(
+                lit("week"),
+                col("t.ts"),
+            )],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = grouped.schema().columns();
+    let aggregate_output = outputs[1].name.clone();
+    // The aggregate output is passed through unaliased, so the `Filter` above can
+    // unproject it into a `HAVING` before this projection is reached.
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            cast(Expr::Column(outputs[0].clone()), DataType::Date32).alias("wk"),
+            Expr::Column(outputs[1].clone()),
+        ])?
+        .filter(col(aggregate_output).gt(lit(1i64)))?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("HAVING"),
+        "the grouped predicate has to survive: {sql}"
+    );
+    assert!(
+        !sql.contains("derived_aggregate"),
+        "the aggregate must stay in the SELECT its HAVING names: {sql}"
+    );
+    Ok(())
+}

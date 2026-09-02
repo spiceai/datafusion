@@ -1076,7 +1076,12 @@ impl Unparser<'_> {
                 // `find_agg_node_within_select` is asked the same question
                 // `reconstruct_select_statement` asks below, so the aggregate scoped
                 // here is exactly the one that would otherwise fold into this SELECT.
+                // A `HAVING`/`QUALIFY` already on this SELECT was classified against
+                // the aggregate below, and names an expression only the SELECT that
+                // computes it can name. Moving the aggregate into a scope would
+                // strand it on a SELECT that no longer aggregates.
                 if !self.dialect.group_by_matches_select_subexpressions()
+                    && !select.has_grouped_predicate()
                     && let Some(agg) = find_agg_node_within_select(plan, true)
                     && select_list_wraps_a_grouping_expr(&p.expr, agg)
                 {
