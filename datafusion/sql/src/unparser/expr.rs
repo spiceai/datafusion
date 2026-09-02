@@ -857,7 +857,11 @@ impl Unparser<'_> {
         nulls_via_leading_key: bool,
     ) -> Result<Vec<ast::OrderByExpr>> {
         let item = self.sort_to_sql(sort)?;
-        if !nulls_via_leading_key {
+        // The leading key evaluates the sort expression a second time, so a volatile
+        // one could order by a different value than the key it is meant to place
+        // NULLs within. Leave it as it renders today, which such a dialect refuses
+        // loudly, rather than reorder the frame silently.
+        if !nulls_via_leading_key || sort.expr.is_volatile() {
             return Ok(vec![item]);
         }
         let Some(dialect_default) =

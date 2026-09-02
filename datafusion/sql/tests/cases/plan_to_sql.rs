@@ -9849,3 +9849,131 @@ fn test_a_scoped_aggregate_requalifies_a_qualified_group_output() -> Result<()> 
     );
     Ok(())
 }
+
+/// Shapes the scope cannot describe keep the rendering they have today rather than
+/// being paired up wrongly or failing to build. Both were found by review and
+/// confirmed by rendering them.
+#[test]
+fn test_the_aggregate_scope_declines_shapes_it_cannot_name() -> Result<()> {
+    // A ROLLUP is one `Expr::GroupingSet` covering several outputs, and adds an
+    // internal grouping-id output, so the scope's positional pairing does not
+    // describe it: it recorded the wrong output as the computed one.
+    let rollup_schema = Schema::new(vec![
+        Field::new("a", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]);
+    let rollup = table_scan(Some("t"), &rollup_schema, None)?
+        .aggregate(
+            vec![Expr::GroupingSet(datafusion_expr::GroupingSet::Rollup(
+                vec![
+                    col("t.a"),
+                    datafusion_functions::expr_fn::date_trunc(lit("week"), col("t.ts")),
+                ],
+            ))],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = rollup.schema().columns();
+    let plan = LogicalPlanBuilder::from(rollup)
+        .project(vec![
+            cast(Expr::Column(outputs[1].clone()), DataType::Date32).alias("wk"),
+        ])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("derived_aggregate") && sql.contains("ROLLUP"),
+        "a grouping set has to keep its flat rendering: {sql}"
+    );
+
+    // Grouping a join by two outputs the schema tells apart only by qualifier: the
+    // scope names its outputs by the name the schema reports, which drops the
+    // qualifier, so naming both would collide and the rewrite would fail to build.
+    let left = table_scan(
+        Some("l"),
+        &Schema::new(vec![
+            Field::new("id", DataType::Int64, true),
+            Field::new(
+                "ts",
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                true,
+            ),
+        ]),
+        None,
+    )?;
+    let right = table_scan(
+        Some("r"),
+        &Schema::new(vec![Field::new("id", DataType::Int64, true)]),
+        None,
+    )?
+    .build()?;
+    let joined = left
+        .cross_join(right)?
+        .aggregate(
+            vec![
+                col("l.id"),
+                col("r.id"),
+                datafusion_functions::expr_fn::date_trunc(lit("week"), col("l.ts")),
+            ],
+            vec![count(lit(1i64))],
+        )?
+        .build()?;
+    let outputs = joined.schema().columns();
+    let plan = LogicalPlanBuilder::from(joined)
+        .project(vec![
+            cast(Expr::Column(outputs[2].clone()), DataType::Date32).alias("wk"),
+        ])?
+        .build()?;
+    // Before the guard this returned "Schema contains duplicate unqualified field
+    // name id" — a query that rendered before stopped rendering at all.
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("derived_aggregate"),
+        "duplicate output names have to keep the flat rendering: {sql}"
+    );
+    Ok(())
+}
+
+/// A volatile window sort key is left alone: the leading key would evaluate it a
+/// second time, and could then order by a different value than the key it is
+/// placing NULLs within.
+#[test]
+fn test_a_volatile_range_window_key_keeps_its_nulls_clause() -> Result<()> {
+    let plan = {
+        let schema = Schema::new(vec![Field::new("v", DataType::Int64, true)]);
+        let windowed = Expr::from(WindowFunction {
+            fun: WindowFunctionDefinition::AggregateUDF(sum_udaf()),
+            params: WindowFunctionParams {
+                args: vec![col("t.v")],
+                partition_by: vec![],
+                order_by: vec![datafusion_expr::expr::Sort::new(
+                    datafusion_functions::expr_fn::random(),
+                    true,
+                    false,
+                )],
+                window_frame: WindowFrame::new(Some(false)),
+                null_treatment: None,
+                filter: None,
+                distinct: false,
+            },
+        });
+        table_scan(Some("t"), &schema, None)?
+            .window(vec![windowed])?
+            .build()?
+    };
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("IS NULL"),
+        "a volatile key must not be evaluated twice: {sql}"
+    );
+    Ok(())
+}
