@@ -10901,3 +10901,104 @@ fn test_a_grouping_key_repeated_in_scope_does_not_hide_the_rest() -> Result<()> 
 
     Ok(())
 }
+
+/// The renderings have to reach every shape that means the same thing, or a
+/// statement fails on the one that was missed.
+///
+/// `TRY_CAST(date AS INT64)` is the plain cast with a different keyword, and
+/// BigQuery refuses `SAFE_CAST(DATE AS INT64)` exactly as it refuses `CAST`.
+/// `BETWEEN` compares the way `<=` does, so a dialect that will not mix the
+/// operand types refuses it for the same reason — confirmed against BigQuery,
+/// where a `DATETIME BETWEEN TIMESTAMP AND TIMESTAMP` is rejected and the same
+/// comparison with the civil side converted is accepted.
+#[test]
+fn test_bigquery_renderings_reach_try_cast_and_between() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("d", DataType::Date32, true),
+        Field::new(
+            "naive",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(
+            "aware",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            true,
+        ),
+    ]);
+
+    let rendered = |expr: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .filter(expr)?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    // A try-cast of a date to an integer is the same day count.
+    let day_number = Expr::TryCast(datafusion_expr::expr::TryCast::new(
+        Box::new(col("t.d")),
+        DataType::Int64,
+    ));
+    let sql = rendered(day_number.gt(lit(0i64)))?;
+    assert!(
+        sql.contains("UNIX_DATE("),
+        "a try-cast is refused the same way, so it needs the same rendering: {sql}"
+    );
+    assert!(
+        !sql.contains("AS BIGINT") && !sql.contains("AS INT64"),
+        "no integer cast of a date may survive: {sql}"
+    );
+
+    // BETWEEN's operands have to agree, and only the civil one moves.
+    let sql = rendered(Expr::Between(datafusion_expr::expr::Between::new(
+        Box::new(col("t.naive")),
+        false,
+        Box::new(col("t.aware")),
+        Box::new(col("t.aware")),
+    )))?;
+    assert!(
+        sql.contains("CAST(`t`.`naive` AS TIMESTAMP)"),
+        "the civil side has to become an instant: {sql}"
+    );
+    assert!(
+        !sql.contains("CAST(`t`.`aware`"),
+        "the instant sides already agree: {sql}"
+    );
+
+    Ok(())
+}
+
+/// DataFusion's `median` declares the decimal type it was given and coerces only
+/// integers to float. A median needs no interpolation — at an integer index both
+/// offsets address the same element — so it is rendered as the average of the two
+/// straddling values, which keeps the input's type. Confirmed against BigQuery: a
+/// `NUMERIC` column returns `NUMERIC` with its precision intact, and an `INT64`
+/// column returns a float, as DataFusion does.
+#[test]
+fn test_bigquery_median_keeps_the_input_type() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("v", DataType::Decimal128(20, 4), true)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            Vec::<Expr>::new(),
+            vec![datafusion_functions_aggregate::median::median(col("t.v"))],
+        )?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("FLOAT64"),
+        "a decimal median must not be pushed through a float: {sql}"
+    );
+    assert!(
+        sql.contains(") / 2"),
+        "the median is the average of the two straddling values: {sql}"
+    );
+
+    Ok(())
+}

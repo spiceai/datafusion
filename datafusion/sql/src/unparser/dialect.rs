@@ -28,7 +28,7 @@ use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
 use chrono::DateTime;
 use datafusion_common::{Result, internal_err};
-use datafusion_expr::Expr;
+use datafusion_expr::{Expr, SortExpr};
 use regex::Regex;
 use sqlparser::tokenizer::Span;
 use sqlparser::{
@@ -280,6 +280,8 @@ pub trait Dialect: Send + Sync {
         _func_name: &str,
         _args: &[Expr],
         _distinct: bool,
+        _filter: Option<&Expr>,
+        _order_by: &[SortExpr],
     ) -> Result<Option<ast::Expr>> {
         Ok(None)
     }
@@ -1199,7 +1201,18 @@ impl Dialect for BigQueryDialect {
         func_name: &str,
         args: &[Expr],
         distinct: bool,
+        filter: Option<&Expr>,
+        order_by: &[SortExpr],
     ) -> Result<Option<ast::Expr>> {
+        // A `FILTER (WHERE ...)` restricts which rows the aggregate sees, and a
+        // descending sort makes DataFusion take the percentile from the other
+        // end. Neither survives the rendering below, and computing over the wrong
+        // rows quietly is worse than not translating: declining leaves the
+        // DataFusion name in place, which fails loudly.
+        if filter.is_some() || order_by.iter().any(|sort| !sort.asc) {
+            return Ok(None);
+        }
+
         match func_name {
             "median" => bigquery_percentile_to_sql(unparser, args, None, distinct),
             "approx_percentile_cont" => {

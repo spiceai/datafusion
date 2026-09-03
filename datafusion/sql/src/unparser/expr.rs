@@ -139,9 +139,12 @@ impl Unparser<'_> {
                 low,
                 high,
             }) => {
-                let sql_parser_expr = self.expr_to_sql_inner(expr)?;
-                let sql_low = self.expr_to_sql_inner(low)?;
-                let sql_high = self.expr_to_sql_inner(high)?;
+                // `BETWEEN` compares the same way `<=` does, so a dialect that
+                // will not mix the operand types refuses it for the same reason.
+                let agreed = self.agreed_operand_type(&[expr, low, high]);
+                let sql_parser_expr = self.converged(expr, agreed.as_ref())?;
+                let sql_low = self.converged(low, agreed.as_ref())?;
+                let sql_high = self.converged(high, agreed.as_ref())?;
                 Ok(ast::Expr::Nested(Box::new(self.between_op_to_sql(
                     sql_parser_expr,
                     *negated,
@@ -405,7 +408,12 @@ impl Unparser<'_> {
 
                 if let Some(overridden) =
                     self.dialect.aggregate_function_to_sql_overrides(
-                        self, func_name, args, *distinct,
+                        self,
+                        func_name,
+                        args,
+                        *distinct,
+                        filter.as_deref(),
+                        order_by,
                     )?
                 {
                     return Ok(overridden);
@@ -572,6 +580,16 @@ impl Unparser<'_> {
             }
             Expr::TryCast(TryCast { expr, field }) => {
                 let inner_expr = self.expr_to_sql_inner(expr)?;
+                // A date has no integer cast in some dialects, safe or not:
+                // BigQuery refuses `SAFE_CAST(DATE AS INT64)` the same way it
+                // refuses the plain cast.
+                if field.data_type().is_integer()
+                    && self.is_date(expr)
+                    && let Some(day_number) =
+                        self.dialect.date_to_integer_to_sql(inner_expr.clone())
+                {
+                    return Ok(day_number);
+                }
                 Ok(ast::Expr::Cast {
                     kind: ast::CastKind::TryCast,
                     expr: Box::new(inner_expr),
@@ -1354,6 +1372,43 @@ impl Unparser<'_> {
         }
     }
 
+    /// The one type a set of operands compared together has to agree on, or
+    /// `None` when they already agree or the dialect coerces the pair itself.
+    fn agreed_operand_type(&self, operands: &[&Expr]) -> Option<DataType> {
+        if !self.dialect.requires_explicit_comparison_coercion() {
+            return None;
+        }
+        let types: Vec<DataType> = operands
+            .iter()
+            .map(|operand| self.resolved_data_type(operand))
+            .collect::<Option<Vec<_>>>()?;
+        let refused = types
+            .iter()
+            .any(|left| types.iter().any(|right| refuses_this_pair(left, right)));
+        if !refused {
+            return None;
+        }
+        types
+            .iter()
+            .skip(1)
+            .try_fold(types.first()?.clone(), |common, next| {
+                comparison_coercion(&common, next)
+            })
+    }
+
+    /// `operand` unparsed, cast to `agreed` when it is not already that type.
+    fn converged(&self, operand: &Expr, agreed: Option<&DataType>) -> Result<ast::Expr> {
+        match agreed {
+            Some(agreed) if self.resolved_data_type(operand).as_ref() != Some(agreed) => {
+                self.expr_to_sql_inner(&Expr::Cast(Cast::new(
+                    Box::new(operand.clone()),
+                    agreed.clone(),
+                )))
+            }
+            _ => self.expr_to_sql_inner(operand),
+        }
+    }
+
     /// Whether `expr` is a date, from the schema when one was supplied.
     fn is_date(&self, expr: &Expr) -> bool {
         matches!(self.resolved_data_type(expr), Some(DataType::Date32))
@@ -1403,18 +1458,8 @@ impl Unparser<'_> {
             return Ok(None);
         };
 
-        let converge = |operand: &Expr, operand_type: DataType| -> Result<ast::Expr> {
-            if operand_type == common {
-                return self.expr_to_sql_inner(operand);
-            }
-            self.expr_to_sql_inner(&Expr::Cast(Cast::new(
-                Box::new(operand.clone()),
-                common.clone(),
-            )))
-        };
-
-        let l = converge(left, left_type)?;
-        let r = converge(right, right_type)?;
+        let l = self.converged(left, Some(&common))?;
+        let r = self.converged(right, Some(&common))?;
         let op = self.op_to_sql(op)?;
         Ok(Some(ast::Expr::Nested(Box::new(
             self.binary_op_to_sql(l, r, op),

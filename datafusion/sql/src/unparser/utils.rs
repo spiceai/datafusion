@@ -1247,26 +1247,40 @@ pub(crate) fn bigquery_to_timestamp_to_sql(
     )))
 }
 
-/// Renders an exact percentile over a group for BigQuery, which has no aggregate
+/// Renders a percentile over a group for BigQuery, which has no aggregate
 /// percentile of its own.
 ///
-/// The group is ordered into an array and the result interpolated between the two
-/// values the percentile falls between:
+/// The group is ordered into an array and the two values the percentile falls
+/// between are read off it:
 ///
 /// ```text
 /// idx = p * (n - 1)
-/// result = a[FLOOR(idx)] + (a[CEIL(idx)] - a[FLOOR(idx)]) * (idx - FLOOR(idx))
+/// lo  = a[FLOOR(idx)]
+/// hi  = a[CEIL(idx)]
 /// ```
 ///
-/// which needs no case split: at an integer `idx` both offsets are the same
-/// element and the interpolation term is zero. `IGNORE NULLS` matches
-/// DataFusion, which does not count a null toward the position.
+/// A median is `(lo + hi) / 2`, which is exact for any group size — at an integer
+/// `idx` both offsets address the same element, so the average is that element —
+/// and keeps the input's own type, so a `NUMERIC` column keeps its precision
+/// rather than going through a float. That matches DataFusion, which averages the
+/// two middle values and declares the same decimal type it was given, coercing
+/// only integers to float, which BigQuery's `/` does too.
+///
+/// Any other percentile has to interpolate between the two, which brings in a
+/// fractional weight and so a float result.
+///
+/// `IGNORE NULLS` matches DataFusion, where a null takes no position.
+///
+/// One cost worth stating: `ARRAY_AGG` materialises and sorts each group, where
+/// DataFusion's `approx_percentile_cont` keeps bounded state. A group large
+/// enough to exceed BigQuery's array limits will fail rather than degrade — a
+/// visible error, not a wrong number, which is the better failure of the two, but
+/// it does mean this is not a bounded-memory rendering.
 ///
 /// `percentile_arg` is the index of the argument carrying the percentile, or
-/// `None` for `median`, which is the same thing at `0.5`.
-///
-/// Returns `Ok(None)` when the arguments are not the expected shape, so the
-/// caller falls back rather than emitting something malformed.
+/// `None` for a median. Returns `Ok(None)` when the arguments are not the
+/// expected shape, so the caller falls back rather than emitting something
+/// malformed.
 pub(crate) fn bigquery_percentile_to_sql(
     unparser: &Unparser,
     args: &[Expr],
@@ -1278,11 +1292,13 @@ pub(crate) fn bigquery_percentile_to_sql(
     };
 
     let percentile = match percentile_arg {
-        None => "0.5".to_string(),
+        None => None,
         Some(i) => match args.get(i) {
             // Only a constant percentile can be spliced into the offsets; a
             // per-row one would need a different shape entirely.
-            Some(Expr::Literal(scalar, _)) if !scalar.is_null() => scalar.to_string(),
+            Some(Expr::Literal(scalar, _)) if !scalar.is_null() => {
+                Some(scalar.to_string())
+            }
             _ => return Ok(None),
         },
     };
@@ -1292,14 +1308,27 @@ pub(crate) fn bigquery_percentile_to_sql(
     let sorted =
         format!("ARRAY_AGG({distinct}{value_sql} IGNORE NULLS ORDER BY {value_sql})");
     let length = format!("ARRAY_LENGTH({sorted})");
-    let index = format!("({percentile} * ({length} - 1))");
-    let low = format!("CAST({sorted}[OFFSET(CAST(FLOOR({index}) AS INT64))] AS FLOAT64)");
-    let high = format!("CAST({sorted}[OFFSET(CAST(CEIL({index}) AS INT64))] AS FLOAT64)");
-    let rendered = format!("({low} + ({high} - {low}) * ({index} - FLOOR({index})))");
+    let index = format!(
+        "({} * ({length} - 1))",
+        percentile.as_deref().unwrap_or("0.5")
+    );
+    let low = format!("{sorted}[OFFSET(CAST(FLOOR({index}) AS INT64))]");
+    let high = format!("{sorted}[OFFSET(CAST(CEIL({index}) AS INT64))]");
 
-    // Parsed back rather than hand-built: the nesting is five deep and the shape
-    // is what the doc comment above states, which a reader can check against the
-    // text but not against a tree of constructors.
+    let rendered = if percentile.is_none() {
+        // A median needs no weight, so the input's type survives.
+        format!("(({low}) + ({high})) / 2")
+    } else {
+        format!(
+            "(CAST({low} AS FLOAT64) \
+             + (CAST({high} AS FLOAT64) - CAST({low} AS FLOAT64)) \
+             * ({index} - FLOOR({index})))"
+        )
+    };
+
+    // Parsed back rather than hand-built: the nesting is several deep and the
+    // shape is what the doc comment above states, which a reader can check
+    // against the text but not against a tree of constructors.
     let mut parser =
         sqlparser::parser::Parser::new(&sqlparser::dialect::BigQueryDialect {})
             .try_with_sql(&rendered)?;

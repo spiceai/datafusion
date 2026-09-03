@@ -140,6 +140,15 @@ fn merged_without_conflict(have: &DFSchema, add: &DFSchema) -> Option<DFSchema> 
 fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     let inputs = plan.inputs();
     if inputs.is_empty() {
+        // A scan's pushed-down filters may name columns its projection leaves
+        // out, so the source's own schema is the scope, not the projected one.
+        if let LogicalPlan::TableScan(scan) = plan {
+            return DFSchema::try_from_qualified_schema(
+                scan.table_name.clone(),
+                &scan.source.schema(),
+            )
+            .ok();
+        }
         return Some(plan.schema().as_ref().clone());
     }
 
@@ -456,7 +465,7 @@ impl Unparser<'_> {
 
                 select.projection(items);
                 select.group_by(ast::GroupByExpr::Expressions(
-                    self.group_by_keys(&agg.group_expr)?,
+                    self.group_by_keys(agg)?,
                     vec![],
                 ));
             }
@@ -1013,7 +1022,6 @@ impl Unparser<'_> {
         self.project_window_output(&window_expr, select, None)
     }
 
-    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     /// The `GROUP BY` keys to emit, with constant ones left out.
     ///
     /// A constant partitions nothing — every row carries the same value — so
@@ -1023,16 +1031,31 @@ impl Unparser<'_> {
     /// select-list ordinal reads it as something else entirely, which is not what
     /// the plan meant either.
     ///
-    /// An all-constant grouping leaves no keys, and the empty clause the caller
-    /// then emits is a single group over the input — again the same result.
-    fn group_by_keys(&self, group_expr: &[Expr]) -> Result<Vec<ast::Expr>> {
-        group_expr
+    /// Dropping is withheld in exactly the case DataFusion's own
+    /// `eliminate_group_by_constant` withholds it: when nothing would be left to
+    /// group by *and* there are no aggregates, the grouping is what collapses the
+    /// input to one row, and removing it would return one row per input row
+    /// instead. Everywhere else the plan already means a single group.
+    fn group_by_keys(&self, aggregate: &Aggregate) -> Result<Vec<ast::Expr>> {
+        let (constant, varying): (Vec<_>, Vec<_>) = aggregate
+            .group_expr
             .iter()
-            .filter(|expr| !matches!(expr, Expr::Literal(..)))
+            .partition(|expr| matches!(expr, Expr::Literal(..)));
+
+        let keep_constants =
+            constant.is_empty() || (varying.is_empty() && aggregate.aggr_expr.is_empty());
+
+        let emit: Vec<&Expr> = if keep_constants {
+            aggregate.group_expr.iter().collect()
+        } else {
+            varying
+        };
+        emit.into_iter()
             .map(|expr| self.expr_to_sql(expr))
             .collect()
     }
 
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn select_to_sql_recursively(
         &self,
         plan: &LogicalPlan,
@@ -1439,7 +1462,7 @@ impl Unparser<'_> {
                     select.projection(exprs);
 
                     select.group_by(ast::GroupByExpr::Expressions(
-                        self.group_by_keys(&agg.group_expr)?,
+                        self.group_by_keys(agg)?,
                         vec![],
                     ));
                 }
