@@ -19,7 +19,7 @@
 //! low level control of parquet file readers
 
 use crate::ParquetFileMetrics;
-use crate::metadata::DFParquetMetadata;
+use crate::metadata::{DFParquetMetadata, version_from_head_if_same_generation};
 use bytes::Bytes;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::cache::cache_manager::FileMetadata;
@@ -345,14 +345,17 @@ impl AsyncFileReader for CachedParquetFileReader {
             let page_index_policy = options.map(|o| o.column_index_policy());
 
             let mut object_meta = object_meta;
-            // ListObjectsV2 omits version ids. HEAD supplies one so later
-            // range reads can pin the listed generation instead of If-Match.
+            // ListObjectsV2 omits version ids. HEAD can supply one, but only
+            // if it is still the listed generation; otherwise later page
+            // reads would pin a replacement while footer ranges still use
+            // the listed size.
             if matches!(
                 self.object_versioning_type,
                 Some(ObjectVersionType::Version)
             ) && object_meta.version.is_none()
                 && let Ok(head) = self.store.head(&object_meta.location).await
-                && let Some(version) = head.version
+                && let Some(version) =
+                    version_from_head_if_same_generation(&object_meta, &head)
             {
                 object_meta.version = Some(version.clone());
                 self.inner.set_object_version(version);

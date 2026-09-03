@@ -73,6 +73,27 @@ pub(crate) fn object_store_pin(
     }
 }
 
+/// Promote a LIST-omitted version id from HEAD only when HEAD is still the
+/// listed generation.
+///
+/// ListObjectsV2 omits version ids. HEAD can supply one, but if the key was
+/// replaced after listing, `head.version` names the replacement while
+/// `listed.size` / `listed.e_tag` still describe the listed object. Footer
+/// ranges computed from one generation and fetched from another are the
+/// mixed-read this pin exists to prevent. Matching ETags keeps the HEAD
+/// version; a mismatch leaves version unset so the listed-ETag `If-Match`
+/// fails cleanly.
+pub(crate) fn version_from_head_if_same_generation(
+    listed: &ObjectMeta,
+    head: &ObjectMeta,
+) -> Option<String> {
+    if listed.e_tag.is_some() && listed.e_tag == head.e_tag {
+        head.version.clone()
+    } else {
+        None
+    }
+}
+
 /// Minimum fraction of row groups that must report NDV statistics for the
 /// merged result to be `Inexact` rather than `Absent`, as the estimate
 /// would be too unreliable otherwise.
@@ -965,6 +986,41 @@ fn sorting_columns_to_physical_exprs(
 mod tests {
     use super::*;
     use arrow::array::Int32Array;
+
+    fn object_meta(e_tag: Option<&str>, version: Option<&str>) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from("listing/data.parquet"),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::now()),
+            size: 100,
+            e_tag: e_tag.map(str::to_string),
+            version: version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn head_version_is_used_only_when_etag_matches_the_listing() {
+        let listed = object_meta(Some("etag-a"), None);
+        let same = object_meta(Some("etag-a"), Some("v-listed"));
+        assert_eq!(
+            version_from_head_if_same_generation(&listed, &same).as_deref(),
+            Some("v-listed")
+        );
+
+        let replaced = object_meta(Some("etag-b"), Some("v-new"));
+        assert_eq!(
+            version_from_head_if_same_generation(&listed, &replaced),
+            None,
+            "a replacement between LIST and HEAD must not pin the new version"
+        );
+
+        let no_listed_etag = object_meta(None, None);
+        let head_with_version = object_meta(Some("etag-a"), Some("v-listed"));
+        assert_eq!(
+            version_from_head_if_same_generation(&no_listed_etag, &head_with_version),
+            None,
+            "without a listed ETag there is no proof HEAD is the same generation"
+        );
+    }
 
     #[test]
     fn test_has_any_exact_match() {
