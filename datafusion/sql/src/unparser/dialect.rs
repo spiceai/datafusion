@@ -1197,9 +1197,14 @@ impl Dialect for BigQueryDialect {
             return bigquery_renamed_scalar_fn(unparser, "CURRENT_DATETIME", args);
         }
 
-        // These two depend on their operand's type, so they read it off the
+        // These depend on their operand's type, so they read it off the
         // expression rather than being renamed outright.
-        if func_name == "to_unixtime" {
+        //
+        // `unix_seconds` shares BigQuery's own spelling, so it resolves on name
+        // alone — but only for an instant operand. It needs the same civil-to-
+        // instant conversion as `to_unixtime`, or a `DATETIME` reaches it and
+        // BigQuery refuses the signature.
+        if func_name == "to_unixtime" || func_name == "unix_seconds" {
             return bigquery_to_unixtime_to_sql(unparser, args);
         }
 
