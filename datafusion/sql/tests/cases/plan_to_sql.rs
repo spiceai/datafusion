@@ -10667,3 +10667,62 @@ fn test_bigquery_timestamp_literal_is_truncated_to_microseconds() -> Result<()> 
 
     Ok(())
 }
+
+/// A constant grouping key partitions nothing — every row carries the same value
+/// — so leaving it out groups identically and removes an emission engines
+/// disagree about. `BigQuery` refuses it outright ("Cannot GROUP BY literal
+/// values"), and an engine that reads a bare integer in `GROUP BY` as a
+/// select-list ordinal reads it as something other than the constant the plan
+/// meant.
+///
+/// The constant still projects; only the grouping loses it. An all-constant
+/// grouping leaves no keys at all, which is a single group over the input and the
+/// same result again.
+#[test]
+fn test_constant_group_by_keys_are_left_out() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+
+    let grouped = |keys: Vec<Expr>| -> Result<LogicalPlan> {
+        table_scan(Some("t"), &schema, None)?
+            .aggregate(keys, vec![count(lit(1i64))])?
+            .build()
+    };
+
+    // A constant beside a real key: the key survives, the constant does not.
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&grouped(vec![lit("POOLED"), col("t.g")])?)?
+        .to_string();
+    assert!(
+        sql.contains("GROUP BY `t`.`g`"),
+        "the real key has to survive: {sql}"
+    );
+    let group_by_clause = &sql[sql.find("GROUP BY").expect("a GROUP BY")..];
+    assert!(
+        !group_by_clause.contains("'POOLED'"),
+        "the constant must not reach GROUP BY: {sql}"
+    );
+    assert!(
+        sql.contains("'POOLED'"),
+        "the constant still belongs in the select list: {sql}"
+    );
+
+    // Every dialect gains this, since grouping by a constant means the same
+    // everywhere and an ordinal reading would mean something else.
+    for dialect in [
+        &UnparserDefaultDialect {} as &dyn UnparserDialect,
+        &UnparserPostgreSqlDialect {},
+    ] {
+        let sql = Unparser::new(dialect)
+            .plan_to_sql(&grouped(vec![lit(1i64), col("t.g")])?)?
+            .to_string();
+        assert!(
+            !sql.contains("GROUP BY 1"),
+            "a bare integer key would be read as an ordinal: {sql}"
+        );
+    }
+
+    Ok(())
+}

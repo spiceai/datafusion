@@ -395,10 +395,7 @@ impl Unparser<'_> {
 
                 select.projection(items);
                 select.group_by(ast::GroupByExpr::Expressions(
-                    agg.group_expr
-                        .iter()
-                        .map(|expr| self.expr_to_sql(expr))
-                        .collect::<Result<Vec<_>>>()?,
+                    self.group_by_keys(&agg.group_expr)?,
                     vec![],
                 ));
             }
@@ -956,6 +953,25 @@ impl Unparser<'_> {
     }
 
     #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    /// The `GROUP BY` keys to emit, with constant ones left out.
+    ///
+    /// A constant partitions nothing — every row carries the same value — so
+    /// dropping it groups identically while removing an emission engines
+    /// disagree about. BigQuery refuses it outright ("Cannot GROUP BY literal
+    /// values"), and an engine that reads a bare integer in `GROUP BY` as a
+    /// select-list ordinal reads it as something else entirely, which is not what
+    /// the plan meant either.
+    ///
+    /// An all-constant grouping leaves no keys, and the empty clause the caller
+    /// then emits is a single group over the input — again the same result.
+    fn group_by_keys(&self, group_expr: &[Expr]) -> Result<Vec<ast::Expr>> {
+        group_expr
+            .iter()
+            .filter(|expr| !matches!(expr, Expr::Literal(..)))
+            .map(|expr| self.expr_to_sql(expr))
+            .collect()
+    }
+
     fn select_to_sql_recursively(
         &self,
         plan: &LogicalPlan,
@@ -1362,10 +1378,7 @@ impl Unparser<'_> {
                     select.projection(exprs);
 
                     select.group_by(ast::GroupByExpr::Expressions(
-                        agg.group_expr
-                            .iter()
-                            .map(|expr| self.expr_to_sql(expr))
-                            .collect::<Result<Vec<_>>>()?,
+                        self.group_by_keys(&agg.group_expr)?,
                         vec![],
                     ));
                 }
