@@ -108,6 +108,29 @@ pub fn plan_to_sql(plan: &LogicalPlan) -> Result<ast::Statement> {
     unparser.plan_to_sql(plan)
 }
 
+/// `have` extended with the fields of `add` it does not already carry.
+///
+/// `None` when the two disagree about a field's type under one name, which makes
+/// a reference to it ambiguous.
+fn merged_without_conflict(have: &DFSchema, add: &DFSchema) -> Option<DFSchema> {
+    let mut merged = have.clone();
+    for (qualifier, field) in add.iter() {
+        match have.field_with_name(qualifier, field.name()) {
+            Ok(existing) if existing.data_type() == field.data_type() => {}
+            Ok(_) => return None,
+            Err(_) => {
+                let addition = DFSchema::new_with_metadata(
+                    vec![(qualifier.cloned(), Arc::clone(field))],
+                    std::collections::HashMap::new(),
+                )
+                .ok()?;
+                merged = merged.join(&addition).ok()?;
+            }
+        }
+    }
+    Some(merged)
+}
+
 /// The fields a node's own expressions resolve against: everything its inputs
 /// expose, which for a join is both sides.
 ///
@@ -150,11 +173,14 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
         let Some(input) = below_inputs.first() else {
             break;
         };
-        // A name repeated across levels makes a reference ambiguous, and guessing
-        // is worse than declining: stop with what is unambiguous so far.
-        match schema.join(input.schema()) {
-            Ok(joined) => schema = joined,
-            Err(_) => break,
+        // A name repeats across levels for the ordinary reason — a grouping key
+        // is in both an aggregate's output and its input — and that is the same
+        // column, so it can be skipped. A repeat carrying a *different* type is
+        // a real ambiguity, and guessing which one a reference means is worse
+        // than declining, so the walk stops there.
+        match merged_without_conflict(&schema, input.schema()) {
+            Some(merged) => schema = merged,
+            None => break,
         }
         below = input;
     }

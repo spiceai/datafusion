@@ -10840,3 +10840,64 @@ fn test_type_directed_rendering_survives_unprojection() -> Result<()> {
 
     Ok(())
 }
+
+/// A grouping key appears in both an aggregate's output and its input, so walking
+/// down for the scope an unprojected expression resolves in meets the same name
+/// twice. Treating that as an ambiguity and stopping loses the rest of the scope,
+/// and a rendering that needs a type then declines: a tz-aware column compared
+/// against a tz-naive expression stayed as it was and reached BigQuery as "No
+/// matching signature for operator < for argument types: TIMESTAMP, DATETIME".
+///
+/// The repeat is the same column flowing through, so it is skipped. A repeat
+/// carrying a different type under one name is a real ambiguity and still stops
+/// the walk, since guessing which one a reference means is worse than declining.
+#[test]
+fn test_a_grouping_key_repeated_in_scope_does_not_hide_the_rest() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "deposit_ts",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            true,
+        ),
+        Field::new("cohort_start", DataType::Date32, true),
+        Field::new("tok", DataType::Utf8, true),
+    ]);
+
+    let week = lit(datafusion_common::ScalarValue::IntervalMonthDayNano(Some(
+        arrow::datatypes::IntervalMonthDayNano::new(0, 7, 0),
+    )));
+    let window_end = cast(
+        col("c.cohort_start"),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+    ) + week;
+
+    // The reported shape: the comparison sits inside an aggregate, and the
+    // grouping key is `cohort_start`, which the comparison also reads.
+    let counted = datafusion_functions_aggregate::expr_fn::count_distinct(
+        datafusion_expr::when(col("c.deposit_ts").lt(window_end), col("c.tok"))
+            .otherwise(lit(datafusion_common::ScalarValue::Null))?,
+    );
+    let grouped = table_scan(Some("c"), &schema, None)?
+        .aggregate(vec![col("c.cohort_start")], vec![counted])?
+        .build()?;
+    let outputs = grouped.schema().columns();
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            Expr::Column(outputs[0].clone()),
+            Expr::Column(outputs[1].clone()),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("AS TIMESTAMP)"),
+        "the civil side of the comparison has to be made an instant: {sql}"
+    );
+
+    Ok(())
+}
