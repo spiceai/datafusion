@@ -17,14 +17,16 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::tree_node::TreeNodeContainer;
 use datafusion_common::{
-    Column, HashMap, Result, TableReference,
+    Column, DFSchema, HashMap, Result, TableReference,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
-use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
-use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
+use datafusion_expr::expr::{Alias, BinaryExpr, UNNEST_COLUMN_PREFIX};
+use datafusion_expr::{
+    Expr, ExprSchemable, LogicalPlan, Operator, Projection, Sort, SortExpr,
+};
 use sqlparser::ast::Ident;
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
@@ -645,6 +647,168 @@ pub fn remove_dangling_identifiers(
             // Reset the identifiers to only the last element, which is the column name
             *idents = vec![last.clone()];
         }
+    }
+}
+
+/// Makes the date type of an operand visible in the expression itself, so the
+/// dialect can render date arithmetic without a schema of its own.
+///
+/// Expression unparsing has no schema, so it can only act on types an expression
+/// carries — an explicit cast, or a literal. That is enough for a subtraction of
+/// two explicit date casts, and not enough for `CAST(a AS DATE) - b` or for an
+/// integer cast of a bare date column, where the type lives only in the schema.
+///
+/// A plan node does have the schema its expressions resolve against, so this pass
+/// wraps those operands in a cast to the date type they already have. The cast is
+/// a no-op — the operand is that type — but it puts the type where the unparser
+/// can read it.
+///
+/// Only date operands are wrapped, and only under a subtraction or an integer
+/// cast, so nothing else changes shape. Any expression whose type cannot be
+/// resolved is left exactly as it was.
+pub(super) fn expose_date_operand_types(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_up(|plan| {
+        // Nothing here is required for correct SQL — it only lets the unparser see
+        // a type it would otherwise miss — so a node whose schema will not
+        // combine is skipped rather than failed. Such a schema is ambiguous
+        // anyway, and its own unparsing reports that far better than this pass
+        // could.
+        let Some(schema) = combined_input_schema(&plan) else {
+            return Ok(Transformed::no(plan));
+        };
+
+        plan.map_expressions(|expr| {
+            expr.transform_up(|expr| Ok(expose_in_expr(expr, &schema)))
+        })
+    })
+    .data()
+}
+
+/// The schema this node's expressions resolve against: its inputs' fields, which
+/// for a join is both sides.
+///
+/// `None` when the inputs' fields will not combine, such as two branches that
+/// both expose the same unqualified name.
+fn combined_input_schema(plan: &LogicalPlan) -> Option<DFSchema> {
+    let inputs = plan.inputs();
+    // A leaf carries its expressions itself — a scan's pushed-down filters — and
+    // they resolve against its own schema. A column the scan does not expose
+    // stays unresolved, which leaves the expression as it was.
+    if inputs.is_empty() {
+        return Some(plan.schema().as_ref().clone());
+    }
+
+    let mut schema = DFSchema::empty();
+    for input in inputs {
+        schema = schema.join(input.schema()).ok()?;
+    }
+    Some(schema)
+}
+
+/// Wraps `operand` in a cast to its own type when that type is one the dialect
+/// dispatches on, so the type travels with the expression.
+///
+/// A cast or a literal already states its type, so re-wrapping it would only add
+/// noise. Any expression whose type does not resolve is returned untouched.
+fn expose_type(operand: Expr, schema: &DFSchema) -> (Expr, bool) {
+    if matches!(
+        operand,
+        Expr::Cast(_) | Expr::TryCast(_) | Expr::Literal(..)
+    ) {
+        return (operand, false);
+    }
+    match operand.get_type(schema) {
+        Ok(
+            data_type @ (DataType::Date32
+            | DataType::Timestamp(_, _)
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64),
+        ) => (
+            Expr::Cast(datafusion_expr::expr::Cast::new(
+                Box::new(operand),
+                data_type,
+            )),
+            true,
+        ),
+        _ => (operand, false),
+    }
+}
+
+/// As [`expose_type`], restricted to the date types, so date arithmetic never
+/// gains a cast around an operand that is not a date.
+fn expose_date_type(operand: Expr, schema: &DFSchema) -> (Expr, bool) {
+    match operand.get_type(schema) {
+        Ok(DataType::Date32) => expose_type(operand, schema),
+        _ => (operand, false),
+    }
+}
+
+/// Whether `expr` resolves to one of Arrow's date types against `schema`.
+fn is_date(expr: &Expr, schema: &DFSchema) -> bool {
+    matches!(expr.get_type(schema), Ok(DataType::Date32))
+}
+
+/// Wraps a bare date operand in a cast to its own type. Returns the expression
+/// untouched when it is not one of the two shapes that need it.
+fn expose_in_expr(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
+    let expose_date =
+        |operand: Expr| -> (Expr, bool) { expose_date_type(operand, schema) };
+
+    match expr {
+        // `date - date` is a day count, but only if both sides say they are dates.
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if matches!(op, Operator::Minus)
+                && is_date(&left, schema)
+                && is_date(&right, schema) =>
+        {
+            let (left, left_changed) = expose_date(*left);
+            let (right, right_changed) = expose_date(*right);
+            let rewritten =
+                Expr::BinaryExpr(BinaryExpr::new(Box::new(left), op, Box::new(right)));
+            if left_changed || right_changed {
+                Transformed::yes(rewritten)
+            } else {
+                Transformed::no(rewritten)
+            }
+        }
+        // `to_unixtime` and `to_timestamp` render differently per operand type,
+        // so the operand has to say what it is.
+        Expr::ScalarFunction(mut function)
+            if matches!(function.name(), "to_unixtime" | "to_timestamp") =>
+        {
+            let mut changed = false;
+            function.args = function
+                .args
+                .into_iter()
+                .map(|arg| {
+                    let (arg, arg_changed) = expose_type(arg, schema);
+                    changed |= arg_changed;
+                    arg
+                })
+                .collect();
+            let rewritten = Expr::ScalarFunction(function);
+            if changed {
+                Transformed::yes(rewritten)
+            } else {
+                Transformed::no(rewritten)
+            }
+        }
+        // `CAST(date AS INT64)` is the same day count, spelled as a cast.
+        Expr::Cast(cast) if cast.field.data_type().is_integer() => {
+            let (inner, changed) = expose_date(*cast.expr);
+            let rewritten = Expr::Cast(datafusion_expr::expr::Cast::new(
+                Box::new(inner),
+                cast.field.data_type().clone(),
+            ));
+            if changed {
+                Transformed::yes(rewritten)
+            } else {
+                Transformed::no(rewritten)
+            }
+        }
+        other => Transformed::no(other),
     }
 }
 

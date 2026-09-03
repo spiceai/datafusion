@@ -25,7 +25,8 @@ use super::{
         TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
-        TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
+        TableAliasRewriter, expose_date_operand_types,
+        inject_column_aliases_into_subquery, normalize_union_schema,
         remove_dangling_identifiers, requalify_column_onto_derived_table,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
@@ -61,6 +62,7 @@ use datafusion_expr::{
     UserDefinedLogicalNode, Window, expr::Alias,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
+use sqlparser::tokenizer::Span;
 use std::{collections::HashSet, sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
@@ -109,10 +111,34 @@ pub fn plan_to_sql(plan: &LogicalPlan) -> Result<ast::Statement> {
 }
 
 impl Unparser<'_> {
+    /// Whether the dialect spells date arithmetic as something other than the bare
+    /// operators.
+    ///
+    /// Asked of the renderings themselves rather than declared separately, so a
+    /// dialect cannot answer yes here and then decline to render. Those
+    /// renderings need each date operand to carry its own type, which
+    /// [`expose_date_operand_types`] arranges before unparsing.
+    fn dialect_renders_date_arithmetic(&self) -> bool {
+        let probe = || {
+            ast::Expr::Identifier(Ident {
+                value: "x".to_string(),
+                quote_style: None,
+                span: Span::empty(),
+            })
+        };
+        self.dialect
+            .date_difference_to_sql(probe(), probe())
+            .is_some()
+            || self.dialect.date_to_integer_to_sql(probe()).is_some()
+    }
+
     pub fn plan_to_sql(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
         let mut plan = normalize_union_schema(plan)?;
         if !self.dialect.supports_qualify() {
             plan = rewrite_qualify(plan)?;
+        }
+        if self.dialect_renders_date_arithmetic() {
+            plan = expose_date_operand_types(plan)?;
         }
 
         match plan {

@@ -31,6 +31,7 @@ use std::vec;
 
 use super::Unparser;
 use super::dialect::IntervalStyle;
+use super::utils::provable_data_type;
 use arrow::array::{
     ArrayRef, Date32Array, Date64Array, PrimitiveArray,
     types::{
@@ -178,6 +179,18 @@ impl Unparser<'_> {
             Expr::BinaryExpr(BinaryExpr { left, op, right }) => {
                 let l = self.expr_to_sql_inner(left.as_ref())?;
                 let r = self.expr_to_sql_inner(right.as_ref())?;
+
+                // `date - date` is an integer count of days in the plan, which
+                // some dialects spell as a function rather than an operator.
+                if matches!(op, Operator::Minus)
+                    && is_date_typed_expr(left.as_ref())
+                    && is_date_typed_expr(right.as_ref())
+                    && let Some(difference) =
+                        self.dialect.date_difference_to_sql(l.clone(), r.clone())
+                {
+                    return Ok(difference);
+                }
+
                 let op = self.op_to_sql(op)?;
 
                 Ok(ast::Expr::Nested(Box::new(self.binary_op_to_sql(l, r, op))))
@@ -1375,7 +1388,7 @@ impl Unparser<'_> {
         Ok(ast::Expr::Cast {
             kind: ast::CastKind::Cast,
             expr: Box::new(ast::Expr::value(SingleQuotedString(ts))),
-            data_type: self.dialect.timestamp_cast_dtype(&time_unit, &None),
+            data_type: self.dialect.timestamp_literal_cast_dtype(&time_unit, tz),
             array: false,
             format: None,
         })
@@ -1419,6 +1432,15 @@ impl Unparser<'_> {
                 .timestamp_at_time_zone_to_sql(inner_expr.clone(), tz.as_ref())
         {
             return Ok(at_tz);
+        }
+        // Casting a date to an integer yields its day number, which some dialects
+        // spell as a function because they refuse the cast.
+        if data_type.is_integer()
+            && is_date_typed_expr(expr)
+            && let Some(day_number) =
+                self.dialect.date_to_integer_to_sql(inner_expr.clone())
+        {
+            return Ok(day_number);
         }
         match inner_expr {
             ast::Expr::Value(_) => match data_type {
@@ -2070,6 +2092,17 @@ impl Unparser<'_> {
             }
         }
     }
+}
+
+/// Whether an expression is *provably* a date, from the expression alone.
+///
+/// The unparser has no schema, so this only answers yes where the expression
+/// carries its own type: an explicit cast to a date, or a date literal. A bare
+/// column reference of date type answers no, which costs a translation but never
+/// misreads one — the alternative would be rewriting `date - interval`, a
+/// different and legitimate expression, into a date difference.
+fn is_date_typed_expr(expr: &Expr) -> bool {
+    matches!(provable_data_type(expr), Some(DataType::Date32))
 }
 
 #[cfg(test)]

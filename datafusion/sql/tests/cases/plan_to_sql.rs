@@ -10026,3 +10026,424 @@ fn test_a_having_above_the_projection_declines_the_aggregate_scope() -> Result<(
     );
     Ok(())
 }
+
+/// `BigQuery` has no timezone qualifier on a timestamp type: `TIMESTAMP` is the
+/// absolute instant and `DATETIME` the civil date-and-time, so the Arrow zone has
+/// to select the type rather than decorate it.
+///
+/// The shape here is the one a dashboard card plans to — a `DATETIME` column
+/// compared against a value the source SQL wrote `CAST(x AS TIMESTAMP)` for, which
+/// DataFusion types tz-naive. Rendering that cast as `TIMESTAMP` gives the two
+/// sides no common supertype and `BigQuery` refuses the whole statement with "No
+/// matching signature for operator >= for argument types: DATETIME, TIMESTAMP".
+/// Both operands must land on the same type.
+///
+/// The tz-aware arm is the guard: a zone-carrying cast must keep emitting
+/// `TIMESTAMP`, so this cannot be "fixed" by sending every timestamp to
+/// `DATETIME` and re-breaking the instant-typed columns.
+#[test]
+fn test_bigquery_timestamp_cast_follows_the_arrow_timezone() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "accepted_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(
+            "decided_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+
+    for (cast_type, expected_cast, description) in [
+        (
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            "DATETIME",
+            "a tz-naive cast is BigQuery's civil type",
+        ),
+        (
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Nanosecond,
+                Some("UTC".into()),
+            ),
+            "TIMESTAMP",
+            "a zone-carrying cast is BigQuery's instant type",
+        ),
+    ] {
+        let plan = table_scan(Some("ao"), &schema, None)?
+            .filter(col("ao.accepted_at").gt_eq(cast(col("ao.decided_at"), cast_type)))?
+            .build()?;
+
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+
+        assert!(
+            sql.contains(&format!("AS {expected_cast})")),
+            "{description}: expected a cast to {expected_cast} in: {sql}"
+        );
+    }
+
+    Ok(())
+}
+
+/// A timestamp *literal* is emitted as text that either carries a zone offset or
+/// does not, so its cast target has to agree with the string and not just with the
+/// Arrow type.
+///
+/// `BigQuery` reads neither spelling loosely: an offset-bearing string cast to
+/// `DATETIME` is rejected ("Invalid datetime string"), and a bare civil string
+/// cast to `TIMESTAMP` is silently read as UTC, which is the wrong type to compare
+/// Only `BigQuery` splits the timestamp type on the zone. For every other dialect
+/// the zone must not change the cast target at all, which is the property that
+/// DataFusion's internal name for a function is not always the name the target
+/// engine answers to. `BigQuery` has no `btrim` and no `now`, and says so —
+/// "Function not found: btrim; Did you mean trim?" — which fails the whole
+/// statement.
+///
+/// `btrim` is DataFusion's name for the SQL-standard `TRIM(BOTH ...)`, and
+/// `BigQuery`'s `TRIM` trims both ends and takes the optional character set in the
+/// same position, so the rename is the entire translation. `now()` carries the
+/// session timezone, which is unset by default, so its declared type is the civil
+/// one and `CURRENT_DATETIME` is the match — `CURRENT_TIMESTAMP` is an instant,
+/// which a `DATETIME` column has no common supertype with.
+///
+/// The one-sided trims are the guard: `ltrim`/`rtrim` mean something different
+/// from `TRIM`, and `BigQuery` matches function names case-insensitively so they
+/// already resolve. Renaming them would silently start trimming the other end.
+#[test]
+fn test_bigquery_renames_only_the_functions_it_cannot_resolve() -> Result<()> {
+    use datafusion_functions::datetime::expr_fn as datetime_fn;
+    use datafusion_functions::string::expr_fn as string_fn;
+
+    let unparser = Unparser::new(&BigQueryDialect {});
+
+    for (expr, expected, description) in [
+        (
+            string_fn::btrim(vec![col("s")]),
+            "TRIM(`s`)",
+            "btrim is BigQuery's TRIM",
+        ),
+        (
+            string_fn::btrim(vec![col("s"), lit("xy")]),
+            "TRIM(`s`, 'xy')",
+            "the character set keeps its position",
+        ),
+        (
+            datetime_fn::now(),
+            "CURRENT_DATETIME()",
+            "now() carries the session timezone, unset by default, so its              declared type is the civil one",
+        ),
+    ] {
+        assert_eq!(
+            unparser.expr_to_sql(&expr)?.to_string(),
+            expected,
+            "{description}"
+        );
+    }
+
+    // The one-sided trims must come through untouched.
+    for (expr, name) in [
+        (string_fn::ltrim(vec![col("s")]), "ltrim"),
+        (string_fn::rtrim(vec![col("s")]), "rtrim"),
+    ] {
+        let sql = unparser.expr_to_sql(&expr)?.to_string();
+        assert!(
+            sql.to_lowercase().starts_with(name),
+            "{name} trims one end and must not be rewritten to TRIM: {sql}"
+        );
+    }
+
+    Ok(())
+}
+
+/// DataFusion types `date - date` as an `Int64` count of days. BigQuery types
+/// `DATE - DATE` as an `INTERVAL`, so the bare operator hands the plan's integer
+/// day count to BigQuery as a duration. Whatever the plan does with it next then
+/// fails: comparing it to a number gives "No matching signature for operator <
+/// for argument types: INTERVAL, INT64", and casting it gives "Invalid cast from
+/// INTERVAL to INT64".
+///
+/// `DATE_DIFF(lhs, rhs, DAY)` is the same quantity with the type the plan means.
+///
+/// The negative arms carry the weight here. The unparser has no schema, so the
+/// rewrite fires only where both operands prove their own date type. A bare
+/// column of date type is left alone deliberately: the alternative is guessing,
+/// and `date - interval` is a different, legitimate expression that BigQuery
+/// accepts and that a date difference would destroy.
+#[test]
+fn test_bigquery_date_subtraction_becomes_a_day_count() -> Result<()> {
+    let unparser = Unparser::new(&BigQueryDialect {});
+
+    let date_difference = cast(col("created_at"), DataType::Date32)
+        - cast(col("funding_date"), DataType::Date32);
+
+    assert_eq!(
+        unparser.expr_to_sql(&date_difference)?.to_string(),
+        "DATE_DIFF(CAST(`created_at` AS DATE), CAST(`funding_date` AS DATE), DAY)",
+        "two date operands are a day count"
+    );
+
+    // Wrapped in the integer cast the reporting statements apply. The day count is
+    // already INT64, so the cast is a no-op rather than the rejected INTERVAL cast.
+    assert_eq!(
+        unparser
+            .expr_to_sql(&cast(date_difference.clone(), DataType::Int32))?
+            .to_string(),
+        "CAST(DATE_DIFF(CAST(`created_at` AS DATE), CAST(`funding_date` AS DATE), DAY) \
+         AS INTEGER)",
+        "the integer cast applies to the day count"
+    );
+
+    // Negative arms: none of these are a date difference and all must keep `-`.
+    let interval = lit(datafusion_common::ScalarValue::IntervalMonthDayNano(Some(
+        arrow::datatypes::IntervalMonthDayNano::new(0, 1, 0),
+    )));
+    for (expr, description) in [
+        (
+            cast(col("d"), DataType::Date32) - interval,
+            "date minus interval is a date, not a day count",
+        ),
+        (col("a") - col("b"), "bare columns do not prove a date type"),
+        (
+            cast(col("a"), DataType::Int64) - cast(col("b"), DataType::Int64),
+            "numeric operands are ordinary arithmetic",
+        ),
+        (
+            cast(col("a"), DataType::Date32) + cast(col("b"), DataType::Date32),
+            "only subtraction is a difference",
+        ),
+    ] {
+        let sql = unparser.expr_to_sql(&expr)?.to_string();
+        assert!(!sql.contains("DATE_DIFF"), "{description}: {sql}");
+    }
+
+    // Every other dialect keeps the operator.
+    assert_eq!(
+        Unparser::new(&UnparserDefaultDialect {})
+            .expr_to_sql(&date_difference)?
+            .to_string(),
+        "(CAST(created_at AS DATE) - CAST(funding_date AS DATE))",
+        "the rewrite is BigQuery's, not the shared path's"
+    );
+
+    Ok(())
+}
+
+/// The date rewrites need the operands' types, and expression unparsing has no
+/// schema. A plan node does, so the types are made explicit there first.
+///
+/// These are the two shapes the expression-only rule cannot reach: a subtraction
+/// where one side is a bare date column, and an integer cast of one. Both are
+/// day counts in the plan; BigQuery refuses the first as `INTERVAL` against
+/// `INT64` and the second outright ("Invalid cast from DATE to INT64").
+///
+/// `UNIX_DATE` is the day number DataFusion means by casting a `Date32` to an
+/// integer — zero at the epoch, negative before it — so the two spellings agree
+/// on every date, not just the ones a test happens to pick.
+#[test]
+fn test_bigquery_reads_date_operand_types_from_the_plan() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "requested_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new("repayment_date", DataType::Date32, true),
+        Field::new("chosen_date", DataType::Date32, true),
+        Field::new("decided_on", DataType::Date32, true),
+        Field::new("amount", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+
+    // One explicit cast, one bare date column.
+    let plan = table_scan(Some("p"), &schema, None)?
+        .project(vec![
+            (cast(col("p.requested_at"), DataType::Date32) - col("p.repayment_date"))
+                .alias("dpd"),
+        ])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("DATE_DIFF(") && !sql.contains(" - "),
+        "a bare date column still makes a day count: {sql}"
+    );
+
+    // Integer casts of two bare date columns.
+    let plan = table_scan(Some("r"), &schema, None)?
+        .project(vec![
+            (cast(col("r.chosen_date"), DataType::Int32)
+                - cast(col("r.decided_on"), DataType::Int32))
+            .alias("term_days"),
+        ])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.matches("UNIX_DATE(").count() == 2,
+        "each date-to-integer cast is a day number: {sql}"
+    );
+    assert!(
+        !sql.contains("AS INTEGER"),
+        "no cast from DATE to an integer may survive: {sql}"
+    );
+
+    // Negative arms: nothing here is a date, and all must keep their cast or
+    // operator. A string cast to an integer especially must not become a day
+    // number.
+    for (projection, description) in [
+        (
+            cast(col("n.amount"), DataType::Int32).alias("a"),
+            "an integer cast of a number",
+        ),
+        (
+            cast(col("n.label"), DataType::Int64).alias("a"),
+            "an integer cast of a string",
+        ),
+        (
+            (col("n.amount") - lit(1i64)).alias("a"),
+            "numeric subtraction",
+        ),
+        (
+            (col("n.repayment_date")
+                - lit(datafusion_common::ScalarValue::IntervalMonthDayNano(Some(
+                    arrow::datatypes::IntervalMonthDayNano::new(0, 1, 0),
+                ))))
+            .alias("a"),
+            "a date minus an interval, which is a date",
+        ),
+    ] {
+        let plan = table_scan(Some("n"), &schema, None)?
+            .project(vec![projection])?
+            .build()?;
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(
+            !sql.contains("UNIX_DATE") && !sql.contains("DATE_DIFF"),
+            "{description} is not a day count: {sql}"
+        );
+    }
+
+    // The pass is BigQuery's: no other dialect sees a changed plan.
+    let plan = table_scan(Some("p"), &schema, None)?
+        .project(vec![
+            (cast(col("p.requested_at"), DataType::Date32) - col("p.repayment_date"))
+                .alias("dpd"),
+        ])?
+        .build()?;
+    assert_eq!(
+        Unparser::new(&UnparserDefaultDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        "SELECT (CAST(p.requested_at AS DATE) - p.repayment_date) AS dpd FROM p",
+        "the shared path keeps the operator and adds no cast"
+    );
+
+    Ok(())
+}
+
+/// `to_unixtime` and `to_timestamp` have no single BigQuery counterpart: the
+/// right spelling depends on the operand's type, so a rename cannot do it.
+///
+/// `UNIX_SECONDS` takes only a `TIMESTAMP` and refuses a `DATETIME` ("No matching
+/// signature for function UNIX_SECONDS"), so a civil operand is read as an
+/// instant in UTC first — the reading DataFusion gives a tz-naive timestamp and a
+/// date. Going the other way, BigQuery has no `TIMESTAMP(int)` ("No matching
+/// signature for function TIMESTAMP"); `TIMESTAMP_SECONDS` is the integer form,
+/// and its result is an instant, so it is brought back to the civil type
+/// `to_timestamp` declares.
+///
+/// An operand whose type is not evident keeps the old rendering rather than
+/// getting a guessed one — the string arms below, where DataFusion's parsing
+/// rules are not BigQuery's.
+#[test]
+fn test_bigquery_unix_time_conversions_follow_the_operand_type() -> Result<()> {
+    use datafusion_functions::datetime::expr_fn as datetime_fn;
+
+    let schema = Schema::new(vec![
+        Field::new(
+            "naive_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(
+            "aware_at",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            true,
+        ),
+        Field::new("opened_on", DataType::Date32, true),
+        Field::new("secs", DataType::Int64, true),
+        Field::new("label", DataType::Utf8, true),
+    ]);
+
+    let rendered = |expr: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![expr.alias("v")])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    // A civil operand is read as an instant; an instant is used as it is.
+    assert!(
+        rendered(datetime_fn::to_unixtime(vec![col("t.naive_at")]))?
+            .contains("UNIX_SECONDS(TIMESTAMP("),
+        "a tz-naive operand has to become an instant first"
+    );
+    assert!(
+        rendered(datetime_fn::to_unixtime(vec![col("t.opened_on")]))?
+            .contains("UNIX_SECONDS(TIMESTAMP("),
+        "a date operand has to become an instant first"
+    );
+    let aware = rendered(datetime_fn::to_unixtime(vec![col("t.aware_at")]))?;
+    assert!(
+        aware.contains("UNIX_SECONDS(") && !aware.contains("UNIX_SECONDS(TIMESTAMP("),
+        "an instant operand needs no conversion: {aware}"
+    );
+
+    // Integer seconds keep the civil return type the plan declares.
+    assert!(
+        rendered(datetime_fn::to_timestamp(vec![col("t.secs")]))?
+            .contains("DATETIME(TIMESTAMP_SECONDS("),
+        "integer seconds are TIMESTAMP_SECONDS, returned as the civil type"
+    );
+
+    // Negative arms: a string operand is left exactly as it was.
+    for expr in [
+        datetime_fn::to_unixtime(vec![col("t.label")]),
+        datetime_fn::to_timestamp(vec![col("t.label")]),
+    ] {
+        let sql = rendered(expr)?;
+        assert!(
+            !sql.contains("UNIX_SECONDS")
+                && !sql.contains("TIMESTAMP_SECONDS")
+                && !sql.contains("DATETIME("),
+            "a string operand must not get a guessed conversion: {sql}"
+        );
+    }
+
+    // No other dialect is touched.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![
+            datetime_fn::to_unixtime(vec![col("t.naive_at")]).alias("v"),
+        ])?
+        .build()?;
+    assert_eq!(
+        Unparser::new(&UnparserDefaultDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        "SELECT to_unixtime(t.naive_at) AS v FROM t",
+        "the shared path keeps DataFusion's own spelling"
+    );
+
+    Ok(())
+}

@@ -21,6 +21,7 @@ use super::{
     Unparser, dialect::CharacterLengthStyle, dialect::DateFieldExtractStyle,
     rewrite::TableAliasRewriter,
 };
+use arrow::datatypes::DataType;
 use datafusion_common::{
     Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
     assert_eq_or_internal_err, internal_err,
@@ -28,7 +29,9 @@ use datafusion_common::{
 };
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Projection,
-    SortExpr, Unnest, Window, expr, utils::grouping_set_to_exprlist,
+    SortExpr, Unnest, Window, expr,
+    expr::{Cast, TryCast},
+    utils::grouping_set_to_exprlist,
 };
 
 use indexmap::IndexSet;
@@ -1129,6 +1132,162 @@ pub(crate) fn sqlite_date_trunc_to_sql(
     }
 
     Ok(None)
+}
+
+/// The type an expression states about itself, without a schema.
+///
+/// Only a cast and a literal carry their own type; everything else answers
+/// `None`, including a column whose type is known only to the schema.
+pub(crate) fn provable_data_type(expr: &Expr) -> Option<DataType> {
+    match expr {
+        Expr::Alias(alias) => provable_data_type(&alias.expr),
+        Expr::Cast(Cast { field, .. }) | Expr::TryCast(TryCast { field, .. }) => {
+            Some(field.data_type().clone())
+        }
+        Expr::Literal(value, _) => Some(value.data_type()),
+        _ => None,
+    }
+}
+
+/// Wraps `arg` in BigQuery's `TIMESTAMP(...)`, which reads a civil date or
+/// date-and-time as an instant in UTC — the same reading DataFusion gives a
+/// tz-naive value.
+fn bigquery_as_instant(arg: ast::Expr) -> ast::Expr {
+    bigquery_call("TIMESTAMP", vec![arg])
+}
+
+/// Builds a BigQuery function call from already-unparsed arguments.
+fn bigquery_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident {
+            value: name.to_string(),
+            quote_style: None,
+            span: Span::empty(),
+        }]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|arg| ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })
+}
+
+/// Converts DataFusion's `to_unixtime(expr)` — seconds since the epoch — to
+/// BigQuery's `UNIX_SECONDS`.
+///
+/// `UNIX_SECONDS` takes only a `TIMESTAMP`; it refuses a `DATETIME` ("No matching
+/// signature for function UNIX_SECONDS"), so a civil operand is read as an
+/// instant in UTC first, which is how DataFusion reads a tz-naive timestamp and a
+/// date.
+///
+/// Returns `Ok(None)` when the operand's type is not evident from the expression,
+/// leaving the default rendering, because the right form depends on that type.
+pub(crate) fn bigquery_to_unixtime_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [arg] = args else {
+        return Ok(None);
+    };
+
+    let Some(data_type) = provable_data_type(arg) else {
+        return Ok(None);
+    };
+
+    let operand = unparser.expr_to_sql(arg)?;
+    let instant = match data_type {
+        DataType::Timestamp(_, Some(_)) => operand,
+        DataType::Timestamp(_, None) | DataType::Date32 | DataType::Date64 => {
+            bigquery_as_instant(operand)
+        }
+        // A number is already seconds and a string needs parsing rules BigQuery
+        // does not share; neither is a rename.
+        _ => return Ok(None),
+    };
+
+    Ok(Some(bigquery_call("UNIX_SECONDS", vec![instant])))
+}
+
+/// Converts DataFusion's `to_timestamp(expr)` to BigQuery.
+///
+/// DataFusion reads an integer as seconds since the epoch and returns a tz-naive
+/// timestamp. BigQuery has no `TIMESTAMP(int)` ("No matching signature for
+/// function TIMESTAMP"); `TIMESTAMP_SECONDS` is the integer form, and its result
+/// is an instant, so it is brought back to the civil type the plan declares.
+///
+/// Returns `Ok(None)` for any other operand type, including one that is not
+/// evident from the expression.
+pub(crate) fn bigquery_to_timestamp_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [arg] = args else {
+        return Ok(None);
+    };
+
+    let Some(data_type) = provable_data_type(arg) else {
+        return Ok(None);
+    };
+
+    if !data_type.is_integer() {
+        return Ok(None);
+    }
+
+    let seconds = unparser.expr_to_sql(arg)?;
+    Ok(Some(bigquery_call(
+        "DATETIME",
+        vec![bigquery_call("TIMESTAMP_SECONDS", vec![seconds])],
+    )))
+}
+
+/// Re-emits a scalar function under the name BigQuery spells it, with the
+/// arguments unchanged.
+///
+/// Only for functions whose BigQuery counterpart takes the same arguments in the
+/// same order and means the same thing, so the rename is the whole translation.
+/// A function whose BigQuery form depends on its argument *types* cannot be
+/// handled here, because those types are not available at unparse time.
+pub(crate) fn bigquery_renamed_scalar_fn(
+    unparser: &Unparser,
+    bigquery_name: &str,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let args = args
+        .iter()
+        .map(|arg| {
+            Ok(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                unparser.expr_to_sql(arg)?,
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident {
+            value: bigquery_name.to_string(),
+            quote_style: None,
+            span: Span::empty(),
+        }]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args,
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
 }
 
 /// Converts DataFusion's `date_trunc(granularity, expr)` to BigQuery's
