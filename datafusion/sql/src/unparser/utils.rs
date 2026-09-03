@@ -1294,45 +1294,165 @@ pub(crate) fn bigquery_percentile_to_sql(
     let percentile = match percentile_arg {
         None => None,
         Some(i) => match args.get(i) {
-            // Only a constant percentile can be spliced into the offsets; a
+            // Only a constant percentile can be folded into the offsets; a
             // per-row one would need a different shape entirely.
-            Some(Expr::Literal(scalar, _)) if !scalar.is_null() => {
-                Some(scalar.to_string())
+            Some(literal @ Expr::Literal(scalar, _)) if !scalar.is_null() => {
+                Some(unparser.expr_to_sql(literal)?)
             }
             _ => return Ok(None),
         },
     };
 
-    let value_sql = unparser.expr_to_sql(value)?.to_string();
-    let distinct = if distinct { "DISTINCT " } else { "" };
-    let sorted =
-        format!("ARRAY_AGG({distinct}{value_sql} IGNORE NULLS ORDER BY {value_sql})");
-    let length = format!("ARRAY_LENGTH({sorted})");
-    let index = format!(
-        "({} * ({length} - 1))",
-        percentile.as_deref().unwrap_or("0.5")
+    let value_sql = unparser.expr_to_sql(value)?;
+    let sorted = ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident {
+            value: "ARRAY_AGG".to_string(),
+            quote_style: None,
+            span: Span::empty(),
+        }]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: distinct.then_some(ast::DuplicateTreatment::Distinct),
+            args: vec![ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                value_sql.clone(),
+            ))],
+            clauses: vec![
+                // Inside the parentheses, and before the ordering: BigQuery
+                // takes both as argument clauses of ARRAY_AGG. A null takes no
+                // position, which is how DataFusion reads it too.
+                ast::FunctionArgumentClause::IgnoreOrRespectNulls(
+                    ast::NullTreatment::IgnoreNulls,
+                ),
+                ast::FunctionArgumentClause::OrderBy(vec![ast::OrderByExpr {
+                    expr: value_sql,
+                    options: ast::OrderByOptions {
+                        asc: None,
+                        nulls_first: None,
+                    },
+                    with_fill: None,
+                }]),
+            ],
+        }),
+        null_treatment: None,
+        filter: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+
+    // idx = p * (ARRAY_LENGTH(sorted) - 1), the 0-based position the percentile
+    // falls at.
+    let index = binary(
+        percentile.clone().unwrap_or_else(|| number("0.5")),
+        ast::BinaryOperator::Multiply,
+        nest(binary(
+            bigquery_call("ARRAY_LENGTH", vec![sorted.clone()]),
+            ast::BinaryOperator::Minus,
+            number("1"),
+        )),
     );
-    let low = format!("{sorted}[OFFSET(CAST(FLOOR({index}) AS INT64))]");
-    let high = format!("{sorted}[OFFSET(CAST(CEIL({index}) AS INT64))]");
+
+    // The two elements it falls between. At an integer index both address the
+    // same element, so the interpolation below degenerates to that element.
+    let at = |round: &str| ast::Expr::CompoundFieldAccess {
+        root: Box::new(sorted.clone()),
+        access_chain: vec![ast::AccessExpr::Subscript(ast::Subscript::Index {
+            index: bigquery_call(
+                "OFFSET",
+                vec![cast_to(
+                    bigquery_call(round, vec![index.clone()]),
+                    ast::DataType::Int64,
+                )],
+            ),
+        })],
+    };
+    let (low, high) = (at("FLOOR"), at("CEIL"));
 
     let rendered = if percentile.is_none() {
-        // A median needs no weight, so the input's type survives.
-        format!("(({low}) + ({high})) / 2")
+        // A median needs no weight, so the input's own type survives.
+        let mean = binary(
+            nest(binary(nest(low), ast::BinaryOperator::Plus, nest(high))),
+            ast::BinaryOperator::Divide,
+            number("2"),
+        );
+        // DataFusion's median over a decimal averages the two middle values as
+        // scaled integers, so the result is truncated to the input's own scale:
+        // the median of 1 and 2 at scale 0 is 1, not 1.5. BigQuery's `/` keeps
+        // the extra digits, so they are truncated off to match.
+        match unparser.resolved_data_type(value) {
+            Some(data_type) if data_type.is_decimal() => {
+                match decimal_scale(&data_type) {
+                    Some(scale) => {
+                        bigquery_call("TRUNC", vec![mean, number(&scale.to_string())])
+                    }
+                    None => mean,
+                }
+            }
+            _ => mean,
+        }
     } else {
-        format!(
-            "(CAST({low} AS FLOAT64) \
-             + (CAST({high} AS FLOAT64) - CAST({low} AS FLOAT64)) \
-             * ({index} - FLOOR({index})))"
+        // low + (high - low) * (idx - FLOOR(idx))
+        let float = |expr| cast_to(expr, ast::DataType::Float64);
+        binary(
+            float(low.clone()),
+            ast::BinaryOperator::Plus,
+            nest(binary(
+                nest(binary(float(high), ast::BinaryOperator::Minus, float(low))),
+                ast::BinaryOperator::Multiply,
+                nest(binary(
+                    index.clone(),
+                    ast::BinaryOperator::Minus,
+                    bigquery_call("FLOOR", vec![index]),
+                )),
+            )),
         )
     };
 
-    // Parsed back rather than hand-built: the nesting is several deep and the
-    // shape is what the doc comment above states, which a reader can check
-    // against the text but not against a tree of constructors.
-    let mut parser =
-        sqlparser::parser::Parser::new(&sqlparser::dialect::BigQueryDialect {})
-            .try_with_sql(&rendered)?;
-    Ok(Some(parser.parse_expr()?))
+    Ok(Some(nest(rendered)))
+}
+
+/// The scale of a decimal type, when it is one and the scale is not negative.
+///
+/// A negative scale stores a value coarser than one unit, which no BigQuery
+/// numeric type has, so there is nothing to truncate to.
+fn decimal_scale(data_type: &DataType) -> Option<i8> {
+    match data_type {
+        DataType::Decimal32(_, scale)
+        | DataType::Decimal64(_, scale)
+        | DataType::Decimal128(_, scale)
+        | DataType::Decimal256(_, scale) => (*scale >= 0).then_some(*scale),
+        _ => None,
+    }
+}
+
+/// `lhs op rhs`.
+fn binary(lhs: ast::Expr, op: ast::BinaryOperator, rhs: ast::Expr) -> ast::Expr {
+    ast::Expr::BinaryOp {
+        left: Box::new(lhs),
+        op,
+        right: Box::new(rhs),
+    }
+}
+
+/// `(expr)`, so composed arithmetic keeps the grouping it was built with.
+fn nest(expr: ast::Expr) -> ast::Expr {
+    ast::Expr::Nested(Box::new(expr))
+}
+
+/// An unquoted numeric literal.
+fn number(value: &str) -> ast::Expr {
+    ast::Expr::Value(ast::Value::Number(value.to_string(), false).into())
+}
+
+/// `CAST(expr AS data_type)`.
+fn cast_to(expr: ast::Expr, data_type: ast::DataType) -> ast::Expr {
+    ast::Expr::Cast {
+        kind: ast::CastKind::Cast,
+        expr: Box::new(expr),
+        data_type,
+        format: None,
+        array: false,
+    }
 }
 
 /// Re-emits a scalar function under the name BigQuery spells it, with the

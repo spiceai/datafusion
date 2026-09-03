@@ -10669,18 +10669,17 @@ fn test_bigquery_timestamp_literal_is_truncated_to_microseconds() -> Result<()> 
     Ok(())
 }
 
-/// A constant grouping key partitions nothing — every row carries the same value
-/// — so leaving it out groups identically and removes an emission engines
-/// disagree about. `BigQuery` refuses it outright ("Cannot GROUP BY literal
-/// values"), and an engine that reads a bare integer in `GROUP BY` as a
-/// select-list ordinal reads it as something other than the constant the plan
-/// meant.
+/// A bare literal is not a portable `GROUP BY` key. `BigQuery` refuses one
+/// outright ("Cannot GROUP BY literal values"), and an engine that reads a bare
+/// integer there as a select-list ordinal groups by something other than the
+/// constant the plan meant. Casting the literal to the type it already has is
+/// accepted everywhere and cannot be read as an ordinal.
 ///
-/// The constant still projects; only the grouping loses it. An all-constant
-/// grouping leaves no keys at all, which is a single group over the input and the
-/// same result again.
+/// The key is kept rather than dropped. Measured on BigQuery over a table
+/// filtered to nothing: `GROUP BY CAST('x' AS STRING)` returns no rows, where
+/// dropping the last key leaves a global aggregate returning one row of zeros.
 #[test]
-fn test_constant_group_by_keys_are_left_out() -> Result<()> {
+fn test_constant_group_by_keys_are_cast_to_their_own_type() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
@@ -10692,26 +10691,23 @@ fn test_constant_group_by_keys_are_left_out() -> Result<()> {
             .build()
     };
 
-    // A constant beside a real key: the key survives, the constant does not.
+    // A constant beside a real key: both are grouping keys, and the constant is
+    // no longer a bare literal.
     let sql = Unparser::new(&BigQueryDialect {})
         .plan_to_sql(&grouped(vec![lit("POOLED"), col("t.g")])?)?
         .to_string();
-    assert!(
-        sql.contains("GROUP BY `t`.`g`"),
-        "the real key has to survive: {sql}"
-    );
     let group_by_clause = &sql[sql.find("GROUP BY").expect("a GROUP BY")..];
     assert!(
-        !group_by_clause.contains("'POOLED'"),
-        "the constant must not reach GROUP BY: {sql}"
+        group_by_clause.contains("`t`.`g`"),
+        "the real key has to survive: {sql}"
     );
     assert!(
-        sql.contains("'POOLED'"),
-        "the constant still belongs in the select list: {sql}"
+        group_by_clause.contains("CAST('POOLED' AS STRING)"),
+        "the constant key has to be cast, not dropped: {sql}"
     );
 
-    // Every dialect gains this, since grouping by a constant means the same
-    // everywhere and an ordinal reading would mean something else.
+    // Every dialect gains this, since a bare integer would be read as an
+    // ordinal and grouping by a constant means the same everywhere.
     for dialect in [
         &UnparserDefaultDialect {} as &dyn UnparserDialect,
         &UnparserPostgreSqlDialect {},
@@ -10719,9 +10715,14 @@ fn test_constant_group_by_keys_are_left_out() -> Result<()> {
         let sql = Unparser::new(dialect)
             .plan_to_sql(&grouped(vec![lit(1i64), col("t.g")])?)?
             .to_string();
+        let group_by_clause = &sql[sql.find("GROUP BY").expect("a GROUP BY")..];
         assert!(
-            !sql.contains("GROUP BY 1"),
+            !group_by_clause.contains("BY 1,") && !group_by_clause.ends_with("BY 1"),
             "a bare integer key would be read as an ordinal: {sql}"
+        );
+        assert!(
+            group_by_clause.contains("CAST(1 AS"),
+            "the constant key is cast to the type it already has: {sql}"
         );
     }
 

@@ -54,7 +54,7 @@ use datafusion_common::{
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
-use datafusion_expr::expr::{OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
+use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
@@ -1022,36 +1022,28 @@ impl Unparser<'_> {
         self.project_window_output(&window_expr, select, None)
     }
 
-    /// The `GROUP BY` keys to emit, with constant ones left out.
+    /// The `GROUP BY` keys to emit, with a constant key cast to its own type.
     ///
-    /// A constant partitions nothing — every row carries the same value — so
-    /// dropping it groups identically while removing an emission engines
-    /// disagree about. BigQuery refuses it outright ("Cannot GROUP BY literal
-    /// values"), and an engine that reads a bare integer in `GROUP BY` as a
-    /// select-list ordinal reads it as something else entirely, which is not what
-    /// the plan meant either.
+    /// A bare literal is not a portable grouping key. BigQuery refuses one
+    /// outright ("Cannot GROUP BY literal values"), and an engine that reads a
+    /// bare integer there as a select-list ordinal groups by something else
+    /// entirely. Casting the literal to the type it already has is accepted
+    /// everywhere and cannot be read as an ordinal.
     ///
-    /// Dropping is withheld in exactly the case DataFusion's own
-    /// `eliminate_group_by_constant` withholds it: when nothing would be left to
-    /// group by *and* there are no aggregates, the grouping is what collapses the
-    /// input to one row, and removing it would return one row per input row
-    /// instead. Everywhere else the plan already means a single group.
+    /// The key is kept rather than dropped, because dropping the last one turns
+    /// a grouped aggregate into a global one: over an empty input the first
+    /// yields no rows and the second yields a row of zeros.
     fn group_by_keys(&self, aggregate: &Aggregate) -> Result<Vec<ast::Expr>> {
-        let (constant, varying): (Vec<_>, Vec<_>) = aggregate
+        aggregate
             .group_expr
             .iter()
-            .partition(|expr| matches!(expr, Expr::Literal(..)));
-
-        let keep_constants =
-            constant.is_empty() || (varying.is_empty() && aggregate.aggr_expr.is_empty());
-
-        let emit: Vec<&Expr> = if keep_constants {
-            aggregate.group_expr.iter().collect()
-        } else {
-            varying
-        };
-        emit.into_iter()
-            .map(|expr| self.expr_to_sql(expr))
+            .map(|expr| match expr {
+                Expr::Literal(value, _) => self.expr_to_sql(&Expr::Cast(Cast::new(
+                    Box::new(expr.clone()),
+                    value.data_type(),
+                ))),
+                _ => self.expr_to_sql(expr),
+            })
             .collect()
     }
 
