@@ -27,7 +27,8 @@ use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::{ObjectStore, ObjectStoreExt};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use parking_lot::Mutex;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{
     AsyncFileReader, ObjectVersionType, ParquetObjectReader,
@@ -38,6 +39,43 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
+
+/// `(location, listed ETag)` → version id discovered by `HEAD` during
+/// metadata load.
+///
+/// ListObjectsV2 omits version ids. `CachedParquetFileReader::get_metadata`
+/// promotes one from HEAD when the ETag still matches. Bloom-filter scans
+/// then build a second reader from the original [`PartitionedFile`] (still
+/// `version: None`); looking this map up keeps that reader on the same
+/// generation pin instead of falling back to a stale `If-Match`.
+type DiscoveredVersions = Arc<Mutex<HashMap<(String, String), String>>>;
+
+fn discovered_version_key(meta: &ObjectMeta) -> Option<(String, String)> {
+    Some((meta.location.to_string(), meta.e_tag.clone()?))
+}
+
+fn apply_discovered_version(pins: &DiscoveredVersions, meta: &mut ObjectMeta) {
+    if meta.version.is_some() {
+        return;
+    }
+    let Some(key) = discovered_version_key(meta) else {
+        return;
+    };
+    if let Some(version) = pins.lock().get(&key).cloned() {
+        meta.version = Some(version);
+    }
+}
+
+fn record_discovered_version(
+    pins: &DiscoveredVersions,
+    meta: &ObjectMeta,
+    version: &str,
+) {
+    let Some(key) = discovered_version_key(meta) else {
+        return;
+    };
+    pins.lock().insert(key, version.to_string());
+}
 
 /// Interface for reading Apache Parquet files.
 ///
@@ -204,6 +242,7 @@ pub struct CachedParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
     metadata_cache: Arc<dyn FileMetadataCache>,
     object_versioning_type: Option<ObjectVersionType>,
+    discovered_versions: DiscoveredVersions,
 }
 
 impl CachedParquetFileReaderFactory {
@@ -215,6 +254,7 @@ impl CachedParquetFileReaderFactory {
             store,
             metadata_cache,
             object_versioning_type: None,
+            discovered_versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -246,6 +286,11 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             metrics,
         );
         let store = Arc::clone(&self.store);
+        let mut partitioned_file = partitioned_file;
+        apply_discovered_version(
+            &self.discovered_versions,
+            &mut partitioned_file.object_meta,
+        );
 
         let mut inner = ParquetObjectReader::new_with_meta(
             store,
@@ -266,7 +311,8 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
                 Arc::clone(&self.metadata_cache),
                 metadata_size_hint,
             )
-            .with_object_versioning_type(self.object_versioning_type.clone()),
+            .with_object_versioning_type(self.object_versioning_type.clone())
+            .with_discovered_versions(Arc::clone(&self.discovered_versions)),
         ))
     }
 }
@@ -282,6 +328,7 @@ pub struct CachedParquetFileReader {
     metadata_cache: Arc<dyn FileMetadataCache>,
     metadata_size_hint: Option<usize>,
     object_versioning_type: Option<ObjectVersionType>,
+    discovered_versions: DiscoveredVersions,
 }
 
 impl CachedParquetFileReader {
@@ -301,6 +348,7 @@ impl CachedParquetFileReader {
             metadata_cache,
             metadata_size_hint,
             object_versioning_type: None,
+            discovered_versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -313,6 +361,11 @@ impl CachedParquetFileReader {
         object_versioning_type: Option<ObjectVersionType>,
     ) -> Self {
         self.object_versioning_type = object_versioning_type;
+        self
+    }
+
+    fn with_discovered_versions(mut self, pins: DiscoveredVersions) -> Self {
+        self.discovered_versions = pins;
         self
     }
 }
@@ -371,6 +424,12 @@ impl AsyncFileReader for CachedParquetFileReader {
                     version_from_head_if_same_generation(&object_meta, &head)
             {
                 object_meta.version = Some(version.clone());
+                self.partitioned_file.object_meta.version = Some(version.clone());
+                record_discovered_version(
+                    &self.discovered_versions,
+                    &object_meta,
+                    &version,
+                );
                 self.inner.set_object_version(version);
             }
 
@@ -431,5 +490,210 @@ impl FileMetadata for CachedParquetMetaData {
         let page_index =
             self.0.column_index().is_some() && self.0.offset_index().is_some();
         HashMap::from([("page_index".to_owned(), page_index.to_string())])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::array::{Int32Array, RecordBatch};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use async_trait::async_trait;
+    use datafusion_execution::cache::DefaultFilesMetadataCache;
+    use futures::stream::BoxStream;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+    use object_store::{
+        CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectStore,
+        ObjectStoreExt, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
+    use parquet::arrow::ArrowWriter;
+    use std::fmt;
+    use std::sync::Mutex as StdMutex;
+
+    fn object_meta(e_tag: Option<&str>, version: Option<&str>) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from("listing/data.parquet"),
+            last_modified: chrono::DateTime::from(std::time::SystemTime::now()),
+            size: 100,
+            e_tag: e_tag.map(str::to_string),
+            version: version.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn replacement_reader_reuses_the_head_promoted_version() {
+        let pins: DiscoveredVersions = Arc::new(Mutex::new(HashMap::new()));
+        let listed = object_meta(Some("etag-a"), None);
+        record_discovered_version(&pins, &listed, "v-listed");
+
+        let mut replacement = listed.clone();
+        apply_discovered_version(&pins, &mut replacement);
+        assert_eq!(
+            replacement.version.as_deref(),
+            Some("v-listed"),
+            "a second reader for the same listing must keep the HEAD version"
+        );
+
+        let mut other_generation = object_meta(Some("etag-b"), None);
+        apply_discovered_version(&pins, &mut other_generation);
+        assert!(
+            other_generation.version.is_none(),
+            "a different listed ETag must not inherit another generation's version"
+        );
+    }
+
+    /// `HEAD` reports a version id; range reads are recorded.
+    #[derive(Debug)]
+    struct VersionHeadStore {
+        inner: InMemory,
+        version: String,
+        reads: StdMutex<Vec<GetOptions>>,
+    }
+
+    impl fmt::Display for VersionHeadStore {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "VersionHeadStore")
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for VersionHeadStore {
+        async fn put_opts(
+            &self,
+            location: &Path,
+            payload: PutPayload,
+            opts: PutOptions,
+        ) -> object_store::Result<PutResult> {
+            self.inner.put_opts(location, payload, opts).await
+        }
+
+        async fn put_multipart_opts(
+            &self,
+            location: &Path,
+            opts: PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+
+        async fn get_opts(
+            &self,
+            location: &Path,
+            options: GetOptions,
+        ) -> object_store::Result<GetResult> {
+            if !options.head {
+                self.reads.lock().expect("reads lock").push(options.clone());
+            }
+            let mut result = self.inner.get_opts(location, options.clone()).await?;
+            if options.head {
+                result.meta.version = Some(self.version.clone());
+            }
+            Ok(result)
+        }
+
+        fn delete_stream(
+            &self,
+            locations: BoxStream<'static, object_store::Result<Path>>,
+        ) -> BoxStream<'static, object_store::Result<Path>> {
+            self.inner.delete_stream(locations)
+        }
+
+        fn list(
+            &self,
+            prefix: Option<&Path>,
+        ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+            self.inner.list(prefix)
+        }
+
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&Path>,
+        ) -> object_store::Result<ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+
+        async fn copy_opts(
+            &self,
+            from: &Path,
+            to: &Path,
+            options: CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    fn write_tiny_parquet() -> Vec<u8> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as _],
+        )
+        .expect("batch");
+        let mut buf = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, None).expect("writer");
+        writer.write(&batch).expect("write");
+        writer.close().expect("close");
+        buf
+    }
+
+    #[tokio::test]
+    async fn bloom_filter_replacement_reader_pins_the_discovered_version() {
+        let buf = write_tiny_parquet();
+        let inner = InMemory::new();
+        let location = Path::from("listing/data.parquet");
+        inner.put(&location, buf.into()).await.expect("put parquet");
+        let listed = inner.head(&location).await.expect("list");
+        assert!(
+            listed.version.is_none(),
+            "this test needs a listing with no version id"
+        );
+        let store = Arc::new(VersionHeadStore {
+            inner,
+            version: "v-listed".to_string(),
+            reads: StdMutex::new(Vec::new()),
+        });
+        let factory = CachedParquetFileReaderFactory::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            Arc::new(DefaultFilesMetadataCache::new(64 * 1024 * 1024)),
+        )
+        .with_object_versioning_type(Some(ObjectVersionType::Version));
+        let file = PartitionedFile::new_from_meta(listed);
+        let metrics = ExecutionPlanMetricsSet::new();
+
+        let mut metadata_reader = factory
+            .create_reader(0, file.clone(), None, &metrics)
+            .expect("metadata reader");
+        metadata_reader
+            .get_metadata(None)
+            .await
+            .expect("metadata load must HEAD and pin the listed generation");
+        drop(metadata_reader);
+        store.reads.lock().expect("reads lock").clear();
+
+        let mut replacement = factory
+            .create_reader(0, file, None, &metrics)
+            .expect("replacement reader");
+        replacement
+            .get_bytes(0..8)
+            .await
+            .expect("page read of the replacement reader");
+
+        let reads = store.reads.lock().expect("reads lock").clone();
+        assert!(
+            !reads.is_empty(),
+            "the replacement reader issued no range request"
+        );
+        for options in &reads {
+            assert_eq!(
+                options.version.as_deref(),
+                Some("v-listed"),
+                "bloom-filter replacement must keep the HEAD version, not fall back to If-Match: {options:?}"
+            );
+            assert!(
+                options.if_match.is_none(),
+                "a version pin must not also send If-Match: {options:?}"
+            );
+        }
     }
 }
