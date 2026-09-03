@@ -292,22 +292,22 @@ strip = "debuginfo"
 incremental = false
 
 [patch.crates-io]
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "0bb8862b4bea7abf36638a934441d408376922dc" }
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "ec847f7c27c9d0b2995755d7a192c2bf7a2d3c2f" }
 
 # Patch datafusion crates so vortex-datafusion uses our local workspace versions
 datafusion = { path = "datafusion/core" }

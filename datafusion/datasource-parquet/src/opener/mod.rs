@@ -996,8 +996,10 @@ impl RowGroupsPrunedParquetOpen {
             && self.prepared.loaded.prepared.enable_bloom_filter
             && !self.row_groups.is_empty()
         {
-            // Use the existing reader for bloom filter I/O;
-            // replace with a fresh reader for decoding below.
+            // Use the existing reader for bloom filter I/O; replace with a
+            // fresh reader for decoding below. CachedParquetFileReaderFactory
+            // reapplies the version discovered during metadata load so the
+            // replacement keeps the same generation pin.
             let reader_metadata = self.prepared.loaded.reader_metadata.clone();
             let replacement_reader = {
                 let prepared = &self.prepared.loaded.prepared;
