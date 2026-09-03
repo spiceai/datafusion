@@ -25,11 +25,10 @@ use super::{
         TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
-        TableAliasRewriter, expose_date_operand_types,
-        inject_column_aliases_into_subquery, normalize_union_schema,
+        TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
         remove_dangling_identifiers, requalify_column_onto_derived_table,
         rewrite_plan_for_sort_on_non_projected_fields,
-        subquery_alias_inner_query_and_columns, unify_comparison_operands,
+        subquery_alias_inner_query_and_columns,
     },
     utils::{
         find_agg_node_within_select, find_projection_node_within_select,
@@ -51,8 +50,8 @@ use crate::unparser::{
 use crate::utils::UNNEST_PLACEHOLDER;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{
-    Column, DataFusionError, Result, ScalarValue, TableReference, assert_or_internal_err,
-    internal_datafusion_err, internal_err, not_impl_err,
+    Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
+    assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
 use datafusion_expr::expr::{OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
@@ -62,7 +61,6 @@ use datafusion_expr::{
     UserDefinedLogicalNode, Window, expr::Alias,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use sqlparser::tokenizer::Span;
 use std::{collections::HashSet, sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
@@ -110,38 +108,30 @@ pub fn plan_to_sql(plan: &LogicalPlan) -> Result<ast::Statement> {
     unparser.plan_to_sql(plan)
 }
 
-impl Unparser<'_> {
-    /// Whether the dialect spells date arithmetic as something other than the bare
-    /// operators.
-    ///
-    /// Asked of the renderings themselves rather than declared separately, so a
-    /// dialect cannot answer yes here and then decline to render. Those
-    /// renderings need each date operand to carry its own type, which
-    /// [`expose_date_operand_types`] arranges before unparsing.
-    fn dialect_renders_date_arithmetic(&self) -> bool {
-        let probe = || {
-            ast::Expr::Identifier(Ident {
-                value: "x".to_string(),
-                quote_style: None,
-                span: Span::empty(),
-            })
-        };
-        self.dialect
-            .date_difference_to_sql(probe(), probe())
-            .is_some()
-            || self.dialect.date_to_integer_to_sql(probe()).is_some()
+/// The fields a node's own expressions resolve against: everything its inputs
+/// expose, which for a join is both sides.
+///
+/// `None` when the inputs' fields will not combine, such as two branches that both
+/// expose the same unqualified name. A leaf carries its expressions itself — a
+/// scan's pushed-down filters — so its own schema is the right one.
+fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
+    let inputs = plan.inputs();
+    if inputs.is_empty() {
+        return Some(plan.schema().as_ref().clone());
     }
 
+    let mut schema = DFSchema::empty();
+    for input in inputs {
+        schema = schema.join(input.schema()).ok()?;
+    }
+    Some(schema)
+}
+
+impl Unparser<'_> {
     pub fn plan_to_sql(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
         let mut plan = normalize_union_schema(plan)?;
         if !self.dialect.supports_qualify() {
             plan = rewrite_qualify(plan)?;
-        }
-        if self.dialect_renders_date_arithmetic() {
-            plan = expose_date_operand_types(plan)?;
-        }
-        if self.dialect.requires_explicit_comparison_coercion() {
-            plan = unify_comparison_operands(plan)?;
         }
 
         match plan {
@@ -967,6 +957,28 @@ impl Unparser<'_> {
 
     #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn select_to_sql_recursively(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        // Bind this node's schema once, here, so everything the node's handling
+        // reaches — helpers included — resolves expression types against it. The
+        // recursion re-enters through this wrapper, so each node rebinds to its
+        // own inputs rather than inheriting an ancestor's.
+        //
+        // A schema whose fields will not combine is not bound, and a rendering
+        // that needs a type then applies only where an expression states its own.
+        match expression_schema(plan) {
+            Some(schema) => self
+                .with_schema(Arc::new(schema))
+                .select_to_sql_recursively_inner(plan, query, select, relation),
+            None => self.select_to_sql_recursively_inner(plan, query, select, relation),
+        }
+    }
+
+    fn select_to_sql_recursively_inner(
         &self,
         plan: &LogicalPlan,
         query: &mut Option<QueryBuilder>,

@@ -1199,7 +1199,7 @@ pub(crate) fn bigquery_to_unixtime_to_sql(
         return Ok(None);
     };
 
-    let Some(data_type) = provable_data_type(arg) else {
+    let Some(data_type) = unparser.resolved_data_type(arg) else {
         return Ok(None);
     };
 
@@ -1232,7 +1232,7 @@ pub(crate) fn bigquery_to_timestamp_to_sql(
         return Ok(None);
     };
 
-    let Some(data_type) = provable_data_type(arg) else {
+    let Some(data_type) = unparser.resolved_data_type(arg) else {
         return Ok(None);
     };
 
@@ -1300,12 +1300,13 @@ pub(crate) fn bigquery_renamed_scalar_fn(
 /// 3. The function name is type-specific. We always emit `TIMESTAMP_TRUNC`,
 ///    which is correct for the common case of a `Timestamp` (with timezone)
 ///    input. DataFusion's `date_trunc` also accepts `Timestamp` *without* a
-///    timezone, `Date32`, and `Time32`/`Time64`, which in BigQuery map to
-///    `DATETIME_TRUNC`, `DATE_TRUNC`, and `TIME_TRUNC` respectively. The source
-///    type is not available at unparse time, so those inputs are rendered as
-///    `TIMESTAMP_TRUNC` too — which BigQuery rejects or mis-types. Callers
-///    truncating non-`TIMESTAMP` types should therefore not push the function
-///    down.
+///    timezone, `Date32`, and `Time32`/`Time64`, which in BigQuery have
+///    `DATETIME_TRUNC`, `DATE_TRUNC` and `TIME_TRUNC` of their own. All of them
+///    are still rendered as `TIMESTAMP_TRUNC`, which BigQuery accepts over a
+///    `DATETIME` and returns a `DATETIME` for, so the common cases hold. The
+///    operand's type is now reachable through [`Unparser::resolved_data_type`]
+///    whenever plan unparsing supplied a schema, so dispatching properly here is
+///    possible; it is left alone because no reported statement needs it.
 ///
 /// Returns `Ok(None)` (falling back to default unparsing) when the arguments
 /// don't match the expected shape or the granularity is not one BigQuery

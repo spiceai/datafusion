@@ -31,7 +31,6 @@ use std::vec;
 
 use super::Unparser;
 use super::dialect::IntervalStyle;
-use super::utils::provable_data_type;
 use arrow::array::{
     ArrayRef, Date32Array, Date64Array, PrimitiveArray,
     types::{
@@ -50,6 +49,7 @@ use datafusion_common::{
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     plan_err,
 };
+use datafusion_expr::type_coercion::binary::comparison_coercion;
 use datafusion_expr::{
     Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator, TryCast,
     expr::{Alias, Exists, InList, ScalarFunction, SetQuantifier, Sort, WindowFunction},
@@ -183,12 +183,18 @@ impl Unparser<'_> {
                 // `date - date` is an integer count of days in the plan, which
                 // some dialects spell as a function rather than an operator.
                 if matches!(op, Operator::Minus)
-                    && is_date_typed_expr(left.as_ref())
-                    && is_date_typed_expr(right.as_ref())
+                    && self.is_date(left.as_ref())
+                    && self.is_date(right.as_ref())
                     && let Some(difference) =
                         self.dialect.date_difference_to_sql(l.clone(), r.clone())
                 {
                     return Ok(difference);
+                }
+
+                // A comparison whose two sides the dialect will not coerce itself
+                // has to be made to agree.
+                if let Some(agreed) = self.agree_on_comparison(left, op, right)? {
+                    return Ok(agreed);
                 }
 
                 let op = self.op_to_sql(op)?;
@@ -1340,6 +1346,73 @@ impl Unparser<'_> {
         }
     }
 
+    /// Whether `expr` is a date, from the schema when one was supplied.
+    fn is_date(&self, expr: &Expr) -> bool {
+        matches!(self.resolved_data_type(expr), Some(DataType::Date32))
+    }
+
+    /// Renders a comparison whose operands the dialect will not coerce itself,
+    /// with each side brought to the type DataFusion's own coercion picks.
+    ///
+    /// DataFusion leaves a mismatched comparison in the plan and coerces at
+    /// execution: it reads a tz-naive timestamp against a tz-aware one as UTC,
+    /// and text against a number by reading the text as that number. An engine
+    /// with no common supertype for such a pair refuses the whole statement
+    /// instead. `Ok(None)` leaves the comparison alone, which is every pair an
+    /// engine handles on its own.
+    fn agree_on_comparison(
+        &self,
+        left: &Expr,
+        op: &Operator,
+        right: &Expr,
+    ) -> Result<Option<ast::Expr>> {
+        if !self.dialect.requires_explicit_comparison_coercion()
+            || !matches!(
+                op,
+                Operator::Eq
+                    | Operator::NotEq
+                    | Operator::Lt
+                    | Operator::LtEq
+                    | Operator::Gt
+                    | Operator::GtEq
+            )
+        {
+            return Ok(None);
+        }
+
+        let (Some(left_type), Some(right_type)) = (
+            self.resolved_data_type(left),
+            self.resolved_data_type(right),
+        ) else {
+            return Ok(None);
+        };
+
+        if !refuses_this_pair(&left_type, &right_type) {
+            return Ok(None);
+        }
+
+        let Some(common) = comparison_coercion(&left_type, &right_type) else {
+            return Ok(None);
+        };
+
+        let converge = |operand: &Expr, operand_type: DataType| -> Result<ast::Expr> {
+            if operand_type == common {
+                return self.expr_to_sql_inner(operand);
+            }
+            self.expr_to_sql_inner(&Expr::Cast(Cast::new(
+                Box::new(operand.clone()),
+                common.clone(),
+            )))
+        };
+
+        let l = converge(left, left_type)?;
+        let r = converge(right, right_type)?;
+        let op = self.op_to_sql(op)?;
+        Ok(Some(ast::Expr::Nested(Box::new(
+            self.binary_op_to_sql(l, r, op),
+        ))))
+    }
+
     fn handle_timestamp<T: ArrowTemporalType>(
         &self,
         v: &ScalarValue,
@@ -1441,7 +1514,7 @@ impl Unparser<'_> {
         // Casting a date to an integer yields its day number, which some dialects
         // spell as a function because they refuse the cast.
         if data_type.is_integer()
-            && is_date_typed_expr(expr)
+            && self.is_date(expr)
             && let Some(day_number) =
                 self.dialect.date_to_integer_to_sql(inner_expr.clone())
         {
@@ -2099,6 +2172,32 @@ impl Unparser<'_> {
     }
 }
 
+/// Whether an engine that splits these two types is known to refuse the pair
+/// outright rather than coerce it.
+///
+/// Restricted to the two pairs that have been observed refused, so a mismatch an
+/// engine handles happily — `INT64` against `FLOAT64`, say — is left alone rather
+/// than dressed up in a cast it never needed.
+fn refuses_this_pair(left: &DataType, right: &DataType) -> bool {
+    let timestamp_zone_disagreement = matches!(
+        (left, right),
+        (
+            DataType::Timestamp(_, None),
+            DataType::Timestamp(_, Some(_))
+        ) | (
+            DataType::Timestamp(_, Some(_)),
+            DataType::Timestamp(_, None)
+        )
+    );
+    let is_text = |t: &DataType| {
+        matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+    };
+    let number_against_text =
+        (left.is_numeric() && is_text(right)) || (is_text(left) && right.is_numeric());
+
+    timestamp_zone_disagreement || number_against_text
+}
+
 /// Truncates the fractional second of an already-formatted timestamp literal to
 /// at most `max_digits` digits, leaving the date, the time and any timezone
 /// suffix untouched.
@@ -2128,17 +2227,6 @@ fn truncate_subsecond_digits(ts: &str, max_digits: usize) -> String {
     }
     truncated.push_str(&ts[digits_end..]);
     truncated
-}
-
-/// Whether an expression is *provably* a date, from the expression alone.
-///
-/// The unparser has no schema, so this only answers yes where the expression
-/// carries its own type: an explicit cast to a date, or a date literal. A bare
-/// column reference of date type answers no, which costs a translation but never
-/// misreads one — the alternative would be rewriting `date - interval`, a
-/// different and legitimate expression, into a date difference.
-fn is_date_typed_expr(expr: &Expr) -> bool {
-    matches!(provable_data_type(expr), Some(DataType::Date32))
 }
 
 #[cfg(test)]

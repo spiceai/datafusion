@@ -25,6 +25,8 @@ mod utils;
 
 use self::dialect::{DefaultDialect, Dialect};
 use crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser;
+use datafusion_common::DFSchemaRef;
+use datafusion_expr::{Expr, ExprSchemable};
 pub use expr::expr_to_sql;
 pub use plan::plan_to_sql;
 use std::sync::Arc;
@@ -58,6 +60,16 @@ pub struct Unparser<'a> {
     dialect: &'a dyn Dialect,
     pretty: bool,
     extension_unparsers: Vec<Arc<dyn UserDefinedLogicalNodeUnparser>>,
+    /// The schema the expressions being unparsed resolve against, when the
+    /// caller knows it.
+    ///
+    /// A dialect sometimes needs an operand's type to render it — BigQuery has
+    /// no cast from `DATE` to `INT64`, and no common supertype for a civil
+    /// timestamp against an instant — and an expression only carries its own type
+    /// when it happens to be a cast or a literal. Plan unparsing does know the
+    /// schema at each node, so it passes it down rather than leaving expression
+    /// unparsing to guess.
+    schema: Option<DFSchemaRef>,
 }
 
 impl<'a> Unparser<'a> {
@@ -66,7 +78,40 @@ impl<'a> Unparser<'a> {
             dialect,
             pretty: false,
             extension_unparsers: vec![],
+            schema: None,
         }
+    }
+
+    /// The same unparser, resolving expression types against `schema`.
+    ///
+    /// Plan unparsing sets this per node, so a dialect that renders by type sees
+    /// the types instead of inferring them from expression shape. Without it the
+    /// renderings still apply wherever an expression states its own type.
+    #[must_use]
+    pub fn with_schema(&self, schema: DFSchemaRef) -> Unparser<'a> {
+        Unparser {
+            dialect: self.dialect,
+            pretty: self.pretty,
+            extension_unparsers: self.extension_unparsers.clone(),
+            schema: Some(schema),
+        }
+    }
+
+    /// The type `expr` resolves to, from the schema when one was supplied and
+    /// otherwise from the expression itself.
+    ///
+    /// `None` means the type is genuinely unknown here, and a rendering that
+    /// depends on it must not fire.
+    pub(crate) fn resolved_data_type(
+        &self,
+        expr: &Expr,
+    ) -> Option<arrow::datatypes::DataType> {
+        if let Some(schema) = &self.schema
+            && let Ok(data_type) = expr.get_type(schema.as_ref())
+        {
+            return Some(data_type);
+        }
+        utils::provable_data_type(expr)
     }
 
     /// Create pretty SQL output, better suited for human consumption
@@ -136,6 +181,7 @@ impl Default for Unparser<'_> {
             dialect: &DefaultDialect {},
             pretty: false,
             extension_unparsers: vec![],
+            schema: None,
         }
     }
 }
