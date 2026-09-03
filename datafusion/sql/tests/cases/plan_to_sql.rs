@@ -10832,6 +10832,34 @@ fn test_bigquery_percentile_aggregates_are_rendered_by_ordering_the_group() -> R
         "an approximation would answer a different question: {sql}"
     );
 
+    // A decimal median truncates to the input's own scale. DataFusion averages
+    // the two middle values as scaled integers, so over `DECIMAL(10,0)` values
+    // 1 and 2 it returns 1, and over `DECIMAL(10,2)` values 1.00 and 1.01 it
+    // returns 1.00 — where BigQuery's `/` alone would give 1.5 and 1.005.
+    let decimal_schema = |scale: i8| {
+        Schema::new(vec![
+            Field::new("g", DataType::Int64, true),
+            Field::new("v", DataType::Decimal128(10, scale), true),
+        ])
+    };
+    for scale in [0i8, 2] {
+        let plan = table_scan(Some("t"), &decimal_schema(scale), None)?
+            .aggregate(vec![col("t.g")], vec![median()])?
+            .build()?;
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(
+            sql.contains("TRUNC(") && sql.contains(&format!(", {scale})")),
+            "a decimal median truncates to its own scale {scale}: {sql}"
+        );
+    }
+    // A float median has no scale to truncate to.
+    assert!(
+        !sql.contains("TRUNC("),
+        "only a decimal input needs truncating: {sql}"
+    );
+
     // Every other dialect keeps its own aggregate.
     assert!(
         rendered(median(), &UnparserDefaultDialect {})?.contains("median("),

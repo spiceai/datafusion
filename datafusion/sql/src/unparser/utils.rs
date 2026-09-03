@@ -1379,16 +1379,13 @@ pub(crate) fn bigquery_percentile_to_sql(
         // scaled integers, so the result is truncated to the input's own scale:
         // the median of 1 and 2 at scale 0 is 1, not 1.5. BigQuery's `/` keeps
         // the extra digits, so they are truncated off to match.
-        match unparser.resolved_data_type(value) {
-            Some(data_type) if data_type.is_decimal() => {
-                match decimal_scale(&data_type) {
-                    Some(scale) => {
-                        bigquery_call("TRUNC", vec![mean, number(&scale.to_string())])
-                    }
-                    None => mean,
-                }
-            }
-            _ => mean,
+        match unparser
+            .resolved_data_type(value)
+            .as_ref()
+            .and_then(decimal_scale)
+        {
+            Some(scale) => bigquery_call("TRUNC", vec![mean, number(&scale.to_string())]),
+            None => mean,
         }
     } else {
         // low + (high - low) * (idx - FLOOR(idx))
