@@ -58,6 +58,7 @@ use datafusion_expr::builder::{
 };
 use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions::unicode::planner::UnicodeFunctionPlanner;
+use datafusion_functions_nested::expr_fn::array_element;
 use datafusion_functions_nested::extract::array_element_udf;
 use datafusion_functions_nested::planner::{FieldAccessPlanner, NestedFunctionPlanner};
 use datafusion_sql::unparser::ast::{
@@ -10723,6 +10724,59 @@ fn test_constant_group_by_keys_are_left_out() -> Result<()> {
             "a bare integer key would be read as an ordinal: {sql}"
         );
     }
+
+    Ok(())
+}
+
+/// `array_element` is 1-based and yields NULL outside the array. `BigQuery`'s
+/// bare subscript is 0-based, so the generic rendering reads the neighbouring
+/// element, and its `ORDINAL` raises on a miss instead of yielding NULL.
+/// `SAFE_ORDINAL` agrees with both rules.
+///
+/// Measured on both engines over `[10,20,30]`: `array_element` returns 10, 30,
+/// NULL, NULL for indexes 1, 3, 0 and 4, and `[SAFE_ORDINAL(i)]` returns the
+/// same four, where the bare `[1]` returns 20.
+#[test]
+fn test_bigquery_array_element_is_rendered_one_based() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "arr",
+            DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+            true,
+        ),
+        Field::new("i", DataType::Int64, true),
+    ]);
+
+    let rendered = |index: Expr, dialect: &dyn UnparserDialect| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![array_element(col("t.arr"), index)])?
+            .build()?;
+        Ok(Unparser::new(dialect).plan_to_sql(&plan)?.to_string())
+    };
+
+    let sql = rendered(lit(1i64), &BigQueryDialect {})?;
+    assert!(
+        sql.contains("`t`.`arr`[SAFE_ORDINAL(1)]"),
+        "the first element is ordinal 1, not offset 1: {sql}"
+    );
+
+    // An index whose sign is not known cannot be rendered: BigQuery has no
+    // end-relative subscript, and a bare subscript would silently read the
+    // element beside the one asked for.
+    assert!(
+        rendered(col("t.i"), &BigQueryDialect {}).is_err(),
+        "an unknown index must not be rendered as a bare subscript"
+    );
+    assert!(
+        rendered(lit(-1i64), &BigQueryDialect {}).is_err(),
+        "a negative index counts from the end, which BigQuery cannot express"
+    );
+
+    // Every other dialect subscripts 1-based already.
+    assert!(
+        rendered(lit(1i64), &UnparserDefaultDialect {})?.contains("arr[1]"),
+        "only BigQuery needs the ordinal spelling"
+    );
 
     Ok(())
 }

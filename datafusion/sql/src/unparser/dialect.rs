@@ -18,11 +18,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    Unparser, utils::bigquery_date_trunc_to_sql, utils::bigquery_percentile_to_sql,
-    utils::bigquery_renamed_scalar_fn, utils::bigquery_to_timestamp_to_sql,
-    utils::bigquery_to_unixtime_to_sql, utils::character_length_to_sql,
-    utils::date_part_to_sql, utils::sqlite_date_trunc_to_sql,
-    utils::sqlite_from_unixtime_to_sql,
+    Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
+    utils::bigquery_percentile_to_sql, utils::bigquery_renamed_scalar_fn,
+    utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
+    utils::character_length_to_sql, utils::date_part_to_sql,
+    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
@@ -1264,6 +1264,12 @@ impl Dialect for BigQueryDialect {
 
         if func_name == "to_timestamp" {
             return bigquery_to_timestamp_to_sql(unparser, args);
+        }
+
+        // A bare subscript is 0-based in BigQuery, where `array_element` is
+        // 1-based, so the generic rendering reads the neighbouring element.
+        if func_name == "array_element" {
+            return bigquery_array_element_to_sql(unparser, args);
         }
 
         Ok(None)

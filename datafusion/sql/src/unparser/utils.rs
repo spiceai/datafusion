@@ -24,7 +24,7 @@ use super::{
 use arrow::datatypes::DataType;
 use datafusion_common::{
     Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
-    assert_eq_or_internal_err, internal_err,
+    assert_eq_or_internal_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::{
@@ -1462,4 +1462,47 @@ pub(crate) fn bigquery_date_trunc_to_sql(
         parameters: ast::FunctionArguments::None,
         uses_odbc_syntax: false,
     })))
+}
+
+/// Renders `array_element` for BigQuery.
+///
+/// DataFusion's `array_element` is 1-based, counts from the end for a negative
+/// index, and yields NULL for an index outside the array. BigQuery's bare
+/// subscript is 0-based, and its `ORDINAL` raises on a miss rather than yielding
+/// NULL, so `SAFE_ORDINAL` is the form that agrees on every non-negative index.
+///
+/// BigQuery has no end-relative subscript, so an index that is not a
+/// non-negative integer literal is refused: a bare subscript would read the
+/// neighbouring element instead, and returning wrong rows is worse than
+/// declining to render.
+pub(crate) fn bigquery_array_element_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [array, index] = args else {
+        return Ok(None);
+    };
+
+    let non_negative = match index {
+        Expr::Literal(value, _) => matches!(
+            value.cast_to(&DataType::Int64),
+            Ok(ScalarValue::Int64(Some(index))) if index >= 0
+        ),
+        _ => false,
+    };
+    if !non_negative {
+        return not_impl_err!(
+            "BigQuery has no end-relative array subscript, so array_element needs a non-negative integer index"
+        );
+    }
+
+    let array = unparser.expr_to_sql(array)?;
+    let index = unparser.expr_to_sql(index)?;
+
+    Ok(Some(ast::Expr::CompoundFieldAccess {
+        root: Box::new(array),
+        access_chain: vec![ast::AccessExpr::Subscript(ast::Subscript::Index {
+            index: bigquery_call("SAFE_ORDINAL", vec![index]),
+        })],
+    }))
 }
