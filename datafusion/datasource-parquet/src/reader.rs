@@ -257,15 +257,17 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             inner = inner.with_footer_size_hint(hint)
         };
 
-        Ok(Box::new(CachedParquetFileReader::new(
-            file_metrics,
-            Arc::clone(&self.store),
-            inner,
-            partitioned_file,
-            Arc::clone(&self.metadata_cache),
-            metadata_size_hint,
-            self.object_versioning_type.clone(),
-        )))
+        Ok(Box::new(
+            CachedParquetFileReader::new(
+                file_metrics,
+                Arc::clone(&self.store),
+                inner,
+                partitioned_file,
+                Arc::clone(&self.metadata_cache),
+                metadata_size_hint,
+            )
+            .with_object_versioning_type(self.object_versioning_type.clone()),
+        ))
     }
 }
 
@@ -290,7 +292,6 @@ impl CachedParquetFileReader {
         partitioned_file: PartitionedFile,
         metadata_cache: Arc<dyn FileMetadataCache>,
         metadata_size_hint: Option<usize>,
-        object_versioning_type: Option<ObjectVersionType>,
     ) -> Self {
         Self {
             file_metrics,
@@ -299,8 +300,20 @@ impl CachedParquetFileReader {
             partitioned_file,
             metadata_cache,
             metadata_size_hint,
-            object_versioning_type,
+            object_versioning_type: None,
         }
+    }
+
+    /// Pin footer and page reads to the listed object generation.
+    ///
+    /// Must match the `object_versioning_type` already applied to `inner`.
+    /// Defaults to `None` so existing `new` callers keep compiling.
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
     }
 }
 
