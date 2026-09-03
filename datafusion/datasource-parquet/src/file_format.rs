@@ -54,7 +54,9 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, LexRequirement};
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_session::Session;
 
-use crate::metadata::{DFParquetMetadata, lex_ordering_to_sorting_columns};
+use crate::metadata::{
+    DFParquetMetadata, lex_ordering_to_sorting_columns, object_store_pin,
+};
 use crate::reader::CachedParquetFileReaderFactory;
 use crate::source::{
     ParquetSource, parse_coerce_int96_string, parse_coerce_int96_tz_string,
@@ -66,8 +68,8 @@ use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::path::Path;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
-use parquet::arrow::async_reader::MetadataFetch;
+use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt};
+use parquet::arrow::async_reader::{MetadataFetch, ObjectVersionType};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -593,19 +595,51 @@ impl ParquetFormat {
 pub struct ObjectStoreFetch<'a> {
     store: &'a dyn ObjectStore,
     meta: &'a ObjectMeta,
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl<'a> ObjectStoreFetch<'a> {
     pub fn new(store: &'a dyn ObjectStore, meta: &'a ObjectMeta) -> Self {
-        Self { store, meta }
+        Self {
+            store,
+            meta,
+            object_versioning_type: None,
+        }
+    }
+
+    /// Pin fetches to the listed object generation.
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
     }
 }
 
 impl MetadataFetch for ObjectStoreFetch<'_> {
     fn fetch(&mut self, range: Range<u64>) -> BoxFuture<'_, Result<Bytes, ParquetError>> {
         async {
+            let (if_match, version) =
+                object_store_pin(self.object_versioning_type.as_ref(), self.meta);
+            if if_match.is_none() && version.is_none() {
+                return self
+                    .store
+                    .get_range(&self.meta.location, range)
+                    .await
+                    .map_err(ParquetError::from);
+            }
+            let opts = GetOptions {
+                range: Some(GetRange::Bounded(range)),
+                if_match,
+                version,
+                ..Default::default()
+            };
             self.store
-                .get_range(&self.meta.location, range)
+                .get_opts(&self.meta.location, opts)
+                .await
+                .map_err(ParquetError::from)?
+                .bytes()
                 .await
                 .map_err(ParquetError::from)
         }

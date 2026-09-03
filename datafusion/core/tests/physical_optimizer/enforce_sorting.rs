@@ -1602,8 +1602,7 @@ async fn test_parallelize_sorts_preserves_collect_left_coalesce() -> Result<()> 
     let schema = create_test_schema()?;
     // Build side: its `CoalescePartitionsExec` satisfies the CollectLeft
     // join's SinglePartition requirement and must not be removed.
-    let left =
-        coalesce_partitions_exec(repartition_exec(parquet_exec(schema.clone())));
+    let left = coalesce_partitions_exec(repartition_exec(parquet_exec(schema.clone())));
     // Probe side: contains a `CoalescePartitionsExec` reachable through
     // operators that don't require a single partition, so the coalesce link
     // propagates through the join to the coalesce at the top of the plan.
@@ -1614,10 +1613,7 @@ async fn test_parallelize_sorts_preserves_collect_left_coalesce() -> Result<()> 
     let join = Arc::new(HashJoinExec::try_new(
         left,
         right,
-        vec![(
-            col("nullable_col", &schema)?,
-            col("nullable_col", &schema)?,
-        )],
+        vec![(col("nullable_col", &schema)?, col("nullable_col", &schema)?)],
         None,
         &JoinType::LeftAnti,
         None,
@@ -3026,7 +3022,8 @@ fn reorder_projection_physical_plan() -> Result<Arc<dyn ExecutionPlan>> {
 }
 
 #[tokio::test]
-async fn test_parallelize_sorts_remaps_index_through_reordering_projection() -> Result<()> {
+async fn test_parallelize_sorts_remaps_index_through_reordering_projection() -> Result<()>
+{
     let physical_plan = reorder_projection_physical_plan()?;
 
     // EnforceSorting with sort repartitioning enabled runs `parallelize_sorts`.

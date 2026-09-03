@@ -27,7 +27,7 @@ use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
 use futures::future::BoxFuture;
-use object_store::ObjectStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
 use parquet::arrow::async_reader::{
     AsyncFileReader, ObjectVersionType, ParquetObjectReader,
@@ -264,6 +264,7 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             partitioned_file,
             Arc::clone(&self.metadata_cache),
             metadata_size_hint,
+            self.object_versioning_type.clone(),
         )))
     }
 }
@@ -278,6 +279,7 @@ pub struct CachedParquetFileReader {
     partitioned_file: PartitionedFile,
     metadata_cache: Arc<dyn FileMetadataCache>,
     metadata_size_hint: Option<usize>,
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl CachedParquetFileReader {
@@ -288,6 +290,7 @@ impl CachedParquetFileReader {
         partitioned_file: PartitionedFile,
         metadata_cache: Arc<dyn FileMetadataCache>,
         metadata_size_hint: Option<usize>,
+        object_versioning_type: Option<ObjectVersionType>,
     ) -> Self {
         Self {
             file_metrics,
@@ -296,6 +299,7 @@ impl CachedParquetFileReader {
             partitioned_file,
             metadata_cache,
             metadata_size_hint,
+            object_versioning_type,
         }
     }
 }
@@ -340,11 +344,26 @@ impl AsyncFileReader for CachedParquetFileReader {
 
             let page_index_policy = options.map(|o| o.column_index_policy());
 
+            let mut object_meta = object_meta;
+            // ListObjectsV2 omits version ids. HEAD supplies one so later
+            // range reads can pin the listed generation instead of If-Match.
+            if matches!(
+                self.object_versioning_type,
+                Some(ObjectVersionType::Version)
+            ) && object_meta.version.is_none()
+                && let Ok(head) = self.store.head(&object_meta.location).await
+                && let Some(version) = head.version
+            {
+                object_meta.version = Some(version.clone());
+                self.inner.set_object_version(version);
+            }
+
             DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
                 .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
                 .with_metadata_size_hint(self.metadata_size_hint)
                 .with_page_index_policy(page_index_policy)
+                .with_object_versioning_type(self.object_versioning_type.clone())
                 .fetch_metadata()
                 .await
                 .map_err(|e| {

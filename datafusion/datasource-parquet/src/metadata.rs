@@ -39,9 +39,10 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::Accumulator;
 use log::debug;
 use object_store::path::Path;
-use object_store::{ObjectMeta, ObjectStore};
+use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore};
 use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
+use parquet::arrow::async_reader::ObjectVersionType;
 use parquet::arrow::{parquet_column, parquet_to_arrow_schema};
 use parquet::file::metadata::{
     PageIndexPolicy, ParquetMetaData, ParquetMetaDataPushDecoder, ParquetMetaDataReader,
@@ -50,7 +51,27 @@ use parquet::file::metadata::{
 use parquet::schema::types::SchemaDescriptor;
 use std::any::Any;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
+
+/// `(if_match, version)` for a `GetOptions` pin.
+///
+/// A `Version` pin with no version id uses the listed ETag. Listings from
+/// unversioned buckets never carry a version id; without this fallback those
+/// reads are unpinned and a replacement mid-scan is decoded as a mixture.
+pub(crate) fn object_store_pin(
+    object_versioning_type: Option<&ObjectVersionType>,
+    meta: &ObjectMeta,
+) -> (Option<String>, Option<String>) {
+    match object_versioning_type {
+        Some(ObjectVersionType::ETag) => (meta.e_tag.clone(), None),
+        Some(ObjectVersionType::Version) => match meta.version.clone() {
+            Some(version) => (None, Some(version)),
+            None => (meta.e_tag.clone(), None),
+        },
+        None => (None, None),
+    }
+}
 
 /// Minimum fraction of row groups that must report NDV statistics for the
 /// merged result to be `Inexact` rather than `Absent`, as the estimate
@@ -76,6 +97,8 @@ pub struct DFParquetMetadata<'a> {
     pub coerce_int96: Option<TimeUnit>,
     /// Optional timezone applied to INT96-coerced timestamps.
     pub coerce_int96_tz: Option<Arc<str>>,
+    /// Pin every metadata fetch to the listed object generation.
+    object_versioning_type: Option<ObjectVersionType>,
 }
 
 impl<'a> DFParquetMetadata<'a> {
@@ -89,6 +112,7 @@ impl<'a> DFParquetMetadata<'a> {
             page_index_policy: None,
             coerce_int96: None,
             coerce_int96_tz: None,
+            object_versioning_type: None,
         }
     }
 
@@ -137,6 +161,56 @@ impl<'a> DFParquetMetadata<'a> {
         self
     }
 
+    /// Pin metadata fetches to the listed object generation.
+    ///
+    /// Must be forwarded from the same `object_versioning_type` the file
+    /// reader uses for page reads. `CachedParquetFileReader::get_metadata`
+    /// calls this path instead of `ParquetObjectReader`, so omitting it
+    /// leaves the footer unpinned while the pages are pinned.
+    pub fn with_object_versioning_type(
+        mut self,
+        object_versioning_type: Option<ObjectVersionType>,
+    ) -> Self {
+        self.object_versioning_type = object_versioning_type;
+        self
+    }
+
+    async fn get_ranges_pinned(
+        &self,
+        ranges: &[Range<u64>],
+    ) -> Result<Vec<bytes::Bytes>> {
+        let (if_match, version) =
+            object_store_pin(self.object_versioning_type.as_ref(), self.object_meta);
+        if if_match.is_none() && version.is_none() {
+            return self
+                .store
+                .get_ranges(&self.object_meta.location, ranges)
+                .await
+                .map_err(DataFusionError::from);
+        }
+        object_store::coalesce_ranges(
+            ranges,
+            |range| {
+                let opts = GetOptions {
+                    range: Some(GetRange::Bounded(range)),
+                    if_match: if_match.clone(),
+                    version: version.clone(),
+                    ..Default::default()
+                };
+                async {
+                    self.store
+                        .get_opts(&self.object_meta.location, opts)
+                        .await?
+                        .bytes()
+                        .await
+                }
+            },
+            object_store::OBJECT_STORE_COALESCE_DEFAULT,
+        )
+        .await
+        .map_err(DataFusionError::from)
+    }
+
     /// Fetch parquet metadata from the remote object store
     pub async fn fetch_metadata(&self) -> Result<Arc<ParquetMetaData>> {
         // fetch_metadata
@@ -178,9 +252,7 @@ impl<'a> DFParquetMetadata<'a> {
             {
                 return Ok(cached_metadata);
             }
-            let metadata =
-                Self::load_page_index(self.store, self.object_meta, cached_metadata)
-                    .await?;
+            let metadata = self.load_page_index(cached_metadata).await?;
             if cache_metadata {
                 self.cache_metadata(Arc::clone(&metadata)).await?;
             }
@@ -241,13 +313,8 @@ impl<'a> DFParquetMetadata<'a> {
             let prefetch_start = file_size.saturating_sub(hint as u64);
             let prefetch_range = prefetch_start..file_size;
             let data = self
-                .store
-                .get_ranges(
-                    &self.object_meta.location,
-                    std::slice::from_ref(&prefetch_range),
-                )
-                .await
-                .map_err(DataFusionError::from)?;
+                .get_ranges_pinned(std::slice::from_ref(&prefetch_range))
+                .await?;
             decoder
                 .push_ranges(vec![prefetch_range], data)
                 .map_err(DataFusionError::from)?;
@@ -257,11 +324,7 @@ impl<'a> DFParquetMetadata<'a> {
             match decoder.try_decode().map_err(DataFusionError::from)? {
                 DecodeResult::Data(metadata) => break metadata,
                 DecodeResult::NeedsData(ranges) => {
-                    let buffers = self
-                        .store
-                        .get_ranges(&self.object_meta.location, &ranges)
-                        .await
-                        .map_err(DataFusionError::from)?;
+                    let buffers = self.get_ranges_pinned(&ranges).await?;
                     decoder
                         .push_ranges(ranges, buffers)
                         .map_err(DataFusionError::from)?;
@@ -279,8 +342,7 @@ impl<'a> DFParquetMetadata<'a> {
     }
 
     async fn load_page_index(
-        store: &dyn ObjectStore,
-        object_meta: &ObjectMeta,
+        &self,
         metadata: Arc<ParquetMetaData>,
     ) -> Result<Arc<ParquetMetaData>> {
         if metadata.column_index().is_some() && metadata.offset_index().is_some() {
@@ -290,7 +352,8 @@ impl<'a> DFParquetMetadata<'a> {
             Arc::try_unwrap(metadata).unwrap_or_else(|shared| (*shared).clone());
         let mut reader = ParquetMetaDataReader::new_with_metadata(metadata)
             .with_page_index_policy(PageIndexPolicy::Optional);
-        let fetch = ObjectStoreFetch::new(store, object_meta);
+        let fetch = ObjectStoreFetch::new(self.store, self.object_meta)
+            .with_object_versioning_type(self.object_versioning_type.clone());
         reader
             .load_page_index(fetch)
             .await
