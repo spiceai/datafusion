@@ -10495,9 +10495,10 @@ fn test_bigquery_unix_time_conversions_follow_the_operand_type() -> Result<()> {
     Ok(())
 }
 
-/// Arrow timestamps are epoch-based, so DataFusion compares a tz-naive value
-/// against a tz-aware one directly and reads the naive side as UTC. `BigQuery`
-/// has no common supertype for that pair and refuses the whole statement, so the
+/// DataFusion leaves a mismatched comparison in the plan and coerces at
+/// execution: it reads a tz-naive timestamp against a tz-aware one as UTC, and a
+/// string against a number by reading the string as that number. `BigQuery` has
+/// no common supertype for either pair and refuses the whole statement, so the
 /// comparison has to be made to agree first.
 ///
 /// The naive side is cast to the other side's zone, which on epoch-based values
@@ -10509,7 +10510,7 @@ fn test_bigquery_unix_time_conversions_follow_the_operand_type() -> Result<()> {
 /// The matched-pair arms are the guard: a comparison whose sides already agree
 /// must not collect a cast, and no other dialect may see a changed plan.
 #[test]
-fn test_bigquery_mixed_timestamp_comparison_is_made_to_agree() -> Result<()> {
+fn test_bigquery_mismatched_comparison_is_made_to_agree() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new(
             "aware",
@@ -10524,6 +10525,9 @@ fn test_bigquery_mixed_timestamp_comparison_is_made_to_agree() -> Result<()> {
             DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
             true,
         ),
+        Field::new("num", DataType::Int64, true),
+        Field::new("txt", DataType::Utf8, true),
+        Field::new("flt", DataType::Float64, true),
     ]);
 
     let rendered = |expr: Expr, dialect: &dyn UnparserDialect| -> Result<String> {
@@ -10560,6 +10564,27 @@ fn test_bigquery_mixed_timestamp_comparison_is_made_to_agree() -> Result<()> {
             "a matched pair needs no conversion: {sql}"
         );
     }
+
+    // A number against text is the same shape, and the target type is
+    // DataFusion's own coercion: it reads the text as the number.
+    for expr in [col("t.num").eq(col("t.txt")), col("t.txt").eq(col("t.num"))] {
+        let sql = rendered(expr, &BigQueryDialect {})?;
+        assert!(
+            sql.contains("CAST(`t`.`txt` AS BIGINT)"),
+            "the text side has to be read as the number: {sql}"
+        );
+        assert!(
+            !sql.contains("CAST(`t`.`num`"),
+            "the numeric side is already the common type: {sql}"
+        );
+    }
+
+    // A pair the engine coerces on its own is left alone rather than dressed up.
+    let coercible = rendered(col("t.num").eq(col("t.flt")), &BigQueryDialect {})?;
+    assert!(
+        !coercible.contains("CAST("),
+        "INT64 against FLOAT64 needs no help: {coercible}"
+    );
 
     // Every other dialect keeps the comparison it had.
     assert_eq!(

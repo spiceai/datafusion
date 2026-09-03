@@ -29,7 +29,7 @@ use super::{
         inject_column_aliases_into_subquery, normalize_union_schema,
         remove_dangling_identifiers, requalify_column_onto_derived_table,
         rewrite_plan_for_sort_on_non_projected_fields,
-        subquery_alias_inner_query_and_columns, unify_timestamp_awareness,
+        subquery_alias_inner_query_and_columns, unify_comparison_operands,
     },
     utils::{
         find_agg_node_within_select, find_projection_node_within_select,
@@ -140,8 +140,8 @@ impl Unparser<'_> {
         if self.dialect_renders_date_arithmetic() {
             plan = expose_date_operand_types(plan)?;
         }
-        if self.dialect.rejects_mixed_timestamp_comparison() {
-            plan = unify_timestamp_awareness(plan)?;
+        if self.dialect.requires_explicit_comparison_coercion() {
+            plan = unify_comparison_operands(plan)?;
         }
 
         match plan {

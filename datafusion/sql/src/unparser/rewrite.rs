@@ -24,6 +24,7 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
 use datafusion_expr::expr::{Alias, BinaryExpr, UNNEST_COLUMN_PREFIX};
+use datafusion_expr::type_coercion::binary::comparison_coercion;
 use datafusion_expr::{
     Expr, ExprSchemable, LogicalPlan, Operator, Projection, Sort, SortExpr,
 };
@@ -895,19 +896,21 @@ mod tests {
     }
 }
 
-/// Gives a comparison one timestamp type when its two sides disagree about
-/// carrying a zone.
+/// Makes a comparison's two operands agree when the dialect will not do it
+/// itself.
 ///
-/// Arrow timestamps are epoch-based, so DataFusion compares a tz-naive value
-/// against a tz-aware one directly and its own kernel reads the naive side as
-/// UTC. An engine that splits the civil and instant types has no common supertype
-/// for that pair and refuses the whole statement — BigQuery says "No matching
-/// signature for operator >= for argument types: DATETIME, TIMESTAMP".
+/// DataFusion leaves a mismatched comparison in the plan and coerces at
+/// execution: it reads a tz-naive timestamp against a tz-aware one as UTC, and a
+/// string against a number by reading the string as that number. An engine that
+/// has no common supertype for such a pair refuses the whole statement instead —
+/// BigQuery says "No matching signature for operator >= for argument types:
+/// DATETIME, TIMESTAMP", or "... INT64, STRING".
 ///
-/// The naive side is cast to the other side's zone. On epoch-based values that is
-/// a no-op, and it is the same reading DataFusion already gives the comparison, so
-/// the rows do not move; it only makes the agreement explicit in the SQL.
-pub(super) fn unify_timestamp_awareness(plan: LogicalPlan) -> Result<LogicalPlan> {
+/// The target type is DataFusion's own [`comparison_coercion`], so the rewrite
+/// says what the plan already meant rather than choosing for it. Only the two
+/// pairs an engine is known to refuse are touched; a mismatch it coerces happily,
+/// such as `INT64` against `FLOAT64`, is left alone rather than dressed up.
+pub(super) fn unify_comparison_operands(plan: LogicalPlan) -> Result<LogicalPlan> {
     plan.transform_up(|plan| {
         let Some(schema) = combined_input_schema(&plan) else {
             return Ok(Transformed::no(plan));
@@ -920,10 +923,33 @@ pub(super) fn unify_timestamp_awareness(plan: LogicalPlan) -> Result<LogicalPlan
     .data()
 }
 
+/// Whether the engine is known to refuse this pair outright rather than coerce it.
+fn needs_saying_out_loud(left: &DataType, right: &DataType) -> bool {
+    let timestamp_zone_disagreement = matches!(
+        (left, right),
+        (
+            DataType::Timestamp(_, None),
+            DataType::Timestamp(_, Some(_))
+        ) | (
+            DataType::Timestamp(_, Some(_)),
+            DataType::Timestamp(_, None)
+        )
+    );
+    let is_text = |t: &DataType| {
+        matches!(t, DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View)
+    };
+    let number_against_text =
+        (left.is_numeric() && is_text(right)) || (is_text(left) && right.is_numeric());
+
+    timestamp_zone_disagreement || number_against_text
+}
+
 fn unify_in_expr(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
     let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
         return Transformed::no(expr);
     };
+
+    let rebuilt = || Expr::BinaryExpr(BinaryExpr::new(left.clone(), op, right.clone()));
 
     if !matches!(
         op,
@@ -934,42 +960,35 @@ fn unify_in_expr(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
             | Operator::Gt
             | Operator::GtEq
     ) {
-        return Transformed::no(Expr::BinaryExpr(BinaryExpr::new(left, op, right)));
+        return Transformed::no(rebuilt());
     }
 
-    let unchanged = || {
-        Transformed::no(Expr::BinaryExpr(BinaryExpr::new(
-            left.clone(),
-            op,
-            right.clone(),
+    let (Ok(left_type), Ok(right_type)) = (left.get_type(schema), right.get_type(schema))
+    else {
+        return Transformed::no(rebuilt());
+    };
+
+    if !needs_saying_out_loud(&left_type, &right_type) {
+        return Transformed::no(rebuilt());
+    }
+
+    let Some(common) = comparison_coercion(&left_type, &right_type) else {
+        return Transformed::no(rebuilt());
+    };
+
+    let converge = |operand: &Expr, operand_type: DataType| -> Box<Expr> {
+        if operand_type == common {
+            return Box::new(operand.clone());
+        }
+        Box::new(Expr::Cast(datafusion_expr::expr::Cast::new(
+            Box::new(operand.clone()),
+            common.clone(),
         )))
     };
 
-    let (
-        Ok(DataType::Timestamp(left_unit, left_tz)),
-        Ok(DataType::Timestamp(right_unit, right_tz)),
-    ) = (left.get_type(schema), right.get_type(schema))
-    else {
-        return unchanged();
-    };
-
-    // Only a disagreement about the zone needs saying out loud.
-    let (naive, naive_unit, aware, zone, naive_is_left) = match (left_tz, right_tz) {
-        (None, Some(zone)) => (&left, left_unit, &right, zone, true),
-        (Some(zone), None) => (&right, right_unit, &left, zone, false),
-        _ => return unchanged(),
-    };
-
-    let converted = Expr::Cast(datafusion_expr::expr::Cast::new(
-        Box::new(naive.as_ref().clone()),
-        DataType::Timestamp(naive_unit, Some(zone)),
-    ));
-
-    let (left, right) = if naive_is_left {
-        (Box::new(converted), aware.clone())
-    } else {
-        (aware.clone(), Box::new(converted))
-    };
-
-    Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(left, op, right)))
+    Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(
+        converge(&left, left_type),
+        op,
+        converge(&right, right_type),
+    )))
 }

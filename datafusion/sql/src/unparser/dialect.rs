@@ -176,7 +176,7 @@ pub trait Dialect: Send + Sync {
     ///
     /// When `true` the unparser makes such a comparison agree before unparsing,
     /// by casting the naive side to the other side's zone.
-    fn rejects_mixed_timestamp_comparison(&self) -> bool {
+    fn requires_explicit_comparison_coercion(&self) -> bool {
         false
     }
 
@@ -1069,7 +1069,7 @@ impl Dialect for BigQueryDialect {
     /// `DATETIME` and `TIMESTAMP` have no common supertype in BigQuery: "No
     /// matching signature for operator >= for argument types: DATETIME,
     /// TIMESTAMP".
-    fn rejects_mixed_timestamp_comparison(&self) -> bool {
+    fn requires_explicit_comparison_coercion(&self) -> bool {
         true
     }
 
