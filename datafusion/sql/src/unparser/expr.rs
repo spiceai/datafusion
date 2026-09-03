@@ -1385,6 +1385,11 @@ impl Unparser<'_> {
                 .to_string()
         };
 
+        let ts = match self.dialect.timestamp_literal_max_subsecond_digits() {
+            Some(max_digits) => truncate_subsecond_digits(&ts, max_digits),
+            None => ts,
+        };
+
         Ok(ast::Expr::Cast {
             kind: ast::CastKind::Cast,
             expr: Box::new(ast::Expr::value(SingleQuotedString(ts))),
@@ -2092,6 +2097,37 @@ impl Unparser<'_> {
             }
         }
     }
+}
+
+/// Truncates the fractional second of an already-formatted timestamp literal to
+/// at most `max_digits` digits, leaving the date, the time and any timezone
+/// suffix untouched.
+///
+/// A timezone offset carries no `.`, so the first `.` always begins the
+/// fractional second.
+fn truncate_subsecond_digits(ts: &str, max_digits: usize) -> String {
+    let Some(dot) = ts.find('.') else {
+        return ts.to_string();
+    };
+
+    let digits_start = dot + 1;
+    let digits_end = ts[digits_start..]
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(ts.len(), |offset| digits_start + offset);
+
+    if digits_end - digits_start <= max_digits {
+        return ts.to_string();
+    }
+
+    let kept = &ts[digits_start..digits_start + max_digits];
+    let mut truncated = String::with_capacity(ts.len());
+    truncated.push_str(&ts[..dot]);
+    if !kept.is_empty() {
+        truncated.push('.');
+        truncated.push_str(kept);
+    }
+    truncated.push_str(&ts[digits_end..]);
+    truncated
 }
 
 /// Whether an expression is *provably* a date, from the expression alone.
@@ -3990,13 +4026,15 @@ mod tests {
                 ),
                 "CAST('2025-09-15T10:00:00.123456-01:00' AS TIMESTAMP)",
             ),
+            // BigQuery holds microseconds and refuses a longer literal outright,
+            // so the fractional second is truncated for it alone.
             (
                 Arc::clone(&bigquery_dialect),
                 ScalarValue::TimestampNanosecond(
                     Some(1757934000123456789),
                     Some("+00:00".into()),
                 ),
-                "CAST('2025-09-15T11:00:00.123456789+00:00' AS TIMESTAMP)",
+                "CAST('2025-09-15T11:00:00.123456+00:00' AS TIMESTAMP)",
             ),
         ] {
             let unparser = Unparser::new(dialect.as_ref());

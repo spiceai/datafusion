@@ -894,3 +894,82 @@ mod tests {
         assert!(columns.is_empty());
     }
 }
+
+/// Gives a comparison one timestamp type when its two sides disagree about
+/// carrying a zone.
+///
+/// Arrow timestamps are epoch-based, so DataFusion compares a tz-naive value
+/// against a tz-aware one directly and its own kernel reads the naive side as
+/// UTC. An engine that splits the civil and instant types has no common supertype
+/// for that pair and refuses the whole statement — BigQuery says "No matching
+/// signature for operator >= for argument types: DATETIME, TIMESTAMP".
+///
+/// The naive side is cast to the other side's zone. On epoch-based values that is
+/// a no-op, and it is the same reading DataFusion already gives the comparison, so
+/// the rows do not move; it only makes the agreement explicit in the SQL.
+pub(super) fn unify_timestamp_awareness(plan: LogicalPlan) -> Result<LogicalPlan> {
+    plan.transform_up(|plan| {
+        let Some(schema) = combined_input_schema(&plan) else {
+            return Ok(Transformed::no(plan));
+        };
+
+        plan.map_expressions(|expr| {
+            expr.transform_up(|expr| Ok(unify_in_expr(expr, &schema)))
+        })
+    })
+    .data()
+}
+
+fn unify_in_expr(expr: Expr, schema: &DFSchema) -> Transformed<Expr> {
+    let Expr::BinaryExpr(BinaryExpr { left, op, right }) = expr else {
+        return Transformed::no(expr);
+    };
+
+    if !matches!(
+        op,
+        Operator::Eq
+            | Operator::NotEq
+            | Operator::Lt
+            | Operator::LtEq
+            | Operator::Gt
+            | Operator::GtEq
+    ) {
+        return Transformed::no(Expr::BinaryExpr(BinaryExpr::new(left, op, right)));
+    }
+
+    let unchanged = || {
+        Transformed::no(Expr::BinaryExpr(BinaryExpr::new(
+            left.clone(),
+            op,
+            right.clone(),
+        )))
+    };
+
+    let (
+        Ok(DataType::Timestamp(left_unit, left_tz)),
+        Ok(DataType::Timestamp(right_unit, right_tz)),
+    ) = (left.get_type(schema), right.get_type(schema))
+    else {
+        return unchanged();
+    };
+
+    // Only a disagreement about the zone needs saying out loud.
+    let (naive, naive_unit, aware, zone, naive_is_left) = match (left_tz, right_tz) {
+        (None, Some(zone)) => (&left, left_unit, &right, zone, true),
+        (Some(zone), None) => (&right, right_unit, &left, zone, false),
+        _ => return unchanged(),
+    };
+
+    let converted = Expr::Cast(datafusion_expr::expr::Cast::new(
+        Box::new(naive.as_ref().clone()),
+        DataType::Timestamp(naive_unit, Some(zone)),
+    ));
+
+    let (left, right) = if naive_is_left {
+        (Box::new(converted), aware.clone())
+    } else {
+        (aware.clone(), Box::new(converted))
+    };
+
+    Transformed::yes(Expr::BinaryExpr(BinaryExpr::new(left, op, right)))
+}

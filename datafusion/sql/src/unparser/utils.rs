@@ -1206,9 +1206,7 @@ pub(crate) fn bigquery_to_unixtime_to_sql(
     let operand = unparser.expr_to_sql(arg)?;
     let instant = match data_type {
         DataType::Timestamp(_, Some(_)) => operand,
-        DataType::Timestamp(_, None) | DataType::Date32 | DataType::Date64 => {
-            bigquery_as_instant(operand)
-        }
+        DataType::Timestamp(_, None) | DataType::Date32 => bigquery_as_instant(operand),
         // A number is already seconds and a string needs parsing rules BigQuery
         // does not share; neither is a rename.
         _ => return Ok(None),

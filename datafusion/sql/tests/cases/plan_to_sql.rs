@@ -10089,14 +10089,61 @@ fn test_bigquery_timestamp_cast_follows_the_arrow_timezone() -> Result<()> {
 }
 
 /// A timestamp *literal* is emitted as text that either carries a zone offset or
-/// does not, so its cast target has to agree with the string and not just with the
+/// does not, so its cast target has to agree with the string and not only with the
 /// Arrow type.
 ///
 /// `BigQuery` reads neither spelling loosely: an offset-bearing string cast to
-/// `DATETIME` is rejected ("Invalid datetime string"), and a bare civil string
-/// cast to `TIMESTAMP` is silently read as UTC, which is the wrong type to compare
-/// Only `BigQuery` splits the timestamp type on the zone. For every other dialect
-/// the zone must not change the cast target at all, which is the property that
+/// `DATETIME` is rejected ("Invalid datetime string"), and a bare civil string cast
+/// to `TIMESTAMP` is silently read as UTC, which is the wrong type to compare
+/// against a `DATETIME` column. Every other dialect must keep the rendering it
+/// had, which is what makes this a `BigQuery` fix and not a change to the shared
+/// literal path.
+#[test]
+fn test_bigquery_timestamp_literal_cast_follows_the_offset_it_renders() -> Result<()> {
+    let naive = lit(datafusion_common::ScalarValue::TimestampNanosecond(
+        Some(1_757_934_000_123_456_789),
+        None,
+    ));
+    let aware = lit(datafusion_common::ScalarValue::TimestampNanosecond(
+        Some(1_757_934_000_123_456_789),
+        Some("+00:00".into()),
+    ));
+
+    let bigquery = Unparser::new(&BigQueryDialect {});
+    assert!(
+        bigquery
+            .expr_to_sql(&naive)?
+            .to_string()
+            .ends_with("AS DATETIME)"),
+        "a literal with no offset is the civil type"
+    );
+    assert!(
+        bigquery
+            .expr_to_sql(&aware)?
+            .to_string()
+            .ends_with("AS TIMESTAMP)"),
+        "a literal carrying an offset is the instant type"
+    );
+
+    // The zone must not reach the cast target in any other dialect.
+    let cast_target = |sql: String| sql.rsplit_once("' ").map(|(_, t)| t.to_string());
+    for dialect in [
+        &UnparserDefaultDialect {} as &dyn UnparserDialect,
+        &UnparserPostgreSqlDialect {},
+        &UnparserMySqlDialect {},
+        &SqliteDialect {},
+    ] {
+        let unparser = Unparser::new(dialect);
+        assert_eq!(
+            cast_target(unparser.expr_to_sql(&naive)?.to_string()),
+            cast_target(unparser.expr_to_sql(&aware)?.to_string()),
+            "the shared literal path must not gain a zone-dependent cast target"
+        );
+    }
+
+    Ok(())
+}
+
 /// DataFusion's internal name for a function is not always the name the target
 /// engine answers to. `BigQuery` has no `btrim` and no `now`, and says so —
 /// "Function not found: btrim; Did you mean trim?" — which fails the whole
@@ -10444,6 +10491,154 @@ fn test_bigquery_unix_time_conversions_follow_the_operand_type() -> Result<()> {
         "SELECT to_unixtime(t.naive_at) AS v FROM t",
         "the shared path keeps DataFusion's own spelling"
     );
+
+    Ok(())
+}
+
+/// Arrow timestamps are epoch-based, so DataFusion compares a tz-naive value
+/// against a tz-aware one directly and reads the naive side as UTC. `BigQuery`
+/// has no common supertype for that pair and refuses the whole statement, so the
+/// comparison has to be made to agree first.
+///
+/// The naive side is cast to the other side's zone, which on epoch-based values
+/// is a no-op and is the reading DataFusion already gives — confirmed against
+/// BigQuery, where `CAST(DATETIME '1970-01-02' AS TIMESTAMP)` equals
+/// `TIMESTAMP '1970-01-02+00'`. So the rows do not move; only the SQL says what
+/// was already meant.
+///
+/// The matched-pair arms are the guard: a comparison whose sides already agree
+/// must not collect a cast, and no other dialect may see a changed plan.
+#[test]
+fn test_bigquery_mixed_timestamp_comparison_is_made_to_agree() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new(
+            "aware",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            true,
+        ),
+        Field::new(
+            "naive",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+
+    let rendered = |expr: Expr, dialect: &dyn UnparserDialect| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .filter(expr)?
+            .build()?;
+        Ok(Unparser::new(dialect).plan_to_sql(&plan)?.to_string())
+    };
+
+    // Either order gets the naive side converted, and only that side.
+    for expr in [
+        col("t.aware").gt_eq(col("t.naive")),
+        col("t.naive").gt_eq(col("t.aware")),
+    ] {
+        let sql = rendered(expr, &BigQueryDialect {})?;
+        assert!(
+            sql.contains("CAST(`t`.`naive` AS TIMESTAMP)"),
+            "the civil side has to become an instant: {sql}"
+        );
+        assert!(
+            !sql.contains("CAST(`t`.`aware`"),
+            "the instant side is already agreeing and must be left alone: {sql}"
+        );
+    }
+
+    // Sides that already agree collect nothing.
+    for expr in [
+        col("t.aware").gt_eq(col("t.aware")),
+        col("t.naive").gt_eq(col("t.naive")),
+    ] {
+        let sql = rendered(expr, &BigQueryDialect {})?;
+        assert!(
+            !sql.contains("CAST("),
+            "a matched pair needs no conversion: {sql}"
+        );
+    }
+
+    // Every other dialect keeps the comparison it had.
+    assert_eq!(
+        rendered(
+            col("t.aware").gt_eq(col("t.naive")),
+            &UnparserDefaultDialect {}
+        )?,
+        "SELECT * FROM t WHERE (t.aware >= t.naive)",
+        "only a dialect that refuses the mix rewrites it"
+    );
+
+    Ok(())
+}
+
+/// BigQuery holds microseconds and its client refuses a longer literal outright
+/// rather than rounding it: seven or more sub-second digits come back as "Invalid
+/// timestamp: '...'" and fail the statement. A `now()` folded at plan time
+/// carries nanoseconds, so a statement whose own SQL holds no literal can still
+/// be handed one it will not accept.
+///
+/// Six digits and fewer pass through untouched, and no other dialect is capped,
+/// so a nanosecond literal still reaches an engine that can store it.
+#[test]
+fn test_bigquery_timestamp_literal_is_truncated_to_microseconds() -> Result<()> {
+    let bigquery = Unparser::new(&BigQueryDialect {});
+
+    for (scalar, expected, description) in [
+        (
+            datafusion_common::ScalarValue::TimestampNanosecond(
+                Some(1_776_177_802_860_544_307),
+                Some("UTC".into()),
+            ),
+            "'2026-04-14T14:43:22.860544+00:00'",
+            "nanoseconds are cut to microseconds",
+        ),
+        (
+            datafusion_common::ScalarValue::TimestampNanosecond(
+                Some(1_776_177_802_860_544_307),
+                None,
+            ),
+            "'2026-04-14 14:43:22.860544'",
+            "the civil form is cut the same way",
+        ),
+        (
+            datafusion_common::ScalarValue::TimestampMicrosecond(
+                Some(1_776_177_802_860_544),
+                Some("UTC".into()),
+            ),
+            "'2026-04-14T14:43:22.860544+00:00'",
+            "a literal already within range is untouched",
+        ),
+        (
+            datafusion_common::ScalarValue::TimestampMillisecond(
+                Some(1_776_177_802_860),
+                Some("UTC".into()),
+            ),
+            "'2026-04-14T14:43:22.860+00:00'",
+            "fewer digits are not padded",
+        ),
+    ] {
+        let sql = bigquery.expr_to_sql(&lit(scalar))?.to_string();
+        assert!(sql.contains(expected), "{description}: {sql}");
+    }
+
+    // No other dialect is capped: a nanosecond literal survives in full.
+    let nanos = lit(datafusion_common::ScalarValue::TimestampNanosecond(
+        Some(1_776_177_802_860_544_307),
+        Some("UTC".into()),
+    ));
+    for dialect in [
+        &UnparserDefaultDialect {} as &dyn UnparserDialect,
+        &UnparserPostgreSqlDialect {},
+    ] {
+        let sql = Unparser::new(dialect).expr_to_sql(&nanos)?.to_string();
+        assert!(
+            sql.contains(".860544307"),
+            "an uncapped dialect keeps every digit: {sql}"
+        );
+    }
 
     Ok(())
 }

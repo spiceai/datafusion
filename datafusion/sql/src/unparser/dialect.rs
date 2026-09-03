@@ -152,6 +152,34 @@ pub trait Dialect: Send + Sync {
         self.timestamp_cast_dtype(time_unit, &None)
     }
 
+    /// The most sub-second digits the dialect's timestamp literals hold, or
+    /// `None` when it places no limit of its own.
+    ///
+    /// A dialect whose timestamp type is less precise than Arrow's may reject a
+    /// literal carrying more digits than it can store rather than rounding it, so
+    /// the unparser truncates the fractional second first. Truncation drops
+    /// precision the target could not have represented anyway, but it does move
+    /// the literal earlier in time, which is visible at the boundary of a range
+    /// predicate.
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether the dialect refuses to compare a tz-aware timestamp with a
+    /// tz-naive one.
+    ///
+    /// Arrow timestamps are epoch-based, so DataFusion compares the two directly
+    /// and reads the naive side as UTC. Most engines coerce the pair the same way
+    /// even when they spell the types differently, so this cannot be inferred
+    /// from [`Self::timestamp_cast_dtype`]; an engine that has no common
+    /// supertype for the pair, and so rejects the whole statement, has to say so.
+    ///
+    /// When `true` the unparser makes such a comparison agree before unparsing,
+    /// by casting the naive side to the other side's zone.
+    fn rejects_mixed_timestamp_comparison(&self) -> bool {
+        false
+    }
+
     /// How the dialect spells the integer day number of a date.
     ///
     /// DataFusion reads `Date32` as days since the epoch, so casting one to an
@@ -1029,6 +1057,20 @@ impl Dialect for BigQueryDialect {
         tz: &Option<Arc<str>>,
     ) -> ast::DataType {
         self.timestamp_cast_dtype(time_unit, tz)
+    }
+
+    /// BigQuery holds microseconds, and its client refuses a longer literal
+    /// outright rather than rounding: seven digits or more come back as "Invalid
+    /// timestamp: '...'" / "Invalid datetime string ...", failing the statement.
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        Some(6)
+    }
+
+    /// `DATETIME` and `TIMESTAMP` have no common supertype in BigQuery: "No
+    /// matching signature for operator >= for argument types: DATETIME,
+    /// TIMESTAMP".
+    fn rejects_mixed_timestamp_comparison(&self) -> bool {
+        true
     }
 
     /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from
