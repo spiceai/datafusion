@@ -18,15 +18,17 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    Unparser, utils::bigquery_date_trunc_to_sql, utils::character_length_to_sql,
-    utils::date_part_to_sql, utils::sqlite_date_trunc_to_sql,
-    utils::sqlite_from_unixtime_to_sql,
+    Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
+    utils::bigquery_percentile_to_sql, utils::bigquery_renamed_scalar_fn,
+    utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
+    utils::character_length_to_sql, utils::date_part_to_sql,
+    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
 use chrono::DateTime;
 use datafusion_common::{Result, internal_err};
-use datafusion_expr::Expr;
+use datafusion_expr::{Expr, SortExpr};
 use regex::Regex;
 use sqlparser::tokenizer::Span;
 use sqlparser::{
@@ -134,6 +136,80 @@ pub trait Dialect: Send + Sync {
         ast::DataType::Timestamp(None, tz_info)
     }
 
+    /// The SQL type to cast a timestamp *literal* to.
+    ///
+    /// Separate from [`Self::timestamp_cast_dtype`] because a literal is emitted
+    /// as text that either carries a zone offset or does not, so the cast target
+    /// has to agree with the string and not only with the Arrow type.
+    ///
+    /// The default discards `tz`, which is the rendering every dialect has always
+    /// received; only a dialect whose timestamp type depends on the zone needs to
+    /// override it.
+    fn timestamp_literal_cast_dtype(
+        &self,
+        time_unit: &TimeUnit,
+        _tz: &Option<Arc<str>>,
+    ) -> ast::DataType {
+        self.timestamp_cast_dtype(time_unit, &None)
+    }
+
+    /// The most sub-second digits the dialect's timestamp literals hold, or
+    /// `None` when it places no limit of its own.
+    ///
+    /// A dialect whose timestamp type is less precise than Arrow's may reject a
+    /// literal carrying more digits than it can store rather than rounding it, so
+    /// the unparser truncates the fractional second first. Truncation drops
+    /// precision the target could not have represented anyway, but it does move
+    /// the literal earlier in time, which is visible at the boundary of a range
+    /// predicate.
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether the dialect refuses to compare a tz-aware timestamp with a
+    /// tz-naive one.
+    ///
+    /// Arrow timestamps are epoch-based, so DataFusion compares the two directly
+    /// and reads the naive side as UTC. Most engines coerce the pair the same way
+    /// even when they spell the types differently, so this cannot be inferred
+    /// from [`Self::timestamp_cast_dtype`]; an engine that has no common
+    /// supertype for the pair, and so rejects the whole statement, has to say so.
+    ///
+    /// When `true` the unparser makes such a comparison agree before unparsing,
+    /// by casting the naive side to the other side's zone.
+    fn requires_explicit_comparison_coercion(&self) -> bool {
+        false
+    }
+
+    /// How the dialect spells the integer day number of a date.
+    ///
+    /// DataFusion reads `Date32` as days since the epoch, so casting one to an
+    /// integer yields that day number. An engine that refuses the cast outright
+    /// needs its own spelling.
+    ///
+    /// `date` is the already-unparsed operand, known to be a date expression.
+    /// Returning `None` (the default) keeps the plain cast.
+    fn date_to_integer_to_sql(&self, _date: ast::Expr) -> Option<ast::Expr> {
+        None
+    }
+
+    /// How the dialect spells the difference between two dates.
+    ///
+    /// DataFusion types `date - date` as an `Int64` count of days, but the bare
+    /// `-` operator does not mean that everywhere: an engine with an interval
+    /// type reads it as a duration, which then has no common supertype with the
+    /// integer the plan compares it against.
+    ///
+    /// `lhs` and `rhs` are the already-unparsed operands, both known to be date
+    /// expressions. Returning `None` (the default) keeps the bare `-`.
+    fn date_difference_to_sql(
+        &self,
+        _lhs: ast::Expr,
+        _rhs: ast::Expr,
+    ) -> Option<ast::Expr> {
+        None
+    }
+
     /// How to unparse a cast that attaches a specific timezone to a timestamp —
     /// the logical-plan form `CAST(expr AS Timestamp(_, Some(tz)))` that
     /// DataFusion produces for `expr AT TIME ZONE 'tz'`.
@@ -189,6 +265,23 @@ pub trait Dialect: Send + Sync {
         _unparser: &Unparser,
         _func_name: &str,
         _args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        Ok(None)
+    }
+
+    /// Allows the dialect to override aggregate function unparsing.
+    ///
+    /// The counterpart of [`Self::scalar_function_to_sql_overrides`], for an
+    /// aggregate the dialect spells differently or has no direct equivalent of.
+    /// `Ok(None)` uses the default rendering.
+    fn aggregate_function_to_sql_overrides(
+        &self,
+        _unparser: &Unparser,
+        _func_name: &str,
+        _args: &[Expr],
+        _distinct: bool,
+        _filter: Option<&Expr>,
+        _order_by: &[SortExpr],
     ) -> Result<Option<ast::Expr>> {
         Ok(None)
     }
@@ -951,12 +1044,116 @@ impl Dialect for BigQueryDialect {
         ast::DataType::String(None)
     }
 
+    /// BigQuery splits the two halves of Arrow's `Timestamp` across two types:
+    /// `TIMESTAMP` is the absolute instant, `DATETIME` the civil date-and-time.
+    /// Neither is spelled with a timezone qualifier, so the zone has to pick the
+    /// type rather than decorate it.
+    ///
+    /// Collapsing both onto `TIMESTAMP` types a tz-naive value as an instant. It
+    /// parses, so nothing complains locally, but a `DATETIME` column compared
+    /// against it has no common supertype and BigQuery refuses the whole
+    /// statement: "No matching signature for operator >= for argument types:
+    /// DATETIME, TIMESTAMP".
     fn timestamp_cast_dtype(
         &self,
         _time_unit: &TimeUnit,
-        _tz: &Option<Arc<str>>,
+        tz: &Option<Arc<str>>,
     ) -> ast::DataType {
-        ast::DataType::Timestamp(None, TimezoneInfo::None)
+        if tz.is_some() {
+            ast::DataType::Timestamp(None, TimezoneInfo::None)
+        } else {
+            ast::DataType::Datetime(None)
+        }
+    }
+
+    /// Without this, the tz-blind default would send a tz-aware literal — which
+    /// renders with its offset — to `DATETIME`, and BigQuery refuses an
+    /// offset-bearing string as a datetime ("Invalid datetime string").
+    fn timestamp_literal_cast_dtype(
+        &self,
+        time_unit: &TimeUnit,
+        tz: &Option<Arc<str>>,
+    ) -> ast::DataType {
+        self.timestamp_cast_dtype(time_unit, tz)
+    }
+
+    /// BigQuery holds microseconds, and its client refuses a longer literal
+    /// outright rather than rounding: seven digits or more come back as "Invalid
+    /// timestamp: '...'" / "Invalid datetime string ...", failing the statement.
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        Some(6)
+    }
+
+    /// `DATETIME` and `TIMESTAMP` have no common supertype in BigQuery: "No
+    /// matching signature for operator >= for argument types: DATETIME,
+    /// TIMESTAMP".
+    fn requires_explicit_comparison_coercion(&self) -> bool {
+        true
+    }
+
+    /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from
+    /// DATE to INT64" — and `UNIX_DATE` is the day number DataFusion means:
+    /// zero at the epoch, negative before it.
+    fn date_to_integer_to_sql(&self, date: ast::Expr) -> Option<ast::Expr> {
+        Some(ast::Expr::Function(Function {
+            name: ObjectName::from(vec![Ident {
+                value: "UNIX_DATE".to_string(),
+                quote_style: None,
+                span: Span::empty(),
+            }]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(date))],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        }))
+    }
+
+    /// BigQuery types `DATE - DATE` as an `INTERVAL`, so the plan's integer day
+    /// count arrives as a duration: comparing it to a number fails with "No
+    /// matching signature for operator < for argument types: INTERVAL, INT64",
+    /// and casting it fails with "Invalid cast from INTERVAL to INT64".
+    /// `DATE_DIFF(lhs, rhs, DAY)` is the same quantity as an `INT64`.
+    fn date_difference_to_sql(
+        &self,
+        lhs: ast::Expr,
+        rhs: ast::Expr,
+    ) -> Option<ast::Expr> {
+        Some(ast::Expr::Function(Function {
+            name: ObjectName::from(vec![Ident {
+                value: "DATE_DIFF".to_string(),
+                quote_style: None,
+                span: Span::empty(),
+            }]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(lhs)),
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(rhs)),
+                    // The date part is a bare keyword, not a string literal.
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                        ast::Expr::Identifier(Ident {
+                            value: "DAY".to_string(),
+                            quote_style: None,
+                            span: Span::empty(),
+                        }),
+                    )),
+                ],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        }))
     }
 
     fn date_field_extract_style(&self) -> DateFieldExtractStyle {
@@ -989,6 +1186,42 @@ impl Dialect for BigQueryDialect {
         ast::SetQuantifier::Distinct
     }
 
+    /// BigQuery has no aggregate percentile: `PERCENTILE_CONT` exists only as an
+    /// analytic function, and says so — "percentile_cont aggregate function is not
+    /// supported". `APPROX_QUANTILES` is an aggregate but answers a different
+    /// question: over `[1,2,3,4]` it returns 2 where the median is 2.5.
+    ///
+    /// Both are rendered by ordering the group into an array and interpolating
+    /// between the two values the percentile falls between. That is what
+    /// `PERCENTILE_CONT` does, and what DataFusion's `median` does — it averages
+    /// the two middle values, coercing integers to float first.
+    fn aggregate_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+        distinct: bool,
+        filter: Option<&Expr>,
+        order_by: &[SortExpr],
+    ) -> Result<Option<ast::Expr>> {
+        // A `FILTER (WHERE ...)` restricts which rows the aggregate sees, and a
+        // descending sort makes DataFusion take the percentile from the other
+        // end. Neither survives the rendering below, and computing over the wrong
+        // rows quietly is worse than not translating: declining leaves the
+        // DataFusion name in place, which fails loudly.
+        if filter.is_some() || order_by.iter().any(|sort| !sort.asc) {
+            return Ok(None);
+        }
+
+        match func_name {
+            "median" => bigquery_percentile_to_sql(unparser, args, None, distinct),
+            "approx_percentile_cont" => {
+                bigquery_percentile_to_sql(unparser, args, Some(1), distinct)
+            }
+            _ => Ok(None),
+        }
+    }
+
     fn scalar_function_to_sql_overrides(
         &self,
         unparser: &Unparser,
@@ -1001,6 +1234,42 @@ impl Dialect for BigQueryDialect {
 
         if func_name == "date_trunc" {
             return bigquery_date_trunc_to_sql(unparser, args);
+        }
+
+        // DataFusion's name for the SQL-standard `TRIM(BOTH ...)`; BigQuery's
+        // `TRIM` trims both ends and takes the optional character set in the same
+        // position, so the name is the only difference.
+        if func_name == "btrim" {
+            return bigquery_renamed_scalar_fn(unparser, "TRIM", args);
+        }
+
+        // `now()` carries the session timezone, which is unset by default, so its
+        // declared type is the civil one and `CURRENT_DATETIME` is the match.
+        // `CURRENT_TIMESTAMP` would be an instant, which a `DATETIME` column has
+        // no common supertype with.
+        if func_name == "now" {
+            return bigquery_renamed_scalar_fn(unparser, "CURRENT_DATETIME", args);
+        }
+
+        // These depend on their operand's type, so they read it off the
+        // expression rather than being renamed outright.
+        //
+        // `unix_seconds` shares BigQuery's own spelling, so it resolves on name
+        // alone — but only for an instant operand. It needs the same civil-to-
+        // instant conversion as `to_unixtime`, or a `DATETIME` reaches it and
+        // BigQuery refuses the signature.
+        if func_name == "to_unixtime" || func_name == "unix_seconds" {
+            return bigquery_to_unixtime_to_sql(unparser, args);
+        }
+
+        if func_name == "to_timestamp" {
+            return bigquery_to_timestamp_to_sql(unparser, args);
+        }
+
+        // A bare subscript is 0-based in BigQuery, where `array_element` is
+        // 1-based, so the generic rendering reads the neighbouring element.
+        if func_name == "array_element" {
+            return bigquery_array_element_to_sql(unparser, args);
         }
 
         Ok(None)

@@ -50,11 +50,11 @@ use crate::unparser::{
 use crate::utils::UNNEST_PLACEHOLDER;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{
-    Column, DataFusionError, Result, ScalarValue, TableReference, assert_or_internal_err,
-    internal_datafusion_err, internal_err, not_impl_err,
+    Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
+    assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
-use datafusion_expr::expr::{OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
+use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
@@ -106,6 +106,95 @@ use std::{collections::HashSet, sync::Arc, vec};
 pub fn plan_to_sql(plan: &LogicalPlan) -> Result<ast::Statement> {
     let unparser = Unparser::default();
     unparser.plan_to_sql(plan)
+}
+
+/// `have` extended with the fields of `add` it does not already carry.
+///
+/// `None` when the two disagree about a field's type under one name, which makes
+/// a reference to it ambiguous.
+fn merged_without_conflict(have: &DFSchema, add: &DFSchema) -> Option<DFSchema> {
+    let mut merged = have.clone();
+    for (qualifier, field) in add.iter() {
+        match have.field_with_name(qualifier, field.name()) {
+            Ok(existing) if existing.data_type() == field.data_type() => {}
+            Ok(_) => return None,
+            Err(_) => {
+                let addition = DFSchema::new_with_metadata(
+                    vec![(qualifier.cloned(), Arc::clone(field))],
+                    std::collections::HashMap::new(),
+                )
+                .ok()?;
+                merged = merged.join(&addition).ok()?;
+            }
+        }
+    }
+    Some(merged)
+}
+
+/// The fields a node's own expressions resolve against: everything its inputs
+/// expose, which for a join is both sides.
+///
+/// `None` when the inputs' fields will not combine, such as two branches that both
+/// expose the same unqualified name. A leaf carries its expressions itself — a
+/// scan's pushed-down filters — so its own schema is the right one.
+fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
+    let inputs = plan.inputs();
+    if inputs.is_empty() {
+        // A scan's pushed-down filters may name columns its projection leaves
+        // out, so the source's own schema is the scope, not the projected one.
+        if let LogicalPlan::TableScan(scan) = plan {
+            return DFSchema::try_from_qualified_schema(
+                scan.table_name.clone(),
+                &scan.source.schema(),
+            )
+            .ok();
+        }
+        return Some(plan.schema().as_ref().clone());
+    }
+
+    let mut schema = DFSchema::empty();
+    for input in &inputs {
+        schema = schema.join(input.schema()).ok()?;
+    }
+
+    // An expression unparsed here may have been unprojected from a node below —
+    // a select item is substituted back into the aggregate or window expression
+    // that produced it — and then it references that node's input rather than
+    // this one's. Those nodes flatten into the same `SELECT`, so their inputs are
+    // in scope for the expressions that end up in it.
+    // Start one level down: this node's inputs are already joined above, and
+    // re-joining them would collide with themselves.
+    let mut below: &LogicalPlan = *inputs.first()?;
+    loop {
+        if !matches!(
+            below,
+            LogicalPlan::Projection(_)
+                | LogicalPlan::Aggregate(_)
+                | LogicalPlan::Window(_)
+                | LogicalPlan::Filter(_)
+                | LogicalPlan::Sort(_)
+                | LogicalPlan::Limit(_)
+                | LogicalPlan::Distinct(_)
+        ) {
+            break;
+        }
+        let below_inputs = below.inputs();
+        let Some(input) = below_inputs.first() else {
+            break;
+        };
+        // A name repeats across levels for the ordinary reason — a grouping key
+        // is in both an aggregate's output and its input — and that is the same
+        // column, so it can be skipped. A repeat carrying a *different* type is
+        // a real ambiguity, and guessing which one a reference means is worse
+        // than declining, so the walk stops there.
+        match merged_without_conflict(&schema, input.schema()) {
+            Some(merged) => schema = merged,
+            None => break,
+        }
+        below = input;
+    }
+
+    Some(schema)
 }
 
 impl Unparser<'_> {
@@ -376,10 +465,7 @@ impl Unparser<'_> {
 
                 select.projection(items);
                 select.group_by(ast::GroupByExpr::Expressions(
-                    agg.group_expr
-                        .iter()
-                        .map(|expr| self.expr_to_sql(expr))
-                        .collect::<Result<Vec<_>>>()?,
+                    self.group_by_keys(agg)?,
                     vec![],
                 ));
             }
@@ -936,8 +1022,55 @@ impl Unparser<'_> {
         self.project_window_output(&window_expr, select, None)
     }
 
+    /// The `GROUP BY` keys to emit, with a constant key cast to its own type.
+    ///
+    /// A bare literal is not a portable grouping key. BigQuery refuses one
+    /// outright ("Cannot GROUP BY literal values"), and an engine that reads a
+    /// bare integer there as a select-list ordinal groups by something else
+    /// entirely. Casting the literal to the type it already has is accepted
+    /// everywhere and cannot be read as an ordinal.
+    ///
+    /// The key is kept rather than dropped, because dropping the last one turns
+    /// a grouped aggregate into a global one: over an empty input the first
+    /// yields no rows and the second yields a row of zeros.
+    fn group_by_keys(&self, aggregate: &Aggregate) -> Result<Vec<ast::Expr>> {
+        aggregate
+            .group_expr
+            .iter()
+            .map(|expr| match expr {
+                Expr::Literal(value, _) => self.expr_to_sql(&Expr::Cast(Cast::new(
+                    Box::new(expr.clone()),
+                    value.data_type(),
+                ))),
+                _ => self.expr_to_sql(expr),
+            })
+            .collect()
+    }
+
     #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn select_to_sql_recursively(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        // Bind this node's schema once, here, so everything the node's handling
+        // reaches — helpers included — resolves expression types against it. The
+        // recursion re-enters through this wrapper, so each node rebinds to its
+        // own inputs rather than inheriting an ancestor's.
+        //
+        // A schema whose fields will not combine is not bound, and a rendering
+        // that needs a type then applies only where an expression states its own.
+        match expression_schema(plan) {
+            Some(schema) => self
+                .with_schema(Arc::new(schema))
+                .select_to_sql_recursively_inner(plan, query, select, relation),
+            None => self.select_to_sql_recursively_inner(plan, query, select, relation),
+        }
+    }
+
+    fn select_to_sql_recursively_inner(
         &self,
         plan: &LogicalPlan,
         query: &mut Option<QueryBuilder>,
@@ -1321,10 +1454,7 @@ impl Unparser<'_> {
                     select.projection(exprs);
 
                     select.group_by(ast::GroupByExpr::Expressions(
-                        agg.group_expr
-                            .iter()
-                            .map(|expr| self.expr_to_sql(expr))
-                            .collect::<Result<Vec<_>>>()?,
+                        self.group_by_keys(agg)?,
                         vec![],
                     ));
                 }

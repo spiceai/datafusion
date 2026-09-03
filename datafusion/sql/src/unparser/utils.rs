@@ -21,14 +21,17 @@ use super::{
     Unparser, dialect::CharacterLengthStyle, dialect::DateFieldExtractStyle,
     rewrite::TableAliasRewriter,
 };
+use arrow::datatypes::DataType;
 use datafusion_common::{
     Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
-    assert_eq_or_internal_err, internal_err,
+    assert_eq_or_internal_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Projection,
-    SortExpr, Unnest, Window, expr, utils::grouping_set_to_exprlist,
+    SortExpr, Unnest, Window, expr,
+    expr::{Cast, TryCast},
+    utils::grouping_set_to_exprlist,
 };
 
 use indexmap::IndexSet;
@@ -1131,6 +1134,365 @@ pub(crate) fn sqlite_date_trunc_to_sql(
     Ok(None)
 }
 
+/// The type an expression states about itself, without a schema.
+///
+/// Only a cast and a literal carry their own type; everything else answers
+/// `None`, including a column whose type is known only to the schema.
+pub(crate) fn provable_data_type(expr: &Expr) -> Option<DataType> {
+    match expr {
+        Expr::Alias(alias) => provable_data_type(&alias.expr),
+        Expr::Cast(Cast { field, .. }) | Expr::TryCast(TryCast { field, .. }) => {
+            Some(field.data_type().clone())
+        }
+        Expr::Literal(value, _) => Some(value.data_type()),
+        _ => None,
+    }
+}
+
+/// Wraps `arg` in BigQuery's `TIMESTAMP(...)`, which reads a civil date or
+/// date-and-time as an instant in UTC — the same reading DataFusion gives a
+/// tz-naive value.
+fn bigquery_as_instant(arg: ast::Expr) -> ast::Expr {
+    bigquery_call("TIMESTAMP", vec![arg])
+}
+
+/// Builds a BigQuery function call from already-unparsed arguments.
+fn bigquery_call(name: &str, args: Vec<ast::Expr>) -> ast::Expr {
+    ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident {
+            value: name.to_string(),
+            quote_style: None,
+            span: Span::empty(),
+        }]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: args
+                .into_iter()
+                .map(|arg| ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(arg)))
+                .collect(),
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })
+}
+
+/// Converts DataFusion's `to_unixtime(expr)` — seconds since the epoch — to
+/// BigQuery's `UNIX_SECONDS`.
+///
+/// `UNIX_SECONDS` takes only a `TIMESTAMP`; it refuses a `DATETIME` ("No matching
+/// signature for function UNIX_SECONDS"), so a civil operand is read as an
+/// instant in UTC first, which is how DataFusion reads a tz-naive timestamp and a
+/// date.
+///
+/// Returns `Ok(None)` when the operand's type is not evident from the expression,
+/// leaving the default rendering, because the right form depends on that type.
+pub(crate) fn bigquery_to_unixtime_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [arg] = args else {
+        return Ok(None);
+    };
+
+    let Some(data_type) = unparser.resolved_data_type(arg) else {
+        return Ok(None);
+    };
+
+    let operand = unparser.expr_to_sql(arg)?;
+    let instant = match data_type {
+        DataType::Timestamp(_, Some(_)) => operand,
+        DataType::Timestamp(_, None) | DataType::Date32 => bigquery_as_instant(operand),
+        // A number is already seconds and a string needs parsing rules BigQuery
+        // does not share; neither is a rename.
+        _ => return Ok(None),
+    };
+
+    Ok(Some(bigquery_call("UNIX_SECONDS", vec![instant])))
+}
+
+/// Converts DataFusion's `to_timestamp(expr)` to BigQuery.
+///
+/// DataFusion reads an integer as seconds since the epoch and returns a tz-naive
+/// timestamp. BigQuery has no `TIMESTAMP(int)` ("No matching signature for
+/// function TIMESTAMP"); `TIMESTAMP_SECONDS` is the integer form, and its result
+/// is an instant, so it is brought back to the civil type the plan declares.
+///
+/// Returns `Ok(None)` for any other operand type, including one that is not
+/// evident from the expression.
+pub(crate) fn bigquery_to_timestamp_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [arg] = args else {
+        return Ok(None);
+    };
+
+    let Some(data_type) = unparser.resolved_data_type(arg) else {
+        return Ok(None);
+    };
+
+    if !data_type.is_integer() {
+        return Ok(None);
+    }
+
+    let seconds = unparser.expr_to_sql(arg)?;
+    Ok(Some(bigquery_call(
+        "DATETIME",
+        vec![bigquery_call("TIMESTAMP_SECONDS", vec![seconds])],
+    )))
+}
+
+/// Renders a percentile over a group for BigQuery, which has no aggregate
+/// percentile of its own.
+///
+/// The group is ordered into an array and the two values the percentile falls
+/// between are read off it:
+///
+/// ```text
+/// idx = p * (n - 1)
+/// lo  = a[FLOOR(idx)]
+/// hi  = a[CEIL(idx)]
+/// ```
+///
+/// A median is `(lo + hi) / 2`, which is exact for any group size — at an integer
+/// `idx` both offsets address the same element, so the average is that element —
+/// and keeps the input's own type, so a `NUMERIC` column keeps its precision
+/// rather than going through a float. That matches DataFusion, which averages the
+/// two middle values and declares the same decimal type it was given, coercing
+/// only integers to float, which BigQuery's `/` does too.
+///
+/// Any other percentile has to interpolate between the two, which brings in a
+/// fractional weight and so a float result.
+///
+/// `IGNORE NULLS` matches DataFusion, where a null takes no position.
+///
+/// One cost worth stating: `ARRAY_AGG` materialises and sorts each group, where
+/// DataFusion's `approx_percentile_cont` keeps bounded state. A group large
+/// enough to exceed BigQuery's array limits will fail rather than degrade — a
+/// visible error, not a wrong number, which is the better failure of the two, but
+/// it does mean this is not a bounded-memory rendering.
+///
+/// `percentile_arg` is the index of the argument carrying the percentile, or
+/// `None` for a median. Returns `Ok(None)` when the arguments are not the
+/// expected shape, so the caller falls back rather than emitting something
+/// malformed.
+pub(crate) fn bigquery_percentile_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+    percentile_arg: Option<usize>,
+    distinct: bool,
+) -> Result<Option<ast::Expr>> {
+    let Some(value) = args.first() else {
+        return Ok(None);
+    };
+
+    let percentile = match percentile_arg {
+        None => None,
+        Some(i) => match args.get(i) {
+            // Only a constant percentile can be folded into the offsets; a
+            // per-row one would need a different shape entirely.
+            Some(literal @ Expr::Literal(scalar, _)) if !scalar.is_null() => {
+                Some(unparser.expr_to_sql(literal)?)
+            }
+            _ => return Ok(None),
+        },
+    };
+
+    let value_sql = unparser.expr_to_sql(value)?;
+    let sorted = ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident {
+            value: "ARRAY_AGG".to_string(),
+            quote_style: None,
+            span: Span::empty(),
+        }]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: distinct.then_some(ast::DuplicateTreatment::Distinct),
+            args: vec![ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                value_sql.clone(),
+            ))],
+            clauses: vec![
+                // Inside the parentheses, and before the ordering: BigQuery
+                // takes both as argument clauses of ARRAY_AGG. A null takes no
+                // position, which is how DataFusion reads it too.
+                ast::FunctionArgumentClause::IgnoreOrRespectNulls(
+                    ast::NullTreatment::IgnoreNulls,
+                ),
+                ast::FunctionArgumentClause::OrderBy(vec![ast::OrderByExpr {
+                    expr: value_sql,
+                    options: ast::OrderByOptions {
+                        asc: None,
+                        nulls_first: None,
+                    },
+                    with_fill: None,
+                }]),
+            ],
+        }),
+        null_treatment: None,
+        filter: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+
+    // idx = p * (ARRAY_LENGTH(sorted) - 1), the 0-based position the percentile
+    // falls at.
+    let index = binary(
+        percentile.clone().unwrap_or_else(|| number("0.5")),
+        ast::BinaryOperator::Multiply,
+        nest(binary(
+            bigquery_call("ARRAY_LENGTH", vec![sorted.clone()]),
+            ast::BinaryOperator::Minus,
+            number("1"),
+        )),
+    );
+
+    // The two elements it falls between. At an integer index both address the
+    // same element, so the interpolation below degenerates to that element.
+    let at = |round: &str| ast::Expr::CompoundFieldAccess {
+        root: Box::new(sorted.clone()),
+        access_chain: vec![ast::AccessExpr::Subscript(ast::Subscript::Index {
+            index: bigquery_call(
+                "OFFSET",
+                vec![cast_to(
+                    bigquery_call(round, vec![index.clone()]),
+                    ast::DataType::Int64,
+                )],
+            ),
+        })],
+    };
+    let (low, high) = (at("FLOOR"), at("CEIL"));
+
+    let rendered = if percentile.is_none() {
+        // A median needs no weight, so the input's own type survives.
+        let mean = binary(
+            nest(binary(nest(low), ast::BinaryOperator::Plus, nest(high))),
+            ast::BinaryOperator::Divide,
+            number("2"),
+        );
+        // DataFusion's median over a decimal averages the two middle values as
+        // scaled integers, so the result is truncated to the input's own scale:
+        // the median of 1 and 2 at scale 0 is 1, not 1.5. BigQuery's `/` keeps
+        // the extra digits, so they are truncated off to match.
+        match unparser
+            .resolved_data_type(value)
+            .as_ref()
+            .and_then(decimal_scale)
+        {
+            Some(scale) => bigquery_call("TRUNC", vec![mean, number(&scale.to_string())]),
+            None => mean,
+        }
+    } else {
+        // low + (high - low) * (idx - FLOOR(idx))
+        let float = |expr| cast_to(expr, ast::DataType::Float64);
+        binary(
+            float(low.clone()),
+            ast::BinaryOperator::Plus,
+            nest(binary(
+                nest(binary(float(high), ast::BinaryOperator::Minus, float(low))),
+                ast::BinaryOperator::Multiply,
+                nest(binary(
+                    index.clone(),
+                    ast::BinaryOperator::Minus,
+                    bigquery_call("FLOOR", vec![index]),
+                )),
+            )),
+        )
+    };
+
+    Ok(Some(nest(rendered)))
+}
+
+/// The scale of a decimal type, when it is one and the scale is not negative.
+///
+/// A negative scale stores a value coarser than one unit, which no BigQuery
+/// numeric type has, so there is nothing to truncate to.
+fn decimal_scale(data_type: &DataType) -> Option<i8> {
+    match data_type {
+        DataType::Decimal32(_, scale)
+        | DataType::Decimal64(_, scale)
+        | DataType::Decimal128(_, scale)
+        | DataType::Decimal256(_, scale) => (*scale >= 0).then_some(*scale),
+        _ => None,
+    }
+}
+
+/// `lhs op rhs`.
+fn binary(lhs: ast::Expr, op: ast::BinaryOperator, rhs: ast::Expr) -> ast::Expr {
+    ast::Expr::BinaryOp {
+        left: Box::new(lhs),
+        op,
+        right: Box::new(rhs),
+    }
+}
+
+/// `(expr)`, so composed arithmetic keeps the grouping it was built with.
+fn nest(expr: ast::Expr) -> ast::Expr {
+    ast::Expr::Nested(Box::new(expr))
+}
+
+/// An unquoted numeric literal.
+fn number(value: &str) -> ast::Expr {
+    ast::Expr::Value(ast::Value::Number(value.to_string(), false).into())
+}
+
+/// `CAST(expr AS data_type)`.
+fn cast_to(expr: ast::Expr, data_type: ast::DataType) -> ast::Expr {
+    ast::Expr::Cast {
+        kind: ast::CastKind::Cast,
+        expr: Box::new(expr),
+        data_type,
+        format: None,
+        array: false,
+    }
+}
+
+/// Re-emits a scalar function under the name BigQuery spells it, with the
+/// arguments unchanged.
+///
+/// Only for functions whose BigQuery counterpart takes the same arguments in the
+/// same order and means the same thing, so the rename is the whole translation.
+/// A function whose BigQuery form depends on its argument *types* cannot be
+/// handled here, because those types are not available at unparse time.
+pub(crate) fn bigquery_renamed_scalar_fn(
+    unparser: &Unparser,
+    bigquery_name: &str,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let args = args
+        .iter()
+        .map(|arg| {
+            Ok(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                unparser.expr_to_sql(arg)?,
+            )))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(Some(ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident {
+            value: bigquery_name.to_string(),
+            quote_style: None,
+            span: Span::empty(),
+        }]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args,
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
+}
+
 /// Converts DataFusion's `date_trunc(granularity, expr)` to BigQuery's
 /// `TIMESTAMP_TRUNC(expr, GRANULARITY)`.
 ///
@@ -1143,12 +1505,13 @@ pub(crate) fn sqlite_date_trunc_to_sql(
 /// 3. The function name is type-specific. We always emit `TIMESTAMP_TRUNC`,
 ///    which is correct for the common case of a `Timestamp` (with timezone)
 ///    input. DataFusion's `date_trunc` also accepts `Timestamp` *without* a
-///    timezone, `Date32`, and `Time32`/`Time64`, which in BigQuery map to
-///    `DATETIME_TRUNC`, `DATE_TRUNC`, and `TIME_TRUNC` respectively. The source
-///    type is not available at unparse time, so those inputs are rendered as
-///    `TIMESTAMP_TRUNC` too — which BigQuery rejects or mis-types. Callers
-///    truncating non-`TIMESTAMP` types should therefore not push the function
-///    down.
+///    timezone, `Date32`, and `Time32`/`Time64`, which in BigQuery have
+///    `DATETIME_TRUNC`, `DATE_TRUNC` and `TIME_TRUNC` of their own. All of them
+///    are still rendered as `TIMESTAMP_TRUNC`, which BigQuery accepts over a
+///    `DATETIME` and returns a `DATETIME` for, so the common cases hold. The
+///    operand's type is now reachable through [`Unparser::resolved_data_type`]
+///    whenever plan unparsing supplied a schema, so dispatching properly here is
+///    possible; it is left alone because no reported statement needs it.
 ///
 /// Returns `Ok(None)` (falling back to default unparsing) when the arguments
 /// don't match the expected shape or the granularity is not one BigQuery
@@ -1216,4 +1579,47 @@ pub(crate) fn bigquery_date_trunc_to_sql(
         parameters: ast::FunctionArguments::None,
         uses_odbc_syntax: false,
     })))
+}
+
+/// Renders `array_element` for BigQuery.
+///
+/// DataFusion's `array_element` is 1-based, counts from the end for a negative
+/// index, and yields NULL for an index outside the array. BigQuery's bare
+/// subscript is 0-based, and its `ORDINAL` raises on a miss rather than yielding
+/// NULL, so `SAFE_ORDINAL` is the form that agrees on every non-negative index.
+///
+/// BigQuery has no end-relative subscript, so an index that is not a
+/// non-negative integer literal is refused: a bare subscript would read the
+/// neighbouring element instead, and returning wrong rows is worse than
+/// declining to render.
+pub(crate) fn bigquery_array_element_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [array, index] = args else {
+        return Ok(None);
+    };
+
+    let non_negative = match index {
+        Expr::Literal(value, _) if value.data_type().is_integer() => matches!(
+            value.cast_to(&DataType::Int64),
+            Ok(ScalarValue::Int64(Some(index))) if index >= 0
+        ),
+        _ => false,
+    };
+    if !non_negative {
+        return not_impl_err!(
+            "BigQuery has no end-relative array subscript, so array_element needs a non-negative integer index"
+        );
+    }
+
+    let array = unparser.expr_to_sql(array)?;
+    let index = unparser.expr_to_sql(index)?;
+
+    Ok(Some(ast::Expr::CompoundFieldAccess {
+        root: Box::new(array),
+        access_chain: vec![ast::AccessExpr::Subscript(ast::Subscript::Index {
+            index: bigquery_call("SAFE_ORDINAL", vec![index]),
+        })],
+    }))
 }
