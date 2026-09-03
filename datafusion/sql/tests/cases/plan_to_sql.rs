@@ -10781,3 +10781,62 @@ fn test_bigquery_percentile_aggregates_are_rendered_by_ordering_the_group() -> R
 
     Ok(())
 }
+
+/// An expression unparsed for one node may have been unprojected from a node
+/// below it — a select item substituted back into the aggregate expression that
+/// produced it — and it then references that node's input rather than this one's.
+///
+/// Those nodes flatten into the same `SELECT`, so their inputs are in scope for
+/// the expressions that end up in it. Without that, a type-directed rendering
+/// declines on the way back up: `to_unixtime` over a column of the aggregate's
+/// input stayed untranslated and reached BigQuery as `Function not found:
+/// to_unixtime`, even though the same expression translates when the column's own
+/// schema is in hand.
+#[test]
+fn test_type_directed_rendering_survives_unprojection() -> Result<()> {
+    use datafusion_functions::datetime::expr_fn as datetime_fn;
+
+    let schema = Schema::new(vec![
+        Field::new(
+            "canceled_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+        Field::new(
+            "first_rej_at",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+
+    let days = cast(
+        (datetime_fn::to_unixtime(vec![col("c.canceled_at")])
+            - datetime_fn::to_unixtime(vec![col("c.first_rej_at")]))
+            / lit(86400i64),
+        DataType::Int64,
+    );
+    let grouped = table_scan(Some("c"), &schema, None)?
+        .aggregate(vec![days.alias("days_to_cancel")], vec![count(lit(1i64))])?
+        .build()?;
+    let outputs = grouped.schema().columns();
+    let plan = LogicalPlanBuilder::from(grouped)
+        .project(vec![
+            Expr::Column(outputs[0].clone()),
+            Expr::Column(outputs[1].clone()),
+        ])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("to_unixtime"),
+        "the unprojected expression still has to be translated: {sql}"
+    );
+    assert!(
+        sql.contains("UNIX_SECONDS(TIMESTAMP(`c`.`canceled_at`))"),
+        "and translated by the operand's real type: {sql}"
+    );
+
+    Ok(())
+}

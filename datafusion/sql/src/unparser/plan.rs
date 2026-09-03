@@ -121,9 +121,44 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     }
 
     let mut schema = DFSchema::empty();
-    for input in inputs {
+    for input in &inputs {
         schema = schema.join(input.schema()).ok()?;
     }
+
+    // An expression unparsed here may have been unprojected from a node below —
+    // a select item is substituted back into the aggregate or window expression
+    // that produced it — and then it references that node's input rather than
+    // this one's. Those nodes flatten into the same `SELECT`, so their inputs are
+    // in scope for the expressions that end up in it.
+    // Start one level down: this node's inputs are already joined above, and
+    // re-joining them would collide with themselves.
+    let mut below: &LogicalPlan = *inputs.first()?;
+    loop {
+        if !matches!(
+            below,
+            LogicalPlan::Projection(_)
+                | LogicalPlan::Aggregate(_)
+                | LogicalPlan::Window(_)
+                | LogicalPlan::Filter(_)
+                | LogicalPlan::Sort(_)
+                | LogicalPlan::Limit(_)
+                | LogicalPlan::Distinct(_)
+        ) {
+            break;
+        }
+        let below_inputs = below.inputs();
+        let Some(input) = below_inputs.first() else {
+            break;
+        };
+        // A name repeated across levels makes a reference ambiguous, and guessing
+        // is worse than declining: stop with what is unambiguous so far.
+        match schema.join(input.schema()) {
+            Ok(joined) => schema = joined,
+            Err(_) => break,
+        }
+        below = input;
+    }
+
     Some(schema)
 }
 
