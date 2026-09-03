@@ -354,12 +354,21 @@ impl CachedParquetFileReader {
 
     /// Pin footer and page reads to the listed object generation.
     ///
-    /// Must match the `object_versioning_type` already applied to `inner`.
-    /// Defaults to `None` so existing `new` callers keep compiling.
+    /// Applied to both this wrapper and `inner`, so
+    /// `new(...).with_object_versioning_type(...)` pins `get_bytes` /
+    /// `get_byte_ranges` as well as metadata fetches. Defaults to `None`
+    /// so existing `new` callers keep compiling.
     pub fn with_object_versioning_type(
         mut self,
         object_versioning_type: Option<ObjectVersionType>,
     ) -> Self {
+        // `CachedParquetFileReader` implements `Drop`, so `inner` cannot be
+        // moved out. `ParquetObjectReader` is cheap to clone (store handle
+        // plus metadata).
+        self.inner = self
+            .inner
+            .clone()
+            .with_object_versioning_type(object_versioning_type.clone());
         self.object_versioning_type = object_versioning_type;
         self
     }
@@ -693,6 +702,55 @@ mod tests {
             assert!(
                 options.if_match.is_none(),
                 "a version pin must not also send If-Match: {options:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_builder_pins_page_reads_as_well_as_metadata() {
+        let buf = write_tiny_parquet();
+        let inner_store = InMemory::new();
+        let location = Path::from("listing/data.parquet");
+        inner_store
+            .put(&location, buf.into())
+            .await
+            .expect("put parquet");
+        let listed = inner_store.head(&location).await.expect("list");
+        let etag = listed.e_tag.clone().expect("listing still carries an ETag");
+        let store = Arc::new(VersionHeadStore {
+            inner: inner_store,
+            version: "unused".to_string(),
+            reads: StdMutex::new(Vec::new()),
+        });
+        let metrics = ExecutionPlanMetricsSet::new();
+        let inner = ParquetObjectReader::new_with_meta(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            listed.clone(),
+        );
+        let mut reader = CachedParquetFileReader::new(
+            ParquetFileMetrics::new(0, listed.location.as_ref(), &metrics),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            inner,
+            PartitionedFile::new_from_meta(listed),
+            Arc::new(DefaultFilesMetadataCache::new(64 * 1024 * 1024)),
+            None,
+        )
+        .with_object_versioning_type(Some(ObjectVersionType::ETag));
+        reader
+            .get_bytes(0..8)
+            .await
+            .expect("page read through the public builder");
+
+        let reads = store.reads.lock().expect("reads lock").clone();
+        assert!(
+            !reads.is_empty(),
+            "the builder-configured reader issued no range request"
+        );
+        for options in &reads {
+            assert_eq!(
+                options.if_match.as_deref(),
+                Some(etag.as_str()),
+                "new().with_object_versioning_type must pin get_bytes, not only metadata: {options:?}"
             );
         }
     }
