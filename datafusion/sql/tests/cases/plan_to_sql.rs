@@ -10771,6 +10771,10 @@ fn test_bigquery_array_element_is_rendered_one_based() -> Result<()> {
         rendered(lit(-1i64), &BigQueryDialect {}).is_err(),
         "a negative index counts from the end, which BigQuery cannot express"
     );
+    assert!(
+        rendered(lit("1"), &BigQueryDialect {}).is_err(),
+        "a textual index is not an ordinal BigQuery would accept"
+    );
 
     // Every other dialect subscripts 1-based already.
     assert!(

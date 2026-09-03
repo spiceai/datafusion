@@ -1484,7 +1484,7 @@ pub(crate) fn bigquery_array_element_to_sql(
     };
 
     let non_negative = match index {
-        Expr::Literal(value, _) => matches!(
+        Expr::Literal(value, _) if value.data_type().is_integer() => matches!(
             value.cast_to(&DataType::Int64),
             Ok(ScalarValue::Int64(Some(index))) if index >= 0
         ),
