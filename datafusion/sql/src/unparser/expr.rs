@@ -403,6 +403,14 @@ impl Unparser<'_> {
                     ..
                 } = &agg.params;
 
+                if let Some(overridden) =
+                    self.dialect.aggregate_function_to_sql_overrides(
+                        self, func_name, args, *distinct,
+                    )?
+                {
+                    return Ok(overridden);
+                }
+
                 let args = self.function_args_to_sql(args)?;
                 let filter = match filter {
                     Some(filter) => Some(Box::new(self.expr_to_sql_inner(filter)?)),

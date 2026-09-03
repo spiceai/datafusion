@@ -10726,3 +10726,58 @@ fn test_constant_group_by_keys_are_left_out() -> Result<()> {
 
     Ok(())
 }
+
+/// `BigQuery` has no aggregate percentile. `PERCENTILE_CONT` exists only as an
+/// analytic function and says so — "percentile_cont aggregate function is not
+/// supported" — and `APPROX_QUANTILES`, which is an aggregate, answers a
+/// different question: over `[1,2,3,4]` it returns 2 where the median is 2.5.
+///
+/// Both `median` and `approx_percentile_cont` are therefore rendered by ordering
+/// the group into an array and interpolating between the two values the
+/// percentile falls between. Checked against BigQuery on the emitted statement:
+/// the medians of `[1,2,3,4]` and `[10,20,31]` come back 2.5 and 20.0, and the
+/// p95s 3.85 and 29.9 — matching `PERCENTILE_CONT` to floating-point noise, and
+/// matching DataFusion's `median`, which averages the two middle values.
+#[test]
+fn test_bigquery_percentile_aggregates_are_rendered_by_ordering_the_group() -> Result<()>
+{
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Float64, true),
+    ]);
+
+    let rendered = |agg: Expr, dialect: &dyn UnparserDialect| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .aggregate(vec![col("t.g")], vec![agg])?
+            .build()?;
+        Ok(Unparser::new(dialect).plan_to_sql(&plan)?.to_string())
+    };
+
+    let median = || datafusion_functions_aggregate::median::median(col("t.v"));
+
+    let sql = rendered(median(), &BigQueryDialect {})?;
+    assert!(
+        !sql.contains("median("),
+        "BigQuery has no median to call: {sql}"
+    );
+    assert!(
+        sql.contains("ARRAY_AGG(`t`.`v` IGNORE NULLS ORDER BY `t`.`v`)"),
+        "the group has to be ordered, and a null must not take a position: {sql}"
+    );
+    assert!(
+        sql.contains("FLOOR(") && sql.contains("CEIL("),
+        "the two straddling values are what the result interpolates between: {sql}"
+    );
+    assert!(
+        !sql.contains("APPROX_QUANTILES"),
+        "an approximation would answer a different question: {sql}"
+    );
+
+    // Every other dialect keeps its own aggregate.
+    assert!(
+        rendered(median(), &UnparserDefaultDialect {})?.contains("median("),
+        "only BigQuery lacks the aggregate"
+    );
+
+    Ok(())
+}

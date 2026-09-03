@@ -1247,6 +1247,65 @@ pub(crate) fn bigquery_to_timestamp_to_sql(
     )))
 }
 
+/// Renders an exact percentile over a group for BigQuery, which has no aggregate
+/// percentile of its own.
+///
+/// The group is ordered into an array and the result interpolated between the two
+/// values the percentile falls between:
+///
+/// ```text
+/// idx = p * (n - 1)
+/// result = a[FLOOR(idx)] + (a[CEIL(idx)] - a[FLOOR(idx)]) * (idx - FLOOR(idx))
+/// ```
+///
+/// which needs no case split: at an integer `idx` both offsets are the same
+/// element and the interpolation term is zero. `IGNORE NULLS` matches
+/// DataFusion, which does not count a null toward the position.
+///
+/// `percentile_arg` is the index of the argument carrying the percentile, or
+/// `None` for `median`, which is the same thing at `0.5`.
+///
+/// Returns `Ok(None)` when the arguments are not the expected shape, so the
+/// caller falls back rather than emitting something malformed.
+pub(crate) fn bigquery_percentile_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+    percentile_arg: Option<usize>,
+    distinct: bool,
+) -> Result<Option<ast::Expr>> {
+    let Some(value) = args.first() else {
+        return Ok(None);
+    };
+
+    let percentile = match percentile_arg {
+        None => "0.5".to_string(),
+        Some(i) => match args.get(i) {
+            // Only a constant percentile can be spliced into the offsets; a
+            // per-row one would need a different shape entirely.
+            Some(Expr::Literal(scalar, _)) if !scalar.is_null() => scalar.to_string(),
+            _ => return Ok(None),
+        },
+    };
+
+    let value_sql = unparser.expr_to_sql(value)?.to_string();
+    let distinct = if distinct { "DISTINCT " } else { "" };
+    let sorted =
+        format!("ARRAY_AGG({distinct}{value_sql} IGNORE NULLS ORDER BY {value_sql})");
+    let length = format!("ARRAY_LENGTH({sorted})");
+    let index = format!("({percentile} * ({length} - 1))");
+    let low = format!("CAST({sorted}[OFFSET(CAST(FLOOR({index}) AS INT64))] AS FLOAT64)");
+    let high = format!("CAST({sorted}[OFFSET(CAST(CEIL({index}) AS INT64))] AS FLOAT64)");
+    let rendered = format!("({low} + ({high} - {low}) * ({index} - FLOOR({index})))");
+
+    // Parsed back rather than hand-built: the nesting is five deep and the shape
+    // is what the doc comment above states, which a reader can check against the
+    // text but not against a tree of constructors.
+    let mut parser =
+        sqlparser::parser::Parser::new(&sqlparser::dialect::BigQueryDialect {})
+            .try_with_sql(&rendered)?;
+    Ok(Some(parser.parse_expr()?))
+}
+
 /// Re-emits a scalar function under the name BigQuery spells it, with the
 /// arguments unchanged.
 ///

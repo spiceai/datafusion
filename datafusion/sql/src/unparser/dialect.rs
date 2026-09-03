@@ -18,10 +18,11 @@
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    Unparser, utils::bigquery_date_trunc_to_sql, utils::bigquery_renamed_scalar_fn,
-    utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
-    utils::character_length_to_sql, utils::date_part_to_sql,
-    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
+    Unparser, utils::bigquery_date_trunc_to_sql, utils::bigquery_percentile_to_sql,
+    utils::bigquery_renamed_scalar_fn, utils::bigquery_to_timestamp_to_sql,
+    utils::bigquery_to_unixtime_to_sql, utils::character_length_to_sql,
+    utils::date_part_to_sql, utils::sqlite_date_trunc_to_sql,
+    utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
@@ -264,6 +265,21 @@ pub trait Dialect: Send + Sync {
         _unparser: &Unparser,
         _func_name: &str,
         _args: &[Expr],
+    ) -> Result<Option<ast::Expr>> {
+        Ok(None)
+    }
+
+    /// Allows the dialect to override aggregate function unparsing.
+    ///
+    /// The counterpart of [`Self::scalar_function_to_sql_overrides`], for an
+    /// aggregate the dialect spells differently or has no direct equivalent of.
+    /// `Ok(None)` uses the default rendering.
+    fn aggregate_function_to_sql_overrides(
+        &self,
+        _unparser: &Unparser,
+        _func_name: &str,
+        _args: &[Expr],
+        _distinct: bool,
     ) -> Result<Option<ast::Expr>> {
         Ok(None)
     }
@@ -1166,6 +1182,31 @@ impl Dialect for BigQueryDialect {
 
     fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
         ast::SetQuantifier::Distinct
+    }
+
+    /// BigQuery has no aggregate percentile: `PERCENTILE_CONT` exists only as an
+    /// analytic function, and says so — "percentile_cont aggregate function is not
+    /// supported". `APPROX_QUANTILES` is an aggregate but answers a different
+    /// question: over `[1,2,3,4]` it returns 2 where the median is 2.5.
+    ///
+    /// Both are rendered by ordering the group into an array and interpolating
+    /// between the two values the percentile falls between. That is what
+    /// `PERCENTILE_CONT` does, and what DataFusion's `median` does — it averages
+    /// the two middle values, coercing integers to float first.
+    fn aggregate_function_to_sql_overrides(
+        &self,
+        unparser: &Unparser,
+        func_name: &str,
+        args: &[Expr],
+        distinct: bool,
+    ) -> Result<Option<ast::Expr>> {
+        match func_name {
+            "median" => bigquery_percentile_to_sql(unparser, args, None, distinct),
+            "approx_percentile_cont" => {
+                bigquery_percentile_to_sql(unparser, args, Some(1), distinct)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn scalar_function_to_sql_overrides(
