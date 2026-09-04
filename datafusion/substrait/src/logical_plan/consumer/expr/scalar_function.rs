@@ -124,6 +124,8 @@ pub fn name_to_op(name: &str) -> Option<Operator> {
 pub fn substrait_to_df_name(name: &str) -> Option<&str> {
     match name {
         "is_nan" => Some("isnan"),
+        // Substrait `extract` (e.g. extract:req_date) is DataFusion `date_part`.
+        "extract" => Some("date_part"),
         _ => None,
     }
 }
@@ -572,6 +574,55 @@ mod tests {
             panic!("Expected Expr::Like (negated), got {result:?}");
         }
 
+        Ok(())
+    }
+
+    /// Isthmus TPC-H q07/q08/q09 emit `extract:req_date` with
+    /// `FunctionArgument { enum: "YEAR" }` plus a date Value.
+    #[tokio::test]
+    async fn test_extract_enum_arg() -> Result<()> {
+        let mut extensions = Extensions::default();
+        extensions
+            .functions
+            .insert(0, "extract:req_date".to_string());
+        let consumer = DefaultSubstraitConsumer::new(&extensions, &TEST_SESSION_STATE);
+
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let df_schema = DFSchema::try_from(schema).unwrap();
+
+        let enum_arg = FunctionArgument {
+            arg_type: Some(ArgType::Enum("YEAR".to_string())),
+        };
+        let date_arg = FunctionArgument {
+            arg_type: Some(ArgType::Value(Expression {
+                rex_type: Some(RexType::Selection(Box::new(
+                    substrait::proto::expression::FieldReference {
+                        reference_type: Some(substrait::proto::expression::field_reference::ReferenceType::DirectReference(
+                            substrait::proto::expression::ReferenceSegment {
+                                reference_type: Some(substrait::proto::expression::reference_segment::ReferenceType::StructField(
+                                    Box::new(substrait::proto::expression::reference_segment::StructField {
+                                        field: 0,
+                                        child: None,
+                                    })
+                                )),
+                            }
+                        )),
+                        root_type: Some(substrait::proto::expression::field_reference::RootType::RootReference(
+                            substrait::proto::expression::field_reference::RootReference {}
+                        )),
+                    }
+                ))),
+            })),
+        };
+
+        let func = ScalarFunction {
+            function_reference: 0,
+            arguments: vec![enum_arg, date_arg],
+            ..Default::default()
+        };
+
+        let result = consumer.consume_scalar_function(&func, &df_schema).await?;
+        assert_eq!(result.to_string(), r#"date_part(Utf8("YEAR"), d)"#);
         Ok(())
     }
 }

@@ -214,27 +214,93 @@ mod tests {
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn tpch_test_07() -> Result<()> {
         let plan_str = tpch_plan_to_string(7).await?;
-        assert_snapshot!(plan_str, "Missing support for enum function arguments");
+        assert_snapshot!(
+        plan_str,
+        @r#"
+        Projection: left.N_NAME AS SUPP_NATION, right.N_NAME AS CUST_NATION, date_part(Utf8("YEAR"),left.L_SHIPDATE) AS L_YEAR, sum(left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT) AS REVENUE
+          Sort: left.N_NAME ASC NULLS LAST, right.N_NAME ASC NULLS LAST, date_part(Utf8("YEAR"),left.L_SHIPDATE) ASC NULLS LAST
+            Aggregate: groupBy=[[left.N_NAME, right.N_NAME, date_part(Utf8("YEAR"),left.L_SHIPDATE)]], aggr=[[sum(left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT)]]
+              Projection: left.N_NAME, right.N_NAME, date_part(Utf8("YEAR"), left.L_SHIPDATE), left.L_EXTENDEDPRICE * (CAST(Int32(1) AS Decimal128(15, 2)) - left.L_DISCOUNT)
+                Filter: left.S_SUPPKEY = left.L_SUPPKEY AND left.O_ORDERKEY = left.L_ORDERKEY AND left.C_CUSTKEY = left.O_CUSTKEY AND left.S_NATIONKEY = left.N_NATIONKEY AND left.C_NATIONKEY = right.N_NATIONKEY AND (left.N_NAME = Utf8("FRANCE") AND right.N_NAME = Utf8("GERMANY") OR left.N_NAME = Utf8("GERMANY") AND right.N_NAME = Utf8("FRANCE")) AND left.L_SHIPDATE >= CAST(Utf8("1995-01-01") AS Date32) AND left.L_SHIPDATE <= CAST(Utf8("1996-12-31") AS Date32)
+                  Cross Join:
+                    SubqueryAlias: left
+                      Cross Join:
+                        Cross Join:
+                          Cross Join:
+                            Cross Join:
+                              TableScan: SUPPLIER
+                              TableScan: LINEITEM
+                            TableScan: ORDERS
+                          TableScan: CUSTOMER
+                        TableScan: NATION
+                    SubqueryAlias: right
+                      TableScan: NATION
+        "#
+                );
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn tpch_test_08() -> Result<()> {
         let plan_str = tpch_plan_to_string(8).await?;
-        assert_snapshot!(plan_str, "Missing support for enum function arguments");
+        assert_snapshot!(
+        plan_str,
+        @r#"
+        Projection: date_part(Utf8("YEAR"),left.O_ORDERDATE) AS O_YEAR, sum(CASE WHEN right.N_NAME = Utf8("BRAZIL") THEN left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT ELSE Decimal128(Some(0),19,4) END) / sum(left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT) AS MKT_SHARE
+          Sort: date_part(Utf8("YEAR"),left.O_ORDERDATE) ASC NULLS LAST
+            Projection: date_part(Utf8("YEAR"),left.O_ORDERDATE), sum(CASE WHEN right.N_NAME = Utf8("BRAZIL") THEN left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT ELSE Decimal128(Some(0),19,4) END) / sum(left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT)
+              Aggregate: groupBy=[[date_part(Utf8("YEAR"),left.O_ORDERDATE)]], aggr=[[sum(CASE WHEN right.N_NAME = Utf8("BRAZIL") THEN left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT ELSE Decimal128(Some(0),19,4) END), sum(left.L_EXTENDEDPRICE * Int32(1) - left.L_DISCOUNT)]]
+                Projection: date_part(Utf8("YEAR"), left.O_ORDERDATE), CASE WHEN right.N_NAME = Utf8("BRAZIL") THEN left.L_EXTENDEDPRICE * (CAST(Int32(1) AS Decimal128(15, 2)) - left.L_DISCOUNT) ELSE Decimal128(Some(0),19,4) END, left.L_EXTENDEDPRICE * (CAST(Int32(1) AS Decimal128(15, 2)) - left.L_DISCOUNT)
+                  Filter: left.P_PARTKEY = left.L_PARTKEY AND left.S_SUPPKEY = left.L_SUPPKEY AND left.L_ORDERKEY = left.O_ORDERKEY AND left.O_CUSTKEY = left.C_CUSTKEY AND left.C_NATIONKEY = left.N_NATIONKEY AND left.N_REGIONKEY = REGION.R_REGIONKEY AND REGION.R_NAME = Utf8("AMERICA") AND left.S_NATIONKEY = right.N_NATIONKEY AND left.O_ORDERDATE >= CAST(Utf8("1995-01-01") AS Date32) AND left.O_ORDERDATE <= CAST(Utf8("1996-12-31") AS Date32) AND left.P_TYPE = Utf8("ECONOMY ANODIZED STEEL")
+                    Cross Join:
+                      Cross Join:
+                        SubqueryAlias: left
+                          Cross Join:
+                            Cross Join:
+                              Cross Join:
+                                Cross Join:
+                                  Cross Join:
+                                    TableScan: PART
+                                    TableScan: SUPPLIER
+                                  TableScan: LINEITEM
+                                TableScan: ORDERS
+                              TableScan: CUSTOMER
+                            TableScan: NATION
+                        SubqueryAlias: right
+                          TableScan: NATION
+                      TableScan: REGION
+        "#
+                );
         Ok(())
     }
 
-    #[ignore]
     #[tokio::test]
     async fn tpch_test_09() -> Result<()> {
         let plan_str = tpch_plan_to_string(9).await?;
-        assert_snapshot!(plan_str, "Missing support for enum function arguments");
+        assert_snapshot!(
+        plan_str,
+        @r#"
+        Projection: NATION.N_NAME AS NATION, date_part(Utf8("YEAR"),ORDERS.O_ORDERDATE) AS O_YEAR, sum(LINEITEM.L_EXTENDEDPRICE * Int32(1) - LINEITEM.L_DISCOUNT - PARTSUPP.PS_SUPPLYCOST * LINEITEM.L_QUANTITY) AS SUM_PROFIT
+          Sort: NATION.N_NAME ASC NULLS LAST, date_part(Utf8("YEAR"),ORDERS.O_ORDERDATE) DESC NULLS FIRST
+            Aggregate: groupBy=[[NATION.N_NAME, date_part(Utf8("YEAR"),ORDERS.O_ORDERDATE)]], aggr=[[sum(LINEITEM.L_EXTENDEDPRICE * Int32(1) - LINEITEM.L_DISCOUNT - PARTSUPP.PS_SUPPLYCOST * LINEITEM.L_QUANTITY)]]
+              Projection: NATION.N_NAME, date_part(Utf8("YEAR"), ORDERS.O_ORDERDATE), LINEITEM.L_EXTENDEDPRICE * (CAST(Int32(1) AS Decimal128(15, 2)) - LINEITEM.L_DISCOUNT) - PARTSUPP.PS_SUPPLYCOST * LINEITEM.L_QUANTITY
+                Filter: SUPPLIER.S_SUPPKEY = LINEITEM.L_SUPPKEY AND PARTSUPP.PS_SUPPKEY = LINEITEM.L_SUPPKEY AND PARTSUPP.PS_PARTKEY = LINEITEM.L_PARTKEY AND PART.P_PARTKEY = LINEITEM.L_PARTKEY AND ORDERS.O_ORDERKEY = LINEITEM.L_ORDERKEY AND SUPPLIER.S_NATIONKEY = NATION.N_NATIONKEY AND PART.P_NAME LIKE CAST(Utf8("%green%") AS Utf8)
+                  Cross Join:
+                    Cross Join:
+                      Cross Join:
+                        Cross Join:
+                          Cross Join:
+                            TableScan: PART
+                            TableScan: SUPPLIER
+                          TableScan: LINEITEM
+                        TableScan: PARTSUPP
+                      TableScan: ORDERS
+                    TableScan: NATION
+        "#
+                );
         Ok(())
     }
 
