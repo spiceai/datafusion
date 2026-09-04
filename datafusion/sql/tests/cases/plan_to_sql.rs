@@ -26,8 +26,8 @@ use datafusion_expr::test::function_stub::{
     count, count_udaf, max, max_udaf, min_udaf, sum, sum_udaf,
 };
 use datafusion_expr::{
-    ColumnarValue, EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
-    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
+    ColumnarValue, EmptyRelation, Expr, ExprFunctionExt, Extension, LogicalPlan,
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
     WindowFunctionDefinition, cast, col, exists, in_subquery, lit, out_ref_col,
     scalar_subquery, table_scan, wildcard,
@@ -10729,6 +10729,298 @@ fn test_constant_group_by_keys_are_cast_to_their_own_type() -> Result<()> {
     Ok(())
 }
 
+/// A comparison needs both sides' types to agree on one, so an operand whose
+/// type cannot be read leaves the pair alone. A function call's type follows
+/// from its arguments, and without resolving it an instant compared against
+/// `date_trunc(...)` kept its zone disagreement and `BigQuery` refused the
+/// statement with "No matching signature for operator >= ... TIMESTAMP,
+/// DATETIME".
+#[test]
+fn test_bigquery_agrees_a_comparison_against_a_function_call() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "instant",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        true,
+    )]);
+
+    let civil_call = datafusion_functions::expr_fn::date_trunc(
+        lit("month"),
+        cast(
+            col("t.instant"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ),
+    );
+    let plan = table_scan(Some("t"), &schema, None)?
+        .filter(col("t.instant").gt_eq(civil_call))?
+        .project(vec![col("t.instant")])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    assert!(
+        sql.matches("CAST(").count() >= 2,
+        "both sides of the comparison have to be brought to one type: {sql}"
+    );
+
+    // The shape the corpus actually holds: the call is wrapped in an operator, so
+    // the type has to survive that too.
+    let shifted = table_scan(Some("t"), &schema, None)?
+        .filter(col("t.instant").gt_eq(
+            datafusion_functions::expr_fn::date_trunc(
+                lit("month"),
+                cast(
+                    col("t.instant"),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                ),
+            ) - lit(datafusion_common::ScalarValue::IntervalMonthDayNano(Some(
+                arrow::datatypes::IntervalMonthDayNano::new(11, 0, 0),
+            ))),
+        ))?
+        .project(vec![col("t.instant")])?
+        .build()?;
+    let shifted_sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&shifted)?
+        .to_string();
+    assert!(
+        shifted_sql.matches("CAST(").count() >= 2,
+        "an operator over the call must not hide its type: {shifted_sql}"
+    );
+
+    // And the shape as the plan actually holds it: the argument is a date where
+    // the signature declares a timestamp, so the type is only readable once the
+    // arguments are coerced through the signature. The two asserts above both
+    // passed while this one failed, because they wrote the cast by hand.
+    let uncast = table_scan(Some("t"), &schema, None)?
+        .filter(
+            col("t.instant").gt_eq(datafusion_functions::expr_fn::date_trunc(
+                lit("month"),
+                datafusion_functions::expr_fn::current_date(),
+            )),
+        )?
+        .project(vec![col("t.instant")])?
+        .build()?;
+    let uncast_sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&uncast)?
+        .to_string();
+    assert!(
+        uncast_sql.contains("CAST("),
+        "an argument needing coercion must not make the call unreadable: {uncast_sql}"
+    );
+
+    Ok(())
+}
+
+/// The federation optimizer pushes a filter into `TableScan.full_filters`
+/// *before* type coercion runs, so the expression the unparser sees is the one
+/// the user wrote: `date_trunc('month', current_date())` passes a date where the
+/// signature declares a timestamp, and no cast was ever inserted.
+///
+/// This is the shape the corpus actually produces. A `Filter` node above the
+/// scan is coerced by then and does not reproduce it.
+#[test]
+fn test_bigquery_agrees_a_scan_filter_comparing_against_a_function() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "instant",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        true,
+    )]);
+
+    let predicate = col("instant").gt_eq(datafusion_functions::expr_fn::date_trunc(
+        lit("month"),
+        datafusion_functions::expr_fn::current_date(),
+    ));
+    let plan = table_scan_with_filters(Some("t"), &schema, None, vec![predicate])?
+        .project(vec![col("instant")])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    assert!(
+        sql.contains("CAST("),
+        "an instant and a civil truncation have no common supertype in BigQuery, \
+         so the scan filter has to bring them together: {sql}"
+    );
+    Ok(())
+}
+
+/// `BigQuery` has no `FILTER (WHERE ...)`: it rejects the statement with
+/// "Expected keyword AS but got keyword FILTER". The predicate moves inside the
+/// aggregate instead — measured over `[1,2,3]` with `x > 1`, `COUNTIF(x > 1)`
+/// and `COUNT(CASE WHEN x > 1 THEN 1 END)` both give 2, and
+/// `SUM(CASE WHEN x > 1 THEN x END)` gives 5.
+#[test]
+fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+
+    let rendered = |agg: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .aggregate(vec![col("t.g")], vec![agg])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+    let keeps_rows = col("t.v").gt(lit(1i64));
+
+    // COUNT(*) counts rows, so the predicate is the whole aggregate.
+    let counted = rendered(
+        datafusion_functions_aggregate::expr_fn::count(lit(1i64))
+            .filter(keeps_rows.clone())
+            .build()?,
+    )?;
+    assert!(
+        counted.contains("COUNTIF(") && !counted.contains("FILTER"),
+        "a filtered row count is COUNTIF: {counted}"
+    );
+
+    // Any other aggregate guards its argument instead.
+    let summed = rendered(
+        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+            .filter(keeps_rows)
+            .build()?,
+    )?;
+    assert!(
+        summed.contains("CASE WHEN") && !summed.contains("FILTER"),
+        "a filtered sum guards its argument: {summed}"
+    );
+
+    Ok(())
+}
+
+/// An instant compared against a date has no common supertype in `BigQuery`,
+/// but a *civil* timestamp against a date does. Measured: `TIMESTAMP >= DATE`
+/// is rejected with "No matching signature for operator >=", while
+/// `DATETIME >= DATE` is accepted, so only the zoned side needs bringing
+/// together.
+#[test]
+fn test_bigquery_agrees_an_instant_with_a_date_but_leaves_a_civil_one() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("d", DataType::Date32, true),
+        Field::new(
+            "instant",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            true,
+        ),
+        Field::new(
+            "civil",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+
+    let rendered = |left: &str| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .filter(col(format!("t.{left}")).gt_eq(col("t.d")))?
+            .project(vec![col("t.d")])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let instant = rendered("instant")?;
+    assert!(
+        instant.contains("CAST("),
+        "an instant and a date have no common supertype, so one side has to move: {instant}"
+    );
+
+    // A civil timestamp already compares against a date, so nothing is added.
+    let civil = rendered("civil")?;
+    assert!(
+        !civil.contains("CAST("),
+        "BigQuery compares DATETIME with DATE directly; coercing it would be noise: {civil}"
+    );
+
+    Ok(())
+}
+
+/// Casting text to a timestamp is a *parse*, and `BigQuery`'s two casts disagree
+/// about what text they take: `CAST(text AS DATETIME)` refuses every string
+/// carrying a `Z` or a UTC offset that `CAST(text AS TIMESTAMP)` accepts, and
+/// neither takes more than six sub-second digits.
+///
+/// Measured on `BigQuery`. `'2026-09-02T04:53:18.789421+00:00'`: `AS TIMESTAMP`
+/// ok, `AS DATETIME` rejected. `'2026-08-21T22:09:04.390436170Z'`: both rejected.
+/// The rendering below returns `2026-09-02 04:53:18.789421` and
+/// `2026-08-21 22:09:04.390436` respectively, and turns `…04.390436170+02:00`
+/// into `20:09:04.390436`, which is the UTC-naive value DataFusion also produces.
+#[test]
+fn test_bigquery_parses_text_into_a_timestamp_rather_than_casting() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+
+    let rendered = |expr: Expr, dialect: &dyn UnparserDialect| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![expr])?
+            .build()?;
+        Ok(Unparser::new(dialect).plan_to_sql(&plan)?.to_string())
+    };
+
+    let civil = |column: &str| {
+        cast(
+            col(format!("t.{column}")),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )
+    };
+
+    let sql = rendered(civil("s"), &BigQueryDialect {})?;
+    assert!(
+        sql.contains("DATETIME(TIMESTAMP(") && sql.contains("REGEXP_REPLACE("),
+        "text has to be parsed as an instant and narrowed to microseconds: {sql}"
+    );
+    assert!(
+        !sql.contains("CAST(`t`.`s` AS DATETIME)"),
+        "a plain DATETIME cast refuses every zone-bearing string: {sql}"
+    );
+
+    // An instant target parses the same way but keeps the instant.
+    let instant = rendered(
+        cast(
+            col("t.s"),
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+        ),
+        &BigQueryDialect {},
+    )?;
+    assert!(
+        instant.contains("REGEXP_REPLACE(") && !instant.contains("DATETIME("),
+        "an instant target stays an instant: {instant}"
+    );
+
+    // A timestamp operand is not text, so it keeps the plain cast that the
+    // comparison work depends on.
+    let from_timestamp = rendered(civil("ts"), &BigQueryDialect {})?;
+    assert!(
+        from_timestamp.contains("CAST(`t`.`ts` AS DATETIME)")
+            && !from_timestamp.contains("REGEXP_REPLACE("),
+        "only text is parsed; a timestamp operand is cast: {from_timestamp}"
+    );
+
+    // No other dialect changes.
+    assert!(
+        rendered(civil("s"), &UnparserDefaultDialect {})?.contains("CAST("),
+        "only BigQuery needs the parse spelled out"
+    );
+
+    Ok(())
+}
+
 /// `array_element` is 1-based and yields NULL outside the array. `BigQuery`'s
 /// bare subscript is 0-based, so the generic rendering reads the neighbouring
 /// element, and its `ORDINAL` raises on a miss instead of yielding NULL.
@@ -11087,5 +11379,288 @@ fn test_bigquery_median_keeps_the_input_type() -> Result<()> {
         "the median is the average of the two straddling values: {sql}"
     );
 
+    Ok(())
+}
+
+/// The optimizer pushes a join predicate that reads one input down into that
+/// input, so by the time the plan is unparsed the subquery sits in a `Filter`
+/// below the join rather than in its `ON`. Lifted back out of a null-extended
+/// input it would land in `ON`, which some dialects refuse a subquery in, so it
+/// stays in that input's own scope instead.
+///
+/// This is the shape a federated pushdown actually carries; a plan straight from
+/// the SQL planner keeps the predicate in `ON` and does not exercise it.
+#[test]
+fn test_a_pushed_down_subquery_filter_stays_in_the_null_extended_input() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("token", DataType::Utf8, true),
+    ]);
+    let candidates = table_scan(Some("c"), &schema, None)?
+        .project(vec![col("c.token")])?
+        .build()?;
+    // The optimizer's shape: the predicate already inside the join's right input.
+    let right = table_scan(Some("w"), &schema, None)?
+        .filter(in_subquery(col("w.token"), Arc::new(candidates)))?
+        .build()?;
+    let plan = table_scan(Some("e"), &schema, None)?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Left,
+            vec![col("e.id").eq(col("w.id"))],
+        )?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let (before_on, after_on) = sql
+        .split_once(" ON ")
+        .expect("the join has to keep an ON clause");
+    assert!(
+        !after_on.contains("IN (SELECT"),
+        "a null-extended input's subquery must not be lifted into ON: {sql}"
+    );
+    assert!(
+        before_on.contains("IN (SELECT"),
+        "it has to stay in that input's own scope: {sql}"
+    );
+    Ok(())
+}
+
+/// An `IN` subquery inside a join predicate is refused outright by some dialects.
+/// On an inner join `ON` and `WHERE` select the same rows, so the conjunct
+/// carrying it moves; on an outer join they do not — `WHERE` would discard the
+/// rows the join preserves — so it stays where it is.
+#[test]
+fn test_a_subquery_in_an_inner_join_predicate_moves_to_where() -> Result<()> {
+    let plan_for = |join: &str| -> Result<String> {
+        let query = format!(
+            "SELECT j1.j1_id FROM j1 {join} j2 \
+             ON j1.j1_id = j2.j2_id \
+             AND j2.j2_string IN (SELECT j1.j1_string FROM j1)"
+        );
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(&query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let inner = plan_for("JOIN")?;
+    let (on_clause, after_on) = inner
+        .split_once(" ON ")
+        .expect("the join has to keep an ON clause");
+    let _ = on_clause;
+    let (on_clause, where_clause) = match after_on.split_once(" WHERE ") {
+        Some(split) => split,
+        None => panic!("the moved conjunct has to land in a WHERE: {inner}"),
+    };
+    assert!(
+        !on_clause.contains("IN (SELECT"),
+        "an inner join must not carry a subquery in ON: {inner}"
+    );
+    assert!(
+        where_clause.contains("IN (SELECT"),
+        "the subquery has to survive in WHERE: {inner}"
+    );
+
+    // The preserved side of an outer join makes the two clauses different — WHERE
+    // would discard the rows the join preserves — so the conjunct cannot move
+    // there. It reads only the null-extended input, and applied to that input
+    // before the join it selects the same rows, so that input's scope takes it.
+    let left = plan_for("LEFT JOIN")?;
+    let (before_on, after_on) = left
+        .split_once(" ON ")
+        .expect("the join has to keep an ON clause");
+    assert!(
+        !after_on.contains("IN (SELECT"),
+        "an outer join must not carry a subquery in ON either: {left}"
+    );
+    assert!(
+        before_on.contains("IN (SELECT"),
+        "the null-extended input's own scope has to take it: {left}"
+    );
+    Ok(())
+}
+
+/// A subquery in an outer join's predicate may be correlated to the preserved
+/// input. Applied in the null-extended input's own scope it would name a
+/// relation that scope cannot see — a non-lateral derived table has no view of
+/// the join's other side — so the conjunct has to stay in `ON`. Only a
+/// correlation the null-extended input itself answers, or one a body inside the
+/// subquery answers, may move with it. A reference two levels down is on no
+/// `outer_ref_columns` list the outer subquery holds, so it is asked separately.
+#[test]
+fn test_a_subquery_correlated_to_the_preserved_input_stays_in_on() -> Result<()> {
+    let plan_for = |predicate: &str| -> Result<String> {
+        let query = format!(
+            "SELECT j1.j1_id, j2.j2_id FROM j1 LEFT JOIN j2 \
+             ON j1.j1_id = j2.j2_id AND {predicate}"
+        );
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(&query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+    let split = |sql: &str| -> (String, String) {
+        let (before_on, after_on) = sql
+            .split_once(" ON ")
+            .expect("the join has to keep an ON clause");
+        (before_on.to_string(), after_on.to_string())
+    };
+
+    // Correlated to the preserved input, directly or two levels down: the
+    // derived table wrapping `j2` cannot see `j1`.
+    for predicate in [
+        "EXISTS (SELECT 1 FROM j3 WHERE j3.j3_id = j1.j1_id)",
+        "EXISTS (SELECT 1 FROM j3 WHERE EXISTS \
+            (SELECT 1 FROM j3 AS x WHERE x.j3_id = j1.j1_id))",
+    ] {
+        let sql = plan_for(predicate)?;
+        let (before_on, after_on) = split(&sql);
+        assert!(
+            !before_on.contains("EXISTS (SELECT"),
+            "a correlation to the preserved input must not move into the other \
+             input's scope: {sql}"
+        );
+        assert!(
+            after_on.contains("EXISTS (SELECT"),
+            "the conjunct has to stay in ON, where the reference is in scope: {sql}"
+        );
+    }
+
+    // Correlated to the null-extended input, directly or two levels down, or to
+    // the body enclosing the nested subquery: every reference is answered at or
+    // inside the scope the conjunct moves to.
+    for predicate in [
+        "EXISTS (SELECT 1 FROM j3 WHERE j3.j3_id = j2.j2_id)",
+        "EXISTS (SELECT 1 FROM j3 WHERE EXISTS \
+            (SELECT 1 FROM j3 AS x WHERE x.j3_id = j2.j2_id))",
+        "EXISTS (SELECT 1 FROM j3 WHERE EXISTS \
+            (SELECT 1 FROM j3 AS x WHERE x.j3_id = j3.j3_id))",
+    ] {
+        let sql = plan_for(predicate)?;
+        let (before_on, after_on) = split(&sql);
+        assert!(
+            !after_on.contains("EXISTS (SELECT"),
+            "an outer join must not carry a subquery in ON: {sql}"
+        );
+        assert!(
+            before_on.contains("EXISTS (SELECT"),
+            "the null-extended input's own scope has to take it: {sql}"
+        );
+    }
+    Ok(())
+}
+
+/// A `BigQuery` cast target carries no precision or scale — a parameterized type
+/// is refused in a `CAST` — so the type itself has to carry the width: `NUMERIC`
+/// holds nine fractional digits and `BIGNUMERIC` thirty-eight, and a scale past
+/// nine is refused rather than rounded. The wide scale arrives from arithmetic —
+/// dividing two decimals widens it — so no declared column type reveals it.
+#[test]
+fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
+    let narrow = cast(col("a"), DataType::Decimal128(38, 9));
+    let wide = cast(col("a"), DataType::Decimal128(38, 17));
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let narrow_sql = unparser.expr_to_sql(&narrow)?.to_string();
+    let wide_sql = unparser.expr_to_sql(&wide)?.to_string();
+    assert!(
+        narrow_sql.contains("AS NUMERIC)") && !narrow_sql.contains("BIGNUMERIC"),
+        "nine fractional digits fit NUMERIC, unparameterized: {narrow_sql}"
+    );
+    assert!(
+        wide_sql.contains("AS BIGNUMERIC)"),
+        "a scale past nine needs BIGNUMERIC, unparameterized: {wide_sql}"
+    );
+    Ok(())
+}
+
+/// A sort above an aggregate that is given a scope of its own has to name that
+/// scope's output, not the grouping expression inside it.
+///
+/// The plan is what `ORDER BY <a grouping expression not in the select list>`
+/// produces: the key is projected alongside the aggregate's outputs, sorted, then
+/// projected away. Unprojecting that key back into the grouping expression names
+/// the relation the expression reads, and the scope encloses that relation, so the
+/// remote binder reports the qualifier as unknown.
+#[test]
+fn test_a_sort_over_a_scoped_aggregate_names_the_scope_not_its_grouping_expr()
+-> Result<()> {
+    let query = "SELECT CAST(person.birth_date AS DATE) || '' AS d, \
+                 sum(person.salary) AS total \
+                 FROM person \
+                 GROUP BY CAST(person.birth_date AS DATE) \
+                 ORDER BY CAST(person.birth_date AS DATE)";
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(query)?
+        .parse_statement()?;
+    let state = MockSessionState::default()
+        .with_aggregate_function(sum_udaf())
+        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()));
+    let context = MockContextProvider { state };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("FROM (SELECT"),
+        "the grouping expression is wrapped, so the aggregate takes a scope: {sql}"
+    );
+    let (_, order_by) = sql
+        .rsplit_once("ORDER BY")
+        .expect("the sort has to survive as an ORDER BY");
+    assert!(
+        !order_by.contains("`person`."),
+        "the sort key must not name a relation the scope encloses: {sql}"
+    );
+    assert!(
+        !order_by.contains("CAST("),
+        "the grouping expression must not be inlined into the sort key: {sql}"
+    );
+    Ok(())
+}
+
+/// A pushed-down scan filter is unparsed with no schema in scope, so a comparison
+/// there resolves its operand types from the expressions themselves. A call is
+/// readable only through `return_field_from_args` when it reads a literal
+/// argument — `date_trunc`'s granularity — and its `return_type` reports an
+/// internal error instead, which left the call unreadable and the comparison
+/// uncoerced.
+///
+/// `BigQuery` refuses the pair that leaves: `TIMESTAMP_TRUNC` of a date is a
+/// `DATETIME`, and an instant compared against it is
+/// `No matching signature for operator >=`.
+#[test]
+fn test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date() -> Result<()> {
+    let instant = cast(
+        col("disputed_at"),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+    );
+    let filter = instant.gt_eq(datafusion_functions::expr_fn::date_trunc(
+        lit("month"),
+        datafusion_functions::expr_fn::current_date(),
+    ));
+    // No schema: this is how a scan's pushed filters reach the unparser.
+    let sql = Unparser::new(&BigQueryDialect {})
+        .expr_to_sql(&filter)?
+        .to_string();
+    assert!(
+        sql.contains("AS TIMESTAMP)") && sql.matches("CAST(").count() >= 2,
+        "both sides have to be brought to one type BigQuery accepts: {sql}"
+    );
     Ok(())
 }

@@ -19,7 +19,8 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::{
     Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
-    utils::bigquery_percentile_to_sql, utils::bigquery_renamed_scalar_fn,
+    utils::bigquery_filtered_aggregate_to_sql, utils::bigquery_percentile_to_sql,
+    utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_timestamp_to_sql,
     utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
     utils::character_length_to_sql, utils::date_part_to_sql,
     utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
@@ -145,6 +146,16 @@ pub trait Dialect: Send + Sync {
     /// The default discards `tz`, which is the rendering every dialect has always
     /// received; only a dialect whose timestamp type depends on the zone needs to
     /// override it.
+    /// How this dialect spells a decimal of `precision` and `scale`.
+    ///
+    /// `None` keeps `DECIMAL(precision, scale)`, which is what every dialect has
+    /// always received. A dialect whose decimal types carry different scale limits
+    /// has to select between them here, because the width follows from arithmetic
+    /// — dividing two decimals widens the scale — and not from any declared type.
+    fn decimal_type_to_sql(&self, _precision: u64, _scale: i64) -> Option<ast::DataType> {
+        None
+    }
+
     fn timestamp_literal_cast_dtype(
         &self,
         time_unit: &TimeUnit,
@@ -163,6 +174,24 @@ pub trait Dialect: Send + Sync {
     /// the literal earlier in time, which is visible at the boundary of a range
     /// predicate.
     fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        None
+    }
+
+    /// Renders a cast of *text* to a timestamp, when the dialect needs the parse
+    /// spelled out rather than written as a cast.
+    ///
+    /// `tz` is the target's timezone: `Some` for an instant, `None` for a civil
+    /// value. Defaults to `None`, which keeps the plain cast.
+    ///
+    /// `BigQuery` is why this exists. `CAST(text AS DATETIME)` refuses any string
+    /// carrying a `Z` or a UTC offset — exactly the strings `CAST(text AS
+    /// TIMESTAMP)` accepts — and neither takes more than six sub-second digits,
+    /// which is all a BigQuery timestamp can hold.
+    fn string_to_timestamp_to_sql(
+        &self,
+        _value: ast::Expr,
+        _tz: Option<&Arc<str>>,
+    ) -> Option<ast::Expr> {
         None
     }
 
@@ -1015,6 +1044,19 @@ impl Dialect for BigQueryDialect {
         }
     }
 
+    fn decimal_type_to_sql(&self, _precision: u64, scale: i64) -> Option<ast::DataType> {
+        // A cast target carries no precision or scale — `CAST(x AS NUMERIC(38, 9))`
+        // is refused as a parameterized type — so the choice of type is the only
+        // way to keep the width. `NUMERIC` holds nine fractional digits and
+        // `BIGNUMERIC` thirty-eight, and a scale past nine is refused rather than
+        // rounded, so it selects the wider type instead of truncating.
+        Some(if scale > 9 {
+            ast::DataType::BigNumeric(ast::ExactNumberInfo::None)
+        } else {
+            ast::DataType::Numeric(ast::ExactNumberInfo::None)
+        })
+    }
+
     fn unnest_as_table_factor(&self) -> bool {
         true
     }
@@ -1089,6 +1131,14 @@ impl Dialect for BigQueryDialect {
     /// TIMESTAMP".
     fn requires_explicit_comparison_coercion(&self) -> bool {
         true
+    }
+
+    fn string_to_timestamp_to_sql(
+        &self,
+        value: ast::Expr,
+        tz: Option<&Arc<str>>,
+    ) -> Option<ast::Expr> {
+        Some(bigquery_string_to_timestamp_to_sql(value, tz.is_some()))
     }
 
     /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from
@@ -1170,6 +1220,10 @@ impl Dialect for BigQueryDialect {
         _start_bound: &WindowFrameBound,
         _end_bound: &WindowFrameBound,
     ) -> bool {
+        // Measured on BigQuery: these refuse a framing clause outright. The
+        // navigation functions that *do* take one — `first_value`, `last_value`,
+        // `nth_value` — are deliberately absent, because dropping their frame
+        // would change which rows contribute rather than fix a rejection.
         ![
             "row_number",
             "rank",
@@ -1177,9 +1231,11 @@ impl Dialect for BigQueryDialect {
             "percent_rank",
             "cume_dist",
             "ntile",
+            "lead",
+            "lag",
         ]
         .iter()
-        .any(|numbering_function| func_name.eq_ignore_ascii_case(numbering_function))
+        .any(|unframed| func_name.eq_ignore_ascii_case(unframed))
     }
 
     fn union_distinct_set_quantifier(&self) -> ast::SetQuantifier {
@@ -1204,13 +1260,20 @@ impl Dialect for BigQueryDialect {
         filter: Option<&Expr>,
         order_by: &[SortExpr],
     ) -> Result<Option<ast::Expr>> {
-        // A `FILTER (WHERE ...)` restricts which rows the aggregate sees, and a
-        // descending sort makes DataFusion take the percentile from the other
-        // end. Neither survives the rendering below, and computing over the wrong
-        // rows quietly is worse than not translating: declining leaves the
+        // A descending sort makes DataFusion take the percentile from the other
+        // end, and that does not survive the rendering below. Computing over the
+        // wrong rows quietly is worse than not translating: declining leaves the
         // DataFusion name in place, which fails loudly.
-        if filter.is_some() || order_by.iter().any(|sort| !sort.asc) {
+        if order_by.iter().any(|sort| !sort.asc) {
             return Ok(None);
+        }
+
+        // BigQuery has no `FILTER (WHERE ...)`; it restricts the rows by moving
+        // the predicate inside the aggregate instead.
+        if let Some(predicate) = filter {
+            return bigquery_filtered_aggregate_to_sql(
+                unparser, func_name, args, distinct, predicate,
+            );
         }
 
         match func_name {
