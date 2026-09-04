@@ -443,6 +443,10 @@ pub(crate) fn from_substrait_literal(
             _ => return plan_err!("Substrait compound interval missing components"),
         },
         Some(LiteralType::FixedChar(c)) => ScalarValue::Utf8(Some(c.clone())),
+        // Isthmus / TPC-H emit VarChar literals (value + max length). Arrow has no
+        // distinct VarChar scalar; map like FixedChar / types.rs Kind::Varchar -> Utf8.
+        // Length is type metadata only and is ignored for ScalarValue (same as type map).
+        Some(LiteralType::VarChar(v)) => ScalarValue::Utf8(Some(v.value.clone())),
         Some(LiteralType::UserDefined(user_defined)) => {
             if let Ok(value) = consumer.consume_user_defined_literal(user_defined) {
                 return Ok(value);
@@ -590,6 +594,7 @@ pub(crate) fn from_substrait_literal(
 mod tests {
     use super::*;
     use crate::logical_plan::consumer::utils::tests::test_consumer;
+    use substrait::proto::expression::literal::VarChar;
 
     #[test]
     fn interval_compound_different_precision() -> datafusion::common::Result<()> {
@@ -622,6 +627,28 @@ mod tests {
                 days: 3,
                 nanoseconds: 4_000_005_000
             }))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn varchar_literal() -> datafusion::common::Result<()> {
+        // Isthmus emits LiteralType::VarChar { value, length } for TPC-H string
+        // predicates (e.g. r_name = 'EUROPE'). Must lower to Utf8 like FixedChar.
+        let substrait = Literal {
+            nullable: false,
+            type_variation_reference: 0,
+            literal_type: Some(LiteralType::VarChar(VarChar {
+                value: "EUROPE".to_string(),
+                length: 25,
+            })),
+        };
+
+        let consumer = test_consumer();
+        assert_eq!(
+            from_substrait_literal_without_names(&consumer, &substrait)?,
+            ScalarValue::Utf8(Some("EUROPE".to_string()))
         );
 
         Ok(())
