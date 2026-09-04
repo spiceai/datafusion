@@ -1578,6 +1578,17 @@ impl Unparser<'_> {
         {
             return Ok(parsed);
         }
+        // Casting text to a date *parses* it too, and by a different rule than
+        // the timestamp cast above: an engine may accept a zone marker in one and
+        // refuse it in the other, so the dialect spells this parse separately.
+        if matches!(data_type, DataType::Date32 | DataType::Date64)
+            && self
+                .resolved_data_type(expr)
+                .is_some_and(|resolved| resolved.is_string())
+            && let Some(parsed) = self.dialect.string_to_date_to_sql(inner_expr.clone())
+        {
+            return Ok(parsed);
+        }
         // Casting a date to an integer yields its day number, which some dialects
         // spell as a function because they refuse the cast.
         if data_type.is_integer()
@@ -2272,8 +2283,29 @@ fn refuses_this_pair(left: &DataType, right: &DataType) -> bool {
     let instant_against_date = (matches!(left, DataType::Timestamp(_, Some(_)))
         && is_date(right))
         || (is_date(left) && matches!(right, DataType::Timestamp(_, Some(_))));
+    // Text against a temporal value. DataFusion reads the text *as* that
+    // temporal type — `string_temporal_coercion` picks the temporal side — where
+    // an engine with no implicit parse refuses the pair: measured on BigQuery,
+    // `STRING < DATETIME` is "No matching signature for operator <". Bringing
+    // them together casts the text side, which is where the dialect's own
+    // text-to-temporal parse applies.
+    let is_temporal = |t: &DataType| {
+        matches!(
+            t,
+            DataType::Timestamp(_, _)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+        )
+    };
+    let text_against_temporal =
+        (is_text(left) && is_temporal(right)) || (is_temporal(left) && is_text(right));
 
-    timestamp_zone_disagreement || number_against_text || instant_against_date
+    timestamp_zone_disagreement
+        || number_against_text
+        || instant_against_date
+        || text_against_temporal
 }
 
 /// Truncates the fractional second of an already-formatted timestamp literal to

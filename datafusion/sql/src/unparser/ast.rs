@@ -44,6 +44,28 @@ impl QueryBuilder {
         self.with = value;
         self
     }
+    /// Adds one CTE to this query's `WITH`, creating the clause if it has none.
+    ///
+    /// `recursive` is sticky: `WITH RECURSIVE` applies to the whole clause, so
+    /// one recursive CTE among several makes the clause recursive. That is what
+    /// the standard says and what engines accept — a non-recursive CTE inside a
+    /// `WITH RECURSIVE` is still valid.
+    pub fn push_cte(&mut self, cte: ast::Cte, recursive: bool) -> &mut Self {
+        match &mut self.with {
+            Some(with) => {
+                with.recursive |= recursive;
+                with.cte_tables.push(cte);
+            }
+            None => {
+                self.with = Some(ast::With {
+                    with_token: AttachedToken::empty(),
+                    recursive,
+                    cte_tables: vec![cte],
+                });
+            }
+        }
+        self
+    }
     pub fn body(&mut self, value: Box<ast::SetExpr>) -> &mut Self {
         self.body = Some(value);
         self

@@ -20,7 +20,8 @@ use std::{collections::HashMap, sync::Arc};
 use super::{
     Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
     utils::bigquery_filtered_aggregate_to_sql, utils::bigquery_percentile_to_sql,
-    utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_timestamp_to_sql,
+    utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_date_to_sql,
+    utils::bigquery_string_to_timestamp_to_sql,
     utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
     utils::character_length_to_sql, utils::date_part_to_sql,
     utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
@@ -196,6 +197,36 @@ pub trait Dialect: Send + Sync {
         _value: ast::Expr,
         _tz: Option<&Arc<str>>,
     ) -> Option<ast::Expr> {
+        None
+    }
+
+    /// Whether this dialect can evaluate a recursive CTE (`WITH RECURSIVE`).
+    ///
+    /// Defaults to `false`, which keeps a [`LogicalPlan::RecursiveQuery`]
+    /// unparseable and so keeps it out of a pushdown — the behaviour every
+    /// dialect had before this existed. Only a dialect known to run one opts in,
+    /// because a federated statement has no local-execution fallback: emitting
+    /// `WITH RECURSIVE` to an engine that does not support it turns a query that
+    /// used to evaluate locally into a failure.
+    ///
+    /// [`LogicalPlan::RecursiveQuery`]: datafusion_expr::LogicalPlan::RecursiveQuery
+    fn supports_recursive_cte(&self) -> bool {
+        false
+    }
+
+    /// How this dialect reads a string *as a date*, where its own `DATE` cast
+    /// will not.
+    ///
+    /// Separate from [`Self::string_to_timestamp_to_sql`] because the text a cast
+    /// accepts differs by target, not only by dialect. `BigQuery`'s `DATE` cast
+    /// takes a bare `YYYY-MM-DD` and refuses *any* time-of-day or zone —
+    /// measured, it refuses `'2026-01-15 10:30:00'` as surely as
+    /// `'2026-01-15T10:30:00.123456789Z'` — while its `TIMESTAMP` cast takes the
+    /// zoned forms. A dialect that has to parse the string first spells that
+    /// here.
+    ///
+    /// `None` keeps the plain `CAST(value AS DATE)`.
+    fn string_to_date_to_sql(&self, _value: ast::Expr) -> Option<ast::Expr> {
         None
     }
 
@@ -1180,6 +1211,16 @@ impl Dialect for BigQueryDialect {
         tz: Option<&Arc<str>>,
     ) -> Option<ast::Expr> {
         Some(bigquery_string_to_timestamp_to_sql(value, tz.is_some()))
+    }
+
+    fn string_to_date_to_sql(&self, value: ast::Expr) -> Option<ast::Expr> {
+        Some(bigquery_string_to_date_to_sql(value))
+    }
+
+    /// Measured on BigQuery: `WITH RECURSIVE counted AS (SELECT 1 AS n UNION ALL
+    /// SELECT n + 1 FROM counted WHERE n < 5)` returns `1..5`.
+    fn supports_recursive_cte(&self) -> bool {
+        true
     }
 
     /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from

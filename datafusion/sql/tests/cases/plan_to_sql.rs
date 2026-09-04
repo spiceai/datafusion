@@ -11869,6 +11869,134 @@ fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
     Ok(())
 }
 
+/// A recursive CTE renders as `WITH RECURSIVE`, for a dialect that says it can
+/// run one.
+///
+/// The plan was previously unparseable at all — `LogicalPlan::RecursiveQuery`
+/// reached `not_impl_err` — which kept it out of every pushdown. Measured on
+/// BigQuery, `WITH RECURSIVE counted AS (SELECT 1 AS n UNION ALL SELECT n + 1
+/// FROM counted WHERE n < 5)` returns `1..5`, so it can carry one.
+///
+/// A dialect that has not opted in still refuses, because a federated statement
+/// has no local-execution fallback: emitting `WITH RECURSIVE` to an engine that
+/// cannot run one would turn a query that evaluated locally into a failure.
+#[test]
+fn test_bigquery_renders_a_recursive_cte() -> Result<()> {
+    let query = "WITH RECURSIVE counted AS (\
+                   SELECT 1 AS n \
+                   UNION ALL \
+                   SELECT n + 1 FROM counted WHERE n < 5\
+                 ) SELECT * FROM counted";
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(query)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    let bigquery = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        bigquery.contains("WITH RECURSIVE"),
+        "a recursive CTE has to keep its RECURSIVE keyword: {bigquery}"
+    );
+    assert!(
+        bigquery.contains("UNION ALL"),
+        "the plan is not distinct, so the terms are UNION ALL: {bigquery}"
+    );
+    assert!(
+        bigquery.contains("`counted`"),
+        "the recursive term's self-reference has to name the CTE: {bigquery}"
+    );
+
+    // A dialect that has not opted in keeps refusing, so nothing starts being
+    // pushed down to an engine that cannot evaluate it.
+    let generic = Unparser::new(&DefaultDialect {}).plan_to_sql(&plan);
+    assert!(
+        generic.is_err(),
+        "a dialect that does not support recursive CTEs must still refuse: \
+         {generic:?}"
+    );
+
+    Ok(())
+}
+
+/// Text cast to a date is *parsed*, not cast, where the dialect says so.
+///
+/// BigQuery's `DATE` cast takes only a bare `YYYY-MM-DD`: measured, it refuses
+/// `'2026-01-15 10:30:00'` and `'2026-01-15T10:30:00.123456789Z'` alike, so a
+/// column holding an ISO instant as text cannot be narrowed to a date at all
+/// through the plain cast. Parsing to an instant first and then narrowing
+/// accepts every form, and agrees with DataFusion on each — including an offset,
+/// where `'2026-01-15T02:30:00+05:00'` is `2026-01-14` on both sides because the
+/// instant is resolved to UTC before the date is taken.
+#[test]
+fn test_bigquery_parses_text_into_a_date_rather_than_casting() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("note", DataType::Utf8, true)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![cast(col("t.note"), DataType::Date32)])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("TIMESTAMP(REGEXP_REPLACE("),
+        "the text has to be parsed, and its sub-second digits truncated to the \
+         six a BigQuery timestamp holds: {sql}"
+    );
+    assert!(
+        sql.contains("AS DATE)"),
+        "the parsed instant still has to be narrowed to a date: {sql}"
+    );
+    assert!(
+        !sql.contains("CAST(`t`.`note` AS DATE)"),
+        "the plain cast is the rendering BigQuery refuses: {sql}"
+    );
+
+    Ok(())
+}
+
+/// Text compared against a temporal value has to be brought to that type, not
+/// left for the engine to coerce.
+///
+/// DataFusion reads the text *as* the temporal type — `string_temporal_coercion`
+/// picks the temporal side — and coerces at execution. BigQuery has no implicit
+/// parse and refuses the pair: measured, `STRING < DATETIME` is "No matching
+/// signature for operator <". This is the shape a federated aggregate reaches,
+/// where `min(<a text column>)` is compared against a computed timestamp.
+#[test]
+fn test_bigquery_agrees_text_compared_against_a_timestamp() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("note", DataType::Utf8, true),
+        Field::new(
+            "naive",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .filter(col("t.note").lt(col("t.naive")))?
+        .project(vec![col("t.note")])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("TIMESTAMP(REGEXP_REPLACE("),
+        "the text side has to be parsed so both sides are one type: {sql}"
+    );
+    assert!(
+        !sql.contains("`t`.`note` < `t`.`naive`"),
+        "the bare pair is what BigQuery refuses: {sql}"
+    );
+
+    Ok(())
+}
+
 /// A decimal whose *integer* part does not fit `NUMERIC` needs `BIGNUMERIC`
 /// too, not only one whose scale does not.
 ///

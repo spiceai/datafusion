@@ -61,6 +61,7 @@ use datafusion_expr::{
     UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use std::{collections::HashSet, sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
@@ -225,6 +226,11 @@ impl Unparser<'_> {
             LogicalPlan::Extension(extension) => {
                 self.extension_to_statement(extension.node.as_ref())
             }
+            LogicalPlan::RecursiveQuery(recursive)
+                if self.dialect.supports_recursive_cte() =>
+            {
+                self.recursive_query_to_sql_statement(&recursive)
+            }
             LogicalPlan::Explain(_)
             | LogicalPlan::Analyze(_)
             | LogicalPlan::Ddl(_)
@@ -286,6 +292,120 @@ impl Unparser<'_> {
         let query = query_builder.unwrap().body(Box::new(body)).build()?;
 
         Ok(ast::Statement::Query(Box::new(query)))
+    }
+
+    /// Builds the `<name> AS (<static> UNION [ALL] <recursive>)` a recursive CTE
+    /// contributes to an enclosing query's `WITH`.
+    ///
+    /// The recursive term already refers to the working table as a scan of
+    /// `name`, so it renders as that name without help — the self-reference the
+    /// CTE needs is the ordinary table reference the plan carries.
+    ///
+    /// `is_distinct` picks the set quantifier, and it is the whole difference
+    /// between `UNION` and `UNION ALL` here: DataFusion dedupes the working
+    /// table for the distinct form, which is what `UNION` asks the remote to do.
+    fn recursive_cte(
+        &self,
+        recursive: &datafusion_expr::RecursiveQuery,
+    ) -> Result<(ast::Cte, Ident)> {
+        let mut static_query = Some(QueryBuilder::default());
+        let static_term =
+            self.select_to_sql_expr(&recursive.static_term, &mut static_query)?;
+        let mut recursive_query = Some(QueryBuilder::default());
+        let recursive_term =
+            self.select_to_sql_expr(&recursive.recursive_term, &mut recursive_query)?;
+
+        let set_quantifier = if recursive.is_distinct {
+            self.dialect.union_distinct_set_quantifier()
+        } else {
+            ast::SetQuantifier::All
+        };
+        let body = SetExpr::SetOperation {
+            op: ast::SetOperator::Union,
+            set_quantifier,
+            left: Box::new(static_term),
+            right: Box::new(recursive_term),
+        };
+
+        let name = self.new_ident_quoted_if_needs(recursive.name.clone());
+        let cte = ast::Cte {
+            alias: ast::TableAlias {
+                name: name.clone(),
+                columns: vec![],
+                at: None,
+                explicit: false,
+            },
+            query: Box::new(
+                QueryBuilder::default()
+                    .body(Box::new(body))
+                    .build()
+                    .map_err(|e| internal_datafusion_err!("{e}"))?,
+            ),
+            from: None,
+            materialized: None,
+            closing_paren_token: AttachedToken::empty(),
+        };
+        Ok((cte, name))
+    }
+
+    /// A recursive CTE as the whole statement: `WITH RECURSIVE … SELECT * FROM
+    /// <name>`.
+    fn recursive_query_to_sql_statement(
+        &self,
+        recursive: &datafusion_expr::RecursiveQuery,
+    ) -> Result<ast::Statement> {
+        let (cte, name) = self.recursive_cte(recursive)?;
+        let select_all = ast::Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection: vec![ast::SelectItem::Wildcard(
+                ast::WildcardAdditionalOptions::default(),
+            )],
+            exclude: None,
+            into: None,
+            from: vec![ast::TableWithJoins {
+                relation: ast::TableFactor::Table {
+                    name: ast::ObjectName::from(vec![name]),
+                    alias: None,
+                    args: None,
+                    with_hints: vec![],
+                    version: None,
+                    with_ordinality: false,
+                    partitions: vec![],
+                    json_path: None,
+                    sample: None,
+                    index_hints: vec![],
+                },
+                joins: vec![],
+            }],
+            lateral_views: vec![],
+            prewhere: None,
+            selection: None,
+            group_by: ast::GroupByExpr::Expressions(vec![], vec![]),
+            cluster_by: vec![],
+            distribute_by: vec![],
+            sort_by: vec![],
+            having: None,
+            named_window: vec![],
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: vec![],
+            flavor: ast::SelectFlavor::Standard,
+            optimizer_hints: vec![],
+            select_modifiers: None,
+        };
+
+        let mut query = QueryBuilder::default();
+        query
+            .push_cte(cte, true)
+            .body(Box::new(SetExpr::Select(Box::new(select_all))));
+
+        Ok(ast::Statement::Query(Box::new(
+            query.build().map_err(|e| internal_datafusion_err!("{e}"))?,
+        )))
     }
 
     fn select_to_sql_expr(
@@ -2285,6 +2405,27 @@ impl Unparser<'_> {
                         vec![],
                     )
                 }
+            }
+            LogicalPlan::RecursiveQuery(recursive)
+                if self.dialect.supports_recursive_cte() =>
+            {
+                // A recursive CTE nested inside a larger statement becomes a CTE
+                // on the enclosing query and a plain table reference where it
+                // stood, which is the shape the plan already describes: the
+                // recursive term refers to the working table by this same name.
+                let (cte, name) = self.recursive_cte(recursive)?;
+                let Some(query) = query.as_mut() else {
+                    return internal_err!(
+                        "a recursive CTE is only valid in a statement context"
+                    );
+                };
+                query.push_cte(cte, true);
+
+                let mut builder = TableRelationBuilder::default();
+                builder.name(ast::ObjectName::from(vec![name]));
+                relation.table(builder);
+
+                Ok(())
             }
             _ => {
                 not_impl_err!("Unsupported operator: {plan:?}")
