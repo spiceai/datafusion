@@ -1742,24 +1742,29 @@ pub(crate) fn filter_rewrite_is_exact(func_name: &str) -> bool {
 /// Renders an aggregate's `FILTER (WHERE ...)` for BigQuery, which has no such
 /// clause and rejects the statement outright.
 ///
-/// The predicate moves inside the aggregate. `COUNT(*)` becomes `COUNTIF(p)`;
-/// everything else takes `CASE WHEN p THEN arg END`, which the aggregate reads
-/// the same because the `CASE` yields a null for each rejected row and these
-/// aggregates skip nulls. Measured on BigQuery over `[1,2,3]` with `x > 1`:
-/// `COUNTIF` and `COUNT(CASE …)` both give 2, and `SUM(CASE …)` gives 5.
+/// The predicate moves inside the aggregate, for the aggregates where doing so
+/// is exact. `COUNT(*)` and `COUNT(<non-null literal>)` become `COUNTIF(p)`;
+/// everything else takes `CASE WHEN p THEN arg END`, which reads the same
+/// because the `CASE` yields a null for each rejected row and these aggregates
+/// skip nulls. Measured on BigQuery over `[1,2,3]` with `x > 1`: `COUNTIF` and
+/// `COUNT(CASE …)` both give 2, and `SUM(CASE …)` gives 5.
 ///
-/// `array_agg` is the aggregate this reads differently, since it keeps nulls —
-/// but it is deliberately *not* declined here. BigQuery refuses to build an
-/// array holding a null at all ("Array cannot have a null element", measured),
-/// so the rewrite is correct whenever it runs and fails loudly whenever it would
-/// not be. Declining instead would only take away the cases that work: a
-/// federated statement has no local-execution fallback, so the alternative to
-/// this rendering is a failed query, not a slower one.
+/// Declines:
 ///
-/// Declines where the rewriting would answer differently rather than fail:
-///
+/// * any aggregate [`filter_rewrite_is_exact`] does not name — an allowlist, so
+///   an aggregate that keeps nulls is declined without having to be listed.
+///   `array_agg` is the instructive one: the `CASE` gives it an element for
+///   every *rejected* row, and BigQuery refuses to build an array holding a null
+///   at all ("Array cannot have a null element", measured), so the rewrite fails
+///   for any filter that actually filters — where DataFusion answers `[2, 3]`.
 /// * a multi-argument aggregate, where which argument the predicate should guard
 ///   is not obvious and guessing would compute over the wrong rows.
+///
+/// Note what a decline costs and who pays it. A federated statement has no
+/// local-execution fallback, so on its own a decline fails the query rather than
+/// running it elsewhere — it converts a wrong answer into a loud one. What makes
+/// these cases actually *work* is the federation layer refusing the same shapes,
+/// so they evaluate locally; the two have to name the same set.
 pub(crate) fn bigquery_filtered_aggregate_to_sql(
     unparser: &Unparser,
     func_name: &str,
