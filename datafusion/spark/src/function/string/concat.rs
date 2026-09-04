@@ -71,8 +71,19 @@ impl ScalarUDFImpl for SparkConcat {
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
-        // Accept any string types, including zero arguments
-        Ok(arg_types.to_vec())
+        // Accept any string types, including zero arguments. An untyped `Null`
+        // has to be given one: `spark_concat` hands its arguments to
+        // `ConcatFunc`, whose array branch matches the concrete string and
+        // binary variants and reaches `unreachable!("concat")` for anything
+        // else. Under Spark semantics a NULL argument makes the whole call
+        // NULL, so the type only has to be one that branch accepts.
+        Ok(arg_types
+            .iter()
+            .map(|arg_type| match arg_type {
+                DataType::Null => DataType::Utf8,
+                other => other.clone(),
+            })
+            .collect())
     }
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         datafusion_common::internal_err!(
@@ -161,7 +172,103 @@ fn spark_concat(args: ScalarFunctionArgs) -> Result<ColumnarValue> {
 mod tests {
     use super::*;
     use crate::function::utils::test::test_scalar_function;
-    use arrow::array::{Array, StringArray};
+    use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
+    use datafusion_common::config::ConfigOptions;
+
+    /// `concat(<array>, NULL)` where the NULL literal carries no type.
+    /// Without the coercion in `coerce_types` the untyped `Null` reached
+    /// `ConcatFunc`'s array branch, which matches only the concrete string and
+    /// binary variants, and panicked on its `unreachable!("concat")`.
+    #[test]
+    fn an_untyped_null_argument_is_coerced_to_a_string_type() -> Result<()> {
+        let func = SparkConcat::new();
+
+        assert_eq!(
+            func.coerce_types(&[DataType::Utf8, DataType::Null])?,
+            vec![DataType::Utf8, DataType::Utf8],
+            "an untyped Null argument must be given a string type"
+        );
+
+        // Controls: the string and binary types the kernel already handles are
+        // passed through untouched, and zero arguments stay zero arguments.
+        assert_eq!(
+            func.coerce_types(&[DataType::Utf8View, DataType::LargeUtf8])?,
+            vec![DataType::Utf8View, DataType::LargeUtf8]
+        );
+        assert_eq!(
+            func.coerce_types(&[DataType::Binary])?,
+            vec![DataType::Binary]
+        );
+        assert_eq!(func.coerce_types(&[])?, Vec::<DataType>::new());
+
+        Ok(())
+    }
+
+    /// The coerced call answers NULL for every row, matching what an
+    /// already-typed NULL literal (`arrow_cast(NULL, 'Utf8')`) answers.
+    #[test]
+    fn an_array_beside_a_null_literal_answers_null_for_every_row() -> Result<()> {
+        let names: ArrayRef = Arc::new(StringArray::from(vec![
+            Some("alpha"),
+            Some("beta"),
+            None,
+            Some("delta"),
+        ]));
+        let coerced =
+            SparkConcat::new().coerce_types(&[DataType::Utf8, DataType::Null])?;
+
+        let result = SparkConcat::new().invoke_with_args(ScalarFunctionArgs {
+            args: vec![
+                ColumnarValue::Array(Arc::clone(&names)),
+                ColumnarValue::Scalar(ScalarValue::try_from(&coerced[1])?),
+            ],
+            arg_fields: vec![
+                Arc::new(Field::new("name", coerced[0].clone(), true)),
+                Arc::new(Field::new("lit", coerced[1].clone(), true)),
+            ],
+            number_rows: names.len(),
+            return_field: Arc::new(Field::new("concat", DataType::Utf8, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })?;
+
+        let array = result.to_array(names.len())?;
+        assert_eq!(array.len(), names.len());
+        assert_eq!(
+            array.null_count(),
+            names.len(),
+            "every row must be NULL, got {array:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Whether `concat` accepts a type must not depend on how many rows are NULL.
+    #[test]
+    fn an_unsupported_argument_type_is_rejected_whatever_its_null_count() -> Result<()> {
+        let call = |values: Vec<Option<i32>>| {
+            let array: ArrayRef = Arc::new(Int32Array::from(values));
+            SparkConcat::new().invoke_with_args(ScalarFunctionArgs {
+                args: vec![ColumnarValue::Array(Arc::clone(&array))],
+                arg_fields: vec![Arc::new(Field::new("v", DataType::Int32, true))],
+                number_rows: array.len(),
+                return_field: Arc::new(Field::new("concat", DataType::Utf8, true)),
+                config_options: Arc::new(ConfigOptions::default()),
+            })
+        };
+
+        // Control: one non-NULL row, so the call reaches ConcatFunc.
+        assert!(
+            call(vec![None, Some(2), None]).is_err(),
+            "Int32 is not a concat argument type"
+        );
+        // The same expression over the same column type, all rows NULL.
+        assert!(
+            call(vec![None, None, None]).is_err(),
+            "an all-NULL Int32 column must be rejected the same way"
+        );
+
+        Ok(())
+    }
 
     #[test]
     fn test_concat_basic() -> Result<()> {
