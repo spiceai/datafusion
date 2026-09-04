@@ -31,7 +31,7 @@ use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_expr::type_coercion::functions::fields_with_udf;
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Projection,
-    SortExpr, Unnest, Window, expr,
+    ReturnFieldArgs, SortExpr, Unnest, Window, expr,
     expr::{Cast, TryCast},
     utils::grouping_set_to_exprlist,
 };
@@ -1181,12 +1181,28 @@ pub(crate) fn provable_data_type(expr: &Expr) -> Option<DataType> {
                     Arc::new(arrow::datatypes::Field::new("f", data_type.clone(), true))
                 })
                 .collect::<Vec<_>>();
-            let coerced = fields_with_udf(&declared, function.func.as_ref())
-                .ok()?
+            let coerced = fields_with_udf(&declared, function.func.as_ref()).ok()?;
+            // A function that reads a literal argument — a `date_trunc`
+            // granularity, say — answers only through `return_field_from_args`,
+            // and its `return_type` reports an internal error instead. Passing
+            // the literals through is what makes the call's type readable, and
+            // without it a comparison against the call is left uncoerced.
+            let scalar_arguments = function
+                .args
                 .iter()
-                .map(|field| field.data_type().clone())
+                .map(|argument| match argument {
+                    Expr::Literal(value, _) => Some(value),
+                    _ => None,
+                })
                 .collect::<Vec<_>>();
-            function.func.return_type(&coerced).ok()
+            function
+                .func
+                .return_field_from_args(ReturnFieldArgs {
+                    arg_fields: &coerced,
+                    scalar_arguments: &scalar_arguments,
+                })
+                .ok()
+                .map(|field| field.data_type().clone())
         }
         _ => None,
     }

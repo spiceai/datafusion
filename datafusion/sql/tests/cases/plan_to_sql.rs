@@ -10811,6 +10811,40 @@ fn test_bigquery_agrees_a_comparison_against_a_function_call() -> Result<()> {
     Ok(())
 }
 
+/// The federation optimizer pushes a filter into `TableScan.full_filters`
+/// *before* type coercion runs, so the expression the unparser sees is the one
+/// the user wrote: `date_trunc('month', current_date())` passes a date where the
+/// signature declares a timestamp, and no cast was ever inserted.
+///
+/// This is the shape the corpus actually produces. A `Filter` node above the
+/// scan is coerced by then and does not reproduce it.
+#[test]
+fn test_bigquery_agrees_a_scan_filter_comparing_against_a_function() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "instant",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        true,
+    )]);
+
+    let predicate = col("instant").gt_eq(datafusion_functions::expr_fn::date_trunc(
+        lit("month"),
+        datafusion_functions::expr_fn::current_date(),
+    ));
+    let plan = table_scan_with_filters(Some("t"), &schema, None, vec![predicate])?
+        .project(vec![col("instant")])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    assert!(
+        sql.contains("CAST("),
+        "an instant and a civil truncation have no common supertype in BigQuery, \
+         so the scan filter has to bring them together: {sql}"
+    );
+    Ok(())
+}
+
 /// `BigQuery` has no `FILTER (WHERE ...)`: it rejects the statement with
 /// "Expected keyword AS but got keyword FILTER". The predicate moves inside the
 /// aggregate instead — measured over `[1,2,3]` with `x > 1`, `COUNTIF(x > 1)`
@@ -11345,5 +11379,36 @@ fn test_bigquery_median_keeps_the_input_type() -> Result<()> {
         "the median is the average of the two straddling values: {sql}"
     );
 
+    Ok(())
+}
+
+/// A pushed-down scan filter is unparsed with no schema in scope, so a comparison
+/// there resolves its operand types from the expressions themselves. A call is
+/// readable only through `return_field_from_args` when it reads a literal
+/// argument — `date_trunc`'s granularity — and its `return_type` reports an
+/// internal error instead, which left the call unreadable and the comparison
+/// uncoerced.
+///
+/// `BigQuery` refuses the pair that leaves: `TIMESTAMP_TRUNC` of a date is a
+/// `DATETIME`, and an instant compared against it is
+/// `No matching signature for operator >=`.
+#[test]
+fn test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date() -> Result<()> {
+    let instant = cast(
+        col("disputed_at"),
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+    );
+    let filter = instant.gt_eq(datafusion_functions::expr_fn::date_trunc(
+        lit("month"),
+        datafusion_functions::expr_fn::current_date(),
+    ));
+    // No schema: this is how a scan's pushed filters reach the unparser.
+    let sql = Unparser::new(&BigQueryDialect {})
+        .expr_to_sql(&filter)?
+        .to_string();
+    assert!(
+        sql.contains("AS TIMESTAMP)") && sql.matches("CAST(").count() >= 2,
+        "both sides have to be brought to one type BigQuery accepts: {sql}"
+    );
     Ok(())
 }
