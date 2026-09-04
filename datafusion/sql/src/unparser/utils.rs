@@ -27,6 +27,7 @@ use datafusion_common::{
     assert_eq_or_internal_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
+use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Projection,
     SortExpr, Unnest, Window, expr,
@@ -1151,6 +1152,17 @@ pub(crate) fn provable_data_type(expr: &Expr) -> Option<DataType> {
         // needs the type declines — which is how `ts >= date_trunc(...)` kept its
         // zone disagreement: the column resolved, the call did not, and a
         // comparison needs both sides to agree on one.
+        // An operator's result type follows from its operands, the same way a
+        // call's follows from its arguments. Without this, `date_trunc(...) -
+        // INTERVAL '11 months'` is opaque even though the call inside it is not,
+        // and a comparison against it is left alone.
+        Expr::BinaryExpr(binary) => {
+            let left = provable_data_type(&binary.left)?;
+            let right = provable_data_type(&binary.right)?;
+            BinaryTypeCoercer::new(&left, &binary.op, &right)
+                .get_result_type()
+                .ok()
+        }
         Expr::ScalarFunction(function) => {
             let argument_types = function
                 .args

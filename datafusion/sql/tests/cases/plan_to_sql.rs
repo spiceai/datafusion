@@ -10762,6 +10762,31 @@ fn test_bigquery_agrees_a_comparison_against_a_function_call() -> Result<()> {
         sql.matches("CAST(").count() >= 2,
         "both sides of the comparison have to be brought to one type: {sql}"
     );
+
+    // The shape the corpus actually holds: the call is wrapped in an operator, so
+    // the type has to survive that too.
+    let shifted = table_scan(Some("t"), &schema, None)?
+        .filter(col("t.instant").gt_eq(
+            datafusion_functions::expr_fn::date_trunc(
+                lit("month"),
+                cast(
+                    col("t.instant"),
+                    DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+                ),
+            ) - lit(datafusion_common::ScalarValue::IntervalMonthDayNano(Some(
+                arrow::datatypes::IntervalMonthDayNano::new(11, 0, 0),
+            ))),
+        ))?
+        .project(vec![col("t.instant")])?
+        .build()?;
+    let shifted_sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&shifted)?
+        .to_string();
+    assert!(
+        shifted_sql.matches("CAST(").count() >= 2,
+        "an operator over the call must not hide its type: {shifted_sql}"
+    );
+
     Ok(())
 }
 
