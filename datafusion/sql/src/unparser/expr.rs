@@ -1564,6 +1564,20 @@ impl Unparser<'_> {
         {
             return Ok(at_tz);
         }
+        // Casting text to a timestamp *parses* it, and engines disagree about what
+        // text they accept, so the dialect gets to spell the parse. BigQuery is the
+        // reason: its `DATETIME` cast refuses every zone marker its `TIMESTAMP`
+        // cast accepts, and neither takes more than six sub-second digits.
+        if let DataType::Timestamp(_, tz) = data_type
+            && self
+                .resolved_data_type(expr)
+                .is_some_and(|resolved| resolved.is_string())
+            && let Some(parsed) = self
+                .dialect
+                .string_to_timestamp_to_sql(inner_expr.clone(), tz.as_ref())
+        {
+            return Ok(parsed);
+        }
         // Casting a date to an integer yields its day number, which some dialects
         // spell as a function because they refuse the cast.
         if data_type.is_integer()
@@ -2247,8 +2261,16 @@ fn refuses_this_pair(left: &DataType, right: &DataType) -> bool {
     };
     let number_against_text =
         (left.is_numeric() && is_text(right)) || (is_text(left) && right.is_numeric());
+    // An instant against a date has no common supertype either. A *civil*
+    // timestamp against a date does, so only the zoned side is refused —
+    // measured on BigQuery: `TIMESTAMP >= DATE` is rejected where
+    // `DATETIME >= DATE` is accepted.
+    let is_date = |t: &DataType| matches!(t, DataType::Date32 | DataType::Date64);
+    let instant_against_date = (matches!(left, DataType::Timestamp(_, Some(_)))
+        && is_date(right))
+        || (is_date(left) && matches!(right, DataType::Timestamp(_, Some(_))));
 
-    timestamp_zone_disagreement || number_against_text
+    timestamp_zone_disagreement || number_against_text || instant_against_date
 }
 
 /// Truncates the fractional second of an already-formatted timestamp literal to

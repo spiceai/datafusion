@@ -26,8 +26,8 @@ use datafusion_expr::test::function_stub::{
     count, count_udaf, max, max_udaf, min_udaf, sum, sum_udaf,
 };
 use datafusion_expr::{
-    ColumnarValue, EmptyRelation, Expr, Extension, LogicalPlan, LogicalPlanBuilder,
-    ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
+    ColumnarValue, EmptyRelation, Expr, ExprFunctionExt, Extension, LogicalPlan,
+    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
     UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
     WindowFunctionDefinition, cast, col, exists, in_subquery, lit, out_ref_col,
     scalar_subquery, table_scan, wildcard,
@@ -10725,6 +10725,182 @@ fn test_constant_group_by_keys_are_cast_to_their_own_type() -> Result<()> {
             "the constant key is cast to the type it already has: {sql}"
         );
     }
+
+    Ok(())
+}
+
+/// `BigQuery` has no `FILTER (WHERE ...)`: it rejects the statement with
+/// "Expected keyword AS but got keyword FILTER". The predicate moves inside the
+/// aggregate instead — measured over `[1,2,3]` with `x > 1`, `COUNTIF(x > 1)`
+/// and `COUNT(CASE WHEN x > 1 THEN 1 END)` both give 2, and
+/// `SUM(CASE WHEN x > 1 THEN x END)` gives 5.
+#[test]
+fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+
+    let rendered = |agg: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .aggregate(vec![col("t.g")], vec![agg])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+    let keeps_rows = col("t.v").gt(lit(1i64));
+
+    // COUNT(*) counts rows, so the predicate is the whole aggregate.
+    let counted = rendered(
+        datafusion_functions_aggregate::expr_fn::count(lit(1i64))
+            .filter(keeps_rows.clone())
+            .build()?,
+    )?;
+    assert!(
+        counted.contains("COUNTIF(") && !counted.contains("FILTER"),
+        "a filtered row count is COUNTIF: {counted}"
+    );
+
+    // Any other aggregate guards its argument instead.
+    let summed = rendered(
+        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+            .filter(keeps_rows)
+            .build()?,
+    )?;
+    assert!(
+        summed.contains("CASE WHEN") && !summed.contains("FILTER"),
+        "a filtered sum guards its argument: {summed}"
+    );
+
+    Ok(())
+}
+
+/// An instant compared against a date has no common supertype in `BigQuery`,
+/// but a *civil* timestamp against a date does. Measured: `TIMESTAMP >= DATE`
+/// is rejected with "No matching signature for operator >=", while
+/// `DATETIME >= DATE` is accepted, so only the zoned side needs bringing
+/// together.
+#[test]
+fn test_bigquery_agrees_an_instant_with_a_date_but_leaves_a_civil_one() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("d", DataType::Date32, true),
+        Field::new(
+            "instant",
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+            true,
+        ),
+        Field::new(
+            "civil",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+
+    let rendered = |left: &str| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .filter(col(format!("t.{left}")).gt_eq(col("t.d")))?
+            .project(vec![col("t.d")])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let instant = rendered("instant")?;
+    assert!(
+        instant.contains("CAST("),
+        "an instant and a date have no common supertype, so one side has to move: {instant}"
+    );
+
+    // A civil timestamp already compares against a date, so nothing is added.
+    let civil = rendered("civil")?;
+    assert!(
+        !civil.contains("CAST("),
+        "BigQuery compares DATETIME with DATE directly; coercing it would be noise: {civil}"
+    );
+
+    Ok(())
+}
+
+/// Casting text to a timestamp is a *parse*, and `BigQuery`'s two casts disagree
+/// about what text they take: `CAST(text AS DATETIME)` refuses every string
+/// carrying a `Z` or a UTC offset that `CAST(text AS TIMESTAMP)` accepts, and
+/// neither takes more than six sub-second digits.
+///
+/// Measured on `BigQuery`. `'2026-09-02T04:53:18.789421+00:00'`: `AS TIMESTAMP`
+/// ok, `AS DATETIME` rejected. `'2026-08-21T22:09:04.390436170Z'`: both rejected.
+/// The rendering below returns `2026-09-02 04:53:18.789421` and
+/// `2026-08-21 22:09:04.390436` respectively, and turns `…04.390436170+02:00`
+/// into `20:09:04.390436`, which is the UTC-naive value DataFusion also produces.
+#[test]
+fn test_bigquery_parses_text_into_a_timestamp_rather_than_casting() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+
+    let rendered = |expr: Expr, dialect: &dyn UnparserDialect| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![expr])?
+            .build()?;
+        Ok(Unparser::new(dialect).plan_to_sql(&plan)?.to_string())
+    };
+
+    let civil = |column: &str| {
+        cast(
+            col(format!("t.{column}")),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+        )
+    };
+
+    let sql = rendered(civil("s"), &BigQueryDialect {})?;
+    assert!(
+        sql.contains("DATETIME(TIMESTAMP(") && sql.contains("REGEXP_REPLACE("),
+        "text has to be parsed as an instant and narrowed to microseconds: {sql}"
+    );
+    assert!(
+        !sql.contains("CAST(`t`.`s` AS DATETIME)"),
+        "a plain DATETIME cast refuses every zone-bearing string: {sql}"
+    );
+
+    // An instant target parses the same way but keeps the instant.
+    let instant = rendered(
+        cast(
+            col("t.s"),
+            DataType::Timestamp(
+                arrow::datatypes::TimeUnit::Microsecond,
+                Some("UTC".into()),
+            ),
+        ),
+        &BigQueryDialect {},
+    )?;
+    assert!(
+        instant.contains("REGEXP_REPLACE(") && !instant.contains("DATETIME("),
+        "an instant target stays an instant: {instant}"
+    );
+
+    // A timestamp operand is not text, so it keeps the plain cast that the
+    // comparison work depends on.
+    let from_timestamp = rendered(civil("ts"), &BigQueryDialect {})?;
+    assert!(
+        from_timestamp.contains("CAST(`t`.`ts` AS DATETIME)")
+            && !from_timestamp.contains("REGEXP_REPLACE("),
+        "only text is parsed; a timestamp operand is cast: {from_timestamp}"
+    );
+
+    // No other dialect changes.
+    assert!(
+        rendered(civil("s"), &UnparserDefaultDialect {})?.contains("CAST("),
+        "only BigQuery needs the parse spelled out"
+    );
 
     Ok(())
 }

@@ -36,6 +36,7 @@ use datafusion_expr::{
 
 use indexmap::IndexSet;
 use sqlparser::ast;
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::tokenizer::Span;
 
 /// Recursively searches children of [LogicalPlan] to find an Aggregate node if exists
@@ -1622,4 +1623,100 @@ pub(crate) fn bigquery_array_element_to_sql(
             index: bigquery_call("SAFE_ORDINAL", vec![index]),
         })],
     }))
+}
+
+/// Parses text into a BigQuery timestamp, as a cast cannot.
+///
+/// `CAST(text AS DATETIME)` refuses any string carrying a `Z` or a UTC offset —
+/// the very strings `CAST(text AS TIMESTAMP)` accepts — so a civil target has to
+/// parse as an instant first and then take the civil value. Measured on
+/// BigQuery: `'2026-09-02T04:53:18.789421+00:00'` casts to `TIMESTAMP` and not to
+/// `DATETIME`, and `DATETIME(TIMESTAMP(x))` yields `2026-09-02 04:53:18.789421`.
+///
+/// Sub-second digits past six are dropped first, because neither cast takes them
+/// and a BigQuery timestamp cannot hold them: `'…04.390436170Z'` fails both casts
+/// outright. DataFusion reads nanoseconds here, so this narrows the value to what
+/// the engine can represent rather than failing the statement.
+pub(crate) fn bigquery_string_to_timestamp_to_sql(
+    value: ast::Expr,
+    instant: bool,
+) -> ast::Expr {
+    let microseconds = bigquery_call(
+        "REGEXP_REPLACE",
+        vec![value, raw_string(r"(\.\d{6})\d+"), raw_string(r"\1")],
+    );
+    let parsed = bigquery_call("TIMESTAMP", vec![microseconds]);
+    if instant {
+        parsed
+    } else {
+        bigquery_call("DATETIME", vec![parsed])
+    }
+}
+
+/// A `R'...'` literal, so a regex's backslashes reach the engine unescaped.
+fn raw_string(value: &str) -> ast::Expr {
+    ast::Expr::Value(ast::Value::SingleQuotedRawStringLiteral(value.to_string()).into())
+}
+
+/// Renders an aggregate's `FILTER (WHERE ...)` for BigQuery, which has no such
+/// clause and rejects the statement outright.
+///
+/// The predicate moves inside the aggregate. `COUNT(*)` becomes `COUNTIF(p)`;
+/// everything else takes `CASE WHEN p THEN arg END`, which every aggregate here
+/// reads the same way because they all skip nulls — measured on BigQuery over
+/// `[1,2,3]` with `x > 1`: `COUNTIF` and `COUNT(CASE …)` both give 2, and
+/// `SUM(CASE …)` gives 5.
+///
+/// Declines for a multi-argument aggregate, where which argument the predicate
+/// should guard is not obvious and guessing would compute over the wrong rows.
+pub(crate) fn bigquery_filtered_aggregate_to_sql(
+    unparser: &Unparser,
+    func_name: &str,
+    args: &[Expr],
+    distinct: bool,
+    predicate: &Expr,
+) -> Result<Option<ast::Expr>> {
+    let condition = unparser.expr_to_sql(predicate)?;
+
+    // `COUNT(*)` counts rows, so the predicate is the whole of it.
+    let counts_rows = func_name.eq_ignore_ascii_case("count")
+        && (args.is_empty() || matches!(args, [Expr::Literal(..)]));
+    if counts_rows && !distinct {
+        return Ok(Some(bigquery_call("COUNTIF", vec![condition])));
+    }
+
+    let [value] = args else {
+        return Ok(None);
+    };
+    let guarded = ast::Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![ast::CaseWhen {
+            condition,
+            result: unparser.expr_to_sql(value)?,
+        }],
+        else_result: None,
+    };
+
+    Ok(Some(ast::Expr::Function(ast::Function {
+        name: ast::ObjectName::from(vec![ast::Ident {
+            value: func_name.to_string(),
+            quote_style: None,
+            span: Span::empty(),
+        }]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: distinct.then_some(ast::DuplicateTreatment::Distinct),
+            args: vec![ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(
+                guarded,
+            ))],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
 }
