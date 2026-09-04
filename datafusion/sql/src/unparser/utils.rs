@@ -1146,6 +1146,19 @@ pub(crate) fn provable_data_type(expr: &Expr) -> Option<DataType> {
             Some(field.data_type().clone())
         }
         Expr::Literal(value, _) => Some(value.data_type()),
+        // A function's return type follows from its arguments, so it is provable
+        // whenever they are. Without this a call is opaque, and a rendering that
+        // needs the type declines — which is how `ts >= date_trunc(...)` kept its
+        // zone disagreement: the column resolved, the call did not, and a
+        // comparison needs both sides to agree on one.
+        Expr::ScalarFunction(function) => {
+            let argument_types = function
+                .args
+                .iter()
+                .map(provable_data_type)
+                .collect::<Option<Vec<_>>>()?;
+            function.func.return_type(&argument_types).ok()
+        }
         _ => None,
     }
 }

@@ -10729,6 +10729,42 @@ fn test_constant_group_by_keys_are_cast_to_their_own_type() -> Result<()> {
     Ok(())
 }
 
+/// A comparison needs both sides' types to agree on one, so an operand whose
+/// type cannot be read leaves the pair alone. A function call's type follows
+/// from its arguments, and without resolving it an instant compared against
+/// `date_trunc(...)` kept its zone disagreement and `BigQuery` refused the
+/// statement with "No matching signature for operator >= ... TIMESTAMP,
+/// DATETIME".
+#[test]
+fn test_bigquery_agrees_a_comparison_against_a_function_call() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "instant",
+        DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
+        true,
+    )]);
+
+    let civil_call = datafusion_functions::expr_fn::date_trunc(
+        lit("month"),
+        cast(
+            col("t.instant"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        ),
+    );
+    let plan = table_scan(Some("t"), &schema, None)?
+        .filter(col("t.instant").gt_eq(civil_call))?
+        .project(vec![col("t.instant")])?
+        .build()?;
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    assert!(
+        sql.matches("CAST(").count() >= 2,
+        "both sides of the comparison have to be brought to one type: {sql}"
+    );
+    Ok(())
+}
+
 /// `BigQuery` has no `FILTER (WHERE ...)`: it rejects the statement with
 /// "Expected keyword AS but got keyword FILTER". The predicate moves inside the
 /// aggregate instead — measured over `[1,2,3]` with `x > 1`, `COUNTIF(x > 1)`
