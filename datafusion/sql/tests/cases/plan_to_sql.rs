@@ -11382,6 +11382,52 @@ fn test_bigquery_median_keeps_the_input_type() -> Result<()> {
     Ok(())
 }
 
+/// The optimizer pushes a join predicate that reads one input down into that
+/// input, so by the time the plan is unparsed the subquery sits in a `Filter`
+/// below the join rather than in its `ON`. Lifted back out of a null-extended
+/// input it would land in `ON`, which some dialects refuse a subquery in, so it
+/// stays in that input's own scope instead.
+///
+/// This is the shape a federated pushdown actually carries; a plan straight from
+/// the SQL planner keeps the predicate in `ON` and does not exercise it.
+#[test]
+fn test_a_pushed_down_subquery_filter_stays_in_the_null_extended_input() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int64, true),
+        Field::new("token", DataType::Utf8, true),
+    ]);
+    let candidates = table_scan(Some("c"), &schema, None)?
+        .project(vec![col("c.token")])?
+        .build()?;
+    // The optimizer's shape: the predicate already inside the join's right input.
+    let right = table_scan(Some("w"), &schema, None)?
+        .filter(in_subquery(col("w.token"), Arc::new(candidates)))?
+        .build()?;
+    let plan = table_scan(Some("e"), &schema, None)?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Left,
+            vec![col("e.id").eq(col("w.id"))],
+        )?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let (before_on, after_on) = sql
+        .split_once(" ON ")
+        .expect("the join has to keep an ON clause");
+    assert!(
+        !after_on.contains("IN (SELECT"),
+        "a null-extended input's subquery must not be lifted into ON: {sql}"
+    );
+    assert!(
+        before_on.contains("IN (SELECT"),
+        "it has to stay in that input's own scope: {sql}"
+    );
+    Ok(())
+}
+
 /// An `IN` subquery inside a join predicate is refused outright by some dialects.
 /// On an inner join `ON` and `WHERE` select the same rows, so the conjunct
 /// carrying it moves; on an outer join they do not — `WHERE` would discard the
@@ -11425,17 +11471,20 @@ fn test_a_subquery_in_an_inner_join_predicate_moves_to_where() -> Result<()> {
     );
 
     // The preserved side of an outer join makes the two clauses different — WHERE
-    // would discard the rows the join preserves — so the conjunct stays in ON and
-    // the dialect's own limit applies. A dialect that refuses it there needs the
-    // conjunct applied to the null-extended input instead, which the join
-    // rendering does not express yet.
+    // would discard the rows the join preserves — so the conjunct cannot move
+    // there. It reads only the null-extended input, and applied to that input
+    // before the join it selects the same rows, so that input's scope takes it.
     let left = plan_for("LEFT JOIN")?;
-    let (_, after_on) = left
+    let (before_on, after_on) = left
         .split_once(" ON ")
         .expect("the join has to keep an ON clause");
     assert!(
-        after_on.contains("IN (SELECT"),
-        "a left join keeps the subquery in ON: {left}"
+        !after_on.contains("IN (SELECT"),
+        "an outer join must not carry a subquery in ON either: {left}"
+    );
+    assert!(
+        before_on.contains("IN (SELECT"),
+        "the null-extended input's own scope has to take it: {left}"
     );
     Ok(())
 }

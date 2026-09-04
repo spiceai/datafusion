@@ -31,10 +31,10 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        find_agg_node_within_select, find_projection_node_within_select,
-        find_unnest_node_within_select, find_window_nodes_within_select,
-        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
-        select_list_wraps_a_grouping_expr,
+        expr_contains_subquery, find_agg_node_within_select,
+        find_projection_node_within_select, find_unnest_node_within_select,
+        find_window_nodes_within_select, name_derived_scope_outputs, name_scope_outputs,
+        partition_subquery_filters, select_list_wraps_a_grouping_expr,
         try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
         unproject_unnamed_projection_exprs, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -54,7 +54,9 @@ use datafusion_common::{
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
-use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
+use datafusion_expr::expr::{
+    Cast, Exists, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX,
+};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
@@ -806,6 +808,68 @@ impl Unparser<'_> {
     /// everything it extracted and `scan_filters` the subset belonging to the
     /// scan. `relation` already holds the plain table reference built for this
     /// side; it is overwritten with the derived subquery.
+    /// Splits an outer join's `ON` filter into what stays and what belongs in the
+    /// non-preserved input's own scope.
+    ///
+    /// A subquery inside a join predicate is refused outright by some dialects. On
+    /// an inner join the conjunct carrying one moves to `WHERE`, which selects the
+    /// same rows; on an outer join it cannot, because `WHERE` discards the rows the
+    /// join preserves. Applied to the non-preserved input before the join it does
+    /// select the same rows, so that input's own scope is where it goes.
+    ///
+    /// Only a conjunct whose every reference — its own columns and any outer
+    /// reference its subquery carries — comes from that input is moved. Anything
+    /// else would leave the scope that answers it behind.
+    ///
+    /// Returns `(the filter that stays, the conjuncts the input's scope takes)`.
+    fn scope_subquery_onto_non_preserved_input(join: &Join) -> (Option<Expr>, Vec<Expr>) {
+        let Some(filter) = &join.filter else {
+            return (None, vec![]);
+        };
+        let non_preserved = match join.join_type {
+            JoinType::Left => &join.right,
+            JoinType::Right => &join.left,
+            _ => return (join.filter.clone(), vec![]),
+        };
+        let reachable: HashSet<Column> =
+            non_preserved.schema().columns().into_iter().collect();
+        let reads_only_that_input = |expr: &Expr| {
+            expr.column_refs()
+                .into_iter()
+                .all(|column| reachable.contains(column))
+                && expr
+                    .apply(|sub| {
+                        let outer = match sub {
+                            Expr::InSubquery(in_subquery) => {
+                                &in_subquery.subquery.outer_ref_columns
+                            }
+                            Expr::ScalarSubquery(subquery)
+                            | Expr::Exists(Exists { subquery, .. }) => {
+                                &subquery.outer_ref_columns
+                            }
+                            _ => return Ok(TreeNodeRecursion::Continue),
+                        };
+                        if outer
+                            .iter()
+                            .flat_map(Expr::column_refs)
+                            .all(|column| reachable.contains(column))
+                        {
+                            Ok(TreeNodeRecursion::Continue)
+                        } else {
+                            Ok(TreeNodeRecursion::Stop)
+                        }
+                    })
+                    .is_ok_and(|recursion| recursion != TreeNodeRecursion::Stop)
+        };
+        let (scoped, kept): (Vec<Expr>, Vec<Expr>) = split_conjunction(filter)
+            .into_iter()
+            .cloned()
+            .partition(|conjunct| {
+                expr_contains_subquery(conjunct) && reads_only_that_input(conjunct)
+            });
+        (kept.into_iter().reduce(Expr::and), scoped)
+    }
+
     fn derive_join_side(
         &self,
         clean_plan: &LogicalPlan,
@@ -1564,6 +1628,15 @@ impl Unparser<'_> {
                 } else {
                     (&join.left, &join.right)
                 };
+                // A subquery in `ON` is refused by some dialects, and an outer join
+                // cannot move it to `WHERE`. The non-preserved input's own scope is
+                // the remaining clause that selects the same rows.
+                let (scoped_join_filter, scoped_for_input) =
+                    Self::scope_subquery_onto_non_preserved_input(join);
+                let (mut left_scoped, mut right_scoped) = match join.join_type {
+                    JoinType::Right => (scoped_for_input, vec![]),
+                    _ => (vec![], scoped_for_input),
+                };
                 // If there's an outer projection plan, it will already set up the projection.
                 // In that case, we don't need to worry about setting up the projection here.
                 // The outer projection plan will handle projecting the correct columns.
@@ -1581,6 +1654,14 @@ impl Unparser<'_> {
                         }
                         None => Arc::clone(left_plan),
                     };
+
+                if join.join_type == JoinType::Right {
+                    let (kept, scoped) = partition_subquery_filters(std::mem::take(
+                        &mut left_scan_filters,
+                    ));
+                    left_scan_filters = kept;
+                    left_scoped.extend(scoped);
+                }
 
                 // A join that null-extends its left input must not let a
                 // predicate from that subtree reach the SELECT-global `WHERE`:
@@ -1616,10 +1697,15 @@ impl Unparser<'_> {
                 // also routed to `ON`/`WHERE` below.
                 if left_scan_fetch.is_some()
                     || (join.join_type == JoinType::Full && !left_scan_filters.is_empty())
+                    || !left_scoped.is_empty()
                 {
+                    let mut side_filters = std::mem::take(&mut left_scoped);
+                    if left_scan_fetch.is_some() || join.join_type == JoinType::Full {
+                        side_filters.append(&mut left_scan_filters);
+                    }
                     self.derive_join_side(
                         left_plan.as_ref(),
-                        std::mem::take(&mut left_scan_filters),
+                        side_filters,
                         &left_scan_only_filters,
                         left_scan_fetch,
                         relation,
@@ -1674,6 +1760,18 @@ impl Unparser<'_> {
                             }
                             None => Arc::clone(right_plan),
                         };
+                    // A predicate lifted out of the non-preserved input carrying a
+                    // subquery cannot go to `ON`, which some dialects refuse it in,
+                    // nor to `WHERE`, which would discard the rows the join
+                    // preserves. It selects the same rows applied to that input, so
+                    // it stays in the input's own scope.
+                    if join.join_type == JoinType::Left {
+                        let (kept, scoped) = partition_subquery_filters(std::mem::take(
+                            &mut right_scan_filters,
+                        ));
+                        right_scan_filters = kept;
+                        right_scoped.extend(scoped);
+                    }
 
                     self.select_to_sql_recursively(
                         right_plan.as_ref(),
@@ -1684,10 +1782,16 @@ impl Unparser<'_> {
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full
                             && !right_scan_filters.is_empty())
+                        || !right_scoped.is_empty()
                     {
+                        let mut side_filters = std::mem::take(&mut right_scoped);
+                        if right_scan_fetch.is_some() || join.join_type == JoinType::Full
+                        {
+                            side_filters.append(&mut right_scan_filters);
+                        }
                         self.derive_join_side(
                             right_plan.as_ref(),
-                            std::mem::take(&mut right_scan_filters),
+                            side_filters,
                             &right_scan_only_filters,
                             right_scan_fetch,
                             &mut right_relation,
@@ -1706,7 +1810,7 @@ impl Unparser<'_> {
                 } else {
                     Self::split_join_on_and_where_filters(
                         join.join_type,
-                        &join.filter,
+                        &scoped_join_filter,
                         left_scan_filters,
                         right_scan_filters,
                     )
