@@ -2225,12 +2225,15 @@ impl Unparser<'_> {
                     new_scale = 0
                 }
 
-                Ok(ast::DataType::Decimal(
-                    ast::ExactNumberInfo::PrecisionAndScale(
-                        new_precision,
-                        new_scale as i64,
-                    ),
-                ))
+                Ok(self
+                    .dialect
+                    .decimal_type_to_sql(new_precision, new_scale as i64)
+                    .unwrap_or(ast::DataType::Decimal(
+                        ast::ExactNumberInfo::PrecisionAndScale(
+                            new_precision,
+                            new_scale as i64,
+                        ),
+                    )))
             }
             DataType::Map(_, _) => {
                 not_impl_err!("Unsupported DataType: conversion: {data_type}")

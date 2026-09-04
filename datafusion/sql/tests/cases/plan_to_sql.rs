@@ -11382,6 +11382,129 @@ fn test_bigquery_median_keeps_the_input_type() -> Result<()> {
     Ok(())
 }
 
+/// An `IN` subquery inside a join predicate is refused outright by some dialects.
+/// On an inner join `ON` and `WHERE` select the same rows, so the conjunct
+/// carrying it moves; on an outer join they do not — `WHERE` would discard the
+/// rows the join preserves — so it stays where it is.
+#[test]
+fn test_a_subquery_in_an_inner_join_predicate_moves_to_where() -> Result<()> {
+    let plan_for = |join: &str| -> Result<String> {
+        let query = format!(
+            "SELECT j1.j1_id FROM j1 {join} j2 \
+             ON j1.j1_id = j2.j2_id \
+             AND j1.j1_string IN (SELECT j2.j2_string FROM j2)"
+        );
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(&query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let inner = plan_for("JOIN")?;
+    let (on_clause, after_on) = inner
+        .split_once(" ON ")
+        .expect("the join has to keep an ON clause");
+    let _ = on_clause;
+    let (on_clause, where_clause) = match after_on.split_once(" WHERE ") {
+        Some(split) => split,
+        None => panic!("the moved conjunct has to land in a WHERE: {inner}"),
+    };
+    assert!(
+        !on_clause.contains("IN (SELECT"),
+        "an inner join must not carry a subquery in ON: {inner}"
+    );
+    assert!(
+        where_clause.contains("IN (SELECT"),
+        "the subquery has to survive in WHERE: {inner}"
+    );
+
+    // The preserved side of an outer join makes the two clauses different, so the
+    // conjunct stays in ON rather than silently changing which rows survive.
+    let left = plan_for("LEFT JOIN")?;
+    let (_, after_on) = left
+        .split_once(" ON ")
+        .expect("the join has to keep an ON clause");
+    assert!(
+        after_on.contains("IN (SELECT"),
+        "a left join has to keep the subquery in ON: {left}"
+    );
+    Ok(())
+}
+
+/// `BigQuery` spells a decimal `NUMERIC` up to nine fractional digits and
+/// `BIGNUMERIC` beyond that, and refuses a `NUMERIC` whose scale is wider rather
+/// than rounding it. The wide scale arrives from arithmetic — dividing two
+/// decimals widens it — so no declared column type reveals the shape.
+#[test]
+fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
+    let narrow = cast(col("a"), DataType::Decimal128(38, 9));
+    let wide = cast(col("a"), DataType::Decimal128(38, 17));
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let narrow_sql = unparser.expr_to_sql(&narrow)?.to_string();
+    let wide_sql = unparser.expr_to_sql(&wide)?.to_string();
+    assert!(
+        narrow_sql.contains("NUMERIC(38,9)") && !narrow_sql.contains("BIGNUMERIC"),
+        "nine fractional digits fit NUMERIC: {narrow_sql}"
+    );
+    assert!(
+        wide_sql.contains("BIGNUMERIC(38,17)"),
+        "a scale past nine needs BIGNUMERIC: {wide_sql}"
+    );
+    Ok(())
+}
+
+/// A sort above an aggregate that is given a scope of its own has to name that
+/// scope's output, not the grouping expression inside it.
+///
+/// The plan is what `ORDER BY <a grouping expression not in the select list>`
+/// produces: the key is projected alongside the aggregate's outputs, sorted, then
+/// projected away. Unprojecting that key back into the grouping expression names
+/// the relation the expression reads, and the scope encloses that relation, so the
+/// remote binder reports the qualifier as unknown.
+#[test]
+fn test_a_sort_over_a_scoped_aggregate_names_the_scope_not_its_grouping_expr()
+-> Result<()> {
+    let query = "SELECT CAST(person.birth_date AS DATE) || '' AS d, \
+                 sum(person.salary) AS total \
+                 FROM person \
+                 GROUP BY CAST(person.birth_date AS DATE) \
+                 ORDER BY CAST(person.birth_date AS DATE)";
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(query)?
+        .parse_statement()?;
+    let state = MockSessionState::default()
+        .with_aggregate_function(sum_udaf())
+        .with_expr_planner(Arc::new(CoreFunctionPlanner::default()));
+    let context = MockContextProvider { state };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("FROM (SELECT"),
+        "the grouping expression is wrapped, so the aggregate takes a scope: {sql}"
+    );
+    let (_, order_by) = sql
+        .rsplit_once("ORDER BY")
+        .expect("the sort has to survive as an ORDER BY");
+    assert!(
+        !order_by.contains("`person`."),
+        "the sort key must not name a relation the scope encloses: {sql}"
+    );
+    assert!(
+        !order_by.contains("CAST("),
+        "the grouping expression must not be inlined into the sort key: {sql}"
+    );
+    Ok(())
+}
+
 /// A pushed-down scan filter is unparsed with no schema in scope, so a comparison
 /// there resolves its operand types from the expressions themselves. A call is
 /// readable only through `return_field_from_args` when it reads a literal

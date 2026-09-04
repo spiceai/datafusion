@@ -33,7 +33,7 @@ use super::{
     utils::{
         find_agg_node_within_select, find_projection_node_within_select,
         find_unnest_node_within_select, find_window_nodes_within_select,
-        name_derived_scope_outputs, name_scope_outputs,
+        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
         select_list_wraps_a_grouping_expr,
         try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
         unproject_unnamed_projection_exprs, unproject_unnest_expr,
@@ -58,7 +58,7 @@ use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_P
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
-    UserDefinedLogicalNode, Window, expr::Alias,
+    UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
 };
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
 use std::{collections::HashSet, sync::Arc, vec};
@@ -565,6 +565,31 @@ impl Unparser<'_> {
         });
 
         Ok(())
+    }
+
+    /// Whether `plan`, a `Projection`, is going to move the aggregate below it
+    /// into a scope of its own rather than folding it into this SELECT.
+    ///
+    /// Asked in two places, which have to agree: the projection acts on it, and a
+    /// sort above the projection reads it to decide what its key may name. A sort
+    /// key unprojected into a grouping expression names the relation that
+    /// expression reads, and once the aggregate is a scope of its own that
+    /// relation is enclosed by it and binds to nothing outside.
+    fn projection_scopes_its_aggregate(
+        &self,
+        plan: &LogicalPlan,
+        select: &SelectBuilder,
+    ) -> bool {
+        if self.dialect.group_by_matches_select_subexpressions()
+            || select.has_grouped_predicate()
+        {
+            return false;
+        }
+        let LogicalPlan::Projection(projection) = plan else {
+            return false;
+        };
+        find_agg_node_within_select(plan, true)
+            .is_some_and(|agg| select_list_wraps_a_grouping_expr(&projection.expr, agg))
     }
 
     fn derive(
@@ -1213,11 +1238,7 @@ impl Unparser<'_> {
                 // the aggregate below, and names an expression only the SELECT that
                 // computes it can name. Moving the aggregate into a scope would
                 // strand it on a SELECT that no longer aggregates.
-                if !self.dialect.group_by_matches_select_subexpressions()
-                    && !select.has_grouped_predicate()
-                    && let Some(agg) = find_agg_node_within_select(plan, true)
-                    && select_list_wraps_a_grouping_expr(&p.expr, agg)
-                {
+                if self.projection_scopes_its_aggregate(plan, select) {
                     return self.projection_over_scoped_aggregate(p, select, relation);
                 }
                 self.reconstruct_select_statement(plan, p, select)?;
@@ -1354,7 +1375,17 @@ impl Unparser<'_> {
                     ))));
                 };
 
-                let agg = find_agg_node_within_select(plan, select.already_projected());
+                // The projection below may be about to move the aggregate into a
+                // scope of its own. The aggregate is then not this SELECT's, and the
+                // sort key has to stay the reference the plan holds so it names that
+                // scope's output rather than the grouping expression inside it.
+                let agg = if self
+                    .projection_scopes_its_aggregate(sort.input.as_ref(), select)
+                {
+                    None
+                } else {
+                    find_agg_node_within_select(plan, select.already_projected())
+                };
                 let window_nodes = find_window_nodes_within_select(
                     plan,
                     None,
@@ -4115,6 +4146,32 @@ impl Unparser<'_> {
         //   side's filter; only a derived table does. The caller isolates a
         //   `FULL JOIN`'s filtered side in one before reaching this function,
         //   so `left_scan_filters`/`right_scan_filters` are always empty here.
+        // A subquery inside `ON` is refused outright by some dialects. Where `ON`
+        // and `WHERE` are equivalent the conjunct carrying it can move; where they
+        // are not — an outer join preserves rows that `WHERE` would then discard —
+        // it has to stay, and the dialect's own limit applies.
+        let (join_filter, subquery_filters) = match join_type {
+            JoinType::Inner => {
+                let (kept, moved) = partition_subquery_filters(
+                    join_filter
+                        .iter()
+                        .flat_map(split_conjunction)
+                        .cloned()
+                        .collect(),
+                );
+                let kept = kept.into_iter().reduce(|acc, filter| {
+                    Expr::BinaryExpr(BinaryExpr {
+                        left: Box::new(acc),
+                        op: Operator::And,
+                        right: Box::new(filter),
+                    })
+                });
+                (kept, moved)
+            }
+            _ => (join_filter.clone(), vec![]),
+        };
+        let join_filter = &join_filter;
+
         let (on_scan_filters, where_scan_filters) = match join_type {
             JoinType::Inner => (
                 vec![],
@@ -4141,6 +4198,11 @@ impl Unparser<'_> {
                 vec![],
             ),
         };
+
+        let where_scan_filters: Vec<Expr> = where_scan_filters
+            .into_iter()
+            .chain(subquery_filters)
+            .collect();
 
         if on_scan_filters.is_empty() {
             return (join_filter.clone(), where_scan_filters);

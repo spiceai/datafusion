@@ -146,6 +146,16 @@ pub trait Dialect: Send + Sync {
     /// The default discards `tz`, which is the rendering every dialect has always
     /// received; only a dialect whose timestamp type depends on the zone needs to
     /// override it.
+    /// How this dialect spells a decimal of `precision` and `scale`.
+    ///
+    /// `None` keeps `DECIMAL(precision, scale)`, which is what every dialect has
+    /// always received. A dialect whose decimal types carry different scale limits
+    /// has to select between them here, because the width follows from arithmetic
+    /// — dividing two decimals widens the scale — and not from any declared type.
+    fn decimal_type_to_sql(&self, _precision: u64, _scale: i64) -> Option<ast::DataType> {
+        None
+    }
+
     fn timestamp_literal_cast_dtype(
         &self,
         time_unit: &TimeUnit,
@@ -1032,6 +1042,19 @@ impl Dialect for BigQueryDialect {
         } else {
             Ok(Some(alias.to_string()))
         }
+    }
+
+    fn decimal_type_to_sql(&self, precision: u64, scale: i64) -> Option<ast::DataType> {
+        // `NUMERIC` carries at most nine fractional digits and `BIGNUMERIC` up to
+        // thirty-eight; a scale past nine is refused outright rather than rounded.
+        // `DECIMAL` is only another spelling of `NUMERIC`, so it carries the same
+        // limit and cannot express the wider scale.
+        let info = ast::ExactNumberInfo::PrecisionAndScale(precision, scale);
+        Some(if scale > 9 {
+            ast::DataType::BigNumeric(info)
+        } else {
+            ast::DataType::Numeric(info)
+        })
     }
 
     fn unnest_as_table_factor(&self) -> bool {
