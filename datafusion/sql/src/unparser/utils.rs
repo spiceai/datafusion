@@ -28,6 +28,7 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode},
 };
 use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
+use datafusion_expr::type_coercion::functions::fields_with_udf;
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Projection,
     SortExpr, Unnest, Window, expr,
@@ -1169,7 +1170,23 @@ pub(crate) fn provable_data_type(expr: &Expr) -> Option<DataType> {
                 .iter()
                 .map(provable_data_type)
                 .collect::<Option<Vec<_>>>()?;
-            function.func.return_type(&argument_types).ok()
+            // The arguments have to be coerced through the signature first. The
+            // plan holds them as written — `date_trunc('month', current_date())`
+            // passes a date where the signature declares a timestamp — and
+            // asking for the return type of the uncoerced pair fails, which
+            // would leave the call unreadable and its comparison uncoerced.
+            let declared = argument_types
+                .iter()
+                .map(|data_type| {
+                    Arc::new(arrow::datatypes::Field::new("f", data_type.clone(), true))
+                })
+                .collect::<Vec<_>>();
+            let coerced = fields_with_udf(&declared, function.func.as_ref())
+                .ok()?
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect::<Vec<_>>();
+            function.func.return_type(&coerced).ok()
         }
         _ => None,
     }

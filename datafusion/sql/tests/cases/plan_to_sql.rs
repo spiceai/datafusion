@@ -10787,6 +10787,27 @@ fn test_bigquery_agrees_a_comparison_against_a_function_call() -> Result<()> {
         "an operator over the call must not hide its type: {shifted_sql}"
     );
 
+    // And the shape as the plan actually holds it: the argument is a date where
+    // the signature declares a timestamp, so the type is only readable once the
+    // arguments are coerced through the signature. The two asserts above both
+    // passed while this one failed, because they wrote the cast by hand.
+    let uncast = table_scan(Some("t"), &schema, None)?
+        .filter(
+            col("t.instant").gt_eq(datafusion_functions::expr_fn::date_trunc(
+                lit("month"),
+                datafusion_functions::expr_fn::current_date(),
+            )),
+        )?
+        .project(vec![col("t.instant")])?
+        .build()?;
+    let uncast_sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&uncast)?
+        .to_string();
+    assert!(
+        uncast_sql.contains("CAST("),
+        "an argument needing coercion must not make the call unreadable: {uncast_sql}"
+    );
+
     Ok(())
 }
 
