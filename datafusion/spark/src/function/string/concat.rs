@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::new_null_array;
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::arrow::datatypes::FieldRef;
 use datafusion_common::{Result, ScalarValue};
@@ -153,18 +152,6 @@ fn spark_concat(args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         };
     }
 
-    // Every row is NULL, so nothing DataFusion's concat computes survives
-    // `apply_null_mask`. Answer directly rather than concatenating values that
-    // are about to be masked away.
-    if let NullMaskResolution::Apply(mask) = &null_mask
-        && mask.null_count() == mask.len()
-    {
-        return Ok(ColumnarValue::Array(new_null_array(
-            return_field.data_type(),
-            mask.len(),
-        )));
-    }
-
     // Step 2: Delegate to DataFusion's concat
     let concat_func = ConcatFunc::new();
     let return_type = return_field.data_type().clone();
@@ -185,7 +172,7 @@ fn spark_concat(args: ScalarFunctionArgs) -> Result<ColumnarValue> {
 mod tests {
     use super::*;
     use crate::function::utils::test::test_scalar_function;
-    use arrow::array::{Array, ArrayRef, StringArray};
+    use arrow::array::{Array, ArrayRef, Int32Array, StringArray};
     use datafusion_common::config::ConfigOptions;
 
     /// `concat(<array>, NULL)` where the NULL literal carries no type.
@@ -250,6 +237,34 @@ mod tests {
             array.null_count(),
             names.len(),
             "every row must be NULL, got {array:?}"
+        );
+
+        Ok(())
+    }
+
+    /// Whether `concat` accepts a type must not depend on how many rows are NULL.
+    #[test]
+    fn an_unsupported_argument_type_is_rejected_whatever_its_null_count() -> Result<()> {
+        let call = |values: Vec<Option<i32>>| {
+            let array: ArrayRef = Arc::new(Int32Array::from(values));
+            SparkConcat::new().invoke_with_args(ScalarFunctionArgs {
+                args: vec![ColumnarValue::Array(Arc::clone(&array))],
+                arg_fields: vec![Arc::new(Field::new("v", DataType::Int32, true))],
+                number_rows: array.len(),
+                return_field: Arc::new(Field::new("concat", DataType::Utf8, true)),
+                config_options: Arc::new(ConfigOptions::default()),
+            })
+        };
+
+        // Control: one non-NULL row, so the call reaches ConcatFunc.
+        assert!(
+            call(vec![None, Some(2), None]).is_err(),
+            "Int32 is not a concat argument type"
+        );
+        // The same expression over the same column type, all rows NULL.
+        assert!(
+            call(vec![None, None, None]).is_err(),
+            "an all-NULL Int32 column must be rejected the same way"
         );
 
         Ok(())
