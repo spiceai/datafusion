@@ -1716,34 +1716,48 @@ fn raw_string(value: &str) -> ast::Expr {
     ast::Expr::Value(ast::Value::SingleQuotedRawStringLiteral(value.to_string()).into())
 }
 
-/// Whether the aggregate keeps null inputs rather than skipping them, so that
-/// guarding its argument with a `CASE` changes its result.
+/// Whether the order of an aggregate's input is part of its answer.
 ///
-/// Almost every aggregate ignores nulls, which is what lets a `FILTER` become a
-/// `CASE`. `array_agg` is the exception: it is documented as "input values,
-/// including nulls, concatenated into an array", so the null the `CASE` yields
-/// for a rejected row becomes an *element*, where the filter would have dropped
-/// the row. BigQuery refuses to build such an array at all ("Array cannot have a
-/// null element", measured), so the rewrite turns a working statement into a
-/// failing one — and `IGNORE NULLS` is not the repair, because that would also
-/// drop the nulls a retained row legitimately holds.
-fn preserves_nulls(func_name: &str) -> bool {
-    func_name.eq_ignore_ascii_case("array_agg")
+/// The rewriting below carries no ordering, so an ordered aggregate reaching it
+/// loses it. For most aggregates that costs nothing — a sum or a count over the
+/// same rows is the same number in any order — but for these the order *is* part
+/// of the result, so they decline rather than answer differently.
+///
+/// Declining is not free: a federated statement has no local-execution
+/// fallback, so it fails rather than running elsewhere. That is the right trade
+/// only where the alternative is a wrong answer, which is why this list is the
+/// order-sensitive aggregates and not every ordered one.
+pub(crate) fn order_sensitive(func_name: &str) -> bool {
+    [
+        "array_agg",
+        "string_agg",
+        "first_value",
+        "last_value",
+        "nth_value",
+    ]
+    .iter()
+    .any(|sensitive| func_name.eq_ignore_ascii_case(sensitive))
 }
 
 /// Renders an aggregate's `FILTER (WHERE ...)` for BigQuery, which has no such
 /// clause and rejects the statement outright.
 ///
 /// The predicate moves inside the aggregate. `COUNT(*)` becomes `COUNTIF(p)`;
-/// everything else takes `CASE WHEN p THEN arg END`, which reads the same only
-/// for an aggregate that skips nulls, because the `CASE` yields a null for every
-/// row the filter rejects rather than removing that row. Measured on BigQuery
-/// over `[1,2,3]` with `x > 1`: `COUNTIF` and `COUNT(CASE …)` both give 2, and
-/// `SUM(CASE …)` gives 5.
+/// everything else takes `CASE WHEN p THEN arg END`, which the aggregate reads
+/// the same because the `CASE` yields a null for each rejected row and these
+/// aggregates skip nulls. Measured on BigQuery over `[1,2,3]` with `x > 1`:
+/// `COUNTIF` and `COUNT(CASE …)` both give 2, and `SUM(CASE …)` gives 5.
 ///
-/// Declines where that equivalence does not hold:
+/// `array_agg` is the aggregate this reads differently, since it keeps nulls —
+/// but it is deliberately *not* declined here. BigQuery refuses to build an
+/// array holding a null at all ("Array cannot have a null element", measured),
+/// so the rewrite is correct whenever it runs and fails loudly whenever it would
+/// not be. Declining instead would only take away the cases that work: a
+/// federated statement has no local-execution fallback, so the alternative to
+/// this rendering is a failed query, not a slower one.
 ///
-/// * an aggregate that preserves nulls — see [`preserves_nulls`];
+/// Declines where the rewriting would answer differently rather than fail:
+///
 /// * a multi-argument aggregate, where which argument the predicate should guard
 ///   is not obvious and guessing would compute over the wrong rows.
 pub(crate) fn bigquery_filtered_aggregate_to_sql(
@@ -1753,10 +1767,6 @@ pub(crate) fn bigquery_filtered_aggregate_to_sql(
     distinct: bool,
     predicate: &Expr,
 ) -> Result<Option<ast::Expr>> {
-    if preserves_nulls(func_name) {
-        return Ok(None);
-    }
-
     let condition = unparser.expr_to_sql(predicate)?;
 
     // `COUNT(*)` counts rows, so the predicate is the whole of it. `COUNT(1)`

@@ -22,7 +22,7 @@ use super::{
     utils::bigquery_filtered_aggregate_to_sql, utils::bigquery_percentile_to_sql,
     utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_timestamp_to_sql,
     utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
-    utils::character_length_to_sql, utils::date_part_to_sql,
+    utils::character_length_to_sql, utils::date_part_to_sql, utils::order_sensitive,
     utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
@@ -1008,14 +1008,20 @@ impl Dialect for SqliteDialect {
     }
 }
 
-/// The widest scale a BigQuery `NUMERIC` holds; a scale past it is refused
-/// rather than rounded.
+/// The widest scale a BigQuery `NUMERIC` holds. Measured: a thirteenth
+/// fractional digit is *rounded away silently*, not refused —
+/// `CAST('1.234567890123' AS NUMERIC)` returns `1.23456789`.
 const NUMERIC_MAX_SCALE: i64 = 9;
 
-/// The most integer digits a BigQuery `NUMERIC` holds — its precision of 38
-/// less its scale of 9. A value needing a thirtieth is refused with "Invalid
-/// NUMERIC value".
+/// The most integer digits a BigQuery `NUMERIC` holds. Measured by bisection:
+/// twenty-nine, and a value needing a thirtieth is refused outright with
+/// "Invalid NUMERIC value".
 const NUMERIC_MAX_INTEGER_DIGITS: u64 = 29;
+
+/// The widest scale a BigQuery `BIGNUMERIC` holds. Measured: a thirty-ninth
+/// fractional digit is *rounded away silently*, so a scale past this cannot be
+/// rendered at all without changing the value.
+const BIGNUMERIC_MAX_SCALE: i64 = 38;
 
 #[derive(Default)]
 pub struct BigQueryDialect {}
@@ -1060,13 +1066,32 @@ impl Dialect for BigQueryDialect {
     fn decimal_type_to_sql(&self, precision: u64, scale: i64) -> Option<ast::DataType> {
         // A cast target carries no precision or scale — `CAST(x AS NUMERIC(38, 9))`
         // is refused as a parameterized type — so the choice of type is the only
-        // way to keep the width.
+        // way to keep the width. The two halves of that width fail differently on
+        // BigQuery, which is what decides the rendering.
         //
-        // `NUMERIC` is precision 38 scale 9, which bounds *both* halves: nine
-        // fractional digits and twenty-nine integer digits. Measured on BigQuery,
-        // a thirtieth integer digit is refused outright ("Invalid NUMERIC value")
-        // where `BIGNUMERIC` takes it, and a scale past nine is refused rather
-        // than rounded. So either half overflowing selects the wider type.
+        // **Scale is lost silently.** Measured: `CAST('1.234567890123' AS
+        // NUMERIC)` returns `1.23456789`, and `BIGNUMERIC` given thirty-nine
+        // fractional digits keeps thirty-eight — no error either time. So a scale
+        // wider than the widest type holds cannot be rendered at all without
+        // changing the value, and declining is the only safe answer. Declining is
+        // loud: the fallback spelling `DECIMAL(p, s)` is refused ("In NUMERIC(P,
+        // S), S must be between 0 and 9"), and a federated statement has no
+        // local-execution fallback, so the query fails rather than returning
+        // rounded rows.
+        //
+        // **Integer width is refused loudly.** Measured by bisection: `NUMERIC`
+        // takes twenty-nine integer digits and `BIGNUMERIC` thirty-nine, and one
+        // more is "Invalid NUMERIC value" / "Invalid BIGNUMERIC value" rather
+        // than a wrapped or truncated number. So the widest type is always worth
+        // emitting: it computes correctly for every value that fits, and a value
+        // that does not fit fails at the remote instead of arriving wrong. That
+        // is why a precision past `BIGNUMERIC` does *not* decline — DataFusion's
+        // arithmetic inflates a decimal's declared precision far beyond the
+        // values it carries, so declining on the type would fail queries whose
+        // data fits comfortably.
+        if scale > BIGNUMERIC_MAX_SCALE {
+            return None;
+        }
         let integer_digits = precision.saturating_sub(scale.unsigned_abs());
         Some(
             if scale > NUMERIC_MAX_SCALE || integer_digits > NUMERIC_MAX_INTEGER_DIGITS {
@@ -1292,11 +1317,14 @@ impl Dialect for BigQueryDialect {
         // the predicate inside the aggregate instead.
         if let Some(predicate) = filter {
             // The rewriting below carries no ordering, so an ordered aggregate
-            // would silently lose it — and for an order-sensitive one like
-            // `string_agg` the order is part of the answer, not a presentation
-            // detail. Decline instead, which fails loudly. Only an ascending
-            // `order_by` can reach here; a descending one already returned.
-            if !order_by.is_empty() {
+            // reaching it loses that ordering. Where the order is part of the
+            // answer that is a wrong result, so it declines; where it is not —
+            // a sum or a count is the same number in any order — the rewriting
+            // still holds, and declining would only fail a query that works,
+            // since a federated statement has no local-execution fallback.
+            // Only an ascending `order_by` can reach here; a descending one has
+            // already returned.
+            if !order_by.is_empty() && order_sensitive(func_name) {
                 return Ok(None);
             }
             return bigquery_filtered_aggregate_to_sql(

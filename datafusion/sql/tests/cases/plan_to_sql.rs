@@ -10983,19 +10983,22 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
     Ok(())
 }
 
-/// Moving the predicate inside the aggregate only preserves the result for an
-/// aggregate that skips nulls, so `array_agg` has to decline.
+/// A filtered `array_agg` still takes the `CASE`, even though `array_agg` keeps
+/// nulls where the rewriting assumes they are skipped.
 ///
-/// `CASE WHEN p THEN v END` yields a null for every row the filter rejects
-/// rather than removing that row, and `array_agg` is documented as "input
-/// values, including nulls, concatenated into an array" — so those nulls become
-/// elements. Measured on BigQuery, it will not build such an array at all:
+/// This looks like the one aggregate the rewriting gets wrong, and it is not:
+/// BigQuery will not build an array holding a null at all — measured,
 /// `ARRAY_AGG(CASE WHEN x > 1 THEN x END)` over `[1,2,3]` is refused with "Array
-/// cannot have a null element", so the rewrite turns a working statement into a
-/// failing one. `IGNORE NULLS` is not the repair either — it returns `[2,3]`
-/// here, but it would equally drop a null a *retained* row holds.
+/// cannot have a null element". So the rendering is correct whenever it runs and
+/// refused whenever it would not be; it cannot return a wrong array.
+///
+/// Declining would buy no correctness and cost the cases that work, because a
+/// federated statement has no local-execution fallback: the alternative to this
+/// rendering is a failed query, not a slower one. Making it *correct* rather
+/// than merely loud is a federation-level job — denying the aggregate pushdown
+/// so it evaluates locally — not an unparser one.
 #[test]
-fn test_bigquery_declines_a_filtered_array_agg() -> Result<()> {
+fn test_bigquery_still_rewrites_a_filtered_array_agg() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
@@ -11015,12 +11018,8 @@ fn test_bigquery_declines_a_filtered_array_agg() -> Result<()> {
         .plan_to_sql(&plan)?
         .to_string();
     assert!(
-        !sql.contains("CASE WHEN"),
-        "a filtered array_agg must not guard its argument: {sql}"
-    );
-    assert!(
-        sql.contains("FILTER"),
-        "declining leaves the FILTER in place, which fails loudly: {sql}"
+        sql.contains("CASE WHEN") && !sql.contains("FILTER"),
+        "BigQuery has no FILTER clause, so the predicate has to move inside: {sql}"
     );
 
     Ok(())
@@ -11062,37 +11061,58 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
     Ok(())
 }
 
-/// A filtered aggregate that is also ordered has to decline, because the
-/// rewriting carries no ordering.
+/// An *order-sensitive* filtered aggregate declines; an order-insensitive one
+/// still takes the rewriting.
 ///
-/// `bigquery_filtered_aggregate_to_sql` receives no `order_by` and emits none,
-/// so an ordered aggregate would silently lose it — and for an order-sensitive
-/// aggregate the order is part of the answer, not a presentation detail. Only a
-/// descending sort was declined before, which let every ascending one through.
+/// The rewriting carries no ordering, so an ordered aggregate reaching it loses
+/// that ordering. Where the order is part of the answer — `array_agg`,
+/// `string_agg` — that is a wrong result, so it declines. Where it is not, a sum
+/// over the same rows is the same number in any order, and declining would only
+/// fail a query that works: a federated statement has no local-execution
+/// fallback. Only a descending sort was declined before, which let every
+/// ascending one through regardless of the aggregate.
 #[test]
-fn test_bigquery_declines_a_filtered_aggregate_that_is_ordered() -> Result<()> {
+fn test_bigquery_declines_only_an_order_sensitive_filtered_aggregate() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
     ]);
-    let plan = table_scan(Some("t"), &schema, None)?
-        .aggregate(
-            vec![col("t.g")],
-            vec![
-                datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
-                    .filter(col("t.v").gt(lit(1i64)))
-                    .order_by(vec![col("t.v").sort(true, false)])
-                    .build()?,
-            ],
-        )?
-        .build()?;
+    let rendered = |aggregate: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .aggregate(vec![col("t.g")], vec![aggregate])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+    let keeps_rows = col("t.v").gt(lit(1i64));
+    let ordering = vec![col("t.v").sort(true, false)];
 
-    let sql = Unparser::new(&BigQueryDialect {})
-        .plan_to_sql(&plan)?
-        .to_string();
+    // Order-sensitive: the order is the answer, so it declines.
+    let ordered_array_agg = rendered(
+        datafusion_functions_aggregate::expr_fn::array_agg(col("t.v"))
+            .filter(keeps_rows.clone())
+            .order_by(ordering.clone())
+            .build()?,
+    )?;
     assert!(
-        !sql.contains("CASE WHEN"),
-        "an ordered filtered aggregate must not be rewritten without its order: {sql}"
+        !ordered_array_agg.contains("CASE WHEN"),
+        "an ordered array_agg must not be rewritten without its order: \
+         {ordered_array_agg}"
+    );
+
+    // Order-insensitive: the same rows give the same sum in any order, so
+    // rewriting it still holds and declining would only lose the pushdown.
+    let ordered_sum = rendered(
+        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+            .filter(keeps_rows)
+            .order_by(ordering)
+            .build()?,
+    )?;
+    assert!(
+        ordered_sum.contains("CASE WHEN") && !ordered_sum.contains("FILTER"),
+        "an ordered sum is the same number in any order, so it still \
+         federates: {ordered_sum}"
     );
 
     Ok(())
@@ -11833,6 +11853,63 @@ fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Resu
     assert!(
         fits.contains("AS NUMERIC)") && !fits.contains("BIGNUMERIC"),
         "29 integer and 9 fractional digits fit NUMERIC exactly: {fits}"
+    );
+
+    // An integer width past BIGNUMERIC's own limit still renders BIGNUMERIC
+    // rather than declining. Measured, BIGNUMERIC takes 39 integer digits and
+    // refuses a fortieth *outright* — "Invalid BIGNUMERIC value" — so the widest
+    // type computes correctly for every value that fits and fails loudly for one
+    // that does not. Declining would fail the statement even where the data fits
+    // comfortably, and DataFusion's arithmetic inflates a declared precision far
+    // beyond the values it carries.
+    let past_bignumeric = rendered(DataType::Decimal256(76, 2))?;
+    assert!(
+        past_bignumeric.contains("AS BIGNUMERIC)"),
+        "the widest type is still worth emitting when overflow is loud: \
+         {past_bignumeric}"
+    );
+
+    Ok(())
+}
+
+/// A *scale* wider than `BIGNUMERIC` holds cannot be rendered at all, because
+/// BigQuery loses it silently.
+///
+/// This is the opposite failure mode to an integer overflow, and the reason the
+/// two halves are treated differently. Measured: `CAST('1.234567890123' AS
+/// NUMERIC)` returns `1.23456789`, and `BIGNUMERIC` given thirty-nine
+/// fractional digits keeps thirty-eight — no error either time. So a rendering
+/// that narrows the scale returns rounded rows and reports nothing, where a
+/// narrowed integer width is refused outright.
+///
+/// Declining is loud: the fallback spelling `DECIMAL(p, s)` is itself refused
+/// ("In NUMERIC(P, S), S must be between 0 and 9"), and a federated statement
+/// has no local-execution fallback, so the statement fails rather than
+/// returning quietly rounded values. Making it *correct* is a federation-level
+/// job — keeping the cast out of the pushdown so it evaluates locally.
+#[test]
+fn test_bigquery_declines_a_decimal_scale_it_would_round_away() -> Result<()> {
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let rendered = |data_type: DataType| -> Result<String> {
+        Ok(unparser
+            .expr_to_sql(&cast(col("a"), data_type))?
+            .to_string())
+    };
+
+    // Thirty-eight fractional digits are exactly what BIGNUMERIC holds.
+    let holds = rendered(DataType::Decimal256(76, 38))?;
+    assert!(
+        holds.contains("AS BIGNUMERIC)"),
+        "38 fractional digits fit BIGNUMERIC exactly: {holds}"
+    );
+
+    // A thirty-ninth is rounded away without an error, so it must not render as
+    // a BigQuery decimal type at all.
+    let rounds = rendered(DataType::Decimal256(76, 39))?;
+    assert!(
+        !rounds.contains("NUMERIC"),
+        "a scale BigQuery would round away must not be rendered as one of its \
+         decimal types: {rounds}"
     );
 
     Ok(())
