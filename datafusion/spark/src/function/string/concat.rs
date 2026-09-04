@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use arrow::array::new_null_array;
 use arrow::datatypes::{DataType, Field};
 use datafusion_common::arrow::datatypes::FieldRef;
 use datafusion_common::{Result, ScalarValue};
@@ -71,8 +72,19 @@ impl ScalarUDFImpl for SparkConcat {
     }
 
     fn coerce_types(&self, arg_types: &[DataType]) -> Result<Vec<DataType>> {
-        // Accept any string types, including zero arguments
-        Ok(arg_types.to_vec())
+        // Accept any string types, including zero arguments. An untyped `Null`
+        // has to be given one: `spark_concat` hands its arguments to
+        // `ConcatFunc`, whose array branch matches the concrete string and
+        // binary variants and reaches `unreachable!("concat")` for anything
+        // else. Under Spark semantics a NULL argument makes the whole call
+        // NULL, so the type only has to be one that branch accepts.
+        Ok(arg_types
+            .iter()
+            .map(|arg_type| match arg_type {
+                DataType::Null => DataType::Utf8,
+                other => other.clone(),
+            })
+            .collect())
     }
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
         datafusion_common::internal_err!(
@@ -141,6 +153,18 @@ fn spark_concat(args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         };
     }
 
+    // Every row is NULL, so nothing DataFusion's concat computes survives
+    // `apply_null_mask`. Answer directly rather than concatenating values that
+    // are about to be masked away.
+    if let NullMaskResolution::Apply(mask) = &null_mask
+        && mask.null_count() == mask.len()
+    {
+        return Ok(ColumnarValue::Array(new_null_array(
+            return_field.data_type(),
+            mask.len(),
+        )));
+    }
+
     // Step 2: Delegate to DataFusion's concat
     let concat_func = ConcatFunc::new();
     let return_type = return_field.data_type().clone();
@@ -203,8 +227,8 @@ mod tests {
             None,
             Some("delta"),
         ]));
-        let coerced = SparkConcat::new()
-            .coerce_types(&[DataType::Utf8, DataType::Null])?;
+        let coerced =
+            SparkConcat::new().coerce_types(&[DataType::Utf8, DataType::Null])?;
 
         let result = SparkConcat::new().invoke_with_args(ScalarFunctionArgs {
             args: vec![
