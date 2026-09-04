@@ -1716,27 +1716,27 @@ fn raw_string(value: &str) -> ast::Expr {
     ast::Expr::Value(ast::Value::SingleQuotedRawStringLiteral(value.to_string()).into())
 }
 
-/// Whether the order of an aggregate's input is part of its answer.
+/// Whether moving a `FILTER` inside this aggregate as `CASE WHEN p THEN arg END`
+/// leaves its result unchanged.
 ///
-/// The rewriting below carries no ordering, so an ordered aggregate reaching it
-/// loses it. For most aggregates that costs nothing — a sum or a count over the
-/// same rows is the same number in any order — but for these the order *is* part
-/// of the result, so they decline rather than answer differently.
+/// An **allowlist**, not a blocklist, and deliberately: the rewriting is exact
+/// only for an aggregate that skips null inputs, and nothing in `AggregateUDF`
+/// reports whether one does. A blocklist would therefore be wrong by default for
+/// every user-defined aggregate — and wrong in the direction that changes
+/// results — so an aggregate this does not name declines instead.
 ///
-/// Declining is not free: a federated statement has no local-execution
-/// fallback, so it fails rather than running elsewhere. That is the right trade
-/// only where the alternative is a wrong answer, which is why this list is the
-/// order-sensitive aggregates and not every ordered one.
-pub(crate) fn order_sensitive(func_name: &str) -> bool {
-    [
-        "array_agg",
-        "string_agg",
-        "first_value",
-        "last_value",
-        "nth_value",
-    ]
-    .iter()
-    .any(|sensitive| func_name.eq_ignore_ascii_case(sensitive))
+/// Measured on BigQuery over `[1,2,3]` with `x > 1`: `COUNTIF` and
+/// `COUNT(CASE …)` both give 2, and `SUM(CASE …)` gives 5.
+///
+/// `array_agg` is the instructive exclusion. It keeps nulls, so the `CASE`
+/// yields an element for every rejected row — and BigQuery refuses to build an
+/// array holding a null at all ("Array cannot have a null element"). The
+/// rewriting therefore fails for any filter that actually filters, where
+/// DataFusion answers `[2, 3]`. Declining leaves it for the local engine.
+pub(crate) fn filter_rewrite_is_exact(func_name: &str) -> bool {
+    ["count", "sum", "min", "max", "avg"]
+        .iter()
+        .any(|exact| func_name.eq_ignore_ascii_case(exact))
 }
 
 /// Renders an aggregate's `FILTER (WHERE ...)` for BigQuery, which has no such
@@ -1767,6 +1767,10 @@ pub(crate) fn bigquery_filtered_aggregate_to_sql(
     distinct: bool,
     predicate: &Expr,
 ) -> Result<Option<ast::Expr>> {
+    if !filter_rewrite_is_exact(func_name) {
+        return Ok(None);
+    }
+
     let condition = unparser.expr_to_sql(predicate)?;
 
     // `COUNT(*)` counts rows, so the predicate is the whole of it. `COUNT(1)`

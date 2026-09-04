@@ -22,7 +22,7 @@ use super::{
     utils::bigquery_filtered_aggregate_to_sql, utils::bigquery_percentile_to_sql,
     utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_timestamp_to_sql,
     utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
-    utils::character_length_to_sql, utils::date_part_to_sql, utils::order_sensitive,
+    utils::character_length_to_sql, utils::date_part_to_sql,
     utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
@@ -1312,15 +1312,17 @@ impl Dialect for BigQueryDialect {
         // BigQuery has no `FILTER (WHERE ...)`; it restricts the rows by moving
         // the predicate inside the aggregate instead.
         if let Some(predicate) = filter {
-            // The rewriting below carries no ordering, so an ordered aggregate
-            // reaching it loses that ordering. Where the order is part of the
-            // answer that is a wrong result, so it declines; where it is not —
-            // a sum or a count is the same number in any order — the rewriting
-            // still holds, and declining would only fail a query that works,
-            // since a federated statement has no local-execution fallback.
-            // Only an ascending `order_by` can reach here; a descending one has
-            // already returned.
-            if !order_by.is_empty() && order_sensitive(func_name) {
+            // The rewriting below carries no ordering and no way to know
+            // whether this aggregate needs one. Nothing on `AggregateUDF`
+            // reaches this method — it receives the name — and a list of
+            // order-sensitive *names* would be wrong by default for every
+            // user-defined aggregate, in the direction that changes results.
+            // So any ordering at all declines. That costs the pushdown for an
+            // ordered `sum`, whose order does not matter; the federation layer
+            // refuses the same shape, so it evaluates locally and answers
+            // correctly rather than failing. Only an ascending `order_by`
+            // reaches here; a descending one has already returned.
+            if !order_by.is_empty() {
                 return Ok(None);
             }
             return bigquery_filtered_aggregate_to_sql(

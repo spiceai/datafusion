@@ -10983,22 +10983,24 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
     Ok(())
 }
 
-/// A filtered `array_agg` still takes the `CASE`, even though `array_agg` keeps
-/// nulls where the rewriting assumes they are skipped.
+/// A filtered `array_agg` declines, because the rewriting does not survive it.
 ///
-/// This looks like the one aggregate the rewriting gets wrong, and it is not:
-/// BigQuery will not build an array holding a null at all — measured,
-/// `ARRAY_AGG(CASE WHEN x > 1 THEN x END)` over `[1,2,3]` is refused with "Array
-/// cannot have a null element". So the rendering is correct whenever it runs and
-/// refused whenever it would not be; it cannot return a wrong array.
+/// `array_agg` keeps null inputs where the rewriting assumes they are skipped,
+/// so `CASE WHEN p THEN v END` yields an element for every *rejected* row — and
+/// BigQuery refuses to build an array holding a null at all, measured:
+/// `ARRAY_AGG(CASE WHEN x > 1 THEN x END)` over `[1,2,3]` is `Array cannot have
+/// a null element`. So the rewriting fails for any filter that actually filters,
+/// where DataFusion answers `[2, 3]`.
 ///
-/// Declining would buy no correctness and cost the cases that work, because a
-/// federated statement has no local-execution fallback: the alternative to this
-/// rendering is a failed query, not a slower one. Making it *correct* rather
-/// than merely loud is a federation-level job — denying the aggregate pushdown
-/// so it evaluates locally — not an unparser one.
+/// Declining is what makes that query work: the federation layer refuses the
+/// same shape, so the aggregate evaluates locally and returns `[2, 3]` rather
+/// than the statement failing at the remote.
+///
+/// The gate is an allowlist — see `filter_rewrite_is_exact` — so a user-defined
+/// aggregate is declined too rather than rewritten on the assumption that it
+/// skips nulls.
 #[test]
-fn test_bigquery_still_rewrites_a_filtered_array_agg() -> Result<()> {
+fn test_bigquery_declines_a_filtered_array_agg() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
@@ -11018,8 +11020,8 @@ fn test_bigquery_still_rewrites_a_filtered_array_agg() -> Result<()> {
         .plan_to_sql(&plan)?
         .to_string();
     assert!(
-        sql.contains("CASE WHEN") && !sql.contains("FILTER"),
-        "BigQuery has no FILTER clause, so the predicate has to move inside: {sql}"
+        !sql.contains("CASE WHEN"),
+        "a filtered array_agg must not be rewritten into an array of nulls: {sql}"
     );
 
     Ok(())
@@ -11061,18 +11063,19 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
     Ok(())
 }
 
-/// An *order-sensitive* filtered aggregate declines; an order-insensitive one
-/// still takes the rewriting.
+/// Any ordered filtered aggregate declines, whatever the aggregate.
 ///
-/// The rewriting carries no ordering, so an ordered aggregate reaching it loses
-/// that ordering. Where the order is part of the answer — `array_agg`,
-/// `string_agg` — that is a wrong result, so it declines. Where it is not, a sum
-/// over the same rows is the same number in any order, and declining would only
-/// fail a query that works: a federated statement has no local-execution
-/// fallback. Only a descending sort was declined before, which let every
-/// ascending one through regardless of the aggregate.
+/// The rewriting carries no ordering, and this method receives the aggregate's
+/// *name*, not its `AggregateUDF` — so there is no way to ask whether this one
+/// needs its ordering. A list of order-sensitive names would be wrong by default
+/// for every user-defined aggregate, and wrong in the direction that changes
+/// results, so any ordering declines.
+///
+/// That costs the pushdown for an ordered `sum`, whose order does not matter.
+/// It costs only the pushdown: the federation layer refuses the same shape, so
+/// the aggregate evaluates locally and still answers correctly.
 #[test]
-fn test_bigquery_declines_only_an_order_sensitive_filtered_aggregate() -> Result<()> {
+fn test_bigquery_declines_any_ordered_filtered_aggregate() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
@@ -11088,31 +11091,29 @@ fn test_bigquery_declines_only_an_order_sensitive_filtered_aggregate() -> Result
     let keeps_rows = col("t.v").gt(lit(1i64));
     let ordering = vec![col("t.v").sort(true, false)];
 
-    // Order-sensitive: the order is the answer, so it declines.
-    let ordered_array_agg = rendered(
-        datafusion_functions_aggregate::expr_fn::array_agg(col("t.v"))
-            .filter(keeps_rows.clone())
-            .order_by(ordering.clone())
-            .build()?,
-    )?;
-    assert!(
-        !ordered_array_agg.contains("CASE WHEN"),
-        "an ordered array_agg must not be rewritten without its order: \
-         {ordered_array_agg}"
-    );
-
-    // Order-insensitive: the same rows give the same sum in any order, so
-    // rewriting it still holds and declining would only lose the pushdown.
     let ordered_sum = rendered(
         datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
-            .filter(keeps_rows)
+            .filter(keeps_rows.clone())
             .order_by(ordering)
             .build()?,
     )?;
     assert!(
-        ordered_sum.contains("CASE WHEN") && !ordered_sum.contains("FILTER"),
-        "an ordered sum is the same number in any order, so it still \
-         federates: {ordered_sum}"
+        !ordered_sum.contains("CASE WHEN"),
+        "an ordered filtered aggregate must not be rewritten without its \
+         ordering: {ordered_sum}"
+    );
+
+    // The control: with no ordering, the same aggregate still rewrites, so the
+    // decline is keyed on the ordering and not on the aggregate.
+    let unordered_sum = rendered(
+        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+            .filter(keeps_rows)
+            .build()?,
+    )?;
+    assert!(
+        unordered_sum.contains("CASE WHEN") && !unordered_sum.contains("FILTER"),
+        "an unordered filtered sum still moves the predicate inside: \
+         {unordered_sum}"
     );
 
     Ok(())
