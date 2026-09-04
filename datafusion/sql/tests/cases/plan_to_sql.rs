@@ -11489,6 +11489,82 @@ fn test_a_subquery_in_an_inner_join_predicate_moves_to_where() -> Result<()> {
     Ok(())
 }
 
+/// A subquery in an outer join's predicate may be correlated to the preserved
+/// input. Applied in the null-extended input's own scope it would name a
+/// relation that scope cannot see — a non-lateral derived table has no view of
+/// the join's other side — so the conjunct has to stay in `ON`. Only a
+/// correlation the null-extended input itself answers, or one a body inside the
+/// subquery answers, may move with it. A reference two levels down is on no
+/// `outer_ref_columns` list the outer subquery holds, so it is asked separately.
+#[test]
+fn test_a_subquery_correlated_to_the_preserved_input_stays_in_on() -> Result<()> {
+    let plan_for = |predicate: &str| -> Result<String> {
+        let query = format!(
+            "SELECT j1.j1_id, j2.j2_id FROM j1 LEFT JOIN j2 \
+             ON j1.j1_id = j2.j2_id AND {predicate}"
+        );
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(&query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+    let split = |sql: &str| -> (String, String) {
+        let (before_on, after_on) = sql
+            .split_once(" ON ")
+            .expect("the join has to keep an ON clause");
+        (before_on.to_string(), after_on.to_string())
+    };
+
+    // Correlated to the preserved input, directly or two levels down: the
+    // derived table wrapping `j2` cannot see `j1`.
+    for predicate in [
+        "EXISTS (SELECT 1 FROM j3 WHERE j3.j3_id = j1.j1_id)",
+        "EXISTS (SELECT 1 FROM j3 WHERE EXISTS \
+            (SELECT 1 FROM j3 AS x WHERE x.j3_id = j1.j1_id))",
+    ] {
+        let sql = plan_for(predicate)?;
+        let (before_on, after_on) = split(&sql);
+        assert!(
+            !before_on.contains("EXISTS (SELECT"),
+            "a correlation to the preserved input must not move into the other \
+             input's scope: {sql}"
+        );
+        assert!(
+            after_on.contains("EXISTS (SELECT"),
+            "the conjunct has to stay in ON, where the reference is in scope: {sql}"
+        );
+    }
+
+    // Correlated to the null-extended input, directly or two levels down, or to
+    // the body enclosing the nested subquery: every reference is answered at or
+    // inside the scope the conjunct moves to.
+    for predicate in [
+        "EXISTS (SELECT 1 FROM j3 WHERE j3.j3_id = j2.j2_id)",
+        "EXISTS (SELECT 1 FROM j3 WHERE EXISTS \
+            (SELECT 1 FROM j3 AS x WHERE x.j3_id = j2.j2_id))",
+        "EXISTS (SELECT 1 FROM j3 WHERE EXISTS \
+            (SELECT 1 FROM j3 AS x WHERE x.j3_id = j3.j3_id))",
+    ] {
+        let sql = plan_for(predicate)?;
+        let (before_on, after_on) = split(&sql);
+        assert!(
+            !after_on.contains("EXISTS (SELECT"),
+            "an outer join must not carry a subquery in ON: {sql}"
+        );
+        assert!(
+            before_on.contains("EXISTS (SELECT"),
+            "the null-extended input's own scope has to take it: {sql}"
+        );
+    }
+    Ok(())
+}
+
 /// A `BigQuery` cast target carries no precision or scale — a parameterized type
 /// is refused in a `CAST` — so the type itself has to carry the width: `NUMERIC`
 /// holds nine fractional digits and `BIGNUMERIC` thirty-eight, and a scale past

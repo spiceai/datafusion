@@ -54,9 +54,7 @@ use datafusion_common::{
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
-use datafusion_expr::expr::{
-    Cast, Exists, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX,
-};
+use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
     LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
@@ -818,8 +816,9 @@ impl Unparser<'_> {
     /// select the same rows, so that input's own scope is where it goes.
     ///
     /// Only a conjunct whose every reference — its own columns and any outer
-    /// reference its subquery carries — comes from that input is moved. Anything
-    /// else would leave the scope that answers it behind.
+    /// reference its subquery emits past itself, at any depth — comes from that
+    /// input is moved. Anything else would leave the scope that answers it
+    /// behind: a non-lateral derived table has no view of the join's other side.
     ///
     /// Returns `(the filter that stays, the conjuncts the input's scope takes)`.
     fn scope_subquery_onto_non_preserved_input(join: &Join) -> (Option<Expr>, Vec<Expr>) {
@@ -839,26 +838,21 @@ impl Unparser<'_> {
                 .all(|column| reachable.contains(column))
                 && expr
                     .apply(|sub| {
-                        let outer = match sub {
-                            Expr::InSubquery(in_subquery) => {
-                                &in_subquery.subquery.outer_ref_columns
-                            }
-                            Expr::ScalarSubquery(subquery)
-                            | Expr::Exists(Exists { subquery, .. }) => {
-                                &subquery.outer_ref_columns
-                            }
-                            _ => return Ok(TreeNodeRecursion::Continue),
+                        let Some(subquery) = Self::subquery_of(sub) else {
+                            return Ok(TreeNodeRecursion::Continue);
                         };
-                        if outer
-                            .iter()
-                            .flat_map(Expr::column_refs)
-                            .all(|column| reachable.contains(column))
-                        {
-                            Ok(TreeNodeRecursion::Continue)
-                        } else {
-                            Ok(TreeNodeRecursion::Stop)
-                        }
+                        let mut reaching = vec![];
+                        Self::outward_references(subquery, &mut reaching)?;
+                        Ok(
+                            if reaching.iter().all(|column| reachable.contains(column)) {
+                                TreeNodeRecursion::Continue
+                            } else {
+                                TreeNodeRecursion::Stop
+                            },
+                        )
                     })
+                    // An error here is a list this cannot read, and keeping the
+                    // conjunct in `ON` is the safe answer to that.
                     .is_ok_and(|recursion| recursion != TreeNodeRecursion::Stop)
         };
         let (scoped, kept): (Vec<Expr>, Vec<Expr>) = split_conjunction(filter)
@@ -868,6 +862,67 @@ impl Unparser<'_> {
                 expr_contains_subquery(conjunct) && reads_only_that_input(conjunct)
             });
         (kept.into_iter().reduce(Expr::and), scoped)
+    }
+
+    /// The columns the outer references `subquery` emits past itself name, at
+    /// any depth.
+    ///
+    /// Its own [`Subquery::outer_ref_columns`] are the references written into
+    /// its body. A nested subquery's are relative to the body enclosing *it*:
+    /// one naming a column the node holding that subquery can see binds there,
+    /// as the planner bound it, and goes no further; the rest pass out through
+    /// this level as well. `outer_ref_columns` leaves those out, for the reason
+    /// [`Self::nested_subqueries_reach_captured_scope`] gives, so reaching them
+    /// needs this descent.
+    ///
+    /// `outer_ref_columns` holds `Expr::OuterReferenceColumn`s, which
+    /// [`Expr::column_refs`] passes over, so the column is read out of each one
+    /// directly. Anything else on the list is an error rather than a reference
+    /// silently taken as reaching nowhere.
+    ///
+    /// Recursion depth is the plan's subquery nesting depth, which nothing
+    /// bounds, so it grows the stack the way
+    /// [`Self::subquery_reaches_captured_scope`] does.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn outward_references(subquery: &Subquery, reaching: &mut Vec<Column>) -> Result<()> {
+        for outer in &subquery.outer_ref_columns {
+            let Expr::OuterReferenceColumn(_, column) = outer else {
+                return internal_err!(
+                    "outer_ref_columns holds a {} rather than an outer reference",
+                    outer.variant_name()
+                );
+            };
+            reaching.push(column.clone());
+        }
+        subquery.subquery.apply(|node| {
+            // What this node's expressions can see: the columns its inputs
+            // present, or its own where it has none.
+            let inputs = node.inputs();
+            let visible: HashSet<Column> = if inputs.is_empty() {
+                node.schema().columns().into_iter().collect()
+            } else {
+                inputs
+                    .into_iter()
+                    .flat_map(|input| input.schema().columns())
+                    .collect()
+            };
+            node.apply_expressions(|expr| {
+                expr.apply(|sub| {
+                    let Some(nested) = Self::subquery_of(sub) else {
+                        return Ok(TreeNodeRecursion::Continue);
+                    };
+                    let mut nested_reaching = vec![];
+                    Self::outward_references(nested, &mut nested_reaching)?;
+                    reaching.extend(
+                        nested_reaching
+                            .into_iter()
+                            .filter(|column| !visible.contains(column)),
+                    );
+                    Ok(TreeNodeRecursion::Continue)
+                })
+            })
+        })?;
+        Ok(())
     }
 
     fn derive_join_side(
