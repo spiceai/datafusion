@@ -9709,6 +9709,97 @@ fn windowed_sum(frame: WindowFrame, asc: bool, nulls_first: bool) -> Result<Logi
         .build()
 }
 
+/// Builds `<window fn>(t.v) OVER (ORDER BY t.k <frame>)` for a named window
+/// function, so a dialect's framing decision can be read off the rendered
+/// `OVER` clause.
+fn windowed_call(
+    fun: WindowFunctionDefinition,
+    args: Vec<Expr>,
+    frame: WindowFrame,
+) -> Result<LogicalPlan> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let windowed = Expr::from(WindowFunction {
+        fun,
+        params: WindowFunctionParams {
+            args,
+            partition_by: vec![],
+            order_by: vec![datafusion_expr::expr::Sort::new(col("t.k"), true, false)],
+            window_frame: frame,
+            null_treatment: None,
+            filter: None,
+            distinct: false,
+        },
+    });
+    table_scan(Some("t"), &schema, None)?
+        .window(vec![windowed])?
+        .build()
+}
+
+/// `BigQuery` refuses a framing clause on `LEAD` and `LAG`, so the frame is
+/// dropped for those two — but kept for the navigation functions that do accept
+/// one, because dropping theirs would change which rows contribute rather than
+/// fix a rejection.
+#[test]
+fn test_bigquery_drops_the_frame_only_from_lead_and_lag() -> Result<()> {
+    let rows = WindowFrame::new_bounds(
+        datafusion_expr::window_frame::WindowFrameUnits::Rows,
+        datafusion_expr::window_frame::WindowFrameBound::Preceding(
+            datafusion_common::ScalarValue::UInt64(None),
+        ),
+        datafusion_expr::window_frame::WindowFrameBound::CurrentRow,
+    );
+    let rendered = |fun: WindowFunctionDefinition, args: Vec<Expr>| -> Result<String> {
+        let plan = windowed_call(fun, args, rows.clone())?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    for (name, fun) in [
+        (
+            "LEAD",
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::lead_lag::lead_udwf(),
+            ),
+        ),
+        (
+            "LAG",
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::lead_lag::lag_udwf(),
+            ),
+        ),
+    ] {
+        let sql = rendered(fun, vec![col("t.v")])?;
+        assert!(
+            !sql.contains("ROWS BETWEEN"),
+            "{name} refuses a framing clause, so none may be emitted: {sql}"
+        );
+        // Non-vacuity: the window and its ordering still have to be there.
+        assert!(
+            sql.contains("OVER (ORDER BY `t`.`k`"),
+            "{name} keeps its window and ordering: {sql}"
+        );
+    }
+
+    // The control: a navigation function that accepts a frame keeps it, so the
+    // frame is not dropped from every window function.
+    let kept = rendered(
+        WindowFunctionDefinition::WindowUDF(
+            datafusion_functions_window::nth_value::first_value_udwf(),
+        ),
+        vec![col("t.v")],
+    )?;
+    assert!(
+        kept.contains("ROWS BETWEEN"),
+        "FIRST_VALUE accepts a frame, so dropping it would change the rows: {kept}"
+    );
+
+    Ok(())
+}
+
 /// A dialect that accepts only its own NULL placement inside a `RANGE` frame gets
 /// the placement as a leading `IS NULL` key, and keeps the rows the plan asked for.
 ///
@@ -10892,6 +10983,121 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
     Ok(())
 }
 
+/// Moving the predicate inside the aggregate only preserves the result for an
+/// aggregate that skips nulls, so `array_agg` has to decline.
+///
+/// `CASE WHEN p THEN v END` yields a null for every row the filter rejects
+/// rather than removing that row, and `array_agg` is documented as "input
+/// values, including nulls, concatenated into an array" — so those nulls become
+/// elements. Measured on BigQuery, it will not build such an array at all:
+/// `ARRAY_AGG(CASE WHEN x > 1 THEN x END)` over `[1,2,3]` is refused with "Array
+/// cannot have a null element", so the rewrite turns a working statement into a
+/// failing one. `IGNORE NULLS` is not the repair either — it returns `[2,3]`
+/// here, but it would equally drop a null a *retained* row holds.
+#[test]
+fn test_bigquery_declines_a_filtered_array_agg() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.g")],
+            vec![
+                datafusion_functions_aggregate::expr_fn::array_agg(col("t.v"))
+                    .filter(col("t.v").gt(lit(1i64)))
+                    .build()?,
+            ],
+        )?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("CASE WHEN"),
+        "a filtered array_agg must not guard its argument: {sql}"
+    );
+    assert!(
+        sql.contains("FILTER"),
+        "declining leaves the FILTER in place, which fails loudly: {sql}"
+    );
+
+    Ok(())
+}
+
+/// `COUNT(*)` counts rows and so does `COUNT(1)`, but `COUNT(NULL)` counts
+/// nothing, so only a *non-null* literal stands in for `*`.
+///
+/// Measured on BigQuery over `[1,2,3]` with `x > 1`: `COUNT(NULL)` is 0 where
+/// `COUNTIF(x > 1)` is 2. Treating every literal as row-counting therefore
+/// returns a different number with no error at all.
+#[test]
+fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.g")],
+            vec![
+                datafusion_functions_aggregate::expr_fn::count(lit(
+                    datafusion_common::ScalarValue::Null,
+                ))
+                    .filter(col("t.v").gt(lit(1i64)))
+                    .build()?,
+            ],
+        )?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("COUNTIF("),
+        "COUNT(NULL) counts no rows, so it is not COUNTIF: {sql}"
+    );
+
+    Ok(())
+}
+
+/// A filtered aggregate that is also ordered has to decline, because the
+/// rewriting carries no ordering.
+///
+/// `bigquery_filtered_aggregate_to_sql` receives no `order_by` and emits none,
+/// so an ordered aggregate would silently lose it — and for an order-sensitive
+/// aggregate the order is part of the answer, not a presentation detail. Only a
+/// descending sort was declined before, which let every ascending one through.
+#[test]
+fn test_bigquery_declines_a_filtered_aggregate_that_is_ordered() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.g")],
+            vec![
+                datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+                    .filter(col("t.v").gt(lit(1i64)))
+                    .order_by(vec![col("t.v").sort(true, false)])
+                    .build()?,
+            ],
+        )?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("CASE WHEN"),
+        "an ordered filtered aggregate must not be rewritten without its order: {sql}"
+    );
+
+    Ok(())
+}
+
 /// An instant compared against a date has no common supertype in `BigQuery`,
 /// but a *civil* timestamp against a date does. Measured: `TIMESTAMP >= DATE`
 /// is rejected with "No matching signature for operator >=", while
@@ -11585,6 +11791,50 @@ fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
         wide_sql.contains("AS BIGNUMERIC)"),
         "a scale past nine needs BIGNUMERIC, unparameterized: {wide_sql}"
     );
+    Ok(())
+}
+
+/// A decimal whose *integer* part does not fit `NUMERIC` needs `BIGNUMERIC`
+/// too, not only one whose scale does not.
+///
+/// `NUMERIC` is precision 38 scale 9, so it holds 29 integer digits. Measured on
+/// BigQuery: `CAST('123456789012345678901234567890' AS NUMERIC)` — thirty digits
+/// — is refused with "Invalid NUMERIC value", where `BIGNUMERIC` returns it, and
+/// 29 integer digits alongside 9 fractional ones is accepted. Selecting on scale
+/// alone emits a type the value overflows, for a width that arrives from
+/// arithmetic and appears in no declared column type.
+#[test]
+fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Result<()>
+{
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let rendered = |data_type: DataType| -> Result<String> {
+        Ok(unparser
+            .expr_to_sql(&cast(col("a"), data_type))?
+            .to_string())
+    };
+
+    // 38 integer digits and no fractional part: the scale fits NUMERIC, the
+    // integer part does not.
+    let integral = rendered(DataType::Decimal128(38, 0))?;
+    assert!(
+        integral.contains("AS BIGNUMERIC)"),
+        "38 integer digits overflow NUMERIC's 29: {integral}"
+    );
+
+    // A 256-bit decimal reaches widths NUMERIC cannot express at any scale.
+    let very_wide = rendered(DataType::Decimal256(76, 2))?;
+    assert!(
+        very_wide.contains("AS BIGNUMERIC)"),
+        "74 integer digits overflow NUMERIC's 29: {very_wide}"
+    );
+
+    // The boundary NUMERIC does hold, so the wider type is not chosen blindly.
+    let fits = rendered(DataType::Decimal128(38, 9))?;
+    assert!(
+        fits.contains("AS NUMERIC)") && !fits.contains("BIGNUMERIC"),
+        "29 integer and 9 fractional digits fit NUMERIC exactly: {fits}"
+    );
+
     Ok(())
 }
 

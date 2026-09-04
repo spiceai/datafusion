@@ -146,22 +146,26 @@ pub trait Dialect: Send + Sync {
     /// The default discards `tz`, which is the rendering every dialect has always
     /// received; only a dialect whose timestamp type depends on the zone needs to
     /// override it.
-    /// How this dialect spells a decimal of `precision` and `scale`.
-    ///
-    /// `None` keeps `DECIMAL(precision, scale)`, which is what every dialect has
-    /// always received. A dialect whose decimal types carry different scale limits
-    /// has to select between them here, because the width follows from arithmetic
-    /// — dividing two decimals widens the scale — and not from any declared type.
-    fn decimal_type_to_sql(&self, _precision: u64, _scale: i64) -> Option<ast::DataType> {
-        None
-    }
-
     fn timestamp_literal_cast_dtype(
         &self,
         time_unit: &TimeUnit,
         _tz: &Option<Arc<str>>,
     ) -> ast::DataType {
         self.timestamp_cast_dtype(time_unit, &None)
+    }
+
+    /// How this dialect spells a decimal of `precision` and `scale`.
+    ///
+    /// `None` keeps `DECIMAL(precision, scale)`, which is what every dialect has
+    /// always received. A dialect whose decimal types carry different limits has
+    /// to select between them here, because the width follows from arithmetic —
+    /// dividing two decimals widens the scale — and not from any declared type.
+    ///
+    /// Both halves of the width matter: `precision - scale` is the integer part,
+    /// which is where the digits a sum or a product grows into actually live, so
+    /// a dialect selecting on `scale` alone silently narrows it.
+    fn decimal_type_to_sql(&self, _precision: u64, _scale: i64) -> Option<ast::DataType> {
+        None
     }
 
     /// The most sub-second digits the dialect's timestamp literals hold, or
@@ -1004,6 +1008,15 @@ impl Dialect for SqliteDialect {
     }
 }
 
+/// The widest scale a BigQuery `NUMERIC` holds; a scale past it is refused
+/// rather than rounded.
+const NUMERIC_MAX_SCALE: i64 = 9;
+
+/// The most integer digits a BigQuery `NUMERIC` holds — its precision of 38
+/// less its scale of 9. A value needing a thirtieth is refused with "Invalid
+/// NUMERIC value".
+const NUMERIC_MAX_INTEGER_DIGITS: u64 = 29;
+
 #[derive(Default)]
 pub struct BigQueryDialect {}
 
@@ -1044,17 +1057,24 @@ impl Dialect for BigQueryDialect {
         }
     }
 
-    fn decimal_type_to_sql(&self, _precision: u64, scale: i64) -> Option<ast::DataType> {
+    fn decimal_type_to_sql(&self, precision: u64, scale: i64) -> Option<ast::DataType> {
         // A cast target carries no precision or scale — `CAST(x AS NUMERIC(38, 9))`
         // is refused as a parameterized type — so the choice of type is the only
-        // way to keep the width. `NUMERIC` holds nine fractional digits and
-        // `BIGNUMERIC` thirty-eight, and a scale past nine is refused rather than
-        // rounded, so it selects the wider type instead of truncating.
-        Some(if scale > 9 {
-            ast::DataType::BigNumeric(ast::ExactNumberInfo::None)
-        } else {
-            ast::DataType::Numeric(ast::ExactNumberInfo::None)
-        })
+        // way to keep the width.
+        //
+        // `NUMERIC` is precision 38 scale 9, which bounds *both* halves: nine
+        // fractional digits and twenty-nine integer digits. Measured on BigQuery,
+        // a thirtieth integer digit is refused outright ("Invalid NUMERIC value")
+        // where `BIGNUMERIC` takes it, and a scale past nine is refused rather
+        // than rounded. So either half overflowing selects the wider type.
+        let integer_digits = precision.saturating_sub(scale.unsigned_abs());
+        Some(
+            if scale > NUMERIC_MAX_SCALE || integer_digits > NUMERIC_MAX_INTEGER_DIGITS {
+                ast::DataType::BigNumeric(ast::ExactNumberInfo::None)
+            } else {
+                ast::DataType::Numeric(ast::ExactNumberInfo::None)
+            },
+        )
     }
 
     fn unnest_as_table_factor(&self) -> bool {
@@ -1271,6 +1291,14 @@ impl Dialect for BigQueryDialect {
         // BigQuery has no `FILTER (WHERE ...)`; it restricts the rows by moving
         // the predicate inside the aggregate instead.
         if let Some(predicate) = filter {
+            // The rewriting below carries no ordering, so an ordered aggregate
+            // would silently lose it — and for an order-sensitive one like
+            // `string_agg` the order is part of the answer, not a presentation
+            // detail. Decline instead, which fails loudly. Only an ascending
+            // `order_by` can reach here; a descending one already returned.
+            if !order_by.is_empty() {
+                return Ok(None);
+            }
             return bigquery_filtered_aggregate_to_sql(
                 unparser, func_name, args, distinct, predicate,
             );
