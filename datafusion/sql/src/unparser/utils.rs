@@ -1794,8 +1794,16 @@ pub(crate) fn bigquery_filtered_aggregate_to_sql(
     // counts them too, but `COUNT(NULL)` counts nothing at all — measured on
     // BigQuery, it is 0 where `COUNTIF` over the same rows is 2 — so only a
     // non-null literal stands in for `*`.
+    //
+    // The wildcard arm is belt-and-braces: `AggregateFunctionPlanner` rewrites
+    // `count(*)` and `count()` into `count(1)` before a SQL-planned statement
+    // reaches here, so a plan built by the planner never carries it. A plan
+    // assembled directly still can, and the generic path below would render it
+    // `COUNT(CASE WHEN p THEN * END)`, which is not valid SQL anywhere.
+    #[expect(deprecated, reason = "Expr::Wildcard is still constructible")]
     let counts_rows = func_name.eq_ignore_ascii_case("count")
         && (args.is_empty()
+            || matches!(args, [Expr::Wildcard { .. }])
             || matches!(args, [Expr::Literal(value, _)] if !value.is_null()));
     if counts_rows && !distinct {
         return Ok(Some(bigquery_call("COUNTIF", vec![condition])));

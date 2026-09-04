@@ -10958,7 +10958,9 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
     };
     let keeps_rows = col("t.v").gt(lit(1i64));
 
-    // COUNT(*) counts rows, so the predicate is the whole aggregate.
+    // COUNT(*) counts rows, so the predicate is the whole aggregate. The SQL
+    // planner rewrites `count(*)` into `count(1)` before the unparser sees it,
+    // so that is the shape a federated statement actually carries.
     let counted = rendered(
         datafusion_functions_aggregate::expr_fn::count(lit(1i64))
             .filter(keeps_rows.clone())
@@ -10967,6 +10969,24 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
     assert!(
         counted.contains("COUNTIF(") && !counted.contains("FILTER"),
         "a filtered row count is COUNTIF: {counted}"
+    );
+
+    // A plan assembled directly can still carry the wildcard, and it has to
+    // reach `COUNTIF` too — the generic path would render it
+    // `COUNT(CASE WHEN p THEN * END)`, which is not valid SQL anywhere.
+    #[expect(deprecated, reason = "Expr::Wildcard is still constructible")]
+    let wildcard = Expr::Wildcard {
+        qualifier: None,
+        options: Box::new(datafusion_expr::expr::WildcardOptions::default()),
+    };
+    let counted_wildcard = rendered(
+        datafusion_functions_aggregate::expr_fn::count(wildcard)
+            .filter(keeps_rows.clone())
+            .build()?,
+    )?;
+    assert!(
+        counted_wildcard.contains("COUNTIF(") && !counted_wildcard.contains("FILTER"),
+        "a filtered wildcard row count is COUNTIF too: {counted_wildcard}"
     );
 
     // Any other aggregate guards its argument instead.
