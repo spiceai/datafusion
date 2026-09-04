@@ -11063,19 +11063,18 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
     Ok(())
 }
 
-/// Any ordered filtered aggregate declines, whatever the aggregate.
+/// An ordering does not stop an allowlisted aggregate from being rewritten,
+/// because every aggregate on that list ignores input order.
 ///
-/// The rewriting carries no ordering, and this method receives the aggregate's
-/// *name*, not its `AggregateUDF` — so there is no way to ask whether this one
-/// needs its ordering. A list of order-sensitive names would be wrong by default
-/// for every user-defined aggregate, and wrong in the direction that changes
-/// results, so any ordering declines.
-///
-/// That costs the pushdown for an ordered `sum`, whose order does not matter.
-/// It costs only the pushdown: the federation layer refuses the same shape, so
-/// the aggregate evaluates locally and still answers correctly.
+/// The rewriting carries no ordering, so this would be a wrong answer for an
+/// aggregate whose result depends on one — and that is exactly what the
+/// allowlist excludes. Measured over `[3,1,2]`: `sum`, `avg`, `count`, `min` and
+/// `max` return the same value ordered ascending, descending or not at all,
+/// where `array_agg` returns `[1,2,3]` against `[3,2,1]`. So a separate ordering
+/// check would only cost the pushdown.
 #[test]
-fn test_bigquery_declines_any_ordered_filtered_aggregate() -> Result<()> {
+fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order()
+-> Result<()> {
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
@@ -11091,29 +11090,32 @@ fn test_bigquery_declines_any_ordered_filtered_aggregate() -> Result<()> {
     let keeps_rows = col("t.v").gt(lit(1i64));
     let ordering = vec![col("t.v").sort(true, false)];
 
+    // On the allowlist: the ordering is irrelevant to the answer, so it still
+    // federates rather than losing the pushdown for nothing.
     let ordered_sum = rendered(
         datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
             .filter(keeps_rows.clone())
+            .order_by(ordering.clone())
+            .build()?,
+    )?;
+    assert!(
+        ordered_sum.contains("CASE WHEN") && !ordered_sum.contains("FILTER"),
+        "a sum ignores its ordering, so an ordered filtered sum still moves the \
+         predicate inside: {ordered_sum}"
+    );
+
+    // Off the allowlist: declined whether ordered or not, because the `CASE`
+    // itself is what it cannot survive.
+    let ordered_array_agg = rendered(
+        datafusion_functions_aggregate::expr_fn::array_agg(col("t.v"))
+            .filter(keeps_rows)
             .order_by(ordering)
             .build()?,
     )?;
     assert!(
-        !ordered_sum.contains("CASE WHEN"),
-        "an ordered filtered aggregate must not be rewritten without its \
-         ordering: {ordered_sum}"
-    );
-
-    // The control: with no ordering, the same aggregate still rewrites, so the
-    // decline is keyed on the ordering and not on the aggregate.
-    let unordered_sum = rendered(
-        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
-            .filter(keeps_rows)
-            .build()?,
-    )?;
-    assert!(
-        unordered_sum.contains("CASE WHEN") && !unordered_sum.contains("FILTER"),
-        "an unordered filtered sum still moves the predicate inside: \
-         {unordered_sum}"
+        !ordered_array_agg.contains("CASE WHEN"),
+        "an array_agg is declined by the allowlist, ordered or not: \
+         {ordered_array_agg}"
     );
 
     Ok(())

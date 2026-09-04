@@ -1312,19 +1312,6 @@ impl Dialect for BigQueryDialect {
         // BigQuery has no `FILTER (WHERE ...)`; it restricts the rows by moving
         // the predicate inside the aggregate instead.
         if let Some(predicate) = filter {
-            // The rewriting below carries no ordering and no way to know
-            // whether this aggregate needs one. Nothing on `AggregateUDF`
-            // reaches this method — it receives the name — and a list of
-            // order-sensitive *names* would be wrong by default for every
-            // user-defined aggregate, in the direction that changes results.
-            // So any ordering at all declines. That costs the pushdown for an
-            // ordered `sum`, whose order does not matter; the federation layer
-            // refuses the same shape, so it evaluates locally and answers
-            // correctly rather than failing. Only an ascending `order_by`
-            // reaches here; a descending one has already returned.
-            if !order_by.is_empty() {
-                return Ok(None);
-            }
             return bigquery_filtered_aggregate_to_sql(
                 unparser, func_name, args, distinct, predicate,
             );

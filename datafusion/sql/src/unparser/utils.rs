@@ -1716,20 +1716,32 @@ fn raw_string(value: &str) -> ast::Expr {
     ast::Expr::Value(ast::Value::SingleQuotedRawStringLiteral(value.to_string()).into())
 }
 
-/// Whether moving a `FILTER` inside this aggregate as `CASE WHEN p THEN arg END`
-/// leaves its result unchanged.
+/// Whether an aggregate's `FILTER` can be moved inside it as
+/// `CASE WHEN p THEN arg END` without changing the result.
 ///
-/// An **allowlist**, not a blocklist, and deliberately: the rewriting is exact
-/// only for an aggregate that skips null inputs, and nothing in `AggregateUDF`
-/// reports whether one does. A blocklist would therefore be wrong by default for
-/// every user-defined aggregate — and wrong in the direction that changes
-/// results — so an aggregate this does not name declines instead.
+/// The rewriting is exact only for an aggregate with **both** properties, and
+/// this list encodes both:
+///
+/// * it **skips null inputs**, so the null the `CASE` yields for a rejected row
+///   drops out instead of becoming part of the answer;
+/// * it **ignores input order**, so the `ORDER BY` the rewriting cannot carry
+///   can be dropped. Measured over `[3,1,2]`: `sum`, `avg`, `count`, `min` and
+///   `max` return the same value with `ORDER BY` ascending, descending or
+///   absent, where `array_agg` returns `[1,2,3]` against `[3,2,1]`.
+///
+/// An **allowlist**, not a blocklist, and deliberately: nothing on
+/// `AggregateUDF` reports either property. `order_sensitivity` looks like the
+/// oracle for the second and is not — it returns `HardRequirement` unless a UDF
+/// overrides it, and `count` and `avg` do not override it despite ignoring order
+/// entirely. So a blocklist would be wrong by default for every user-defined
+/// aggregate, in the direction that changes results; an aggregate this does not
+/// name declines instead.
 ///
 /// Measured on BigQuery over `[1,2,3]` with `x > 1`: `COUNTIF` and
 /// `COUNT(CASE …)` both give 2, and `SUM(CASE …)` gives 5.
 ///
 /// `array_agg` is the instructive exclusion. It keeps nulls, so the `CASE`
-/// yields an element for every rejected row — and BigQuery refuses to build an
+/// yields an element for every *rejected* row — and BigQuery refuses to build an
 /// array holding a null at all ("Array cannot have a null element"). The
 /// rewriting therefore fails for any filter that actually filters, where
 /// DataFusion answers `[2, 3]`. Declining leaves it for the local engine.
