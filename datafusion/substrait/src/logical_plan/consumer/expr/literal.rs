@@ -45,7 +45,7 @@ use substrait::proto;
 use substrait::proto::expression::Literal;
 use substrait::proto::expression::literal::user_defined::{TypeAnchorType, Val};
 use substrait::proto::expression::literal::{
-    IntervalCompound, IntervalDayToSecond, IntervalYearToMonth, LiteralType, VarChar,
+    IntervalCompound, IntervalDayToSecond, IntervalYearToMonth, LiteralType,
     interval_day_to_second,
 };
 
@@ -594,6 +594,7 @@ pub(crate) fn from_substrait_literal(
 mod tests {
     use super::*;
     use crate::logical_plan::consumer::utils::tests::test_consumer;
+    use substrait::proto::expression::literal::VarChar;
 
     #[test]
     fn interval_compound_different_precision() -> datafusion::common::Result<()> {
