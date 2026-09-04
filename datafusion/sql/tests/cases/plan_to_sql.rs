@@ -11872,23 +11872,23 @@ fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Resu
     Ok(())
 }
 
-/// A *scale* wider than `BIGNUMERIC` holds cannot be rendered at all, because
-/// BigQuery loses it silently.
+/// A scale wider than `BIGNUMERIC` holds still renders `BIGNUMERIC`, accepting
+/// the rounding rather than failing the statement.
 ///
-/// This is the opposite failure mode to an integer overflow, and the reason the
-/// two halves are treated differently. Measured: `CAST('1.234567890123' AS
-/// NUMERIC)` returns `1.23456789`, and `BIGNUMERIC` given thirty-nine
-/// fractional digits keeps thirty-eight — no error either time. So a rendering
-/// that narrows the scale returns rounded rows and reports nothing, where a
-/// narrowed integer width is refused outright.
+/// This is the opposite call to the integer half, and deliberately so. Measured:
+/// `BIGNUMERIC` given thirty-nine fractional digits keeps thirty-eight with no
+/// error, where a thirtieth *integer* digit is refused outright. So the scale
+/// half is a silent imprecision and the integer half is a loud failure.
 ///
-/// Declining is loud: the fallback spelling `DECIMAL(p, s)` is itself refused
-/// ("In NUMERIC(P, S), S must be between 0 and 9"), and a federated statement
-/// has no local-execution fallback, so the statement fails rather than
-/// returning quietly rounded values. Making it *correct* is a federation-level
-/// job — keeping the cast out of the pushdown so it evaluates locally.
+/// Declining the scale case would fail the query — a federated statement has no
+/// local-execution fallback, and `DECIMAL(p, s)` is itself refused — and the
+/// imprecision does not earn that. Reaching a scale past 38 takes a `BIGNUMERIC`
+/// source column (`Decimal256(76, 38)`) *and* a division, which types as
+/// `Decimal256(76, 42)`; measured on that shape the rounding is 4.4e-39
+/// absolute, 1.3e-38 relative. Nothing a decimal column carries is meaningful at
+/// the thirty-ninth decimal place.
 #[test]
-fn test_bigquery_declines_a_decimal_scale_it_would_round_away() -> Result<()> {
+fn test_bigquery_accepts_the_rounding_for_a_scale_past_bignumeric() -> Result<()> {
     let unparser = Unparser::new(&BigQueryDialect {});
     let rendered = |data_type: DataType| -> Result<String> {
         Ok(unparser
@@ -11896,20 +11896,25 @@ fn test_bigquery_declines_a_decimal_scale_it_would_round_away() -> Result<()> {
             .to_string())
     };
 
-    // Thirty-eight fractional digits are exactly what BIGNUMERIC holds.
+    // Exactly what BIGNUMERIC holds.
     let holds = rendered(DataType::Decimal256(76, 38))?;
     assert!(
         holds.contains("AS BIGNUMERIC)"),
         "38 fractional digits fit BIGNUMERIC exactly: {holds}"
     );
 
-    // A thirty-ninth is rounded away without an error, so it must not render as
-    // a BigQuery decimal type at all.
-    let rounds = rendered(DataType::Decimal256(76, 39))?;
+    // Past it: still BIGNUMERIC, not a declined cast that would fail the query.
+    // `Decimal256(76, 42)` is what `<bignumeric column> / <numeric column>`
+    // types as, so this is the shape that actually arises.
+    let past = rendered(DataType::Decimal256(76, 42))?;
     assert!(
-        !rounds.contains("NUMERIC"),
-        "a scale BigQuery would round away must not be rendered as one of its \
-         decimal types: {rounds}"
+        past.contains("AS BIGNUMERIC)"),
+        "a scale past 38 keeps the widest type rather than failing: {past}"
+    );
+    assert!(
+        !past.contains("DECIMAL("),
+        "the parameterized spelling is refused by BigQuery, so it must not be \
+         emitted: {past}"
     );
 
     Ok(())

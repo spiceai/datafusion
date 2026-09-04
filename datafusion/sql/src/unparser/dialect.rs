@@ -1018,11 +1018,6 @@ const NUMERIC_MAX_SCALE: i64 = 9;
 /// "Invalid NUMERIC value".
 const NUMERIC_MAX_INTEGER_DIGITS: u64 = 29;
 
-/// The widest scale a BigQuery `BIGNUMERIC` holds. Measured: a thirty-ninth
-/// fractional digit is *rounded away silently*, so a scale past this cannot be
-/// rendered at all without changing the value.
-const BIGNUMERIC_MAX_SCALE: i64 = 38;
-
 #[derive(Default)]
 pub struct BigQueryDialect {}
 
@@ -1069,15 +1064,19 @@ impl Dialect for BigQueryDialect {
         // way to keep the width. The two halves of that width fail differently on
         // BigQuery, which is what decides the rendering.
         //
-        // **Scale is lost silently.** Measured: `CAST('1.234567890123' AS
-        // NUMERIC)` returns `1.23456789`, and `BIGNUMERIC` given thirty-nine
-        // fractional digits keeps thirty-eight — no error either time. So a scale
-        // wider than the widest type holds cannot be rendered at all without
-        // changing the value, and declining is the only safe answer. Declining is
-        // loud: the fallback spelling `DECIMAL(p, s)` is refused ("In NUMERIC(P,
-        // S), S must be between 0 and 9"), and a federated statement has no
-        // local-execution fallback, so the query fails rather than returning
-        // rounded rows.
+        // **Scale past the widest type is rounded away silently**, and that is
+        // accepted here rather than declined. Measured: `BIGNUMERIC` given
+        // thirty-nine fractional digits keeps thirty-eight, with no error.
+        //
+        // Declining instead would fail the statement — a federated statement has
+        // no local-execution fallback, and the `DECIMAL(p, s)` spelling is itself
+        // refused — and the imprecision does not justify that. Reaching a scale
+        // past 38 needs a `BIGNUMERIC` source column (which arrives as
+        // `Decimal256(76, 38)`) *and* a division: `big / num` types as
+        // `Decimal256(76, 42)`. Measured on that shape, the rounding is 4.4e-39
+        // absolute and 1.3e-38 relative — the thirty-ninth decimal place. No
+        // decimal a query carries is meaningful there, so a failed query is the
+        // worse of the two answers.
         //
         // **Integer width is refused loudly.** Measured by bisection: `NUMERIC`
         // takes twenty-nine integer digits and `BIGNUMERIC` thirty-nine, and one
@@ -1089,9 +1088,6 @@ impl Dialect for BigQueryDialect {
         // arithmetic inflates a decimal's declared precision far beyond the
         // values it carries, so declining on the type would fail queries whose
         // data fits comfortably.
-        if scale > BIGNUMERIC_MAX_SCALE {
-            return None;
-        }
         let integer_digits = precision.saturating_sub(scale.unsigned_abs());
         Some(
             if scale > NUMERIC_MAX_SCALE || integer_digits > NUMERIC_MAX_INTEGER_DIGITS {
