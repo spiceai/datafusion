@@ -10989,16 +10989,40 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
         "a filtered wildcard row count is COUNTIF too: {counted_wildcard}"
     );
 
-    // Any other aggregate guards its argument instead.
+    // Any other aggregate on the allowlist guards its argument instead.
     let summed = rendered(
         datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
-            .filter(keeps_rows)
+            .filter(keeps_rows.clone())
             .build()?,
     )?;
     assert!(
         summed.contains("CASE WHEN") && !summed.contains("FILTER"),
         "a filtered sum guards its argument: {summed}"
     );
+
+    // The bitwise three are on the list too: they skip nulls, are
+    // order-independent, and BigQuery spells them under the same names, so they
+    // federated before the allowlist and have to keep doing so.
+    for (label, aggregate) in [
+        (
+            "bit_and",
+            datafusion_functions_aggregate::bit_and_or_xor::bit_and(col("t.v")),
+        ),
+        (
+            "bit_or",
+            datafusion_functions_aggregate::bit_and_or_xor::bit_or(col("t.v")),
+        ),
+        (
+            "bit_xor",
+            datafusion_functions_aggregate::bit_and_or_xor::bit_xor(col("t.v")),
+        ),
+    ] {
+        let bitwise = rendered(aggregate.filter(keeps_rows.clone()).build()?)?;
+        assert!(
+            bitwise.contains("CASE WHEN") && !bitwise.contains("FILTER"),
+            "a filtered {label} guards its argument: {bitwise}"
+        );
+    }
 
     Ok(())
 }
@@ -11075,9 +11099,17 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
     let sql = Unparser::new(&BigQueryDialect {})
         .plan_to_sql(&plan)?
         .to_string();
+    // It must not be COUNTIF, *and* it must still federate: `COUNT(CASE WHEN p
+    // THEN NULL END)` is 0 exactly as `COUNT(NULL)` is, verified on BigQuery, so
+    // declining here would only cost the pushdown. Asserting the absence of
+    // COUNTIF alone would pass on a decline too.
     assert!(
         !sql.contains("COUNTIF("),
         "COUNT(NULL) counts no rows, so it is not COUNTIF: {sql}"
+    );
+    assert!(
+        sql.contains("CASE WHEN") && !sql.contains("FILTER"),
+        "it still federates, as COUNT over a CASE that is always NULL: {sql}"
     );
 
     Ok(())

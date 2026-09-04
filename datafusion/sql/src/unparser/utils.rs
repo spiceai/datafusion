@@ -1727,7 +1727,13 @@ fn raw_string(value: &str) -> ast::Expr {
 /// * it **ignores input order**, so the `ORDER BY` the rewriting cannot carry
 ///   can be dropped. Measured over `[3,1,2]`: `sum`, `avg`, `count`, `min` and
 ///   `max` return the same value with `ORDER BY` ascending, descending or
-///   absent, where `array_agg` returns `[1,2,3]` against `[3,2,1]`.
+///   absent, where `array_agg` returns `[1,2,3]` against `[3,2,1]`. The bitwise
+///   three were measured the same way over `[3, NULL, 1]` — they skip the null
+///   and are order-independent by construction — and BigQuery spells them
+///   `BIT_AND`/`BIT_OR`/`BIT_XOR`, so they federate under their own names.
+///   `bool_and`/`bool_or` deliberately are *not* listed: BigQuery has no
+///   function of either name (it spells them `LOGICAL_AND`/`LOGICAL_OR`), so
+///   they never federate successfully whatever this returns.
 ///
 /// An **allowlist**, not a blocklist, and deliberately: nothing on
 /// `AggregateUDF` reports either property. `order_sensitivity` looks like the
@@ -1746,9 +1752,11 @@ fn raw_string(value: &str) -> ast::Expr {
 /// rewriting therefore fails for any filter that actually filters, where
 /// DataFusion answers `[2, 3]`. Declining leaves it for the local engine.
 pub(crate) fn filter_rewrite_is_exact(func_name: &str) -> bool {
-    ["count", "sum", "min", "max", "avg"]
-        .iter()
-        .any(|exact| func_name.eq_ignore_ascii_case(exact))
+    [
+        "count", "sum", "min", "max", "avg", "bit_and", "bit_or", "bit_xor",
+    ]
+    .iter()
+    .any(|exact| func_name.eq_ignore_ascii_case(exact))
 }
 
 /// Renders an aggregate's `FILTER (WHERE ...)` for BigQuery, which has no such
