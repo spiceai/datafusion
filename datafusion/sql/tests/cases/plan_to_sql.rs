@@ -11392,7 +11392,7 @@ fn test_a_subquery_in_an_inner_join_predicate_moves_to_where() -> Result<()> {
         let query = format!(
             "SELECT j1.j1_id FROM j1 {join} j2 \
              ON j1.j1_id = j2.j2_id \
-             AND j1.j1_string IN (SELECT j2.j2_string FROM j2)"
+             AND j2.j2_string IN (SELECT j1.j1_string FROM j1)"
         );
         let statement = Parser::new(&GenericDialect {})
             .try_with_sql(&query)?
@@ -11424,23 +11424,27 @@ fn test_a_subquery_in_an_inner_join_predicate_moves_to_where() -> Result<()> {
         "the subquery has to survive in WHERE: {inner}"
     );
 
-    // The preserved side of an outer join makes the two clauses different, so the
-    // conjunct stays in ON rather than silently changing which rows survive.
+    // The preserved side of an outer join makes the two clauses different — WHERE
+    // would discard the rows the join preserves — so the conjunct stays in ON and
+    // the dialect's own limit applies. A dialect that refuses it there needs the
+    // conjunct applied to the null-extended input instead, which the join
+    // rendering does not express yet.
     let left = plan_for("LEFT JOIN")?;
     let (_, after_on) = left
         .split_once(" ON ")
         .expect("the join has to keep an ON clause");
     assert!(
         after_on.contains("IN (SELECT"),
-        "a left join has to keep the subquery in ON: {left}"
+        "a left join keeps the subquery in ON: {left}"
     );
     Ok(())
 }
 
-/// `BigQuery` spells a decimal `NUMERIC` up to nine fractional digits and
-/// `BIGNUMERIC` beyond that, and refuses a `NUMERIC` whose scale is wider rather
-/// than rounding it. The wide scale arrives from arithmetic — dividing two
-/// decimals widens it — so no declared column type reveals the shape.
+/// A `BigQuery` cast target carries no precision or scale — a parameterized type
+/// is refused in a `CAST` — so the type itself has to carry the width: `NUMERIC`
+/// holds nine fractional digits and `BIGNUMERIC` thirty-eight, and a scale past
+/// nine is refused rather than rounded. The wide scale arrives from arithmetic —
+/// dividing two decimals widens it — so no declared column type reveals it.
 #[test]
 fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
     let narrow = cast(col("a"), DataType::Decimal128(38, 9));
@@ -11449,12 +11453,12 @@ fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
     let narrow_sql = unparser.expr_to_sql(&narrow)?.to_string();
     let wide_sql = unparser.expr_to_sql(&wide)?.to_string();
     assert!(
-        narrow_sql.contains("NUMERIC(38,9)") && !narrow_sql.contains("BIGNUMERIC"),
-        "nine fractional digits fit NUMERIC: {narrow_sql}"
+        narrow_sql.contains("AS NUMERIC)") && !narrow_sql.contains("BIGNUMERIC"),
+        "nine fractional digits fit NUMERIC, unparameterized: {narrow_sql}"
     );
     assert!(
-        wide_sql.contains("BIGNUMERIC(38,17)"),
-        "a scale past nine needs BIGNUMERIC: {wide_sql}"
+        wide_sql.contains("AS BIGNUMERIC)"),
+        "a scale past nine needs BIGNUMERIC, unparameterized: {wide_sql}"
     );
     Ok(())
 }

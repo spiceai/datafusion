@@ -1044,16 +1044,16 @@ impl Dialect for BigQueryDialect {
         }
     }
 
-    fn decimal_type_to_sql(&self, precision: u64, scale: i64) -> Option<ast::DataType> {
-        // `NUMERIC` carries at most nine fractional digits and `BIGNUMERIC` up to
-        // thirty-eight; a scale past nine is refused outright rather than rounded.
-        // `DECIMAL` is only another spelling of `NUMERIC`, so it carries the same
-        // limit and cannot express the wider scale.
-        let info = ast::ExactNumberInfo::PrecisionAndScale(precision, scale);
+    fn decimal_type_to_sql(&self, _precision: u64, scale: i64) -> Option<ast::DataType> {
+        // A cast target carries no precision or scale — `CAST(x AS NUMERIC(38, 9))`
+        // is refused as a parameterized type — so the choice of type is the only
+        // way to keep the width. `NUMERIC` holds nine fractional digits and
+        // `BIGNUMERIC` thirty-eight, and a scale past nine is refused rather than
+        // rounded, so it selects the wider type instead of truncating.
         Some(if scale > 9 {
-            ast::DataType::BigNumeric(info)
+            ast::DataType::BigNumeric(ast::ExactNumberInfo::None)
         } else {
-            ast::DataType::Numeric(info)
+            ast::DataType::Numeric(ast::ExactNumberInfo::None)
         })
     }
 
