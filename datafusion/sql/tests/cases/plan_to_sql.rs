@@ -9709,6 +9709,97 @@ fn windowed_sum(frame: WindowFrame, asc: bool, nulls_first: bool) -> Result<Logi
         .build()
 }
 
+/// Builds `<window fn>(t.v) OVER (ORDER BY t.k <frame>)` for a named window
+/// function, so a dialect's framing decision can be read off the rendered
+/// `OVER` clause.
+fn windowed_call(
+    fun: WindowFunctionDefinition,
+    args: Vec<Expr>,
+    frame: WindowFrame,
+) -> Result<LogicalPlan> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let windowed = Expr::from(WindowFunction {
+        fun,
+        params: WindowFunctionParams {
+            args,
+            partition_by: vec![],
+            order_by: vec![datafusion_expr::expr::Sort::new(col("t.k"), true, false)],
+            window_frame: frame,
+            null_treatment: None,
+            filter: None,
+            distinct: false,
+        },
+    });
+    table_scan(Some("t"), &schema, None)?
+        .window(vec![windowed])?
+        .build()
+}
+
+/// `BigQuery` refuses a framing clause on `LEAD` and `LAG`, so the frame is
+/// dropped for those two — but kept for the navigation functions that do accept
+/// one, because dropping theirs would change which rows contribute rather than
+/// fix a rejection.
+#[test]
+fn test_bigquery_drops_the_frame_only_from_lead_and_lag() -> Result<()> {
+    let rows = WindowFrame::new_bounds(
+        datafusion_expr::window_frame::WindowFrameUnits::Rows,
+        datafusion_expr::window_frame::WindowFrameBound::Preceding(
+            datafusion_common::ScalarValue::UInt64(None),
+        ),
+        datafusion_expr::window_frame::WindowFrameBound::CurrentRow,
+    );
+    let rendered = |fun: WindowFunctionDefinition, args: Vec<Expr>| -> Result<String> {
+        let plan = windowed_call(fun, args, rows.clone())?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    for (name, fun) in [
+        (
+            "LEAD",
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::lead_lag::lead_udwf(),
+            ),
+        ),
+        (
+            "LAG",
+            WindowFunctionDefinition::WindowUDF(
+                datafusion_functions_window::lead_lag::lag_udwf(),
+            ),
+        ),
+    ] {
+        let sql = rendered(fun, vec![col("t.v")])?;
+        assert!(
+            !sql.contains("ROWS BETWEEN"),
+            "{name} refuses a framing clause, so none may be emitted: {sql}"
+        );
+        // Non-vacuity: the window and its ordering still have to be there.
+        assert!(
+            sql.contains("OVER (ORDER BY `t`.`k`"),
+            "{name} keeps its window and ordering: {sql}"
+        );
+    }
+
+    // The control: a navigation function that accepts a frame keeps it, so the
+    // frame is not dropped from every window function.
+    let kept = rendered(
+        WindowFunctionDefinition::WindowUDF(
+            datafusion_functions_window::nth_value::first_value_udwf(),
+        ),
+        vec![col("t.v")],
+    )?;
+    assert!(
+        kept.contains("ROWS BETWEEN"),
+        "FIRST_VALUE accepts a frame, so dropping it would change the rows: {kept}"
+    );
+
+    Ok(())
+}
+
 /// A dialect that accepts only its own NULL placement inside a `RANGE` frame gets
 /// the placement as a leading `IS NULL` key, and keeps the rows the plan asked for.
 ///
@@ -10867,7 +10958,9 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
     };
     let keeps_rows = col("t.v").gt(lit(1i64));
 
-    // COUNT(*) counts rows, so the predicate is the whole aggregate.
+    // COUNT(*) counts rows, so the predicate is the whole aggregate. The SQL
+    // planner rewrites `count(*)` into `count(1)` before the unparser sees it,
+    // so that is the shape a federated statement actually carries.
     let counted = rendered(
         datafusion_functions_aggregate::expr_fn::count(lit(1i64))
             .filter(keeps_rows.clone())
@@ -10878,15 +10971,203 @@ fn test_bigquery_moves_an_aggregate_filter_inside_the_aggregate() -> Result<()> 
         "a filtered row count is COUNTIF: {counted}"
     );
 
-    // Any other aggregate guards its argument instead.
+    // A plan assembled directly can still carry the wildcard, and it has to
+    // reach `COUNTIF` too — the generic path would render it
+    // `COUNT(CASE WHEN p THEN * END)`, which is not valid SQL anywhere.
+    #[expect(deprecated, reason = "Expr::Wildcard is still constructible")]
+    let wildcard = Expr::Wildcard {
+        qualifier: None,
+        options: Box::new(datafusion_expr::expr::WildcardOptions::default()),
+    };
+    let counted_wildcard = rendered(
+        datafusion_functions_aggregate::expr_fn::count(wildcard)
+            .filter(keeps_rows.clone())
+            .build()?,
+    )?;
+    assert!(
+        counted_wildcard.contains("COUNTIF(") && !counted_wildcard.contains("FILTER"),
+        "a filtered wildcard row count is COUNTIF too: {counted_wildcard}"
+    );
+
+    // Any other aggregate on the allowlist guards its argument instead.
     let summed = rendered(
         datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
-            .filter(keeps_rows)
+            .filter(keeps_rows.clone())
             .build()?,
     )?;
     assert!(
         summed.contains("CASE WHEN") && !summed.contains("FILTER"),
         "a filtered sum guards its argument: {summed}"
+    );
+
+    // The bitwise three are on the list too: they skip nulls, are
+    // order-independent, and BigQuery spells them under the same names, so they
+    // federated before the allowlist and have to keep doing so.
+    for (label, aggregate) in [
+        (
+            "bit_and",
+            datafusion_functions_aggregate::bit_and_or_xor::bit_and(col("t.v")),
+        ),
+        (
+            "bit_or",
+            datafusion_functions_aggregate::bit_and_or_xor::bit_or(col("t.v")),
+        ),
+        (
+            "bit_xor",
+            datafusion_functions_aggregate::bit_and_or_xor::bit_xor(col("t.v")),
+        ),
+    ] {
+        let bitwise = rendered(aggregate.filter(keeps_rows.clone()).build()?)?;
+        assert!(
+            bitwise.contains("CASE WHEN") && !bitwise.contains("FILTER"),
+            "a filtered {label} guards its argument: {bitwise}"
+        );
+    }
+
+    Ok(())
+}
+
+/// A filtered `array_agg` declines, because the rewriting does not survive it.
+///
+/// `array_agg` keeps null inputs where the rewriting assumes they are skipped,
+/// so `CASE WHEN p THEN v END` yields an element for every *rejected* row — and
+/// BigQuery refuses to build an array holding a null at all, measured:
+/// `ARRAY_AGG(CASE WHEN x > 1 THEN x END)` over `[1,2,3]` is `Array cannot have
+/// a null element`. So the rewriting fails for any filter that actually filters,
+/// where DataFusion answers `[2, 3]`.
+///
+/// Declining is what makes that query work: the federation layer refuses the
+/// same shape, so the aggregate evaluates locally and returns `[2, 3]` rather
+/// than the statement failing at the remote.
+///
+/// The gate is an allowlist — see `filter_rewrite_is_exact` — so a user-defined
+/// aggregate is declined too rather than rewritten on the assumption that it
+/// skips nulls.
+#[test]
+fn test_bigquery_declines_a_filtered_array_agg() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.g")],
+            vec![
+                datafusion_functions_aggregate::expr_fn::array_agg(col("t.v"))
+                    .filter(col("t.v").gt(lit(1i64)))
+                    .build()?,
+            ],
+        )?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        !sql.contains("CASE WHEN"),
+        "a filtered array_agg must not be rewritten into an array of nulls: {sql}"
+    );
+
+    Ok(())
+}
+
+/// `COUNT(*)` counts rows and so does `COUNT(1)`, but `COUNT(NULL)` counts
+/// nothing, so only a *non-null* literal stands in for `*`.
+///
+/// Measured on BigQuery over `[1,2,3]` with `x > 1`: `COUNT(NULL)` is 0 where
+/// `COUNTIF(x > 1)` is 2. Treating every literal as row-counting therefore
+/// returns a different number with no error at all.
+#[test]
+fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.g")],
+            vec![
+                datafusion_functions_aggregate::expr_fn::count(lit(
+                    datafusion_common::ScalarValue::Null,
+                ))
+                    .filter(col("t.v").gt(lit(1i64)))
+                    .build()?,
+            ],
+        )?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    // It must not be COUNTIF, *and* it must still federate: `COUNT(CASE WHEN p
+    // THEN NULL END)` is 0 exactly as `COUNT(NULL)` is, verified on BigQuery, so
+    // declining here would only cost the pushdown. Asserting the absence of
+    // COUNTIF alone would pass on a decline too.
+    assert!(
+        !sql.contains("COUNTIF("),
+        "COUNT(NULL) counts no rows, so it is not COUNTIF: {sql}"
+    );
+    assert!(
+        sql.contains("CASE WHEN") && !sql.contains("FILTER"),
+        "it still federates, as COUNT over a CASE that is always NULL: {sql}"
+    );
+
+    Ok(())
+}
+
+/// An ordering does not stop an allowlisted aggregate from being rewritten,
+/// because every aggregate on that list ignores input order.
+///
+/// The rewriting carries no ordering, so this would be a wrong answer for an
+/// aggregate whose result depends on one — and that is exactly what the
+/// allowlist excludes. Measured over `[3,1,2]`: `sum`, `avg`, `count`, `min` and
+/// `max` return the same value ordered ascending, descending or not at all,
+/// where `array_agg` returns `[1,2,3]` against `[3,2,1]`. So a separate ordering
+/// check would only cost the pushdown.
+#[test]
+fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order()
+-> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let rendered = |aggregate: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .aggregate(vec![col("t.g")], vec![aggregate])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+    let keeps_rows = col("t.v").gt(lit(1i64));
+    let ordering = vec![col("t.v").sort(true, false)];
+
+    // On the allowlist: the ordering is irrelevant to the answer, so it still
+    // federates rather than losing the pushdown for nothing.
+    let ordered_sum = rendered(
+        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+            .filter(keeps_rows.clone())
+            .order_by(ordering.clone())
+            .build()?,
+    )?;
+    assert!(
+        ordered_sum.contains("CASE WHEN") && !ordered_sum.contains("FILTER"),
+        "a sum ignores its ordering, so an ordered filtered sum still moves the \
+         predicate inside: {ordered_sum}"
+    );
+
+    // Off the allowlist: declined whether ordered or not, because the `CASE`
+    // itself is what it cannot survive.
+    let ordered_array_agg = rendered(
+        datafusion_functions_aggregate::expr_fn::array_agg(col("t.v"))
+            .filter(keeps_rows)
+            .order_by(ordering)
+            .build()?,
+    )?;
+    assert!(
+        !ordered_array_agg.contains("CASE WHEN"),
+        "an array_agg is declined by the allowlist, ordered or not: \
+         {ordered_array_agg}"
     );
 
     Ok(())
@@ -11585,6 +11866,112 @@ fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
         wide_sql.contains("AS BIGNUMERIC)"),
         "a scale past nine needs BIGNUMERIC, unparameterized: {wide_sql}"
     );
+    Ok(())
+}
+
+/// A decimal whose *integer* part does not fit `NUMERIC` needs `BIGNUMERIC`
+/// too, not only one whose scale does not.
+///
+/// `NUMERIC` is precision 38 scale 9, so it holds 29 integer digits. Measured on
+/// BigQuery: `CAST('123456789012345678901234567890' AS NUMERIC)` — thirty digits
+/// — is refused with "Invalid NUMERIC value", where `BIGNUMERIC` returns it, and
+/// 29 integer digits alongside 9 fractional ones is accepted. Selecting on scale
+/// alone emits a type the value overflows, for a width that arrives from
+/// arithmetic and appears in no declared column type.
+#[test]
+fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Result<()>
+{
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let rendered = |data_type: DataType| -> Result<String> {
+        Ok(unparser
+            .expr_to_sql(&cast(col("a"), data_type))?
+            .to_string())
+    };
+
+    // 38 integer digits and no fractional part: the scale fits NUMERIC, the
+    // integer part does not.
+    let integral = rendered(DataType::Decimal128(38, 0))?;
+    assert!(
+        integral.contains("AS BIGNUMERIC)"),
+        "38 integer digits overflow NUMERIC's 29: {integral}"
+    );
+
+    // A 256-bit decimal reaches widths NUMERIC cannot express at any scale.
+    let very_wide = rendered(DataType::Decimal256(76, 2))?;
+    assert!(
+        very_wide.contains("AS BIGNUMERIC)"),
+        "74 integer digits overflow NUMERIC's 29: {very_wide}"
+    );
+
+    // The boundary NUMERIC does hold, so the wider type is not chosen blindly.
+    let fits = rendered(DataType::Decimal128(38, 9))?;
+    assert!(
+        fits.contains("AS NUMERIC)") && !fits.contains("BIGNUMERIC"),
+        "29 integer and 9 fractional digits fit NUMERIC exactly: {fits}"
+    );
+
+    // An integer width past BIGNUMERIC's own limit still renders BIGNUMERIC
+    // rather than declining. Measured, BIGNUMERIC takes 39 integer digits and
+    // refuses a fortieth *outright* — "Invalid BIGNUMERIC value" — so the widest
+    // type computes correctly for every value that fits and fails loudly for one
+    // that does not. Declining would fail the statement even where the data fits
+    // comfortably, and DataFusion's arithmetic inflates a declared precision far
+    // beyond the values it carries.
+    let past_bignumeric = rendered(DataType::Decimal256(76, 2))?;
+    assert!(
+        past_bignumeric.contains("AS BIGNUMERIC)"),
+        "the widest type is still worth emitting when overflow is loud: \
+         {past_bignumeric}"
+    );
+
+    Ok(())
+}
+
+/// A scale wider than `BIGNUMERIC` holds still renders `BIGNUMERIC`, accepting
+/// the rounding rather than failing the statement.
+///
+/// This is the opposite call to the integer half, and deliberately so. Measured:
+/// `BIGNUMERIC` given thirty-nine fractional digits keeps thirty-eight with no
+/// error, where a thirtieth *integer* digit is refused outright. So the scale
+/// half is a silent imprecision and the integer half is a loud failure.
+///
+/// Declining the scale case would fail the query — a federated statement has no
+/// local-execution fallback, and `DECIMAL(p, s)` is itself refused — and the
+/// imprecision does not earn that. Reaching a scale past 38 takes a `BIGNUMERIC`
+/// source column (`Decimal256(76, 38)`) *and* a division, which types as
+/// `Decimal256(76, 42)`; measured on that shape the rounding is 4.4e-39
+/// absolute, 1.3e-38 relative. Nothing a decimal column carries is meaningful at
+/// the thirty-ninth decimal place.
+#[test]
+fn test_bigquery_accepts_the_rounding_for_a_scale_past_bignumeric() -> Result<()> {
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let rendered = |data_type: DataType| -> Result<String> {
+        Ok(unparser
+            .expr_to_sql(&cast(col("a"), data_type))?
+            .to_string())
+    };
+
+    // Exactly what BIGNUMERIC holds.
+    let holds = rendered(DataType::Decimal256(76, 38))?;
+    assert!(
+        holds.contains("AS BIGNUMERIC)"),
+        "38 fractional digits fit BIGNUMERIC exactly: {holds}"
+    );
+
+    // Past it: still BIGNUMERIC, not a declined cast that would fail the query.
+    // `Decimal256(76, 42)` is what `<bignumeric column> / <numeric column>`
+    // types as, so this is the shape that actually arises.
+    let past = rendered(DataType::Decimal256(76, 42))?;
+    assert!(
+        past.contains("AS BIGNUMERIC)"),
+        "a scale past 38 keeps the widest type rather than failing: {past}"
+    );
+    assert!(
+        !past.contains("DECIMAL("),
+        "the parameterized spelling is refused by BigQuery, so it must not be \
+         emitted: {past}"
+    );
+
     Ok(())
 }
 

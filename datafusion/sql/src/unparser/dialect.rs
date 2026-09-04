@@ -146,22 +146,26 @@ pub trait Dialect: Send + Sync {
     /// The default discards `tz`, which is the rendering every dialect has always
     /// received; only a dialect whose timestamp type depends on the zone needs to
     /// override it.
-    /// How this dialect spells a decimal of `precision` and `scale`.
-    ///
-    /// `None` keeps `DECIMAL(precision, scale)`, which is what every dialect has
-    /// always received. A dialect whose decimal types carry different scale limits
-    /// has to select between them here, because the width follows from arithmetic
-    /// — dividing two decimals widens the scale — and not from any declared type.
-    fn decimal_type_to_sql(&self, _precision: u64, _scale: i64) -> Option<ast::DataType> {
-        None
-    }
-
     fn timestamp_literal_cast_dtype(
         &self,
         time_unit: &TimeUnit,
         _tz: &Option<Arc<str>>,
     ) -> ast::DataType {
         self.timestamp_cast_dtype(time_unit, &None)
+    }
+
+    /// How this dialect spells a decimal of `precision` and `scale`.
+    ///
+    /// `None` keeps `DECIMAL(precision, scale)`, which is what every dialect has
+    /// always received. A dialect whose decimal types carry different limits has
+    /// to select between them here, because the width follows from arithmetic —
+    /// dividing two decimals widens the scale — and not from any declared type.
+    ///
+    /// Both halves of the width matter: `precision - scale` is the integer part,
+    /// which is where the digits a sum or a product grows into actually live, so
+    /// a dialect selecting on `scale` alone silently narrows it.
+    fn decimal_type_to_sql(&self, _precision: u64, _scale: i64) -> Option<ast::DataType> {
+        None
     }
 
     /// The most sub-second digits the dialect's timestamp literals hold, or
@@ -1004,6 +1008,16 @@ impl Dialect for SqliteDialect {
     }
 }
 
+/// The widest scale a BigQuery `NUMERIC` holds. Measured: a thirteenth
+/// fractional digit is *rounded away silently*, not refused —
+/// `CAST('1.234567890123' AS NUMERIC)` returns `1.23456789`.
+const NUMERIC_MAX_SCALE: i64 = 9;
+
+/// The most integer digits a BigQuery `NUMERIC` holds. Measured by bisection:
+/// twenty-nine, and a value needing a thirtieth is refused outright with
+/// "Invalid NUMERIC value".
+const NUMERIC_MAX_INTEGER_DIGITS: u64 = 29;
+
 #[derive(Default)]
 pub struct BigQueryDialect {}
 
@@ -1044,17 +1058,44 @@ impl Dialect for BigQueryDialect {
         }
     }
 
-    fn decimal_type_to_sql(&self, _precision: u64, scale: i64) -> Option<ast::DataType> {
+    fn decimal_type_to_sql(&self, precision: u64, scale: i64) -> Option<ast::DataType> {
         // A cast target carries no precision or scale — `CAST(x AS NUMERIC(38, 9))`
         // is refused as a parameterized type — so the choice of type is the only
-        // way to keep the width. `NUMERIC` holds nine fractional digits and
-        // `BIGNUMERIC` thirty-eight, and a scale past nine is refused rather than
-        // rounded, so it selects the wider type instead of truncating.
-        Some(if scale > 9 {
-            ast::DataType::BigNumeric(ast::ExactNumberInfo::None)
-        } else {
-            ast::DataType::Numeric(ast::ExactNumberInfo::None)
-        })
+        // way to keep the width. The two halves of that width fail differently on
+        // BigQuery, which is what decides the rendering.
+        //
+        // **Scale past the widest type is rounded away silently**, and that is
+        // accepted here rather than declined. Measured: `BIGNUMERIC` given
+        // thirty-nine fractional digits keeps thirty-eight, with no error.
+        //
+        // Declining instead would fail the statement — a federated statement has
+        // no local-execution fallback, and the `DECIMAL(p, s)` spelling is itself
+        // refused — and the imprecision does not justify that. Reaching a scale
+        // past 38 needs a `BIGNUMERIC` source column (which arrives as
+        // `Decimal256(76, 38)`) *and* a division: `big / num` types as
+        // `Decimal256(76, 42)`. Measured on that shape, the rounding is 4.4e-39
+        // absolute and 1.3e-38 relative — the thirty-ninth decimal place. No
+        // decimal a query carries is meaningful there, so a failed query is the
+        // worse of the two answers.
+        //
+        // **Integer width is refused loudly.** Measured by bisection: `NUMERIC`
+        // takes twenty-nine integer digits and `BIGNUMERIC` thirty-nine, and one
+        // more is "Invalid NUMERIC value" / "Invalid BIGNUMERIC value" rather
+        // than a wrapped or truncated number. So the widest type is always worth
+        // emitting: it computes correctly for every value that fits, and a value
+        // that does not fit fails at the remote instead of arriving wrong. That
+        // is why a precision past `BIGNUMERIC` does *not* decline — DataFusion's
+        // arithmetic inflates a decimal's declared precision far beyond the
+        // values it carries, so declining on the type would fail queries whose
+        // data fits comfortably.
+        let integer_digits = precision.saturating_sub(scale.unsigned_abs());
+        Some(
+            if scale > NUMERIC_MAX_SCALE || integer_digits > NUMERIC_MAX_INTEGER_DIGITS {
+                ast::DataType::BigNumeric(ast::ExactNumberInfo::None)
+            } else {
+                ast::DataType::Numeric(ast::ExactNumberInfo::None)
+            },
+        )
     }
 
     fn unnest_as_table_factor(&self) -> bool {

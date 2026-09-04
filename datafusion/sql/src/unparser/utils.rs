@@ -1716,17 +1716,75 @@ fn raw_string(value: &str) -> ast::Expr {
     ast::Expr::Value(ast::Value::SingleQuotedRawStringLiteral(value.to_string()).into())
 }
 
+/// Whether an aggregate's `FILTER` can be moved inside it as
+/// `CASE WHEN p THEN arg END` without changing the result.
+///
+/// The rewriting is exact only for an aggregate with **both** properties, and
+/// this list encodes both:
+///
+/// * it **skips null inputs**, so the null the `CASE` yields for a rejected row
+///   drops out instead of becoming part of the answer;
+/// * it **ignores input order**, so the `ORDER BY` the rewriting cannot carry
+///   can be dropped. Measured over `[3,1,2]`: `sum`, `avg`, `count`, `min` and
+///   `max` return the same value with `ORDER BY` ascending, descending or
+///   absent, where `array_agg` returns `[1,2,3]` against `[3,2,1]`. The bitwise
+///   three were measured the same way over `[3, NULL, 1]` — they skip the null
+///   and are order-independent by construction — and BigQuery spells them
+///   `BIT_AND`/`BIT_OR`/`BIT_XOR`, so they federate under their own names.
+///   `bool_and`/`bool_or` deliberately are *not* listed: BigQuery has no
+///   function of either name (it spells them `LOGICAL_AND`/`LOGICAL_OR`), so
+///   they never federate successfully whatever this returns.
+///
+/// An **allowlist**, not a blocklist, and deliberately: nothing on
+/// `AggregateUDF` reports either property. `order_sensitivity` looks like the
+/// oracle for the second and is not — it returns `HardRequirement` unless a UDF
+/// overrides it, and `count` and `avg` do not override it despite ignoring order
+/// entirely. So a blocklist would be wrong by default for every user-defined
+/// aggregate, in the direction that changes results; an aggregate this does not
+/// name declines instead.
+///
+/// Measured on BigQuery over `[1,2,3]` with `x > 1`: `COUNTIF` and
+/// `COUNT(CASE …)` both give 2, and `SUM(CASE …)` gives 5.
+///
+/// `array_agg` is the instructive exclusion. It keeps nulls, so the `CASE`
+/// yields an element for every *rejected* row — and BigQuery refuses to build an
+/// array holding a null at all ("Array cannot have a null element"). The
+/// rewriting therefore fails for any filter that actually filters, where
+/// DataFusion answers `[2, 3]`. Declining leaves it for the local engine.
+pub(crate) fn filter_rewrite_is_exact(func_name: &str) -> bool {
+    [
+        "count", "sum", "min", "max", "avg", "bit_and", "bit_or", "bit_xor",
+    ]
+    .iter()
+    .any(|exact| func_name.eq_ignore_ascii_case(exact))
+}
+
 /// Renders an aggregate's `FILTER (WHERE ...)` for BigQuery, which has no such
 /// clause and rejects the statement outright.
 ///
-/// The predicate moves inside the aggregate. `COUNT(*)` becomes `COUNTIF(p)`;
-/// everything else takes `CASE WHEN p THEN arg END`, which every aggregate here
-/// reads the same way because they all skip nulls — measured on BigQuery over
-/// `[1,2,3]` with `x > 1`: `COUNTIF` and `COUNT(CASE …)` both give 2, and
-/// `SUM(CASE …)` gives 5.
+/// The predicate moves inside the aggregate, for the aggregates where doing so
+/// is exact. `COUNT(*)` and `COUNT(<non-null literal>)` become `COUNTIF(p)`;
+/// everything else takes `CASE WHEN p THEN arg END`, which reads the same
+/// because the `CASE` yields a null for each rejected row and these aggregates
+/// skip nulls. Measured on BigQuery over `[1,2,3]` with `x > 1`: `COUNTIF` and
+/// `COUNT(CASE …)` both give 2, and `SUM(CASE …)` gives 5.
 ///
-/// Declines for a multi-argument aggregate, where which argument the predicate
-/// should guard is not obvious and guessing would compute over the wrong rows.
+/// Declines:
+///
+/// * any aggregate [`filter_rewrite_is_exact`] does not name — an allowlist, so
+///   an aggregate that keeps nulls is declined without having to be listed.
+///   `array_agg` is the instructive one: the `CASE` gives it an element for
+///   every *rejected* row, and BigQuery refuses to build an array holding a null
+///   at all ("Array cannot have a null element", measured), so the rewrite fails
+///   for any filter that actually filters — where DataFusion answers `[2, 3]`.
+/// * a multi-argument aggregate, where which argument the predicate should guard
+///   is not obvious and guessing would compute over the wrong rows.
+///
+/// Note what a decline costs and who pays it. A federated statement has no
+/// local-execution fallback, so on its own a decline fails the query rather than
+/// running it elsewhere — it converts a wrong answer into a loud one. What makes
+/// these cases actually *work* is the federation layer refusing the same shapes,
+/// so they evaluate locally; the two have to name the same set.
 pub(crate) fn bigquery_filtered_aggregate_to_sql(
     unparser: &Unparser,
     func_name: &str,
@@ -1734,11 +1792,27 @@ pub(crate) fn bigquery_filtered_aggregate_to_sql(
     distinct: bool,
     predicate: &Expr,
 ) -> Result<Option<ast::Expr>> {
+    if !filter_rewrite_is_exact(func_name) {
+        return Ok(None);
+    }
+
     let condition = unparser.expr_to_sql(predicate)?;
 
-    // `COUNT(*)` counts rows, so the predicate is the whole of it.
+    // `COUNT(*)` counts rows, so the predicate is the whole of it. `COUNT(1)`
+    // counts them too, but `COUNT(NULL)` counts nothing at all — measured on
+    // BigQuery, it is 0 where `COUNTIF` over the same rows is 2 — so only a
+    // non-null literal stands in for `*`.
+    //
+    // The wildcard arm is belt-and-braces: `AggregateFunctionPlanner` rewrites
+    // `count(*)` and `count()` into `count(1)` before a SQL-planned statement
+    // reaches here, so a plan built by the planner never carries it. A plan
+    // assembled directly still can, and the generic path below would render it
+    // `COUNT(CASE WHEN p THEN * END)`, which is not valid SQL anywhere.
+    #[expect(deprecated, reason = "Expr::Wildcard is still constructible")]
     let counts_rows = func_name.eq_ignore_ascii_case("count")
-        && (args.is_empty() || matches!(args, [Expr::Literal(..)]));
+        && (args.is_empty()
+            || matches!(args, [Expr::Wildcard { .. }])
+            || matches!(args, [Expr::Literal(value, _)] if !value.is_null()));
     if counts_rows && !distinct {
         return Ok(Some(bigquery_call("COUNTIF", vec![condition])));
     }
