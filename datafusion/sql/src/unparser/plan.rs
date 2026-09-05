@@ -420,9 +420,24 @@ impl Unparser<'_> {
         };
 
         let mut query = QueryBuilder::default();
-        query
-            .push_cte(cte, true)
-            .body(Box::new(SetExpr::Select(Box::new(select_all))));
+        // Inside a derived table this is *not* a statement, whatever the entry
+        // point says: a join input is unparsed by building a whole statement and
+        // embedding it in parentheses, and `WITH RECURSIVE` there is what
+        // BigQuery refuses. Defer the CTE to the real statement root and leave
+        // behind the same `SELECT * FROM <name>` that references it.
+        if self
+            .derived_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.pending_recursive_ctes
+                .lock()
+                .map_err(|e| internal_datafusion_err!("{e}"))?
+                .push(cte);
+        } else {
+            query.push_cte(cte, true);
+        }
+        query.body(Box::new(SetExpr::Select(Box::new(select_all))));
 
         Ok(ast::Statement::Query(Box::new(
             query.build().map_err(|e| internal_datafusion_err!("{e}"))?,

@@ -11190,78 +11190,70 @@ fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order() -> 
     Ok(())
 }
 
-/// A recursive CTE nested in a larger statement is hoisted to the top level.
+/// A recursive CTE behind a derived table is hoisted to the top of the statement.
 ///
-/// `WITH RECURSIVE` is only legal at the top of a statement on BigQuery, and a
-/// literal generator joined to a table is *not* at the top of the plan — it is a
-/// join input, which unparses as a derived table. Attaching the CTE to the
-/// nearest enclosing query put it inside those parentheses and BigQuery refused
-/// the statement outright:
+/// `WITH RECURSIVE` is only legal at the top of a statement on BigQuery. A
+/// generator joined *directly* was already rendered there; the shape that failed
+/// puts it behind a derived table, where it is unparsed by building a whole
+/// statement and embedding that in parentheses:
 ///
 /// ```text
-/// ... AS `c` INNER JOIN (WITH RECURSIVE `day_grid` AS (...) SELECT ...)
+/// ... INNER JOIN (WITH RECURSIVE `g` AS (...) SELECT `g`.`n` FROM `g`) AS `gg`
 ///   -> WITH RECURSIVE is only allowed at the top level of the SELECT, CREATE TABLE ...
 /// ```
 ///
-/// Six corpus statements are this exact shape, so the assertion is about
-/// *position*, not merely that the keyword appears.
+/// **What this does not cover.** The arrangement that actually failed only
+/// appears after optimization — the optimizer puts the generator behind a
+/// `SubqueryAlias` over a `Projection`, which routes it through the *top-level*
+/// renderer rather than the nested one. `datafusion-sql`'s tests cannot run the
+/// optimizer, so this asserts the property for the two shapes it can build and
+/// would **not** have caught that regression. The guard that reproduces it lives
+/// in the Spice repo, where a `SessionContext` supplies an optimized plan; see
+/// the `fork_patches.md` row. Three hand-built plans in a row looked like the
+/// failing shape, routed elsewhere, and passed with the fix reverted — which is
+/// why that is spelled out here rather than assumed.
 #[test]
-fn test_bigquery_hoists_a_nested_recursive_cte_to_the_top_level() -> Result<()> {
-    let schema = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
-    let grid = Schema::new(vec![Field::new("hours", DataType::Int64, true)]);
-
-    let working = |name: &str, s: &Schema| {
-        table_scan(Some(name), s, None).expect("scan the working table")
+fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
+    let plan_for = |query: &str| -> Result<String> {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
     };
 
-    let static_term = working("seed", &grid)
-        .project(vec![col("seed.hours")])?
-        .build()?;
-    let recursive_term = working("day_grid", &grid)
-        .filter(col("day_grid.hours").lt(lit(720i64)))?
-        .project(vec![col("day_grid.hours")])?
-        .build()?;
-    let generator = LogicalPlan::RecursiveQuery(datafusion_expr::RecursiveQuery {
-        name: "day_grid".to_string(),
-        static_term: Arc::new(static_term),
-        recursive_term: Arc::new(recursive_term),
-        is_distinct: false,
-        schema: Arc::new(DFSchema::try_from(grid.clone())?),
-    });
+    let generator = "WITH RECURSIVE g AS (\
+                       SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 5\
+                     ) ";
 
-    // The generator as a join input *inside a derived table*, which is the
-    // corpus shape. The extra alias is the whole point: with the join at the
-    // statement root the nearest enclosing query already is the root, and
-    // attaching the CTE there looks correct by accident.
-    let plan = table_scan(Some("t"), &schema, None)?
-        .join_on(
-            generator,
-            datafusion_expr::JoinType::Inner,
-            [col("t.n").eq(col("day_grid.hours"))],
-        )?
-        .project(vec![col("t.n")])?
-        .alias("inner_q")?
-        .project(vec![col("inner_q.n")])?
-        .build()?;
-
-    let sql = Unparser::new(&BigQueryDialect {})
-        .plan_to_sql(&plan)?
-        .to_string();
-
+    // The shape that failed: the generator behind a derived table.
+    let behind_derived =
+        plan_for(&format!("{generator}SELECT person.id FROM person JOIN (SELECT n FROM g) gg ON person.id = gg.n"))?;
     assert!(
-        sql.starts_with("WITH RECURSIVE"),
-        "the CTE has to open the statement, not sit inside a derived table: {sql}"
+        behind_derived.starts_with("WITH RECURSIVE"),
+        "the CTE has to open the statement: {behind_derived}"
+    );
+    assert!(
+        !behind_derived.contains("JOIN (WITH"),
+        "a WITH inside a derived table is what BigQuery refuses: {behind_derived}"
     );
     assert_eq!(
-        sql.matches("WITH RECURSIVE").count(),
+        behind_derived.matches("WITH RECURSIVE").count(),
         1,
-        "exactly one WITH RECURSIVE, at the top: {sql}"
+        "exactly one, at the top: {behind_derived}"
     );
-    // The join input is now a plain reference to the CTE, not an inlined
-    // definition.
+
+    // The control: joined directly, which already worked and must keep working.
+    let joined_directly =
+        plan_for(&format!("{generator}SELECT person.id FROM person JOIN g ON person.id = g.n"))?;
     assert!(
-        !sql.contains("INNER JOIN (WITH"),
-        "the join input must reference the CTE by name: {sql}"
+        joined_directly.starts_with("WITH RECURSIVE"),
+        "a directly joined generator still opens the statement: {joined_directly}"
     );
 
     Ok(())
