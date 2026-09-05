@@ -60,8 +60,8 @@ use datafusion_expr::{
     LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
     UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
 };
-use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
+use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
 use std::{collections::HashSet, sync::Arc, vec};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]

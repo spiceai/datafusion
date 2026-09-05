@@ -114,6 +114,24 @@ impl<'a> Unparser<'a> {
         utils::provable_data_type(expr)
     }
 
+    /// The field `expr` resolves to, when a schema was supplied.
+    ///
+    /// [`Self::resolved_data_type`] answers with a `DataType`, which is not
+    /// enough for an operand carried by an Arrow **extension type**: the storage
+    /// type of `arrow.json` is `Utf8`, and what distinguishes it from an
+    /// ordinary string lives in the field's metadata. A dialect that renders a
+    /// document differently depending on whether the remote column is a native
+    /// JSON type or a string needs the field to tell them apart.
+    ///
+    /// `None` means the type is genuinely unknown here — there was no schema, or
+    /// the expression does not resolve against it — and a rendering that depends
+    /// on the distinction must take the branch that is safe when it is unknown,
+    /// never guess.
+    pub fn resolved_field(&self, expr: &Expr) -> Option<Arc<arrow::datatypes::Field>> {
+        let schema = self.schema.as_ref()?;
+        expr.to_field(schema.as_ref()).ok().map(|(_, field)| field)
+    }
+
     /// Create pretty SQL output, better suited for human consumption
     ///
     /// See example on the struct level documentation

@@ -21,10 +21,10 @@ use super::{
     Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
     utils::bigquery_filtered_aggregate_to_sql, utils::bigquery_percentile_to_sql,
     utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_date_to_sql,
-    utils::bigquery_string_to_timestamp_to_sql,
-    utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
-    utils::character_length_to_sql, utils::date_part_to_sql,
-    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
+    utils::bigquery_string_to_timestamp_to_sql, utils::bigquery_to_timestamp_to_sql,
+    utils::bigquery_to_unixtime_to_sql, utils::character_length_to_sql,
+    utils::date_part_to_sql, utils::sqlite_date_trunc_to_sql,
+    utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
@@ -1342,16 +1342,14 @@ impl Dialect for BigQueryDialect {
         filter: Option<&Expr>,
         order_by: &[SortExpr],
     ) -> Result<Option<ast::Expr>> {
-        // A descending sort makes DataFusion take the percentile from the other
-        // end, and that does not survive the rendering below. Computing over the
-        // wrong rows quietly is worse than not translating: declining leaves the
-        // DataFusion name in place, which fails loudly.
-        if order_by.iter().any(|sort| !sort.asc) {
-            return Ok(None);
-        }
-
         // BigQuery has no `FILTER (WHERE ...)`; it restricts the rows by moving
         // the predicate inside the aggregate instead.
+        //
+        // The ordering is deliberately not consulted here. Every aggregate the
+        // rewrite accepts skips nulls and ignores input order, so dropping an
+        // `ORDER BY` gives the same answer — and refusing one instead is not a
+        // lost pushdown but a failed query, since the fallback is a generic
+        // `FILTER` clause BigQuery cannot parse.
         if let Some(predicate) = filter {
             return bigquery_filtered_aggregate_to_sql(
                 unparser, func_name, args, distinct, predicate,
@@ -1359,6 +1357,18 @@ impl Dialect for BigQueryDialect {
         }
 
         match func_name {
+            // A descending sort makes DataFusion take the percentile from the
+            // other end, and that does not survive the rendering below.
+            // Computing over the wrong rows quietly is worse than not
+            // translating, so these decline — but only these: the check used to
+            // sit above the `FILTER` branch, where it also declined aggregates
+            // whose ordering does not matter and left them emitting a `FILTER`
+            // clause that fails at BigQuery.
+            "median" | "approx_percentile_cont"
+                if order_by.iter().any(|sort| !sort.asc) =>
+            {
+                Ok(None)
+            }
             "median" => bigquery_percentile_to_sql(unparser, args, None, distinct),
             "approx_percentile_cont" => {
                 bigquery_percentile_to_sql(unparser, args, Some(1), distinct)

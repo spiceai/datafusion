@@ -11090,8 +11090,8 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
                 datafusion_functions_aggregate::expr_fn::count(lit(
                     datafusion_common::ScalarValue::Null,
                 ))
-                    .filter(col("t.v").gt(lit(1i64)))
-                    .build()?,
+                .filter(col("t.v").gt(lit(1i64)))
+                .build()?,
             ],
         )?
         .build()?;
@@ -11125,8 +11125,8 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
 /// where `array_agg` returns `[1,2,3]` against `[3,2,1]`. So a separate ordering
 /// check would only cost the pushdown.
 #[test]
-fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order()
--> Result<()> {
+fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order() -> Result<()>
+{
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
@@ -11168,6 +11168,73 @@ fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order()
         !ordered_array_agg.contains("CASE WHEN"),
         "an array_agg is declined by the allowlist, ordered or not: \
          {ordered_array_agg}"
+    );
+
+    // A *descending* ordering is no different, and used to be: the descending
+    // check sat above the `FILTER` branch, so this emitted a generic `FILTER`
+    // clause. Measured against a real BigQuery project, that came back
+    // `Syntax error: Expected ")" but got "("` — a failed query, not a lost
+    // pushdown, because a federated statement has no local fallback.
+    let descending_sum = rendered(
+        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+            .filter(col("t.v").gt(lit(1i64)))
+            .order_by(vec![col("t.v").sort(false, false)])
+            .build()?,
+    )?;
+    assert!(
+        descending_sum.contains("CASE WHEN") && !descending_sum.contains("FILTER"),
+        "a sum ignores its ordering in either direction, so a descending \
+         filtered sum moves the predicate inside too: {descending_sum}"
+    );
+
+    Ok(())
+}
+
+/// The percentile rewrites are the ones a descending ordering really does
+/// break, and the only ones that still decline for it.
+///
+/// `median`/`approx_percentile_cont` are rendered by ordering the group, so a
+/// descending sort takes the value from the other end and the rendering would
+/// answer over the wrong row. Declining leaves the `DataFusion` name in place,
+/// which `BigQuery` rejects with `Function not found: median` — loud, where
+/// computing the wrong percentile would be silent.
+#[test]
+fn test_bigquery_declines_only_a_descending_percentile() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let rendered = |aggregate: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .aggregate(vec![col("t.g")], vec![aggregate])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let descending_median = rendered(
+        datafusion_functions_aggregate::expr_fn::median(col("t.v"))
+            .order_by(vec![col("t.v").sort(false, false)])
+            .build()?,
+    )?;
+    assert!(
+        descending_median.contains("median("),
+        "a descending median declines, leaving the DataFusion name for the \
+         remote to reject: {descending_median}"
+    );
+
+    // The control: ascending still renders, so "decline every median" cannot
+    // pass as a fix.
+    let ascending_median = rendered(
+        datafusion_functions_aggregate::expr_fn::median(col("t.v"))
+            .order_by(vec![col("t.v").sort(true, false)])
+            .build()?,
+    )?;
+    assert!(
+        !ascending_median.contains("median("),
+        "an ascending median is still rendered by ordering the group: \
+         {ascending_median}"
     );
 
     Ok(())
@@ -12007,8 +12074,7 @@ fn test_bigquery_agrees_text_compared_against_a_timestamp() -> Result<()> {
 /// alone emits a type the value overflows, for a width that arrives from
 /// arithmetic and appears in no declared column type.
 #[test]
-fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Result<()>
-{
+fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Result<()> {
     let unparser = Unparser::new(&BigQueryDialect {});
     let rendered = |data_type: DataType| -> Result<String> {
         Ok(unparser
