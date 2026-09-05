@@ -454,7 +454,7 @@ impl Unparser<'_> {
                 }))
             }
             Expr::ScalarSubquery(subq) => {
-                let sub_statement = self.plan_to_sql(subq.subquery.as_ref())?;
+                let sub_statement = self.plan_to_sql_nested(subq.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query
@@ -468,7 +468,7 @@ impl Unparser<'_> {
             Expr::InSubquery(insubq) => {
                 let inexpr = Box::new(self.expr_to_sql_inner(insubq.expr.as_ref())?);
                 let sub_statement =
-                    self.plan_to_sql(insubq.subquery.subquery.as_ref())?;
+                    self.plan_to_sql_nested(insubq.subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query
@@ -486,7 +486,7 @@ impl Unparser<'_> {
             Expr::SetComparison(set_cmp) => {
                 let left = Box::new(self.expr_to_sql_inner(set_cmp.expr.as_ref())?);
                 let sub_statement =
-                    self.plan_to_sql(set_cmp.subquery.subquery.as_ref())?;
+                    self.plan_to_sql_nested(set_cmp.subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query
@@ -511,7 +511,8 @@ impl Unparser<'_> {
                 }
             }
             Expr::Exists(Exists { subquery, negated }) => {
-                let sub_statement = self.plan_to_sql(subquery.subquery.as_ref())?;
+                let sub_statement =
+                    self.plan_to_sql_nested(subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query
@@ -1578,6 +1579,23 @@ impl Unparser<'_> {
         {
             return Ok(parsed);
         }
+        // Casting text to a date *parses* it too, and by a different rule than
+        // the timestamp cast above: an engine may accept a zone marker in one and
+        // refuse it in the other, so the dialect spells this parse separately.
+        //
+        // `Date32` only. `Date64` carries a time of day and is rendered as
+        // `DATETIME` (or `TIMESTAMP`) by `ast_type_for_date64_in_cast`, so
+        // sending it through a parser that yields a `DATE` would drop the time
+        // and change the column's SQL type — quietly. It keeps the cast path it
+        // already had; the timestamp hook above is the one that serves it.
+        if matches!(data_type, DataType::Date32)
+            && self
+                .resolved_data_type(expr)
+                .is_some_and(|resolved| resolved.is_string())
+            && let Some(parsed) = self.dialect.string_to_date_to_sql(inner_expr.clone())
+        {
+            return Ok(parsed);
+        }
         // Casting a date to an integer yields its day number, which some dialects
         // spell as a function because they refuse the cast.
         if data_type.is_integer()
@@ -2272,8 +2290,29 @@ fn refuses_this_pair(left: &DataType, right: &DataType) -> bool {
     let instant_against_date = (matches!(left, DataType::Timestamp(_, Some(_)))
         && is_date(right))
         || (is_date(left) && matches!(right, DataType::Timestamp(_, Some(_))));
+    // Text against a temporal value. DataFusion reads the text *as* that
+    // temporal type — `string_temporal_coercion` picks the temporal side — where
+    // an engine with no implicit parse refuses the pair: measured on BigQuery,
+    // `STRING < DATETIME` is "No matching signature for operator <". Bringing
+    // them together casts the text side, which is where the dialect's own
+    // text-to-temporal parse applies.
+    let is_temporal = |t: &DataType| {
+        matches!(
+            t,
+            DataType::Timestamp(_, _)
+                | DataType::Date32
+                | DataType::Date64
+                | DataType::Time32(_)
+                | DataType::Time64(_)
+        )
+    };
+    let text_against_temporal =
+        (is_text(left) && is_temporal(right)) || (is_temporal(left) && is_text(right));
 
-    timestamp_zone_disagreement || number_against_text || instant_against_date
+    timestamp_zone_disagreement
+        || number_against_text
+        || instant_against_date
+        || text_against_temporal
 }
 
 /// Truncates the fractional second of an already-formatted timestamp literal to

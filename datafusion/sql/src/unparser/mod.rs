@@ -26,7 +26,7 @@ mod utils;
 use self::dialect::{DefaultDialect, Dialect};
 use crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser;
 use datafusion_common::DFSchemaRef;
-use datafusion_expr::{Expr, ExprSchemable};
+use datafusion_expr::{Expr, ExprSchemable, LogicalPlan};
 pub use expr::expr_to_sql;
 pub use plan::plan_to_sql;
 use std::sync::Arc;
@@ -70,6 +70,23 @@ pub struct Unparser<'a> {
     /// schema at each node, so it passes it down rather than leaving expression
     /// unparsing to guess.
     schema: Option<DFSchemaRef>,
+    /// Recursive CTEs met below the statement root, waiting to be attached to it.
+    ///
+    /// A recursive CTE nested inside a larger statement becomes a `WITH` entry on
+    /// an enclosing query plus a table reference where it stood. *Which*
+    /// enclosing query is the whole question: attaching it to the nearest one
+    /// puts `WITH RECURSIVE` inside a derived table, and BigQuery answers "WITH
+    /// RECURSIVE is only allowed at the top level of the SELECT". The statement
+    /// root drains this, so the entry lands there however deep the plan buried
+    /// it.
+    pending_recursive_ctes: Arc<std::sync::Mutex<Vec<sqlparser::ast::Cte>>>,
+    /// How many derived tables enclose the statement currently being built.
+    ///
+    /// A derived table is rendered by unparsing its plan as a whole statement,
+    /// so "am I a statement?" is not the same question as "am I the top level?".
+    /// Only depth zero may take the pending CTEs; draining at any other depth
+    /// puts `WITH RECURSIVE` back inside the parentheses it has to escape.
+    derived_depth: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<'a> Unparser<'a> {
@@ -79,6 +96,8 @@ impl<'a> Unparser<'a> {
             pretty: false,
             extension_unparsers: vec![],
             schema: None,
+            pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -94,6 +113,11 @@ impl<'a> Unparser<'a> {
             pretty: self.pretty,
             extension_unparsers: self.extension_unparsers.clone(),
             schema: Some(schema),
+            // Shared, not recreated: this is called part-way down the walk, and a
+            // recursive CTE met below would otherwise be collected into a list
+            // that is dropped with the derived unparser.
+            pending_recursive_ctes: Arc::clone(&self.pending_recursive_ctes),
+            derived_depth: Arc::clone(&self.derived_depth),
         }
     }
 
@@ -112,6 +136,44 @@ impl<'a> Unparser<'a> {
             return Some(data_type);
         }
         utils::provable_data_type(expr)
+    }
+
+    /// [`Self::plan_to_sql`] for a plan that is *inside* another statement.
+    ///
+    /// A derived table and an expression subquery are both rendered by building
+    /// a whole statement and embedding it, so "a statement is being built" is not
+    /// the same as "this is the top level". Recursive CTEs are hoisted to the top
+    /// level, and the depth this keeps is how the drain tells the two apart —
+    /// every nested rendering has to go through here, or a CTE met beneath it is
+    /// attached inside the parentheses it needed to escape.
+    fn plan_to_sql_nested(
+        &self,
+        plan: &LogicalPlan,
+    ) -> datafusion_common::Result<sqlparser::ast::Statement> {
+        self.derived_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rendered = self.plan_to_sql(plan);
+        self.derived_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        rendered
+    }
+
+    /// The field `expr` resolves to, when a schema was supplied.
+    ///
+    /// [`Self::resolved_data_type`] answers with a `DataType`, which is not
+    /// enough for an operand carried by an Arrow **extension type**: the storage
+    /// type of `arrow.json` is `Utf8`, and what distinguishes it from an
+    /// ordinary string lives in the field's metadata. A dialect that renders a
+    /// document differently depending on whether the remote column is a native
+    /// JSON type or a string needs the field to tell them apart.
+    ///
+    /// `None` means the type is genuinely unknown here — there was no schema, or
+    /// the expression does not resolve against it — and a rendering that depends
+    /// on the distinction must take the branch that is safe when it is unknown,
+    /// never guess.
+    pub fn resolved_field(&self, expr: &Expr) -> Option<Arc<arrow::datatypes::Field>> {
+        let schema = self.schema.as_ref()?;
+        expr.to_field(schema.as_ref()).ok().map(|(_, field)| field)
     }
 
     /// Create pretty SQL output, better suited for human consumption
@@ -182,6 +244,8 @@ impl Default for Unparser<'_> {
             pretty: false,
             extension_unparsers: vec![],
             schema: None,
+            pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }

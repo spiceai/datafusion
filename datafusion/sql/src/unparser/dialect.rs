@@ -20,15 +20,16 @@ use std::{collections::HashMap, sync::Arc};
 use super::{
     Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
     utils::bigquery_filtered_aggregate_to_sql, utils::bigquery_percentile_to_sql,
-    utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_timestamp_to_sql,
-    utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
-    utils::character_length_to_sql, utils::date_part_to_sql,
-    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
+    utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_date_to_sql,
+    utils::bigquery_string_to_timestamp_to_sql, utils::bigquery_to_timestamp_to_sql,
+    utils::bigquery_to_unixtime_to_sql, utils::character_length_to_sql,
+    utils::date_part_to_sql, utils::sqlite_date_trunc_to_sql,
+    utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
 use chrono::DateTime;
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{Expr, SortExpr};
 use regex::Regex;
 use sqlparser::tokenizer::Span;
@@ -196,6 +197,36 @@ pub trait Dialect: Send + Sync {
         _value: ast::Expr,
         _tz: Option<&Arc<str>>,
     ) -> Option<ast::Expr> {
+        None
+    }
+
+    /// Whether this dialect can evaluate a recursive CTE (`WITH RECURSIVE`).
+    ///
+    /// Defaults to `false`, which keeps a [`LogicalPlan::RecursiveQuery`]
+    /// unparseable and so keeps it out of a pushdown — the behaviour every
+    /// dialect had before this existed. Only a dialect known to run one opts in,
+    /// because a federated statement has no local-execution fallback: emitting
+    /// `WITH RECURSIVE` to an engine that does not support it turns a query that
+    /// used to evaluate locally into a failure.
+    ///
+    /// [`LogicalPlan::RecursiveQuery`]: datafusion_expr::LogicalPlan::RecursiveQuery
+    fn supports_recursive_cte(&self) -> bool {
+        false
+    }
+
+    /// How this dialect reads a string *as a date*, where its own `DATE` cast
+    /// will not.
+    ///
+    /// Separate from [`Self::string_to_timestamp_to_sql`] because the text a cast
+    /// accepts differs by target, not only by dialect. `BigQuery`'s `DATE` cast
+    /// takes a bare `YYYY-MM-DD` and refuses *any* time-of-day or zone —
+    /// measured, it refuses `'2026-01-15 10:30:00'` as surely as
+    /// `'2026-01-15T10:30:00.123456789Z'` — while its `TIMESTAMP` cast takes the
+    /// zoned forms. A dialect that has to parse the string first spells that
+    /// here.
+    ///
+    /// `None` keeps the plain `CAST(value AS DATE)`.
+    fn string_to_date_to_sql(&self, _value: ast::Expr) -> Option<ast::Expr> {
         None
     }
 
@@ -1008,6 +1039,94 @@ impl Dialect for SqliteDialect {
     }
 }
 
+/// The `date_part` fields `BigQuery` names differently from `DataFusion`.
+///
+/// `date_part_to_sql`'s `Extract` arm renders only `year`/`month`/`day`/`hour`/
+/// `minute`/`second` and answers `Ok(None)` for anything else — which makes the
+/// unparser emit `date_part(…)` verbatim, and `BigQuery` answer `Function not
+/// found: date_part`. A customer statement worked around exactly that by
+/// deriving a weekday from the text of a timestamp difference, which is far more
+/// fragile than the extraction it replaced.
+///
+/// Each mapping below is measured against `BigQuery` rather than assumed, on
+/// dates spanning a week boundary and a quarter boundary:
+///
+/// | `date_part` | `BigQuery` | agrees |
+/// |---|---|---|
+/// | `dow` | `DAYOFWEEK` | yes — both count Sunday as 1 |
+/// | `doy` | `DAYOFYEAR` | yes |
+/// | `week` | `ISOWEEK` | yes |
+/// | `quarter` | `QUARTER` | yes |
+///
+/// `week` is the one that matters: `BigQuery`'s bare `WEEK` is Sunday-based and
+/// answered 13 where `DataFusion` answered 14, so the obvious mapping is a wrong
+/// number with no error. `ISOWEEK` agrees on every date measured.
+///
+/// Anything not listed falls through to the shared helper, and from there to a
+/// verbatim `date_part` — a loud remote error rather than a wrong answer.
+fn bigquery_date_part_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [Expr::Literal(field, _), operand] = args else {
+        return Ok(None);
+    };
+    // Every string literal type the planner may produce, not just `Utf8`.
+    // Matching one of them meant the rewrite silently never fired for an
+    // `EXTRACT(DOW FROM …)`, and the call reached BigQuery as `date_part(…)`,
+    // which has no such function.
+    let field = match field {
+        ScalarValue::Utf8(Some(field))
+        | ScalarValue::LargeUtf8(Some(field))
+        | ScalarValue::Utf8View(Some(field)) => field,
+        _ => return Ok(None),
+    };
+
+    // `dow` needs arithmetic, not just a name: `date_part` maps it to
+    // `DatePart::DayOfWeekSunday0` — Arrow's `num_days_from_sunday`, so Sunday is
+    // **0** — and BigQuery's `DAYOFWEEK` counts Sunday as **1**. Rendering the
+    // name alone shifts every weekday by one, silently.
+    //
+    // This holds whichever `date_part` the caller spells, which is worth
+    // recording because it looks ambiguous and is not. A runtime may register
+    // `datafusion_spark`'s `date_part` over the built-in, and Spark counts Sunday
+    // as 1 — but Spark's is a *simplifier*: it rewrites itself into this same
+    // 0-based `date_part` plus an explicit `+ 1`. Both spellings therefore reach
+    // the unparser as the 0-based function, one of them with a visible `+ 1`
+    // beside it, and subtracting one here agrees with both:
+    //
+    //   date_part('dow', c)      ->  (EXTRACT(DAYOFWEEK …) - 1) + 1   = 1
+    //   EXTRACT(DOW FROM c)      ->   EXTRACT(DAYOFWEEK …) - 1        = 0
+    //
+    // matching what each computes locally. Only the *physical* plan shows the
+    // `+ 1`; the logical display does not, which is what makes this easy to get
+    // backwards.
+    let (field, sunday_offset) = match field.to_lowercase().as_str() {
+        "dow" => (ast::DateTimeField::DayOfWeek, 1u8),
+        "doy" => (ast::DateTimeField::DayOfYear, 0),
+        "week" => (ast::DateTimeField::IsoWeek, 0),
+        "quarter" => (ast::DateTimeField::Quarter, 0),
+        _ => return Ok(None),
+    };
+
+    let extracted = ast::Expr::Extract {
+        field,
+        expr: Box::new(unparser.expr_to_sql(operand)?),
+        syntax: ast::ExtractSyntax::From,
+    };
+
+    if sunday_offset == 0 {
+        return Ok(Some(extracted));
+    }
+    Ok(Some(ast::Expr::Nested(Box::new(ast::Expr::BinaryOp {
+        left: Box::new(extracted),
+        op: BinaryOperator::Minus,
+        right: Box::new(ast::Expr::Value(
+            ast::Value::Number(sunday_offset.to_string(), false).into(),
+        )),
+    }))))
+}
+
 /// The widest scale a BigQuery `NUMERIC` holds. Measured: a thirteenth
 /// fractional digit is *rounded away silently*, not refused —
 /// `CAST('1.234567890123' AS NUMERIC)` returns `1.23456789`.
@@ -1182,6 +1301,16 @@ impl Dialect for BigQueryDialect {
         Some(bigquery_string_to_timestamp_to_sql(value, tz.is_some()))
     }
 
+    fn string_to_date_to_sql(&self, value: ast::Expr) -> Option<ast::Expr> {
+        Some(bigquery_string_to_date_to_sql(value))
+    }
+
+    /// Measured on BigQuery: `WITH RECURSIVE counted AS (SELECT 1 AS n UNION ALL
+    /// SELECT n + 1 FROM counted WHERE n < 5)` returns `1..5`.
+    fn supports_recursive_cte(&self) -> bool {
+        true
+    }
+
     /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from
     /// DATE to INT64" — and `UNIX_DATE` is the day number DataFusion means:
     /// zero at the epoch, negative before it.
@@ -1301,16 +1430,14 @@ impl Dialect for BigQueryDialect {
         filter: Option<&Expr>,
         order_by: &[SortExpr],
     ) -> Result<Option<ast::Expr>> {
-        // A descending sort makes DataFusion take the percentile from the other
-        // end, and that does not survive the rendering below. Computing over the
-        // wrong rows quietly is worse than not translating: declining leaves the
-        // DataFusion name in place, which fails loudly.
-        if order_by.iter().any(|sort| !sort.asc) {
-            return Ok(None);
-        }
-
         // BigQuery has no `FILTER (WHERE ...)`; it restricts the rows by moving
         // the predicate inside the aggregate instead.
+        //
+        // The ordering is deliberately not consulted here. Every aggregate the
+        // rewrite accepts skips nulls and ignores input order, so dropping an
+        // `ORDER BY` gives the same answer — and refusing one instead is not a
+        // lost pushdown but a failed query, since the fallback is a generic
+        // `FILTER` clause BigQuery cannot parse.
         if let Some(predicate) = filter {
             return bigquery_filtered_aggregate_to_sql(
                 unparser, func_name, args, distinct, predicate,
@@ -1318,6 +1445,18 @@ impl Dialect for BigQueryDialect {
         }
 
         match func_name {
+            // A descending sort makes DataFusion take the percentile from the
+            // other end, and that does not survive the rendering below.
+            // Computing over the wrong rows quietly is worse than not
+            // translating, so these decline — but only these: the check used to
+            // sit above the `FILTER` branch, where it also declined aggregates
+            // whose ordering does not matter and left them emitting a `FILTER`
+            // clause that fails at BigQuery.
+            "median" | "approx_percentile_cont"
+                if order_by.iter().any(|sort| !sort.asc) =>
+            {
+                Ok(None)
+            }
             "median" => bigquery_percentile_to_sql(unparser, args, None, distinct),
             "approx_percentile_cont" => {
                 bigquery_percentile_to_sql(unparser, args, Some(1), distinct)
@@ -1333,6 +1472,15 @@ impl Dialect for BigQueryDialect {
         args: &[Expr],
     ) -> Result<Option<ast::Expr>> {
         if func_name == "date_part" {
+            // Tried first, and deliberately not folded into `date_part_to_sql`:
+            // that helper's `Extract` arm is shared with `MySqlDialect`, which
+            // spells these differently or not at all — MySQL has a `DAYOFWEEK()`
+            // *function* rather than an `EXTRACT` field, and its `WEEK` numbering
+            // follows `default_week_format`. Widening the shared arm would emit
+            // invalid SQL for one engine to fix another.
+            if let Some(extracted) = bigquery_date_part_to_sql(unparser, args)? {
+                return Ok(Some(extracted));
+            }
             return date_part_to_sql(unparser, self.date_field_extract_style(), args);
         }
 
