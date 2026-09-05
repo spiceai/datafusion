@@ -11190,6 +11190,69 @@ fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order() -> 
     Ok(())
 }
 
+/// `BigQuery` names four `date_part` fields differently, and gets them verbatim
+/// without this.
+///
+/// `date_part_to_sql`'s `Extract` arm renders only year/month/day/hour/minute/
+/// second and answers `Ok(None)` otherwise, so the unparser emits the DataFusion
+/// name and BigQuery answers `Function not found: date_part` — measured against a
+/// real project. A customer statement worked around it by deriving a weekday from
+/// the *text* of a timestamp difference, which is far more fragile.
+///
+/// Every mapping is measured on BigQuery, not assumed. `week` is the trap: the
+/// bare `WEEK` is Sunday-based and answered 13 where DataFusion answered 14, so
+/// this asserts `ISOWEEK` and asserts the bare form is *not* emitted.
+#[test]
+fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+    let rendered = |field: &str| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![datafusion_functions::expr_fn::date_part(
+                lit(field),
+                col("t.d"),
+            )])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    for (field, expected) in [
+        ("dow", "DAYOFWEEK"),
+        ("doy", "DAYOFYEAR"),
+        ("week", "ISOWEEK"),
+        ("quarter", "QUARTER"),
+    ] {
+        let sql = rendered(field)?;
+        assert!(
+            sql.contains(&format!("EXTRACT({expected} FROM")),
+            "date_part('{field}') has to reach BigQuery as EXTRACT({expected}): {sql}"
+        );
+        assert!(
+            !sql.contains("date_part"),
+            "the DataFusion name must not survive into BigQuery SQL: {sql}"
+        );
+    }
+
+    // The trap, asserted directly: `WEEK` is Sunday-based on BigQuery and
+    // disagrees with DataFusion's ISO weeks by one at a year boundary.
+    let week = rendered("week")?;
+    assert!(
+        !week.contains("EXTRACT(WEEK FROM"),
+        "a bare WEEK is Sunday-based and returns a different week number: {week}"
+    );
+
+    // A field neither engine spells differently still goes through the shared
+    // helper, so this stays a narrowing rather than a replacement.
+    let month = rendered("month")?;
+    assert!(
+        month.contains("EXTRACT(MONTH FROM") && !month.contains("date_part"),
+        "the shared Extract arm still handles the common fields: {month}"
+    );
+
+    Ok(())
+}
+
 /// The percentile rewrites are the ones a descending ordering really does
 /// break, and the only ones that still decline for it.
 ///

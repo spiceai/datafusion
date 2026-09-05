@@ -1039,6 +1039,58 @@ impl Dialect for SqliteDialect {
     }
 }
 
+/// The `date_part` fields `BigQuery` names differently from `DataFusion`.
+///
+/// `date_part_to_sql`'s `Extract` arm renders only `year`/`month`/`day`/`hour`/
+/// `minute`/`second` and answers `Ok(None)` for anything else — which makes the
+/// unparser emit `date_part(…)` verbatim, and `BigQuery` answer `Function not
+/// found: date_part`. A customer statement worked around exactly that by
+/// deriving a weekday from the text of a timestamp difference, which is far more
+/// fragile than the extraction it replaced.
+///
+/// Each mapping below is measured against `BigQuery` rather than assumed, on
+/// dates spanning a week boundary and a quarter boundary:
+///
+/// | `date_part` | `BigQuery` | agrees |
+/// |---|---|---|
+/// | `dow` | `DAYOFWEEK` | yes — both count Sunday as 1 |
+/// | `doy` | `DAYOFYEAR` | yes |
+/// | `week` | `ISOWEEK` | yes |
+/// | `quarter` | `QUARTER` | yes |
+///
+/// `week` is the one that matters: `BigQuery`'s bare `WEEK` is Sunday-based and
+/// answered 13 where `DataFusion` answered 14, so the obvious mapping is a wrong
+/// number with no error. `ISOWEEK` agrees on every date measured.
+///
+/// Anything not listed falls through to the shared helper, and from there to a
+/// verbatim `date_part` — a loud remote error rather than a wrong answer.
+fn bigquery_date_part_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [
+        Expr::Literal(datafusion_common::ScalarValue::Utf8(Some(field)), _),
+        operand,
+    ] = args
+    else {
+        return Ok(None);
+    };
+
+    let field = match field.to_lowercase().as_str() {
+        "dow" => ast::DateTimeField::DayOfWeek,
+        "doy" => ast::DateTimeField::DayOfYear,
+        "week" => ast::DateTimeField::IsoWeek,
+        "quarter" => ast::DateTimeField::Quarter,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(ast::Expr::Extract {
+        field,
+        expr: Box::new(unparser.expr_to_sql(operand)?),
+        syntax: ast::ExtractSyntax::From,
+    }))
+}
+
 /// The widest scale a BigQuery `NUMERIC` holds. Measured: a thirteenth
 /// fractional digit is *rounded away silently*, not refused —
 /// `CAST('1.234567890123' AS NUMERIC)` returns `1.23456789`.
@@ -1384,6 +1436,15 @@ impl Dialect for BigQueryDialect {
         args: &[Expr],
     ) -> Result<Option<ast::Expr>> {
         if func_name == "date_part" {
+            // Tried first, and deliberately not folded into `date_part_to_sql`:
+            // that helper's `Extract` arm is shared with `MySqlDialect`, which
+            // spells these differently or not at all — MySQL has a `DAYOFWEEK()`
+            // *function* rather than an `EXTRACT` field, and its `WEEK` numbering
+            // follows `default_week_format`. Widening the shared arm would emit
+            // invalid SQL for one engine to fix another.
+            if let Some(extracted) = bigquery_date_part_to_sql(unparser, args)? {
+                return Ok(Some(extracted));
+            }
             return date_part_to_sql(unparser, self.date_field_extract_style(), args);
         }
 
