@@ -11232,8 +11232,9 @@ fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
                      ) ";
 
     // The shape that failed: the generator behind a derived table.
-    let behind_derived =
-        plan_for(&format!("{generator}SELECT person.id FROM person JOIN (SELECT n FROM g) gg ON person.id = gg.n"))?;
+    let behind_derived = plan_for(&format!(
+        "{generator}SELECT person.id FROM person JOIN (SELECT n FROM g) gg ON person.id = gg.n"
+    ))?;
     assert!(
         behind_derived.starts_with("WITH RECURSIVE"),
         "the CTE has to open the statement: {behind_derived}"
@@ -11249,8 +11250,9 @@ fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
     );
 
     // The control: joined directly, which already worked and must keep working.
-    let joined_directly =
-        plan_for(&format!("{generator}SELECT person.id FROM person JOIN g ON person.id = g.n"))?;
+    let joined_directly = plan_for(&format!(
+        "{generator}SELECT person.id FROM person JOIN g ON person.id = g.n"
+    ))?;
     assert!(
         joined_directly.starts_with("WITH RECURSIVE"),
         "a directly joined generator still opens the statement: {joined_directly}"
@@ -11300,6 +11302,46 @@ fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> 
         assert!(
             !sql.contains("date_part"),
             "the DataFusion name must not survive into BigQuery SQL: {sql}"
+        );
+    }
+
+    // `dow` is the one that needs arithmetic. DataFusion counts Sunday as 0
+    // (`DatePart::DayOfWeekSunday0`) and BigQuery's `DAYOFWEEK` counts it as 1,
+    // so the name alone shifts every weekday by one — silently, which is the
+    // worst way for it to be wrong.
+    let dow = rendered("dow")?;
+    assert!(
+        dow.contains("(EXTRACT(DAYOFWEEK FROM") && dow.contains("- 1)"),
+        "dow has to be brought back to DataFusion's Sunday=0: {dow}"
+    );
+    for zero_based in ["doy", "week", "quarter"] {
+        let sql = rendered(zero_based)?;
+        assert!(
+            !sql.contains("- 1"),
+            "{zero_based} agrees on both sides and must not be shifted: {sql}"
+        );
+    }
+
+    // Every string literal type the planner may produce. Matching only `Utf8`
+    // meant the rewrite never fired for an `EXTRACT(DOW FROM …)` — the call
+    // reached BigQuery as `date_part(…)` and it answered "Function not found".
+    for literal in [
+        datafusion_common::ScalarValue::Utf8(Some("dow".into())),
+        datafusion_common::ScalarValue::LargeUtf8(Some("dow".into())),
+        datafusion_common::ScalarValue::Utf8View(Some("dow".into())),
+    ] {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![datafusion_functions::expr_fn::date_part(
+                Expr::Literal(literal.clone(), None),
+                col("t.d"),
+            )])?
+            .build()?;
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(
+            sql.contains("EXTRACT(DAYOFWEEK FROM") && !sql.contains("date_part"),
+            "a {literal:?} field must reach the rewrite too: {sql}"
         );
     }
 

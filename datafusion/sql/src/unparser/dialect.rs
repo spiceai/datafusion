@@ -29,7 +29,7 @@ use super::{
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
 use chrono::DateTime;
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{Expr, SortExpr};
 use regex::Regex;
 use sqlparser::tokenizer::Span;
@@ -1068,27 +1068,49 @@ fn bigquery_date_part_to_sql(
     unparser: &Unparser,
     args: &[Expr],
 ) -> Result<Option<ast::Expr>> {
-    let [
-        Expr::Literal(datafusion_common::ScalarValue::Utf8(Some(field)), _),
-        operand,
-    ] = args
-    else {
+    let [Expr::Literal(field, _), operand] = args else {
         return Ok(None);
     };
-
-    let field = match field.to_lowercase().as_str() {
-        "dow" => ast::DateTimeField::DayOfWeek,
-        "doy" => ast::DateTimeField::DayOfYear,
-        "week" => ast::DateTimeField::IsoWeek,
-        "quarter" => ast::DateTimeField::Quarter,
+    // Every string literal type the planner may produce, not just `Utf8`.
+    // Matching one of them meant the rewrite silently never fired for an
+    // `EXTRACT(DOW FROM …)`, and the call reached BigQuery as `date_part(…)`,
+    // which has no such function.
+    let field = match field {
+        ScalarValue::Utf8(Some(field))
+        | ScalarValue::LargeUtf8(Some(field))
+        | ScalarValue::Utf8View(Some(field)) => field,
         _ => return Ok(None),
     };
 
-    Ok(Some(ast::Expr::Extract {
+    // `dow` needs arithmetic, not just a name: DataFusion counts Sunday as **0**
+    // (`DatePart::DayOfWeekSunday0`, Arrow's `num_days_from_sunday`) and
+    // BigQuery's `DAYOFWEEK` counts it as **1**. Rendering the name alone shifts
+    // every weekday by one, silently — measured, `date_part('dow', DATE
+    // '2026-01-04')` is 0 on a plain DataFusion session for a Sunday.
+    let (field, sunday_offset) = match field.to_lowercase().as_str() {
+        "dow" => (ast::DateTimeField::DayOfWeek, 1u8),
+        "doy" => (ast::DateTimeField::DayOfYear, 0),
+        "week" => (ast::DateTimeField::IsoWeek, 0),
+        "quarter" => (ast::DateTimeField::Quarter, 0),
+        _ => return Ok(None),
+    };
+
+    let extracted = ast::Expr::Extract {
         field,
         expr: Box::new(unparser.expr_to_sql(operand)?),
         syntax: ast::ExtractSyntax::From,
-    }))
+    };
+
+    if sunday_offset == 0 {
+        return Ok(Some(extracted));
+    }
+    Ok(Some(ast::Expr::Nested(Box::new(ast::Expr::BinaryOp {
+        left: Box::new(extracted),
+        op: BinaryOperator::Minus,
+        right: Box::new(ast::Expr::Value(
+            ast::Value::Number(sunday_offset.to_string(), false).into(),
+        )),
+    }))))
 }
 
 /// The widest scale a BigQuery `NUMERIC` holds. Measured: a thirteenth
