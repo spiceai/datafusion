@@ -2010,7 +2010,16 @@ impl Unparser<'_> {
                 // Keyed on the rewritten relation rather than on the input,
                 // since the input's names still agree with the alias's — the
                 // disagreement is created by the rewrite.
+                //
+                // Only once the `SELECT` list is taken. While it is free, the
+                // rewritten projection is merged into *this* select and the
+                // relation the alias lands on is the bare scan, whose columns
+                // the emitted expressions still name — renaming those would
+                // break a statement that binds. It is the taken list that
+                // forces the projection out into a relation of its own, which
+                // is the one whose single output goes unaddressable.
                 if columns.is_empty()
+                    && select.already_projected()
                     && let Some(rewritten) = &unparsed_table_scan
                 {
                     columns =

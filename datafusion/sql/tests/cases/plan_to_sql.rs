@@ -8125,6 +8125,31 @@ fn test_subquery_alias_over_pushed_down_scan_keeps_a_named_output_unaliased() ->
 }
 
 #[test]
+fn test_subquery_alias_with_a_free_select_list_gets_no_column_list() -> Result<()> {
+    // The same alias and the same rename, with no outer projection to take the
+    // `SELECT` list. The rewritten projection is then merged into this select and
+    // the relation the alias lands on is the bare scan — whose columns the emitted
+    // expression still names, and whose width is not the alias's. Attaching a list
+    // here renamed the scan's columns out from under `(s.a + s.b)` and named one
+    // column where the relation exposes two:
+    //   SELECT (s.a + s.b) FROM (SELECT s.a, s.b FROM t AS s) AS s ("t.a + t.b")
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .alias("s")?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (s.a + s.b) FROM (SELECT s.a, s.b FROM t AS s) AS s"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_subquery_alias_over_pushed_down_scan_on_dialect_without_column_list() -> Result<()>
 {
     // A dialect that cannot spell a column list in a table alias (SQLite) has an
