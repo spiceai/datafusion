@@ -1053,7 +1053,6 @@ impl Dialect for SqliteDialect {
 ///
 /// | `date_part` | `BigQuery` | agrees |
 /// |---|---|---|
-/// | `dow` | `DAYOFWEEK` | yes — both count Sunday as 1 |
 /// | `doy` | `DAYOFYEAR` | yes |
 /// | `week` | `ISOWEEK` | yes |
 /// | `quarter` | `QUARTER` | yes |
@@ -1082,49 +1081,28 @@ fn bigquery_date_part_to_sql(
         _ => return Ok(None),
     };
 
-    // `dow` needs arithmetic, not just a name: `date_part` maps it to
-    // `DatePart::DayOfWeekSunday0` — Arrow's `num_days_from_sunday`, so Sunday is
-    // **0** — and BigQuery's `DAYOFWEEK` counts Sunday as **1**. Rendering the
-    // name alone shifts every weekday by one, silently.
-    //
-    // This holds whichever `date_part` the caller spells, which is worth
-    // recording because it looks ambiguous and is not. A runtime may register
-    // `datafusion_spark`'s `date_part` over the built-in, and Spark counts Sunday
-    // as 1 — but Spark's is a *simplifier*: it rewrites itself into this same
-    // 0-based `date_part` plus an explicit `+ 1`. Both spellings therefore reach
-    // the unparser as the 0-based function, one of them with a visible `+ 1`
-    // beside it, and subtracting one here agrees with both:
-    //
-    //   date_part('dow', c)      ->  (EXTRACT(DAYOFWEEK …) - 1) + 1   = 1
-    //   EXTRACT(DOW FROM c)      ->   EXTRACT(DAYOFWEEK …) - 1        = 0
-    //
-    // matching what each computes locally. Only the *physical* plan shows the
-    // `+ 1`; the logical display does not, which is what makes this easy to get
-    // backwards.
-    let (field, sunday_offset) = match field.to_lowercase().as_str() {
-        "dow" => (ast::DateTimeField::DayOfWeek, 1u8),
-        "doy" => (ast::DateTimeField::DayOfYear, 0),
-        "week" => (ast::DateTimeField::IsoWeek, 0),
-        "quarter" => (ast::DateTimeField::Quarter, 0),
+    // `dow` is deliberately absent. Two spellings of a weekday reach this
+    // function as the *same* call — a `ScalarFunction` named `date_part` —
+    // carrying different implementations: `date_part('dow', c)` resolves through
+    // the registry to `datafusion_spark`'s, which counts Sunday as 1, while
+    // `EXTRACT(DOW FROM c)` is planned straight onto `DataFusion`'s, which counts
+    // Sunday as 0. Measured on a Wednesday: `4` and `3`. The name cannot separate
+    // them, so any single rendering answers one of the two a day short. Declining
+    // leaves the call to evaluate locally, where each spelling keeps the value it
+    // has today. `doy`, `week`, `quarter` and the plain field names were measured
+    // to agree between the two spellings, so they render.
+    let field = match field.to_lowercase().as_str() {
+        "doy" => ast::DateTimeField::DayOfYear,
+        "week" => ast::DateTimeField::IsoWeek,
+        "quarter" => ast::DateTimeField::Quarter,
         _ => return Ok(None),
     };
 
-    let extracted = ast::Expr::Extract {
+    Ok(Some(ast::Expr::Extract {
         field,
         expr: Box::new(unparser.expr_to_sql(operand)?),
         syntax: ast::ExtractSyntax::From,
-    };
-
-    if sunday_offset == 0 {
-        return Ok(Some(extracted));
-    }
-    Ok(Some(ast::Expr::Nested(Box::new(ast::Expr::BinaryOp {
-        left: Box::new(extracted),
-        op: BinaryOperator::Minus,
-        right: Box::new(ast::Expr::Value(
-            ast::Value::Number(sunday_offset.to_string(), false).into(),
-        )),
-    }))))
+    }))
 }
 
 /// The widest scale a BigQuery `NUMERIC` holds. Measured: a thirteenth

@@ -11386,7 +11386,7 @@ fn test_bigquery_hoisting_handles_repeats_and_nesting() -> Result<()> {
     Ok(())
 }
 
-/// `BigQuery` names four `date_part` fields differently, and gets them verbatim
+/// `BigQuery` names three `date_part` fields differently, and gets them verbatim
 /// without this.
 ///
 /// `date_part_to_sql`'s `Extract` arm renders only year/month/day/hour/minute/
@@ -11397,7 +11397,9 @@ fn test_bigquery_hoisting_handles_repeats_and_nesting() -> Result<()> {
 ///
 /// Every mapping is measured on BigQuery, not assumed. `week` is the trap: the
 /// bare `WEEK` is Sunday-based and answered 13 where DataFusion answered 14, so
-/// this asserts `ISOWEEK` and asserts the bare form is *not* emitted.
+/// this asserts `ISOWEEK` and asserts the bare form is *not* emitted. `dow` is
+/// the field that is deliberately *not* rendered — see the arm that asserts the
+/// decline.
 #[test]
 fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> {
     let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
@@ -11414,7 +11416,6 @@ fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> 
     };
 
     for (field, expected) in [
-        ("dow", "DAYOFWEEK"),
         ("doy", "DAYOFYEAR"),
         ("week", "ISOWEEK"),
         ("quarter", "QUARTER"),
@@ -11430,17 +11431,23 @@ fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> 
         );
     }
 
-    // `dow` is brought back to `date_part`'s Sunday = 0. A runtime that registers
-    // Spark's `date_part` over the built-in does not change this: Spark's is a
-    // simplifier that rewrites into the same 0-based function plus an explicit
-    // `+ 1`, so subtracting one here agrees with both spellings. Asserted
-    // explicitly because only the *physical* plan shows that `+ 1`, which makes
-    // the opposite conclusion easy to reach.
+    // `dow` is declined rather than rendered, and the decline is the point of
+    // this arm. Two spellings of a weekday reach the unparser as the same call —
+    // a `date_part` scalar function — carrying different implementations: a
+    // runtime that registers `datafusion_spark`'s `date_part` over the built-in
+    // has `date_part('dow', c)` count Sunday as 1 while `EXTRACT(DOW FROM c)` is
+    // planned onto DataFusion's and counts Sunday as 0. Measured on a Wednesday:
+    // 4 and 3. No single rendering is right for both, so neither is emitted and
+    // the call evaluates locally, where each spelling keeps the value it has.
     let dow = rendered("dow")?;
     assert!(
-        dow.contains("EXTRACT(DAYOFWEEK FROM") && dow.contains("- 1"),
-        "dow has to come back to date_part's Sunday=0: {dow}"
+        !dow.contains("DAYOFWEEK"),
+        "dow must not be rendered: the two spellings that reach here disagree \
+         by a day and one rendering cannot serve both: {dow}"
     );
+
+    // Nothing that *is* rendered carries an offset: the three fields above were
+    // measured to agree between the two spellings.
     for unshifted in ["doy", "week", "quarter"] {
         let sql = rendered(unshifted)?;
         assert!(
@@ -11449,13 +11456,14 @@ fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> 
         );
     }
 
-    // Every string literal type the planner may produce. Matching only `Utf8`
-    // meant the rewrite never fired for an `EXTRACT(DOW FROM …)` — the call
-    // reached BigQuery as `date_part(…)` and it answered "Function not found".
+    // Every string literal type the planner may produce reaches the rewrite.
+    // Matching only `Utf8` meant it silently never fired for a field the planner
+    // spelled as `Utf8View`, and the call reached BigQuery as `date_part(…)`,
+    // which it answers "Function not found".
     for literal in [
-        datafusion_common::ScalarValue::Utf8(Some("dow".into())),
-        datafusion_common::ScalarValue::LargeUtf8(Some("dow".into())),
-        datafusion_common::ScalarValue::Utf8View(Some("dow".into())),
+        datafusion_common::ScalarValue::Utf8(Some("quarter".into())),
+        datafusion_common::ScalarValue::LargeUtf8(Some("quarter".into())),
+        datafusion_common::ScalarValue::Utf8View(Some("quarter".into())),
     ] {
         let plan = table_scan(Some("t"), &schema, None)?
             .project(vec![datafusion_functions::expr_fn::date_part(
@@ -11467,7 +11475,7 @@ fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> 
             .plan_to_sql(&plan)?
             .to_string();
         assert!(
-            sql.contains("EXTRACT(DAYOFWEEK FROM") && !sql.contains("date_part"),
+            sql.contains("EXTRACT(QUARTER FROM") && !sql.contains("date_part"),
             "a {literal:?} field must reach the rewrite too: {sql}"
         );
     }
