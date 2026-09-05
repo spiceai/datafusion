@@ -8048,32 +8048,98 @@ fn test_derived_output_name_carrying_a_quote_is_escaped() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_subquery_alias_over_pushed_down_scan_still_unbindable() -> Result<()> {
-    // The scan pushdown requalifies the projection onto the subquery alias before
-    // the derived table is built, so the name the derived table can report for the
-    // output — `s.a + s.b` — is not the one the enclosing scope uses for it,
-    // `t.a + t.b`. Naming the output cannot close that gap: the repair is for the
-    // enclosing scope to name the relation's columns on the alias it attaches.
+/// The plan `Projection(s."<expr>") -> SubqueryAlias(s) -> Projection(<expr>) ->
+/// TableScan(t)`, whose unnamed output is the shape this file is about.
+fn subquery_alias_over_pushed_down_scan(output: Expr) -> Result<LogicalPlan> {
     let schema = Schema::new(vec![
         Field::new("a", DataType::Int32, false),
         Field::new("b", DataType::Int32, false),
     ]);
-    let plan = LogicalPlanBuilder::from(
-        table_scan(Some("t"), &schema, Some(vec![0, 1]))?
-            .project(vec![col("t.a").add(col("t.b"))])?
-            .alias("s")?
-            .build()?,
-    )
-    .project(vec![Expr::Column(Column::new(
-        Some(TableReference::bare("s")),
-        "t.a + t.b",
-    ))])?
-    .build()?;
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![output])?
+        .alias("s")?
+        .build()?;
+    // Read rather than spelled: this is the name the enclosing scope holds for
+    // the output, and the whole question is whether the emitted relation still
+    // answers to it. Spelling it here would let a test pass by agreeing with
+    // itself.
+    let outer_name = aliased.schema().field(0).name().clone();
+    LogicalPlanBuilder::from(aliased)
+        .project(vec![Expr::Column(Column::new(
+            Some(TableReference::bare("s")),
+            outer_name,
+        ))])?
+        .build()
+}
+
+#[test]
+fn test_subquery_alias_over_pushed_down_scan_is_named_by_the_alias() -> Result<()> {
+    // The scan pushdown requalifies the projection onto the subquery alias before
+    // the derived table is built, so the name the relation can report for the
+    // output — `s.a + s.b` — is not the one the enclosing scope uses for it,
+    // `t.a + t.b`. Each is right for its own scope, so naming the output cannot
+    // close the gap and the reference used to bind to nothing; the enclosing
+    // scope says what it calls the columns instead, on the alias it attaches.
+    let plan = subquery_alias_over_pushed_down_scan(col("t.a").add(col("t.b")))?;
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) AS "s.a + s.b" FROM t AS s) AS s"#
+        @r#"SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) FROM t AS s) AS s ("t.a + t.b")"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_column_list_escapes_a_quote_in_an_output_name() -> Result<()> {
+    // The names on that list come from the plan, so one can carry the quote that
+    // delimits the identifier it is emitted as. Both the list and the reference
+    // to it escape it, so neither closes the identifier early and injects into
+    // the statement.
+    let plan = subquery_alias_over_pushed_down_scan(
+        lit("x\" OR 1=1 --").eq(lit("y")).and(col("t.a").gt(lit(0))),
+    )?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s."Utf8(""x"" OR 1=1 --"") = Utf8(""y"") AND t.a > Int32(0)" FROM (SELECT (('x" OR 1=1 --' = 'y') AND (s.a > 0)) FROM t AS s) AS s ("Utf8(""x"" OR 1=1 --"") = Utf8(""y"") AND t.a > Int32(0)")"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_pushed_down_scan_keeps_a_named_output_unaliased() -> Result<()>
+{
+    // The control for the two above: an output the pushdown does not rename needs
+    // no list, and must not grow one. The column list is what tells the walk the
+    // alias names the relation's outputs, so producing one where nothing is
+    // unbindable would strip qualifiers from references that were binding
+    // perfectly well.
+    let plan =
+        subquery_alias_over_pushed_down_scan(col("t.a").add(col("t.b")).alias("sum"))?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s."sum" FROM (SELECT (s.a + s.b) AS "sum" FROM t AS s) AS s"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_pushed_down_scan_on_dialect_without_column_list() -> Result<()>
+{
+    // A dialect that cannot spell a column list in a table alias (SQLite) has an
+    // established fallback — inject the names into the inner projection — and it
+    // is reached here too. Pinned rather than asserted correct: what it renders is
+    // the measure of whether that fallback covers this shape.
+    let plan = subquery_alias_over_pushed_down_scan(col("t.a").add(col("t.b")))?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_supports_column_alias_in_table_alias(false)
+        .with_identifier_quote_style('"')
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @r#"SELECT "s"."t.a + t.b" FROM (SELECT ("s"."a" + "s"."b") AS "t.a + t.b" FROM "t" AS "s") AS "s""#
     );
     Ok(())
 }

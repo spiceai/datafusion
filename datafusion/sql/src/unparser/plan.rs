@@ -1998,6 +1998,25 @@ impl Unparser<'_> {
                     select.already_projected(),
                 )?;
 
+                // Pushing the alias down onto the scan requalifies the
+                // projection's expressions onto it, so an output with no name
+                // of its own is now named after the requalified expression —
+                // `s.a + s.b` where the enclosing scope still refers to it as
+                // `t.a + t.b`. Nothing the rewritten relation can report closes
+                // that gap, because each name is the right one for its own
+                // scope; the enclosing scope has to say what it calls the
+                // columns, which is what a column list on the alias does.
+                //
+                // Keyed on the rewritten relation rather than on the input,
+                // since the input's names still agree with the alias's — the
+                // disagreement is created by the rewrite.
+                if columns.is_empty()
+                    && let Some(rewritten) = &unparsed_table_scan
+                {
+                    columns =
+                        Self::alias_columns_renamed_by_pushdown(plan_alias, rewritten);
+                }
+
                 // If the (possibly rewritten) inner plan builds its own
                 // SELECT clauses (e.g. Aggregate adds GROUP BY, Window adds
                 // OVER, etc.) and unparse_table_scan_pushdown couldn't reduce it,
@@ -2975,11 +2994,51 @@ impl Unparser<'_> {
         self.binary_op_to_sql(lhs, rhs, ast::BinaryOperator::And)
     }
 
+    /// The names the enclosing scope holds for a [`SubqueryAlias`]'s outputs,
+    /// when pushing the alias down onto the scan has left the rewritten relation
+    /// reporting different ones — and an empty list when it has not.
+    ///
+    /// The rewrite requalifies the projection's expressions onto the alias, so
+    /// an output that carries no name of its own is named after the requalified
+    /// expression. That name is correct inside the relation and wrong outside
+    /// it, and only the enclosing scope knows the name it will use, so it is the
+    /// alias that has to carry the list.
+    ///
+    /// Returns nothing when the names already agree, so the emitted SQL is
+    /// unchanged for every alias the rewrite does not rename — and nothing when
+    /// the widths disagree, since a column list must name every output or none.
+    ///
+    /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
+    fn alias_columns_renamed_by_pushdown(
+        plan_alias: &datafusion_expr::SubqueryAlias,
+        rewritten: &LogicalPlan,
+    ) -> Vec<Ident> {
+        let outer = plan_alias.schema.fields();
+        let inner = rewritten.schema().fields();
+        if outer.len() != inner.len()
+            || outer
+                .iter()
+                .zip(inner.iter())
+                .all(|(outer, inner)| outer.name() == inner.name())
+        {
+            return vec![];
+        }
+        outer
+            .iter()
+            .map(|field| Ident::new(field.name().clone()))
+            .collect()
+    }
+
     fn new_table_alias(&self, alias: String, columns: Vec<Ident>) -> ast::TableAlias {
+        // Quoted on the same terms as the relation's own name: a column list
+        // names outputs, and an output's name comes from the plan, so it can
+        // carry whatever a column name or a literal can — a space, a dot, or
+        // the quote that would otherwise close the identifier early. Callers
+        // hand over bare names, so this is the one place that decides.
         let columns = columns
             .into_iter()
             .map(|ident| TableAliasColumnDef {
-                name: ident,
+                name: self.new_ident_quoted_if_needs(ident.value),
                 data_type: None,
             })
             .collect();
