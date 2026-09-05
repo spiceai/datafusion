@@ -70,6 +70,23 @@ pub struct Unparser<'a> {
     /// schema at each node, so it passes it down rather than leaving expression
     /// unparsing to guess.
     schema: Option<DFSchemaRef>,
+    /// Recursive CTEs met below the statement root, waiting to be attached to it.
+    ///
+    /// A recursive CTE nested inside a larger statement becomes a `WITH` entry on
+    /// an enclosing query plus a table reference where it stood. *Which*
+    /// enclosing query is the whole question: attaching it to the nearest one
+    /// puts `WITH RECURSIVE` inside a derived table, and BigQuery answers "WITH
+    /// RECURSIVE is only allowed at the top level of the SELECT". The statement
+    /// root drains this, so the entry lands there however deep the plan buried
+    /// it.
+    pending_recursive_ctes: Arc<std::sync::Mutex<Vec<sqlparser::ast::Cte>>>,
+    /// How many derived tables enclose the statement currently being built.
+    ///
+    /// A derived table is rendered by unparsing its plan as a whole statement,
+    /// so "am I a statement?" is not the same question as "am I the top level?".
+    /// Only depth zero may take the pending CTEs; draining at any other depth
+    /// puts `WITH RECURSIVE` back inside the parentheses it has to escape.
+    derived_depth: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<'a> Unparser<'a> {
@@ -79,6 +96,8 @@ impl<'a> Unparser<'a> {
             pretty: false,
             extension_unparsers: vec![],
             schema: None,
+            pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -94,6 +113,11 @@ impl<'a> Unparser<'a> {
             pretty: self.pretty,
             extension_unparsers: self.extension_unparsers.clone(),
             schema: Some(schema),
+            // Shared, not recreated: this is called part-way down the walk, and a
+            // recursive CTE met below would otherwise be collected into a list
+            // that is dropped with the derived unparser.
+            pending_recursive_ctes: Arc::clone(&self.pending_recursive_ctes),
+            derived_depth: Arc::clone(&self.derived_depth),
         }
     }
 
@@ -200,6 +224,8 @@ impl Default for Unparser<'_> {
             pretty: false,
             extension_unparsers: vec![],
             schema: None,
+            pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }

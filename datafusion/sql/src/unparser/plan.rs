@@ -289,7 +289,28 @@ impl Unparser<'_> {
 
         let body = self.select_to_sql_expr(plan, &mut query_builder)?;
 
-        let query = query_builder.unwrap().body(Box::new(body)).build()?;
+        // Recursive CTEs met anywhere below here belong on *this* query, not on
+        // whichever derived table happened to enclose them — see
+        // `pending_recursive_ctes`. Draining rather than reading also leaves the
+        // unparser reusable for the next statement.
+        let mut query_builder = query_builder.unwrap();
+        if self
+            .derived_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            let pending: Vec<_> = self
+                .pending_recursive_ctes
+                .lock()
+                .map_err(|e| internal_datafusion_err!("{e}"))?
+                .drain(..)
+                .collect();
+            for cte in pending {
+                query_builder.push_cte(cte, true);
+            }
+        }
+
+        let query = query_builder.body(Box::new(body)).build()?;
 
         Ok(ast::Statement::Query(Box::new(query)))
     }
@@ -736,7 +757,17 @@ impl Unparser<'_> {
 
         let mut derived_builder = DerivedRelationBuilder::default();
         derived_builder.lateral(lateral).alias(alias).subquery({
-            let inner_statement = self.plan_to_sql(plan)?;
+            // Unparsing a derived table builds a whole statement, so the drain in
+            // `select_to_sql_statement` would fire here and put the CTE inside
+            // these parentheses. Depth says this is not the top level.
+            let inner_statement = {
+                self.derived_depth
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let inner = self.plan_to_sql(plan);
+                self.derived_depth
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                inner?
+            };
             if let ast::Statement::Query(inner_query) = inner_statement {
                 inner_query
             } else {
@@ -2410,16 +2441,25 @@ impl Unparser<'_> {
                 if self.dialect.supports_recursive_cte() =>
             {
                 // A recursive CTE nested inside a larger statement becomes a CTE
-                // on the enclosing query and a plain table reference where it
-                // stood, which is the shape the plan already describes: the
-                // recursive term refers to the working table by this same name.
+                // on the *statement* and a plain table reference where it stood,
+                // which is the shape the plan already describes: the recursive
+                // term refers to the working table by this same name.
+                //
+                // Deliberately not attached to the nearest enclosing query. That
+                // query is often itself a derived table — a join input, say — and
+                // BigQuery refuses a `WITH RECURSIVE` there outright: "WITH
+                // RECURSIVE is only allowed at the top level of the SELECT,
+                // CREATE TABLE ...". The statement root drains this instead.
                 let (cte, name) = self.recursive_cte(recursive)?;
-                let Some(query) = query.as_mut() else {
+                if query.is_none() {
                     return internal_err!(
                         "a recursive CTE is only valid in a statement context"
                     );
-                };
-                query.push_cte(cte, true);
+                }
+                self.pending_recursive_ctes
+                    .lock()
+                    .map_err(|e| internal_datafusion_err!("{e}"))?
+                    .push(cte);
 
                 let mut builder = TableRelationBuilder::default();
                 builder.name(ast::ObjectName::from(vec![name]));

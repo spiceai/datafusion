@@ -11190,6 +11190,83 @@ fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order() -> 
     Ok(())
 }
 
+/// A recursive CTE nested in a larger statement is hoisted to the top level.
+///
+/// `WITH RECURSIVE` is only legal at the top of a statement on BigQuery, and a
+/// literal generator joined to a table is *not* at the top of the plan — it is a
+/// join input, which unparses as a derived table. Attaching the CTE to the
+/// nearest enclosing query put it inside those parentheses and BigQuery refused
+/// the statement outright:
+///
+/// ```text
+/// ... AS `c` INNER JOIN (WITH RECURSIVE `day_grid` AS (...) SELECT ...)
+///   -> WITH RECURSIVE is only allowed at the top level of the SELECT, CREATE TABLE ...
+/// ```
+///
+/// Six corpus statements are this exact shape, so the assertion is about
+/// *position*, not merely that the keyword appears.
+#[test]
+fn test_bigquery_hoists_a_nested_recursive_cte_to_the_top_level() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("n", DataType::Int64, true)]);
+    let grid = Schema::new(vec![Field::new("hours", DataType::Int64, true)]);
+
+    let working = |name: &str, s: &Schema| {
+        table_scan(Some(name), s, None).expect("scan the working table")
+    };
+
+    let static_term = working("seed", &grid)
+        .project(vec![col("seed.hours")])?
+        .build()?;
+    let recursive_term = working("day_grid", &grid)
+        .filter(col("day_grid.hours").lt(lit(720i64)))?
+        .project(vec![col("day_grid.hours")])?
+        .build()?;
+    let generator = LogicalPlan::RecursiveQuery(datafusion_expr::RecursiveQuery {
+        name: "day_grid".to_string(),
+        static_term: Arc::new(static_term),
+        recursive_term: Arc::new(recursive_term),
+        is_distinct: false,
+        schema: Arc::new(DFSchema::try_from(grid.clone())?),
+    });
+
+    // The generator as a join input *inside a derived table*, which is the
+    // corpus shape. The extra alias is the whole point: with the join at the
+    // statement root the nearest enclosing query already is the root, and
+    // attaching the CTE there looks correct by accident.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .join_on(
+            generator,
+            datafusion_expr::JoinType::Inner,
+            [col("t.n").eq(col("day_grid.hours"))],
+        )?
+        .project(vec![col("t.n")])?
+        .alias("inner_q")?
+        .project(vec![col("inner_q.n")])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+
+    assert!(
+        sql.starts_with("WITH RECURSIVE"),
+        "the CTE has to open the statement, not sit inside a derived table: {sql}"
+    );
+    assert_eq!(
+        sql.matches("WITH RECURSIVE").count(),
+        1,
+        "exactly one WITH RECURSIVE, at the top: {sql}"
+    );
+    // The join input is now a plain reference to the CTE, not an inlined
+    // definition.
+    assert!(
+        !sql.contains("INNER JOIN (WITH"),
+        "the join input must reference the CTE by name: {sql}"
+    );
+
+    Ok(())
+}
+
 /// `BigQuery` names four `date_part` fields differently, and gets them verbatim
 /// without this.
 ///
