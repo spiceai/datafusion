@@ -11261,6 +11261,94 @@ fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
     Ok(())
 }
 
+/// Hoisting a recursive CTE survives the shapes that repeat or nest it.
+///
+/// Each of these produced invalid SQL or contaminated a later statement, and
+/// none is exotic — they are what a real query does with a generator.
+#[test]
+fn test_bigquery_hoisting_handles_repeats_and_nesting() -> Result<()> {
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let plan_for = |query: &str| -> Result<LogicalPlan> {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        SqlToRel::new(&context).sql_statement_to_plan(statement)
+    };
+
+    let generator = "WITH RECURSIVE g AS (\
+                       SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 5\
+                     ) ";
+
+    // Referenced twice: SQL planning clones the stored plan per reference, so
+    // the definition is met twice and used to be emitted twice —
+    // `WITH RECURSIVE g AS (…), g AS (…)`, which no engine accepts.
+    let self_joined = unparser
+        .plan_to_sql(&plan_for(&format!(
+            "{generator}SELECT a.n FROM g a JOIN g b ON a.n = b.n"
+        ))?)?
+        .to_string();
+    assert_eq!(
+        self_joined.matches("WITH RECURSIVE").count(),
+        1,
+        "one WITH clause: {self_joined}"
+    );
+    assert_eq!(
+        self_joined.matches("`g` AS (").count(),
+        1,
+        "the repeated reference must reuse one definition: {self_joined}"
+    );
+
+    // Inside an expression subquery. These render by building a whole statement
+    // too, so a CTE met beneath one has to reach the *outer* statement — the
+    // depth that decides it is only kept if every nested rendering goes through
+    // the same path.
+    let in_subquery = unparser
+        .plan_to_sql(&plan_for(&format!(
+            "{generator}SELECT person.id FROM person WHERE person.id IN (SELECT n FROM g)"
+        ))?)?
+        .to_string();
+    assert!(
+        in_subquery.starts_with("WITH RECURSIVE"),
+        "a CTE under a subquery still opens the statement: {in_subquery}"
+    );
+    assert!(
+        !in_subquery.contains("IN (WITH"),
+        "and is not left inside the subquery: {in_subquery}"
+    );
+
+    // The same unparser, reused. A statement that fails part-way leaves entries
+    // behind, and the next one must not inherit them.
+    let _ = unparser.plan_to_sql(&plan_for("SELECT * FROM person")?)?;
+    let plain = unparser
+        .plan_to_sql(&plan_for("SELECT person.id FROM person")?)?
+        .to_string();
+    assert!(
+        !plain.contains("WITH RECURSIVE"),
+        "an unrelated later statement must not inherit a CTE: {plain}"
+    );
+
+    // A term carrying a clause of its own keeps it. `ORDER BY`/`LIMIT` land on
+    // the term's builder rather than in its body, and taking the body alone
+    // dropped them — the recursion then ran over different rows, with no error.
+    let bounded_seed = unparser
+        .plan_to_sql(&plan_for(
+            "WITH RECURSIVE g AS (\
+               (SELECT 1 AS n ORDER BY n LIMIT 1) \
+               UNION ALL SELECT n + 1 FROM g WHERE n < 5\
+             ) SELECT n FROM g",
+        )?)?
+        .to_string();
+    assert!(
+        bounded_seed.contains("LIMIT 1"),
+        "the seed's LIMIT has to survive into the CTE: {bounded_seed}"
+    );
+
+    Ok(())
+}
+
 /// `BigQuery` names four `date_part` fields differently, and gets them verbatim
 /// without this.
 ///

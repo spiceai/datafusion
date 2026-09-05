@@ -454,7 +454,7 @@ impl Unparser<'_> {
                 }))
             }
             Expr::ScalarSubquery(subq) => {
-                let sub_statement = self.plan_to_sql(subq.subquery.as_ref())?;
+                let sub_statement = self.plan_to_sql_nested(subq.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query
@@ -468,7 +468,7 @@ impl Unparser<'_> {
             Expr::InSubquery(insubq) => {
                 let inexpr = Box::new(self.expr_to_sql_inner(insubq.expr.as_ref())?);
                 let sub_statement =
-                    self.plan_to_sql(insubq.subquery.subquery.as_ref())?;
+                    self.plan_to_sql_nested(insubq.subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query
@@ -486,7 +486,7 @@ impl Unparser<'_> {
             Expr::SetComparison(set_cmp) => {
                 let left = Box::new(self.expr_to_sql_inner(set_cmp.expr.as_ref())?);
                 let sub_statement =
-                    self.plan_to_sql(set_cmp.subquery.subquery.as_ref())?;
+                    self.plan_to_sql_nested(set_cmp.subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query
@@ -511,7 +511,8 @@ impl Unparser<'_> {
                 }
             }
             Expr::Exists(Exists { subquery, negated }) => {
-                let sub_statement = self.plan_to_sql(subquery.subquery.as_ref())?;
+                let sub_statement =
+                    self.plan_to_sql_nested(subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query

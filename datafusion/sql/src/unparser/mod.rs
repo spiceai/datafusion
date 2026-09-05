@@ -26,7 +26,7 @@ mod utils;
 use self::dialect::{DefaultDialect, Dialect};
 use crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser;
 use datafusion_common::DFSchemaRef;
-use datafusion_expr::{Expr, ExprSchemable};
+use datafusion_expr::{Expr, ExprSchemable, LogicalPlan};
 pub use expr::expr_to_sql;
 pub use plan::plan_to_sql;
 use std::sync::Arc;
@@ -136,6 +136,26 @@ impl<'a> Unparser<'a> {
             return Some(data_type);
         }
         utils::provable_data_type(expr)
+    }
+
+    /// [`Self::plan_to_sql`] for a plan that is *inside* another statement.
+    ///
+    /// A derived table and an expression subquery are both rendered by building
+    /// a whole statement and embedding it, so "a statement is being built" is not
+    /// the same as "this is the top level". Recursive CTEs are hoisted to the top
+    /// level, and the depth this keeps is how the drain tells the two apart —
+    /// every nested rendering has to go through here, or a CTE met beneath it is
+    /// attached inside the parentheses it needed to escape.
+    fn plan_to_sql_nested(
+        &self,
+        plan: &LogicalPlan,
+    ) -> datafusion_common::Result<sqlparser::ast::Statement> {
+        self.derived_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rendered = self.plan_to_sql(plan);
+        self.derived_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        rendered
     }
 
     /// The field `expr` resolves to, when a schema was supplied.
