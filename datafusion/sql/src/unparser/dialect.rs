@@ -1082,11 +1082,25 @@ fn bigquery_date_part_to_sql(
         _ => return Ok(None),
     };
 
-    // `dow` needs arithmetic, not just a name: DataFusion counts Sunday as **0**
-    // (`DatePart::DayOfWeekSunday0`, Arrow's `num_days_from_sunday`) and
-    // BigQuery's `DAYOFWEEK` counts it as **1**. Rendering the name alone shifts
-    // every weekday by one, silently — measured, `date_part('dow', DATE
-    // '2026-01-04')` is 0 on a plain DataFusion session for a Sunday.
+    // `dow` needs arithmetic, not just a name: `date_part` maps it to
+    // `DatePart::DayOfWeekSunday0` — Arrow's `num_days_from_sunday`, so Sunday is
+    // **0** — and BigQuery's `DAYOFWEEK` counts Sunday as **1**. Rendering the
+    // name alone shifts every weekday by one, silently.
+    //
+    // This holds whichever `date_part` the caller spells, which is worth
+    // recording because it looks ambiguous and is not. A runtime may register
+    // `datafusion_spark`'s `date_part` over the built-in, and Spark counts Sunday
+    // as 1 — but Spark's is a *simplifier*: it rewrites itself into this same
+    // 0-based `date_part` plus an explicit `+ 1`. Both spellings therefore reach
+    // the unparser as the 0-based function, one of them with a visible `+ 1`
+    // beside it, and subtracting one here agrees with both:
+    //
+    //   date_part('dow', c)      ->  (EXTRACT(DAYOFWEEK …) - 1) + 1   = 1
+    //   EXTRACT(DOW FROM c)      ->   EXTRACT(DAYOFWEEK …) - 1        = 0
+    //
+    // matching what each computes locally. Only the *physical* plan shows the
+    // `+ 1`; the logical display does not, which is what makes this easy to get
+    // backwards.
     let (field, sunday_offset) = match field.to_lowercase().as_str() {
         "dow" => (ast::DateTimeField::DayOfWeek, 1u8),
         "doy" => (ast::DateTimeField::DayOfYear, 0),

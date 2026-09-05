@@ -11305,20 +11305,22 @@ fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> 
         );
     }
 
-    // `dow` is the one that needs arithmetic. DataFusion counts Sunday as 0
-    // (`DatePart::DayOfWeekSunday0`) and BigQuery's `DAYOFWEEK` counts it as 1,
-    // so the name alone shifts every weekday by one — silently, which is the
-    // worst way for it to be wrong.
+    // `dow` is brought back to `date_part`'s Sunday = 0. A runtime that registers
+    // Spark's `date_part` over the built-in does not change this: Spark's is a
+    // simplifier that rewrites into the same 0-based function plus an explicit
+    // `+ 1`, so subtracting one here agrees with both spellings. Asserted
+    // explicitly because only the *physical* plan shows that `+ 1`, which makes
+    // the opposite conclusion easy to reach.
     let dow = rendered("dow")?;
     assert!(
-        dow.contains("(EXTRACT(DAYOFWEEK FROM") && dow.contains("- 1)"),
-        "dow has to be brought back to DataFusion's Sunday=0: {dow}"
+        dow.contains("EXTRACT(DAYOFWEEK FROM") && dow.contains("- 1"),
+        "dow has to come back to date_part's Sunday=0: {dow}"
     );
-    for zero_based in ["doy", "week", "quarter"] {
-        let sql = rendered(zero_based)?;
+    for unshifted in ["doy", "week", "quarter"] {
+        let sql = rendered(unshifted)?;
         assert!(
-            !sql.contains("- 1"),
-            "{zero_based} agrees on both sides and must not be shifted: {sql}"
+            !sql.contains(" - 1"),
+            "{unshifted} agrees on both sides and must not be shifted: {sql}"
         );
     }
 
