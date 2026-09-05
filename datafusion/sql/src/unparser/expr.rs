@@ -1582,7 +1582,13 @@ impl Unparser<'_> {
         // Casting text to a date *parses* it too, and by a different rule than
         // the timestamp cast above: an engine may accept a zone marker in one and
         // refuse it in the other, so the dialect spells this parse separately.
-        if matches!(data_type, DataType::Date32 | DataType::Date64)
+        //
+        // `Date32` only. `Date64` carries a time of day and is rendered as
+        // `DATETIME` (or `TIMESTAMP`) by `ast_type_for_date64_in_cast`, so
+        // sending it through a parser that yields a `DATE` would drop the time
+        // and change the column's SQL type — quietly. It keeps the cast path it
+        // already had; the timestamp hook above is the one that serves it.
+        if matches!(data_type, DataType::Date32)
             && self
                 .resolved_data_type(expr)
                 .is_some_and(|resolved| resolved.is_string())

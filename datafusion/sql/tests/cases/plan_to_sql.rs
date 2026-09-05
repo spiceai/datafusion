@@ -11261,6 +11261,43 @@ fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
     Ok(())
 }
 
+/// Only a `Date32` cast is parsed as a date; a `Date64` keeps its time of day.
+///
+/// `Date64` is rendered `DATETIME` by `ast_type_for_date64_in_cast`, so routing
+/// it through a parser that yields `DATE` would truncate the time and change the
+/// column's SQL type — with no error, which is the worst way to lose data.
+#[test]
+fn test_bigquery_parses_text_into_a_date_only_for_date32() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("note", DataType::Utf8, true)]);
+    let rendered = |target: DataType| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![cast(col("t.note"), target)])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let as_date = rendered(DataType::Date32)?;
+    assert!(
+        as_date.contains("TIMESTAMP(REGEXP_REPLACE(") && as_date.contains("AS DATE)"),
+        "a Date32 cast is parsed and then narrowed: {as_date}"
+    );
+
+    let as_date64 = rendered(DataType::Date64)?;
+    assert!(
+        !as_date64.contains("AS DATE)"),
+        "a Date64 must not be narrowed to a date, which would drop its time: \
+         {as_date64}"
+    );
+    assert!(
+        as_date64.contains("DATETIME") || as_date64.contains("TIMESTAMP"),
+        "a Date64 keeps a type that carries a time of day: {as_date64}"
+    );
+
+    Ok(())
+}
+
 /// Hoisting a recursive CTE survives the shapes that repeat or nest it.
 ///
 /// Each of these produced invalid SQL or contaminated a later statement, and
