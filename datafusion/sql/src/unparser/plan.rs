@@ -198,6 +198,20 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     Some(schema)
 }
 
+/// Whether `plan` holds the definition of a recursive CTE called `name`.
+fn subtree_defines_recursive_cte(plan: &LogicalPlan, name: &str) -> bool {
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        if let LogicalPlan::RecursiveQuery(recursive) = node
+            && recursive.name == name
+        {
+            return true;
+        }
+        stack.extend(node.inputs());
+    }
+    false
+}
+
 /// Whether any expression in `plan` reads a column from an enclosing query.
 ///
 /// `Expr::OuterReferenceColumn` is how a correlated reference reaches the plan,
@@ -240,12 +254,17 @@ fn relations_bound_outside_a_recursive_cte(plan: &LogicalPlan) -> HashSet<String
             }
             LogicalPlan::SubqueryAlias(alias) => {
                 // A recursive CTE is referenced through an alias carrying its
-                // *own* name, directly above the `RecursiveQuery`. That is the
-                // definition being hoisted, not a relation competing with it, so
-                // it must not count against itself.
-                if let LogicalPlan::RecursiveQuery(recursive) = alias.input.as_ref()
-                    && recursive.name == alias.alias.table()
-                {
+                // *own* name. That is the definition being hoisted, not a
+                // relation competing with it, so it must not count against
+                // itself.
+                //
+                // Matched on the subtree rather than the immediate child: SQL
+                // planning puts a `Projection` between the alias and the
+                // `RecursiveQuery` whenever the reference selects columns, which
+                // every reference from another CTE does. Checking only the direct
+                // child made every such CTE collide with itself and declined the
+                // hoist for the whole shape.
+                if subtree_defines_recursive_cte(node, alias.alias.table()) {
                     continue;
                 }
                 bound.insert(alias.alias.table().to_string());

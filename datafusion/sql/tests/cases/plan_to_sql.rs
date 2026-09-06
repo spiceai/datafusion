@@ -11438,9 +11438,27 @@ fn test_bigquery_refuses_to_hoist_a_cte_over_a_relation_of_the_same_name() -> Re
          silently rebound: {collides:?}"
     );
 
-    // The control. A guard that refused every hoist would satisfy the assertion
-    // above and destroy the feature, so the same shape under a free name has to
-    // keep working.
+    // The control that matters most: a CTE *referenced by another CTE*, which is
+    // how every recursive generator in the corpus this came from is used. SQL
+    // planning puts a `Projection` between the reference's alias and the
+    // `RecursiveQuery`, and a first version of the guard looked only at the
+    // alias's immediate child — so every such CTE collided with itself and the
+    // whole shape stopped federating. Caught against a live engine, not here,
+    // which is why it is here now.
+    let via_another_cte = unparser
+        .plan_to_sql(&plan_for(
+            "WITH RECURSIVE gen AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM gen WHERE id < 3), \
+             doubled AS (SELECT gen.id * 2 AS id FROM gen) \
+             SELECT person.id FROM person JOIN doubled ON person.id = doubled.id",
+        )?)?
+        .to_string();
+    assert!(
+        via_another_cte.contains("WITH RECURSIVE `gen`"),
+        "a CTE referenced through another CTE still hoists: {via_another_cte}"
+    );
+
+    // The plain control: a guard that refused every hoist would satisfy the
+    // assertion above and destroy the feature.
     let clear = unparser
         .plan_to_sql(&plan_for(&format!(
             "SELECT person.id FROM person JOIN ({}) x ON person.id = x.id",
