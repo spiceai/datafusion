@@ -270,23 +270,30 @@ impl Unparser<'_> {
     }
 
     pub fn plan_to_sql(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
-        // Start a top-level rendering from a clean slate. The pending list is
-        // drained when a statement finishes, but an error part-way through
-        // leaves entries behind — and an `Unparser` is reusable, so the next
-        // plan would be handed a recursive CTE belonging to a query that never
-        // completed, hoisted onto an unrelated statement. Nothing below can
-        // observe the previous attempt, so discarding here is the whole fix.
+        // A top-level rendering gets traversal state of its own.
+        //
+        // The queue and the depth belong to one render, not to the unparser.
+        // `plan_to_sql` takes `&self` and an `Unparser` is shareable, so without
+        // this two concurrent renders on one instance would drain each other's
+        // queue; and because the queue is drained only when a statement
+        // *finishes*, a render that failed part-way would hand its leftovers to
+        // the next caller, hoisting a CTE from a query that never completed onto
+        // an unrelated statement.
+        //
+        // Every *nested* render shares the state of the render that entered it,
+        // which is what `plan_to_sql_nested` is for: it raises the depth, so the
+        // branch below is not taken and the pending CTEs still reach the root.
         if self
             .derived_depth
             .load(std::sync::atomic::Ordering::Relaxed)
             == 0
         {
-            self.pending_recursive_ctes
-                .lock()
-                .map_err(|e| internal_datafusion_err!("{e}"))?
-                .clear();
+            return self.with_own_render_state().render_statement(plan);
         }
+        self.render_statement(plan)
+    }
 
+    fn render_statement(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
         let mut plan = normalize_union_schema(plan)?;
         if !self.dialect.supports_qualify() {
             plan = rewrite_qualify(plan)?;

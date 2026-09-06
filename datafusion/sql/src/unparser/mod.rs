@@ -101,6 +101,25 @@ impl<'a> Unparser<'a> {
         }
     }
 
+    /// The same unparser with traversal state of its own — see `plan_to_sql`.
+    ///
+    /// The `Arc`s exist so `with_schema` can hand the state to the derived
+    /// unparsers it builds part-way down a walk. They are *not* meant to carry it
+    /// between two renders, which is why a top-level render starts here: one
+    /// render's queue is then reachable only from the unparsers derived within
+    /// it, so two concurrent renders on one instance cannot drain each other's,
+    /// and a render that failed part-way leaves nothing for the next caller.
+    pub(crate) fn with_own_render_state(&self) -> Unparser<'a> {
+        Unparser {
+            dialect: self.dialect,
+            pretty: self.pretty,
+            extension_unparsers: self.extension_unparsers.clone(),
+            schema: self.schema.clone(),
+            pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
+            derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
     /// The same unparser, resolving expression types against `schema`.
     ///
     /// Plan unparsing sets this per node, so a dialect that renders by type sees
