@@ -200,16 +200,17 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
 
 /// Whether `plan` holds the definition of a recursive CTE called `name`.
 fn subtree_defines_recursive_cte(plan: &LogicalPlan, name: &str) -> bool {
-    let mut stack = vec![plan];
-    while let Some(node) = stack.pop() {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
         if let LogicalPlan::RecursiveQuery(recursive) = node
             && recursive.name == name
         {
-            return true;
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
         }
-        stack.extend(node.inputs());
-    }
-    false
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
 }
 
 /// Whether any expression in `plan` reads a column from an enclosing query.
@@ -239,41 +240,42 @@ fn plan_reads_an_outer_row(plan: &LogicalPlan) -> Result<bool> {
 
 /// The relation names `plan` binds outside any recursive CTE.
 ///
-/// A recursive term refers to its own CTE by name, as a scan of a work table, so
-/// a `RecursiveQuery`'s own subtree is skipped: the names in there are the CTE's
-/// to use and are not what a hoisted definition would collide with.
-fn relations_bound_outside_a_recursive_cte(plan: &LogicalPlan) -> HashSet<String> {
+/// A hoisted CTE's name lands in the statement's top-level namespace, so what
+/// matters is every name the statement binds *anywhere* — a hoisted `h` captures
+/// an `h` in a derived table or a subquery just as surely as one beside the
+/// root.
+///
+/// Two things are deliberately not counted. A `RecursiveQuery`'s own subtree is
+/// skipped: the names in there are the CTE's to use, including the scan of its
+/// work table, which carries the CTE's name. And the alias a CTE is *referenced*
+/// through carries that same name; it is the definition being hoisted, not a
+/// relation competing with it. The alias's subtree is still walked, because a
+/// reference can sit beside relations of its own — an alias `g` over a join of
+/// recursive `g` and a table `h` binds `h`, and dropping it would let a later
+/// hoisted `h` rebind that table silently.
+fn relations_bound_outside_a_recursive_cte(
+    plan: &LogicalPlan,
+) -> Result<HashSet<String>> {
     let mut bound = HashSet::new();
-    let mut stack = vec![plan];
-    while let Some(node) = stack.pop() {
+    // `apply_with_subqueries`, not a walk over `inputs()`: a scalar, `IN`,
+    // `EXISTS` or set-comparison subquery holds its plan in an *expression*, and
+    // a relation in there is as capturable as any other.
+    plan.apply_with_subqueries(|node| {
         match node {
-            // The CTE's own scope; its self-reference lives here.
-            LogicalPlan::RecursiveQuery(_) => continue,
+            LogicalPlan::RecursiveQuery(_) => return Ok(TreeNodeRecursion::Jump),
             LogicalPlan::TableScan(scan) => {
                 bound.insert(scan.table_name.table().to_string());
             }
             LogicalPlan::SubqueryAlias(alias) => {
-                // A recursive CTE is referenced through an alias carrying its
-                // *own* name. That is the definition being hoisted, not a
-                // relation competing with it, so it must not count against
-                // itself.
-                //
-                // Matched on the subtree rather than the immediate child: SQL
-                // planning puts a `Projection` between the alias and the
-                // `RecursiveQuery` whenever the reference selects columns, which
-                // every reference from another CTE does. Checking only the direct
-                // child made every such CTE collide with itself and declined the
-                // hoist for the whole shape.
-                if subtree_defines_recursive_cte(node, alias.alias.table()) {
-                    continue;
+                if !subtree_defines_recursive_cte(node, alias.alias.table()) {
+                    bound.insert(alias.alias.table().to_string());
                 }
-                bound.insert(alias.alias.table().to_string());
             }
             _ => {}
         }
-        stack.extend(node.inputs());
-    }
-    bound
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(bound)
 }
 
 impl Unparser<'_> {
@@ -474,7 +476,7 @@ impl Unparser<'_> {
                 .drain(..)
                 .collect();
             if !pending.is_empty() {
-                let bound = relations_bound_outside_a_recursive_cte(plan);
+                let bound = relations_bound_outside_a_recursive_cte(plan)?;
                 for cte in &pending {
                     // A hoisted CTE keeps its own name, and here that name joins
                     // the statement's top-level namespace. If the statement
@@ -662,6 +664,20 @@ impl Unparser<'_> {
         {
             self.queue_recursive_cte(cte, recursive)?;
         } else {
+            // Rendering this CTE's terms can itself have queued definitions —
+            // an anchor that reads an *earlier* recursive CTE defers that one
+            // here. This is the statement, so they are its to attach; leaving
+            // them queued emits a statement referencing a CTE it never defines.
+            // They go first: a later entry may read an earlier one.
+            let queued: Vec<_> = self
+                .pending_recursive_ctes
+                .lock()
+                .map_err(|e| internal_datafusion_err!("{e}"))?
+                .drain(..)
+                .collect();
+            for queued_cte in queued {
+                query.push_cte(queued_cte, true);
+            }
             query.push_cte(cte, true);
         }
         query.body(Box::new(SetExpr::Select(Box::new(select_all))));
