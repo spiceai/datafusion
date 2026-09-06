@@ -2296,14 +2296,17 @@ fn refuses_this_pair(left: &DataType, right: &DataType) -> bool {
     // `STRING < DATETIME` is "No matching signature for operator <". Bringing
     // them together casts the text side, which is where the dialect's own
     // text-to-temporal parse applies.
+    // `Time32`/`Time64` are deliberately absent. `ast_data_type_to_sql` answers
+    // `not_impl_err!("Unsupported DataType")` for both, so converging a text/time
+    // comparison onto one produces a cast that cannot be rendered at all — the
+    // whole statement then fails to unparse rather than federating or declining
+    // cleanly. Measured: a `Time64(ns)` column compared to text answers
+    // "Unsupported DataType: conversion: Time64(ns)", where the same shape over
+    // `Date32` renders. They belong here once the unparser can render a time cast.
     let is_temporal = |t: &DataType| {
         matches!(
             t,
-            DataType::Timestamp(_, _)
-                | DataType::Date32
-                | DataType::Date64
-                | DataType::Time32(_)
-                | DataType::Time64(_)
+            DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64
         )
     };
     let text_against_temporal =

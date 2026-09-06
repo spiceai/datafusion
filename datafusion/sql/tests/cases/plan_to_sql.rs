@@ -11356,15 +11356,30 @@ fn test_bigquery_hoisting_handles_repeats_and_nesting() -> Result<()> {
         "and is not left inside the subquery: {in_subquery}"
     );
 
-    // The same unparser, reused. A statement that fails part-way leaves entries
-    // behind, and the next one must not inherit them.
-    let _ = unparser.plan_to_sql(&plan_for("SELECT * FROM person")?)?;
+    // The same unparser, reused after a render that *fails part-way*. The CTE
+    // below is met — and queued — before the outer projection is rendered, and
+    // that projection casts to `TIME`, which `ast_data_type_to_sql` refuses. The
+    // queue is therefore non-empty when the error unwinds, and without the reset
+    // at the top of `plan_to_sql` the next statement inherits it.
+    //
+    // A *successful* render here would prove nothing: the drain at the end of a
+    // finished statement empties the queue anyway, so the assertion would hold
+    // with the reset deleted.
+    let failed = unparser.plan_to_sql(&plan_for(&format!(
+        "SELECT a.n FROM ({generator}SELECT n FROM g) a \
+         JOIN (SELECT CAST(person.id AS TIME) AS n FROM person) b ON a.n = b.n"
+    ))?);
+    assert!(
+        failed.is_err(),
+        "this render has to fail for the reuse below to mean anything: {failed:?}"
+    );
+
     let plain = unparser
         .plan_to_sql(&plan_for("SELECT person.id FROM person")?)?
         .to_string();
     assert!(
         !plain.contains("WITH RECURSIVE"),
-        "an unrelated later statement must not inherit a CTE: {plain}"
+        "an unrelated later statement must not inherit a CTE queued by a failed one: {plain}"
     );
 
     // A term carrying a clause of its own keeps it. `ORDER BY`/`LIMIT` land on

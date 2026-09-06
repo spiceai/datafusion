@@ -1416,6 +1416,15 @@ impl Dialect for BigQueryDialect {
         // `ORDER BY` gives the same answer — and refusing one instead is not a
         // lost pushdown but a failed query, since the fallback is a generic
         // `FILTER` clause BigQuery cannot parse.
+        //
+        // `avg` reads as the exception and is not one. It inherits
+        // `AggregateUDFImpl`'s `HardRequirement` ordering rather than declaring
+        // itself insensitive the way `sum`, `min` and `max` do, which suggests
+        // dropping its `ORDER BY` could shift a float result. Measured instead
+        // of assumed, on values chosen so summation order would show —
+        // `1e16, 1.0, -1e16, 2.0, -1.0` — DataFusion answers `0.4` under `ASC`,
+        // under `DESC` and unordered alike. The declared sensitivity is an
+        // unoverridden default, not a statement that the value depends on order.
         if let Some(predicate) = filter {
             return bigquery_filtered_aggregate_to_sql(
                 unparser, func_name, args, distinct, predicate,
