@@ -11401,6 +11401,60 @@ fn test_bigquery_hoisting_handles_repeats_and_nesting() -> Result<()> {
     Ok(())
 }
 
+/// Hoisting a recursive CTE puts its name in the statement's top-level
+/// namespace, where the statement may already bind it.
+///
+/// The planner accepts a CTE scoped to a derived table that shares a name with an
+/// outer relation, and the two mean different things: the outer `person` is the
+/// table, the inner one the CTE. Hoisting the definition to the top makes the
+/// outer reference read the CTE — wrong rows, no error. Refuse instead, which
+/// leaves the statement to whoever asked for it rather than answering it wrongly.
+#[test]
+fn test_bigquery_refuses_to_hoist_a_cte_over_a_relation_of_the_same_name() -> Result<()> {
+    let plan_for = |query: &str| -> Result<LogicalPlan> {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        SqlToRel::new(&context).sql_statement_to_plan(statement)
+    };
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let generator = |name: &str| {
+        format!(
+            "WITH RECURSIVE {name} AS (SELECT 1 AS id UNION ALL \
+             SELECT id + 1 FROM {name} WHERE id < 3) SELECT id FROM {name}"
+        )
+    };
+
+    let collides = unparser.plan_to_sql(&plan_for(&format!(
+        "SELECT person.id FROM person JOIN ({}) x ON person.id = x.id",
+        generator("person")
+    ))?);
+    assert!(
+        collides.is_err(),
+        "hoisting `person` over the table of that name must be refused, not \
+         silently rebound: {collides:?}"
+    );
+
+    // The control. A guard that refused every hoist would satisfy the assertion
+    // above and destroy the feature, so the same shape under a free name has to
+    // keep working.
+    let clear = unparser
+        .plan_to_sql(&plan_for(&format!(
+            "SELECT person.id FROM person JOIN ({}) x ON person.id = x.id",
+            generator("gen")
+        ))?)?
+        .to_string();
+    assert!(
+        clear.starts_with("WITH RECURSIVE `gen`"),
+        "a CTE whose name binds nothing else still hoists: {clear}"
+    );
+
+    Ok(())
+}
+
 /// `BigQuery` names three `date_part` fields differently, and gets them verbatim
 /// without this.
 ///

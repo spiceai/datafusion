@@ -198,6 +198,40 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     Some(schema)
 }
 
+/// The relation names `plan` binds outside any recursive CTE.
+///
+/// A recursive term refers to its own CTE by name, as a scan of a work table, so
+/// a `RecursiveQuery`'s own subtree is skipped: the names in there are the CTE's
+/// to use and are not what a hoisted definition would collide with.
+fn relations_bound_outside_a_recursive_cte(plan: &LogicalPlan) -> HashSet<String> {
+    let mut bound = HashSet::new();
+    let mut stack = vec![plan];
+    while let Some(node) = stack.pop() {
+        match node {
+            // The CTE's own scope; its self-reference lives here.
+            LogicalPlan::RecursiveQuery(_) => continue,
+            LogicalPlan::TableScan(scan) => {
+                bound.insert(scan.table_name.table().to_string());
+            }
+            LogicalPlan::SubqueryAlias(alias) => {
+                // A recursive CTE is referenced through an alias carrying its
+                // *own* name, directly above the `RecursiveQuery`. That is the
+                // definition being hoisted, not a relation competing with it, so
+                // it must not count against itself.
+                if let LogicalPlan::RecursiveQuery(recursive) = alias.input.as_ref()
+                    && recursive.name == alias.alias.table()
+                {
+                    continue;
+                }
+                bound.insert(alias.alias.table().to_string());
+            }
+            _ => {}
+        }
+        stack.extend(node.inputs());
+    }
+    bound
+}
+
 impl Unparser<'_> {
     /// Queues a recursive CTE for the statement root, keeping one definition per
     /// name.
@@ -358,8 +392,33 @@ impl Unparser<'_> {
                 .map_err(|e| internal_datafusion_err!("{e}"))?
                 .drain(..)
                 .collect();
-            for cte in pending {
-                query_builder.push_cte(cte, true);
+            if !pending.is_empty() {
+                let bound = relations_bound_outside_a_recursive_cte(plan);
+                for cte in &pending {
+                    // A hoisted CTE keeps its own name, and here that name joins
+                    // the statement's top-level namespace. If the statement
+                    // already binds a relation of that name, hoisting rebinds it:
+                    // the planner accepts
+                    //
+                    //   SELECT t.id FROM t JOIN (
+                    //     WITH RECURSIVE t AS (…) SELECT id FROM t) x ON …
+                    //
+                    // where the outer `t` is the table and the inner one is the
+                    // CTE, and hoisting the CTE to the top makes both read the
+                    // CTE. Refuse the statement rather than emit SQL that binds
+                    // the wrong relation and returns wrong rows.
+                    if bound.contains(cte.alias.name.value.as_str()) {
+                        return not_impl_err!(
+                            "a recursive CTE named `{}` cannot be hoisted to the \
+                             top of this statement: the name already binds a \
+                             relation there, and hoisting would rebind it",
+                            cte.alias.name
+                        );
+                    }
+                }
+                for cte in pending {
+                    query_builder.push_cte(cte, true);
+                }
             }
         }
 
