@@ -15,13 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::logical_plan::consumer::{SubstraitConsumer, from_substrait_func_args};
+use crate::logical_plan::consumer::{
+    SubstraitConsumer, from_substrait_func_args, from_substrait_type_without_names,
+};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::common::{
     DFSchema, DataFusionError, ScalarValue, not_impl_err, plan_err, substrait_err,
 };
 use datafusion::execution::FunctionRegistry;
-use datafusion::logical_expr::{Between, BinaryExpr, Expr, Like, Operator, expr};
+use datafusion::logical_expr::{Between, BinaryExpr, Cast, Expr, Like, Operator, expr};
 use std::vec::Drain;
 use substrait::proto::expression::ScalarFunction;
 
@@ -44,6 +47,13 @@ pub async fn from_scalar_function(
 
     let fn_name = substrait_fun_name(fn_signature);
     let args = from_substrait_func_args(consumer, &f.arguments, input_schema).await?;
+
+    // Substrait `extract` is not a plain name alias: DataFusion's `date_part`
+    // returns Int32, while plans (e.g. Isthmus TPC-H) declare i64. Handle it
+    // explicitly and cast to the declared output type.
+    if fn_name == "extract" {
+        return build_extract_as_date_part(consumer, f, args);
+    }
 
     let udf_func = consumer.get_function_registry().udf(fn_name).or_else(|e| {
         if let Some(alt_name) = substrait_to_df_name(fn_name) {
@@ -124,9 +134,33 @@ pub fn name_to_op(name: &str) -> Option<Operator> {
 pub fn substrait_to_df_name(name: &str) -> Option<&str> {
     match name {
         "is_nan" => Some("isnan"),
-        // Substrait `extract` (e.g. extract:req_date) is DataFusion `date_part`.
-        "extract" => Some("date_part"),
         _ => None,
+    }
+}
+
+/// Map Substrait `extract` to DataFusion `date_part`, preserving the plan's
+/// declared result type (typically `i64` / [`DataType::Int64`]).
+fn build_extract_as_date_part(
+    consumer: &impl SubstraitConsumer,
+    f: &ScalarFunction,
+    args: Vec<Expr>,
+) -> Result<Expr> {
+    let func = consumer.get_function_registry().udf("date_part")?;
+    let expr = Expr::ScalarFunction(expr::ScalarFunction::new_udf(func.to_owned(), args));
+
+    // Prefer the ScalarFunction's declared output type; default to Int64, which
+    // matches the Substrait datetime `extract` extension return type.
+    let target_type = if let Some(output_type) = f.output_type.as_ref() {
+        from_substrait_type_without_names(consumer, output_type)?
+    } else {
+        DataType::Int64
+    };
+
+    // `date_part` already returns Int32; only cast when the plan needs another type.
+    if target_type == DataType::Int32 {
+        Ok(expr)
+    } else {
+        Ok(Expr::Cast(Cast::new(Box::new(expr), target_type)))
     }
 }
 
@@ -615,14 +649,26 @@ mod tests {
             })),
         };
 
+        let i64_type = substrait::proto::Type {
+            kind: Some(substrait::proto::r#type::Kind::I64(
+                substrait::proto::r#type::I64 {
+                    type_variation_reference: 0,
+                    nullability: substrait::proto::r#type::Nullability::Required as i32,
+                },
+            )),
+        };
         let func = ScalarFunction {
             function_reference: 0,
             arguments: vec![enum_arg, date_arg],
+            output_type: Some(i64_type),
             ..Default::default()
         };
 
         let result = consumer.consume_scalar_function(&func, &df_schema).await?;
-        assert_eq!(result.to_string(), r#"date_part(Utf8("YEAR"), d)"#);
+        assert_eq!(
+            result.to_string(),
+            r#"CAST(date_part(Utf8("YEAR"), d) AS Int64)"#
+        );
         Ok(())
     }
 }
