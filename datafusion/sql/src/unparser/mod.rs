@@ -87,6 +87,14 @@ pub struct Unparser<'a> {
     /// Only depth zero may take the pending CTEs; draining at any other depth
     /// puts `WITH RECURSIVE` back inside the parentheses it has to escape.
     derived_depth: Arc<std::sync::atomic::AtomicUsize>,
+    /// How many statement renders are in progress.
+    ///
+    /// Distinct from `derived_depth`, which counts *enclosing derived tables* and
+    /// is back to zero as soon as a nested render returns — while the CTE it
+    /// queued is still waiting for the root. This says "someone is building a
+    /// statement that will drain the queue", which is what tells a bare
+    /// `expr_to_sql` that nobody will.
+    statements_in_flight: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<'a> Unparser<'a> {
@@ -98,6 +106,7 @@ impl<'a> Unparser<'a> {
             schema: None,
             pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
             derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            statements_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -117,6 +126,7 @@ impl<'a> Unparser<'a> {
             schema: self.schema.clone(),
             pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
             derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            statements_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -137,6 +147,7 @@ impl<'a> Unparser<'a> {
             // that is dropped with the derived unparser.
             pending_recursive_ctes: Arc::clone(&self.pending_recursive_ctes),
             derived_depth: Arc::clone(&self.derived_depth),
+            statements_in_flight: Arc::clone(&self.statements_in_flight),
         }
     }
 
@@ -165,7 +176,16 @@ impl<'a> Unparser<'a> {
     /// level, and the depth this keeps is how the drain tells the two apart —
     /// every nested rendering has to go through here, or a CTE met beneath it is
     /// attached inside the parentheses it needed to escape.
-    fn plan_to_sql_nested(
+    ///
+    /// Public because an extension unparser needs it. The documented pattern for
+    /// [`UserDefinedLogicalNodeUnparser`] builds a subquery by calling
+    /// [`Self::plan_to_sql`] on the node's input and embedding the result; that
+    /// call renders a *standalone* statement, so a recursive CTE in the input
+    /// lands inside the extension's own parentheses. An extension that embeds
+    /// what it renders should call this instead.
+    ///
+    /// [`UserDefinedLogicalNodeUnparser`]: crate::unparser::extension_unparser::UserDefinedLogicalNodeUnparser
+    pub fn plan_to_sql_nested(
         &self,
         plan: &LogicalPlan,
     ) -> datafusion_common::Result<sqlparser::ast::Statement> {
@@ -265,6 +285,7 @@ impl Default for Unparser<'_> {
             schema: None,
             pending_recursive_ctes: Arc::new(std::sync::Mutex::new(Vec::new())),
             derived_depth: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            statements_in_flight: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 }

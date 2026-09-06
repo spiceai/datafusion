@@ -100,6 +100,29 @@ impl Unparser<'_> {
         if self.pretty {
             root_expr = self.remove_unnecessary_nesting(root_expr, LOWEST, LOWEST);
         }
+        // A subquery below this expression may have met a recursive CTE and
+        // queued it for a statement root to attach. Rendering an expression on
+        // its own has no statement root, so nothing will: the expression that
+        // comes back references a relation the caller has no definition for.
+        //
+        // Only when this call is the entry point. Reached from plan unparsing the
+        // depth is above zero, and the statement that entered takes the queue.
+        if self
+            .statements_in_flight
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+            && !self
+                .pending_recursive_ctes
+                .lock()
+                .map_err(|e| internal_datafusion_err!("{e}"))?
+                .is_empty()
+        {
+            return not_impl_err!(
+                "this expression contains a recursive CTE, which has to be \
+                 attached to a statement; unparse the plan that encloses it \
+                 rather than the expression alone"
+            );
+        }
         Ok(root_expr)
     }
 

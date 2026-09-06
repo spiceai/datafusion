@@ -198,6 +198,31 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     Some(schema)
 }
 
+/// Whether any expression in `plan` reads a column from an enclosing query.
+///
+/// `Expr::OuterReferenceColumn` is how a correlated reference reaches the plan,
+/// and it is only meaningful in the scope that supplies the row.
+fn plan_reads_an_outer_row(plan: &LogicalPlan) -> Result<bool> {
+    let mut correlated = false;
+    plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|expr| {
+                if matches!(expr, Expr::OuterReferenceColumn(..)) {
+                    correlated = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        Ok(if correlated {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(correlated)
+}
+
 /// The relation names `plan` binds outside any recursive CTE.
 ///
 /// A recursive term refers to its own CTE by name, as a scan of a work table, so
@@ -246,7 +271,28 @@ impl Unparser<'_> {
     /// are legal as separate scoped sub-plans and cannot both be hoisted, because
     /// the references left behind could not say which they meant. Refuse rather
     /// than emit SQL that binds the wrong one.
-    fn queue_recursive_cte(&self, cte: ast::Cte) -> Result<()> {
+    fn queue_recursive_cte(
+        &self,
+        cte: ast::Cte,
+        recursive: &datafusion_expr::RecursiveQuery,
+    ) -> Result<()> {
+        // Hoisting moves the definition *above* the query that encloses it, which
+        // is a change of scope, not just of position. A term that reads a column
+        // from the enclosing row — a correlated reference — is defined by that
+        // scope, and lifting it to the statement root leaves the reference
+        // pointing at nothing. There is no rendering that repairs this: renaming
+        // the CTE does not move the outer row into view, so this declines.
+        for term in [&recursive.static_term, &recursive.recursive_term] {
+            if plan_reads_an_outer_row(term)? {
+                return not_impl_err!(
+                    "a recursive CTE named `{}` reads a column from the query \
+                     enclosing it, so it cannot be lifted to the top of the \
+                     statement: the reference would no longer be in scope",
+                    cte.alias.name
+                );
+            }
+        }
+
         let mut pending = self
             .pending_recursive_ctes
             .lock()
@@ -294,6 +340,15 @@ impl Unparser<'_> {
     }
 
     fn render_statement(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
+        self.statements_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rendered = self.render_statement_inner(plan);
+        self.statements_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        rendered
+    }
+
+    fn render_statement_inner(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
         let mut plan = normalize_union_schema(plan)?;
         if !self.dialect.supports_qualify() {
             plan = rewrite_qualify(plan)?;
@@ -586,7 +641,7 @@ impl Unparser<'_> {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
         {
-            self.queue_recursive_cte(cte)?;
+            self.queue_recursive_cte(cte, recursive)?;
         } else {
             query.push_cte(cte, true);
         }
@@ -2628,7 +2683,7 @@ impl Unparser<'_> {
                 // both be hoisted, because the references left behind could not
                 // say which they meant. Refuse rather than emit SQL that binds
                 // the wrong one.
-                self.queue_recursive_cte(cte)?;
+                self.queue_recursive_cte(cte, recursive)?;
 
                 let mut builder = TableRelationBuilder::default();
                 builder.name(ast::ObjectName::from(vec![name]));
