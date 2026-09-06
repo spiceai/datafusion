@@ -198,21 +198,6 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     Some(schema)
 }
 
-/// Whether `plan` holds the definition of a recursive CTE called `name`.
-fn subtree_defines_recursive_cte(plan: &LogicalPlan, name: &str) -> bool {
-    let mut found = false;
-    let _ = plan.apply_with_subqueries(|node| {
-        if let LogicalPlan::RecursiveQuery(recursive) = node
-            && recursive.name == name
-        {
-            found = true;
-            return Ok(TreeNodeRecursion::Stop);
-        }
-        Ok(TreeNodeRecursion::Continue)
-    });
-    found
-}
-
 /// Whether any expression in `plan` reads a column from an enclosing query.
 ///
 /// `Expr::OuterReferenceColumn` is how a correlated reference reaches the plan,
@@ -238,35 +223,52 @@ fn plan_reads_an_outer_row(plan: &LogicalPlan) -> Result<bool> {
     Ok(correlated)
 }
 
-/// The relation names `plan` binds outside any recursive CTE.
+/// Whether `plan` holds the definition of a recursive CTE called `name`.
+fn subtree_defines_recursive_cte(plan: &LogicalPlan, name: &str) -> bool {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::RecursiveQuery(recursive) = node
+            && recursive.name == name
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// The relation names `plan` binds that a CTE called `hoisted` would capture.
 ///
-/// A hoisted CTE's name lands in the statement's top-level namespace, so what
-/// matters is every name the statement binds *anywhere* — a hoisted `h` captures
-/// an `h` in a derived table or a subquery just as surely as one beside the
-/// root.
+/// The invariant, stated once because three earlier versions each lost half of
+/// it: **every name the statement binds anywhere is capturable, except the
+/// hoisted CTE's own.**
 ///
-/// Two things are deliberately not counted. A `RecursiveQuery`'s own subtree is
-/// skipped: the names in there are the CTE's to use, including the scan of its
-/// work table, which carries the CTE's name. And the alias a CTE is *referenced*
-/// through carries that same name; it is the definition being hoisted, not a
-/// relation competing with it. The alias's subtree is still walked, because a
-/// reference can sit beside relations of its own — an alias `g` over a join of
-/// recursive `g` and a table `h` binds `h`, and dropping it would let a later
-/// hoisted `h` rebind that table silently.
-fn relations_bound_outside_a_recursive_cte(
-    plan: &LogicalPlan,
-) -> Result<HashSet<String>> {
+/// So the walk covers the whole statement — including relations held in an
+/// *expression*, which is where a scalar, `IN`, `EXISTS` or set-comparison
+/// subquery keeps its plan — and prunes exactly one thing: the subtree of the
+/// `RecursiveQuery` called `hoisted`. That subtree holds the CTE's own work-table
+/// scan, which carries its name and is not a competing relation.
+///
+/// Pruning is per-CTE rather than global, which is what makes both directions
+/// work. Checking `g` prunes `g`'s own definition, so its work table does not
+/// look like a collision with itself. Checking `h` does *not* prune `g`, so a
+/// physical `h` read inside `g`'s terms is still seen — hoisting `h` over it
+/// would rebind that table.
+fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<String>> {
     let mut bound = HashSet::new();
-    // `apply_with_subqueries`, not a walk over `inputs()`: a scalar, `IN`,
-    // `EXISTS` or set-comparison subquery holds its plan in an *expression*, and
-    // a relation in there is as capturable as any other.
     plan.apply_with_subqueries(|node| {
         match node {
-            LogicalPlan::RecursiveQuery(_) => return Ok(TreeNodeRecursion::Jump),
+            LogicalPlan::RecursiveQuery(recursive) if recursive.name == hoisted => {
+                return Ok(TreeNodeRecursion::Jump);
+            }
             LogicalPlan::TableScan(scan) => {
                 bound.insert(scan.table_name.table().to_string());
             }
             LogicalPlan::SubqueryAlias(alias) => {
+                // The alias a CTE is *referenced* through carries its name; that
+                // is the definition, not a rival. The subtree is still walked —
+                // a reference can sit beside relations of its own.
                 if !subtree_defines_recursive_cte(node, alias.alias.table()) {
                     bound.insert(alias.alias.table().to_string());
                 }
@@ -476,8 +478,9 @@ impl Unparser<'_> {
                 .drain(..)
                 .collect();
             if !pending.is_empty() {
-                let bound = relations_bound_outside_a_recursive_cte(plan)?;
                 for cte in &pending {
+                    let bound =
+                        relations_capturable_by(plan, cte.alias.name.value.as_str())?;
                     // A hoisted CTE keeps its own name, and here that name joins
                     // the statement's top-level namespace. If the statement
                     // already binds a relation of that name, hoisting rebinds it:
@@ -539,6 +542,12 @@ impl Unparser<'_> {
             Self::term_with_its_clauses(recursive_query, recursive_term)?;
 
         let set_quantifier = if recursive.is_distinct {
+            if !self.dialect.supports_distinct_recursive_cte() {
+                return not_impl_err!(
+                    "this dialect runs a recursive CTE only with `UNION ALL`, and \
+                     this one combines its terms with `UNION DISTINCT`"
+                );
+            }
             self.dialect.union_distinct_set_quantifier()
         } else {
             ast::SetQuantifier::All

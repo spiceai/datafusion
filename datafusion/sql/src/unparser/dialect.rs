@@ -214,6 +214,21 @@ pub trait Dialect: Send + Sync {
         false
     }
 
+    /// Whether this dialect runs a recursive CTE whose terms are combined with
+    /// `UNION DISTINCT` rather than `UNION ALL`.
+    ///
+    /// Separate from [`Self::supports_recursive_cte`] because an engine can
+    /// support the construct and only one of its quantifiers. BigQuery is such
+    /// an engine — measured, `WITH RECURSIVE g AS (SELECT 1 AS n UNION DISTINCT
+    /// SELECT n + 1 FROM g WHERE n < 3)` answers "Only UNION ALL is supported
+    /// for WITH RECURSIVE" while the `UNION ALL` form returns its three rows.
+    ///
+    /// Defaults to following `supports_recursive_cte`, which is what every
+    /// dialect did before this existed.
+    fn supports_distinct_recursive_cte(&self) -> bool {
+        self.supports_recursive_cte()
+    }
+
     /// How this dialect reads a string *as a date*, where its own `DATE` cast
     /// will not.
     ///
@@ -1287,6 +1302,14 @@ impl Dialect for BigQueryDialect {
     /// SELECT n + 1 FROM counted WHERE n < 5)` returns `1..5`.
     fn supports_recursive_cte(&self) -> bool {
         true
+    }
+
+    /// Only the `UNION ALL` form. Measured: the `UNION DISTINCT` spelling answers
+    /// "Only UNION ALL is supported for WITH RECURSIVE", so a plan carrying
+    /// `is_distinct` has to stay off BigQuery rather than render and be refused
+    /// there.
+    fn supports_distinct_recursive_cte(&self) -> bool {
+        false
     }
 
     /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from
