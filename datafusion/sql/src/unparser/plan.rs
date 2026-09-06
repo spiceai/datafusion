@@ -199,6 +199,42 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
 }
 
 impl Unparser<'_> {
+    /// Queues a recursive CTE for the statement root, keeping one definition per
+    /// name.
+    ///
+    /// Both routes that defer a CTE go through here. A repeated *reference* to
+    /// one CTE reaches the deferring code more than once — SQL planning clones
+    /// the stored plan per reference — and appending each time emits
+    /// `WITH RECURSIVE g AS (…), g AS (…)`, which is invalid. Keep the first and
+    /// drop the repeat.
+    ///
+    /// Two *different* definitions under one name are a different matter: they
+    /// are legal as separate scoped sub-plans and cannot both be hoisted, because
+    /// the references left behind could not say which they meant. Refuse rather
+    /// than emit SQL that binds the wrong one.
+    fn queue_recursive_cte(&self, cte: ast::Cte) -> Result<()> {
+        let mut pending = self
+            .pending_recursive_ctes
+            .lock()
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        match pending
+            .iter()
+            .find(|held| held.alias.name == cte.alias.name)
+        {
+            Some(held) if *held == cte => Ok(()),
+            Some(_) => not_impl_err!(
+                "two different recursive CTEs are named `{}` in one statement; \
+                 hoisting both to the top level would leave their references \
+                 ambiguous",
+                cte.alias.name
+            ),
+            None => {
+                pending.push(cte);
+                Ok(())
+            }
+        }
+    }
+
     pub fn plan_to_sql(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
         // Start a top-level rendering from a clean slate. The pending list is
         // drained when a statement finishes, but an error part-way through
@@ -484,10 +520,7 @@ impl Unparser<'_> {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0
         {
-            self.pending_recursive_ctes
-                .lock()
-                .map_err(|e| internal_datafusion_err!("{e}"))?
-                .push(cte);
+            self.queue_recursive_cte(cte)?;
         } else {
             query.push_cte(cte, true);
         }
@@ -2529,26 +2562,7 @@ impl Unparser<'_> {
                 // both be hoisted, because the references left behind could not
                 // say which they meant. Refuse rather than emit SQL that binds
                 // the wrong one.
-                let mut pending = self
-                    .pending_recursive_ctes
-                    .lock()
-                    .map_err(|e| internal_datafusion_err!("{e}"))?;
-                match pending
-                    .iter()
-                    .find(|held| held.alias.name == cte.alias.name)
-                {
-                    Some(held) if *held == cte => {}
-                    Some(_) => {
-                        return not_impl_err!(
-                            "two different recursive CTEs are named `{}` in one \
-                             statement; hoisting both to the top level would \
-                             leave their references ambiguous",
-                            cte.alias.name
-                        );
-                    }
-                    None => pending.push(cte),
-                }
-                drop(pending);
+                self.queue_recursive_cte(cte)?;
 
                 let mut builder = TableRelationBuilder::default();
                 builder.name(ast::ObjectName::from(vec![name]));

@@ -1569,13 +1569,31 @@ impl Unparser<'_> {
         // text they accept, so the dialect gets to spell the parse. BigQuery is the
         // reason: its `DATETIME` cast refuses every zone marker its `TIMESTAMP`
         // cast accepts, and neither takes more than six sub-second digits.
-        if let DataType::Timestamp(_, tz) = data_type
+        //
+        // `Date64` is served here rather than by the date hook below. It carries
+        // a time of day and renders as `DATETIME`, so the *date* parse — which
+        // yields a `DATE` — would drop that time; but leaving it with a plain
+        // cast is not the answer either. Measured against BigQuery, the bare form
+        // is refused outright:
+        //
+        //   CAST('2025-01-01T09:00:00.240314144Z' AS DATETIME)
+        //     -> Invalid datetime string "2025-01-01T09:00:00.240314144Z"
+        //   DATETIME(TIMESTAMP(REGEXP_REPLACE(…)))
+        //     -> 2025-01-01 09:00:00.240314
+        //
+        // which is the same failure this hook exists to remove, so it takes the
+        // zone-less timestamp parse — exactly what `DATETIME` is here.
+        if matches!(data_type, DataType::Timestamp(_, _) | DataType::Date64)
+            && let tz = match data_type {
+                DataType::Timestamp(_, tz) => tz.as_ref(),
+                _ => None,
+            }
             && self
                 .resolved_data_type(expr)
                 .is_some_and(|resolved| resolved.is_string())
             && let Some(parsed) = self
                 .dialect
-                .string_to_timestamp_to_sql(inner_expr.clone(), tz.as_ref())
+                .string_to_timestamp_to_sql(inner_expr.clone(), tz)
         {
             return Ok(parsed);
         }
