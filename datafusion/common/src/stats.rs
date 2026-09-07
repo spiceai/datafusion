@@ -446,12 +446,12 @@ impl Statistics {
 
         for (i, field) in schema.fields().iter().enumerate() {
             // 1) Prefer the column's own byte_size (a per-column total).
-            if let Some(col) = self.column_statistics.get(i) {
-                if let Some(&bytes) = col.byte_size.get_value() {
-                    sum = sum.saturating_add(bytes);
-                    exact &= col.byte_size.is_exact().unwrap_or(false);
-                    continue;
-                }
+            if let Some(col) = self.column_statistics.get(i)
+                && let Some(&bytes) = col.byte_size.get_value()
+            {
+                sum = sum.saturating_add(bytes);
+                exact &= col.byte_size.is_exact().unwrap_or(false);
+                continue;
             }
             // 2) Fall back to the type width when byte_size is absent.
             match field.data_type().primitive_width() {

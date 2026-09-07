@@ -765,11 +765,11 @@ pub(crate) fn unproject_sort_expr(
                     if let Some(agg) = agg
                         && agg.schema.is_column_from_schema(&col) =>
                 {
-                    return Ok(Transformed::yes(unproject_agg_exprs(
+                    Ok(Transformed::yes(unproject_agg_exprs(
                         Expr::Column(col),
                         agg,
                         None,
-                    )?));
+                    )?))
                 }
                 Expr::Column(col) => {
                     // When an expression in the `ORDER BY` contains an alias from the `SELECT`

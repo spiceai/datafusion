@@ -706,7 +706,7 @@ pub(crate) mod tests {
     #[test]
     fn test_build_balanced_binary_tree_single() {
         let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-        let result = build_balanced_binary_tree(Operator::And, vec![col_a.clone()]);
+        let result = build_balanced_binary_tree(Operator::And, vec![Arc::clone(&col_a)]);
         assert!(result.is_some());
         let result = result.unwrap();
         // Single element should return the element itself
@@ -758,7 +758,7 @@ pub(crate) mod tests {
     #[test]
     fn test_conjunction_opt_single() {
         let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
-        let result = conjunction_opt(vec![col_a.clone()]);
+        let result = conjunction_opt(vec![Arc::clone(&col_a)]);
         assert!(result.is_some());
         assert!(result.unwrap().downcast_ref::<Column>().is_some());
     }
@@ -794,15 +794,19 @@ pub(crate) mod tests {
         let b = Arc::new(BooleanArray::from(vec![true, false, true, false]));
         let c = Arc::new(BooleanArray::from(vec![true, true, true, true]));
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![a, b, c])?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![a, b, c])?;
 
         let col_a: Arc<dyn PhysicalExpr> = Arc::new(Column::new("a", 0));
         let col_b: Arc<dyn PhysicalExpr> = Arc::new(Column::new("b", 1));
         let col_c: Arc<dyn PhysicalExpr> = Arc::new(Column::new("c", 2));
 
         // Test a AND b AND c using conjunction
-        let conj =
-            conjunction_opt(vec![col_a.clone(), col_b.clone(), col_c.clone()]).unwrap();
+        let conj = conjunction_opt(vec![
+            Arc::clone(&col_a),
+            Arc::clone(&col_b),
+            Arc::clone(&col_c),
+        ])
+        .unwrap();
         let result = eval_bool(&conj, &batch)?;
 
         // Expected: true AND true AND true = true
@@ -822,7 +826,11 @@ pub(crate) mod tests {
         let col_c: Arc<dyn PhysicalExpr> = Arc::new(Column::new("c", 2));
 
         // Build a conjunction
-        let conj = conjunction(vec![col_a.clone(), col_b.clone(), col_c.clone()]);
+        let conj = conjunction(vec![
+            Arc::clone(&col_a),
+            Arc::clone(&col_b),
+            Arc::clone(&col_c),
+        ]);
 
         // Split it back
         let split = split_conjunction(&conj);
@@ -844,7 +852,7 @@ pub(crate) mod tests {
         let b = Arc::new(BooleanArray::from(vec![true, true, false, false]));
         let c = Arc::new(BooleanArray::from(vec![true, true, true, false]));
 
-        let batch = RecordBatch::try_new(schema.clone(), vec![a, b, c])?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![a, b, c])?;
 
         // Evaluate original conjunction
         let original_result = eval_bool(&conj, &batch)?;
