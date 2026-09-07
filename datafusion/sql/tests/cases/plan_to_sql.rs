@@ -11202,16 +11202,8 @@ fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order() -> 
 ///   -> WITH RECURSIVE is only allowed at the top level of the SELECT, CREATE TABLE ...
 /// ```
 ///
-/// **What this does not cover.** The arrangement that actually failed only
-/// appears after optimization — the optimizer puts the generator behind a
-/// `SubqueryAlias` over a `Projection`, which routes it through the *top-level*
-/// renderer rather than the nested one. `datafusion-sql`'s tests cannot run the
-/// optimizer, so this asserts the property for the two shapes it can build and
-/// would **not** have caught that regression. The guard that reproduces it lives
-/// in the Spice repo, where a `SessionContext` supplies an optimized plan; see
-/// the `fork_patches.md` row. Three hand-built plans in a row looked like the
-/// failing shape, routed elsewhere, and passed with the fix reverted — which is
-/// why that is spelled out here rather than assumed.
+/// The optimizer-generated projection/alias shape is exercised by
+/// `bigquery_optimized_recursive_cte_roundtrip` in the core SQL integration suite.
 #[test]
 fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
     let plan_for = |query: &str| -> Result<String> {
@@ -12383,6 +12375,27 @@ fn test_bigquery_renders_a_recursive_cte() -> Result<()> {
          {generic:?}"
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_bigquery_standalone_recursive_expression_keeps_unparser_reusable() -> Result<()> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(
+            "WITH RECURSIVE g AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 3) SELECT n FROM g",
+        )?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    let unparser = Unparser::new(&BigQueryDialect {});
+    assert!(
+        unparser
+            .expr_to_sql(&scalar_subquery(Arc::new(plan)))
+            .is_err()
+    );
+    assert_eq!(unparser.expr_to_sql(&lit(1_i64))?.to_string(), "1");
     Ok(())
 }
 

@@ -265,13 +265,12 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
             LogicalPlan::TableScan(scan) => {
                 bound.insert(scan.table_name.table().to_string());
             }
-            LogicalPlan::SubqueryAlias(alias) => {
-                // The alias a CTE is *referenced* through carries its name; that
-                // is the definition, not a rival. The subtree is still walked —
-                // a reference can sit beside relations of its own.
-                if !subtree_defines_recursive_cte(node, alias.alias.table()) {
-                    bound.insert(alias.alias.table().to_string());
-                }
+            // An alias through which the subtree references its own CTE does
+            // not introduce a competing relation name.
+            LogicalPlan::SubqueryAlias(alias)
+                if !subtree_defines_recursive_cte(node, alias.alias.table()) =>
+            {
+                bound.insert(alias.alias.table().to_string());
             }
             _ => {}
         }
@@ -3068,6 +3067,30 @@ impl Unparser<'_> {
         already_projected: bool,
     ) -> Result<Option<LogicalPlan>> {
         match plan {
+            LogicalPlan::RecursiveQuery(recursive)
+                if self.dialect.supports_recursive_cte() =>
+            {
+                if already_projected {
+                    return Ok(Some(plan.clone()));
+                }
+                // A hoisted recursive input is a named relation. Explicit
+                // columns let joins combine each input's projection and let
+                // the surrounding alias rebase its filters.
+                let qualifier =
+                    alias.unwrap_or_else(|| TableReference::bare(recursive.name.clone()));
+                let columns = plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| Column::new(Some(qualifier.clone()), field.name()))
+                    .collect::<Vec<_>>();
+                Ok(Some(
+                    LogicalPlanBuilder::from(plan.clone())
+                        .alias(qualifier)?
+                        .project(columns)?
+                        .build()?,
+                ))
+            }
             LogicalPlan::TableScan(table_scan) => {
                 if !Self::is_scan_with_pushdown(table_scan) {
                     return Ok(None);

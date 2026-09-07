@@ -96,6 +96,17 @@ const IS: &BinaryOperator = &BinaryOperator::BitwiseAnd;
 
 impl Unparser<'_> {
     pub fn expr_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
+        if self
+            .statements_in_flight
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return self.with_own_render_state().render_expr_to_sql(expr);
+        }
+        self.render_expr_to_sql(expr)
+    }
+
+    fn render_expr_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
         let mut root_expr = self.expr_to_sql_inner(expr)?;
         if self.pretty {
             root_expr = self.remove_unnecessary_nesting(root_expr, LOWEST, LOWEST);
