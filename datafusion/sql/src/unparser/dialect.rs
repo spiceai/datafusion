@@ -20,15 +20,16 @@ use std::{collections::HashMap, sync::Arc};
 use super::{
     Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
     utils::bigquery_filtered_aggregate_to_sql, utils::bigquery_percentile_to_sql,
-    utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_timestamp_to_sql,
-    utils::bigquery_to_timestamp_to_sql, utils::bigquery_to_unixtime_to_sql,
-    utils::character_length_to_sql, utils::date_part_to_sql,
-    utils::sqlite_date_trunc_to_sql, utils::sqlite_from_unixtime_to_sql,
+    utils::bigquery_renamed_scalar_fn, utils::bigquery_string_to_date_to_sql,
+    utils::bigquery_string_to_timestamp_to_sql, utils::bigquery_to_timestamp_to_sql,
+    utils::bigquery_to_unixtime_to_sql, utils::character_length_to_sql,
+    utils::date_part_to_sql, utils::sqlite_date_trunc_to_sql,
+    utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
 use chrono::DateTime;
-use datafusion_common::{Result, internal_err};
+use datafusion_common::{Result, ScalarValue, internal_err};
 use datafusion_expr::{Expr, SortExpr};
 use regex::Regex;
 use sqlparser::tokenizer::Span;
@@ -196,6 +197,51 @@ pub trait Dialect: Send + Sync {
         _value: ast::Expr,
         _tz: Option<&Arc<str>>,
     ) -> Option<ast::Expr> {
+        None
+    }
+
+    /// Whether this dialect can evaluate a recursive CTE (`WITH RECURSIVE`).
+    ///
+    /// Defaults to `false`, which keeps a [`LogicalPlan::RecursiveQuery`]
+    /// unparseable and so keeps it out of a pushdown — the behaviour every
+    /// dialect had before this existed. Only a dialect known to run one opts in,
+    /// because a federated statement has no local-execution fallback: emitting
+    /// `WITH RECURSIVE` to an engine that does not support it turns a query that
+    /// used to evaluate locally into a failure.
+    ///
+    /// [`LogicalPlan::RecursiveQuery`]: datafusion_expr::LogicalPlan::RecursiveQuery
+    fn supports_recursive_cte(&self) -> bool {
+        false
+    }
+
+    /// Whether this dialect runs a recursive CTE whose terms are combined with
+    /// `UNION DISTINCT` rather than `UNION ALL`.
+    ///
+    /// Separate from [`Self::supports_recursive_cte`] because an engine can
+    /// support the construct and only one of its quantifiers. BigQuery is such
+    /// an engine — measured, `WITH RECURSIVE g AS (SELECT 1 AS n UNION DISTINCT
+    /// SELECT n + 1 FROM g WHERE n < 3)` answers "Only UNION ALL is supported
+    /// for WITH RECURSIVE" while the `UNION ALL` form returns its three rows.
+    ///
+    /// Defaults to following `supports_recursive_cte`, which is what every
+    /// dialect did before this existed.
+    fn supports_distinct_recursive_cte(&self) -> bool {
+        self.supports_recursive_cte()
+    }
+
+    /// How this dialect reads a string *as a date*, where its own `DATE` cast
+    /// will not.
+    ///
+    /// Separate from [`Self::string_to_timestamp_to_sql`] because the text a cast
+    /// accepts differs by target, not only by dialect. `BigQuery`'s `DATE` cast
+    /// takes a bare `YYYY-MM-DD` and refuses *any* time-of-day or zone —
+    /// measured, it refuses `'2026-01-15 10:30:00'` as surely as
+    /// `'2026-01-15T10:30:00.123456789Z'` — while its `TIMESTAMP` cast takes the
+    /// zoned forms. A dialect that has to parse the string first spells that
+    /// here.
+    ///
+    /// `None` keeps the plain `CAST(value AS DATE)`.
+    fn string_to_date_to_sql(&self, _value: ast::Expr) -> Option<ast::Expr> {
         None
     }
 
@@ -1008,6 +1054,72 @@ impl Dialect for SqliteDialect {
     }
 }
 
+/// The `date_part` fields `BigQuery` names differently from `DataFusion`.
+///
+/// `date_part_to_sql`'s `Extract` arm renders only `year`/`month`/`day`/`hour`/
+/// `minute`/`second` and answers `Ok(None)` for anything else — which makes the
+/// unparser emit `date_part(…)` verbatim, and `BigQuery` answer `Function not
+/// found: date_part`. A customer statement worked around exactly that by
+/// deriving a weekday from the text of a timestamp difference, which is far more
+/// fragile than the extraction it replaced.
+///
+/// Each mapping below is measured against `BigQuery` rather than assumed, on
+/// dates spanning a week boundary and a quarter boundary:
+///
+/// | `date_part` | `BigQuery` | agrees |
+/// |---|---|---|
+/// | `doy` | `DAYOFYEAR` | yes |
+/// | `week` | `ISOWEEK` | yes |
+/// | `quarter` | `QUARTER` | yes |
+///
+/// `week` is the one that matters: `BigQuery`'s bare `WEEK` is Sunday-based and
+/// answered 13 where `DataFusion` answered 14, so the obvious mapping is a wrong
+/// number with no error. `ISOWEEK` agrees on every date measured.
+///
+/// Anything not listed falls through to the shared helper, and from there to a
+/// verbatim `date_part` — a loud remote error rather than a wrong answer.
+fn bigquery_date_part_to_sql(
+    unparser: &Unparser,
+    args: &[Expr],
+) -> Result<Option<ast::Expr>> {
+    let [Expr::Literal(field, _), operand] = args else {
+        return Ok(None);
+    };
+    // Every string literal type the planner may produce, not just `Utf8`.
+    // Matching one of them meant the rewrite silently never fired for an
+    // `EXTRACT(DOW FROM …)`, and the call reached BigQuery as `date_part(…)`,
+    // which has no such function.
+    let field = match field {
+        ScalarValue::Utf8(Some(field))
+        | ScalarValue::LargeUtf8(Some(field))
+        | ScalarValue::Utf8View(Some(field)) => field,
+        _ => return Ok(None),
+    };
+
+    // `dow` is deliberately absent. Two spellings of a weekday reach this
+    // function as the *same* call — a `ScalarFunction` named `date_part` —
+    // carrying different implementations: `date_part('dow', c)` resolves through
+    // the registry to `datafusion_spark`'s, which counts Sunday as 1, while
+    // `EXTRACT(DOW FROM c)` is planned straight onto `DataFusion`'s, which counts
+    // Sunday as 0. Measured on a Wednesday: `4` and `3`. The name cannot separate
+    // them, so any single rendering answers one of the two a day short. Declining
+    // leaves the call to evaluate locally, where each spelling keeps the value it
+    // has today. `doy`, `week`, `quarter` and the plain field names were measured
+    // to agree between the two spellings, so they render.
+    let field = match field.to_lowercase().as_str() {
+        "doy" => ast::DateTimeField::DayOfYear,
+        "week" => ast::DateTimeField::IsoWeek,
+        "quarter" => ast::DateTimeField::Quarter,
+        _ => return Ok(None),
+    };
+
+    Ok(Some(ast::Expr::Extract {
+        field,
+        expr: Box::new(unparser.expr_to_sql(operand)?),
+        syntax: ast::ExtractSyntax::From,
+    }))
+}
+
 /// The widest scale a BigQuery `NUMERIC` holds. Measured: a thirteenth
 /// fractional digit is *rounded away silently*, not refused —
 /// `CAST('1.234567890123' AS NUMERIC)` returns `1.23456789`.
@@ -1182,6 +1294,24 @@ impl Dialect for BigQueryDialect {
         Some(bigquery_string_to_timestamp_to_sql(value, tz.is_some()))
     }
 
+    fn string_to_date_to_sql(&self, value: ast::Expr) -> Option<ast::Expr> {
+        Some(bigquery_string_to_date_to_sql(value))
+    }
+
+    /// Measured on BigQuery: `WITH RECURSIVE counted AS (SELECT 1 AS n UNION ALL
+    /// SELECT n + 1 FROM counted WHERE n < 5)` returns `1..5`.
+    fn supports_recursive_cte(&self) -> bool {
+        true
+    }
+
+    /// Only the `UNION ALL` form. Measured: the `UNION DISTINCT` spelling answers
+    /// "Only UNION ALL is supported for WITH RECURSIVE", so a plan carrying
+    /// `is_distinct` has to stay off BigQuery rather than render and be refused
+    /// there.
+    fn supports_distinct_recursive_cte(&self) -> bool {
+        false
+    }
+
     /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from
     /// DATE to INT64" — and `UNIX_DATE` is the day number DataFusion means:
     /// zero at the epoch, negative before it.
@@ -1301,16 +1431,23 @@ impl Dialect for BigQueryDialect {
         filter: Option<&Expr>,
         order_by: &[SortExpr],
     ) -> Result<Option<ast::Expr>> {
-        // A descending sort makes DataFusion take the percentile from the other
-        // end, and that does not survive the rendering below. Computing over the
-        // wrong rows quietly is worse than not translating: declining leaves the
-        // DataFusion name in place, which fails loudly.
-        if order_by.iter().any(|sort| !sort.asc) {
-            return Ok(None);
-        }
-
         // BigQuery has no `FILTER (WHERE ...)`; it restricts the rows by moving
         // the predicate inside the aggregate instead.
+        //
+        // The ordering is deliberately not consulted here. Every aggregate the
+        // rewrite accepts skips nulls and ignores input order, so dropping an
+        // `ORDER BY` gives the same answer — and refusing one instead is not a
+        // lost pushdown but a failed query, since the fallback is a generic
+        // `FILTER` clause BigQuery cannot parse.
+        //
+        // `avg` reads as the exception and is not one. It inherits
+        // `AggregateUDFImpl`'s `HardRequirement` ordering rather than declaring
+        // itself insensitive the way `sum`, `min` and `max` do, which suggests
+        // dropping its `ORDER BY` could shift a float result. Measured instead
+        // of assumed, on values chosen so summation order would show —
+        // `1e16, 1.0, -1e16, 2.0, -1.0` — DataFusion answers `0.4` under `ASC`,
+        // under `DESC` and unordered alike. The declared sensitivity is an
+        // unoverridden default, not a statement that the value depends on order.
         if let Some(predicate) = filter {
             return bigquery_filtered_aggregate_to_sql(
                 unparser, func_name, args, distinct, predicate,
@@ -1318,6 +1455,18 @@ impl Dialect for BigQueryDialect {
         }
 
         match func_name {
+            // A descending sort makes DataFusion take the percentile from the
+            // other end, and that does not survive the rendering below.
+            // Computing over the wrong rows quietly is worse than not
+            // translating, so these decline — but only these: the check used to
+            // sit above the `FILTER` branch, where it also declined aggregates
+            // whose ordering does not matter and left them emitting a `FILTER`
+            // clause that fails at BigQuery.
+            "median" | "approx_percentile_cont"
+                if order_by.iter().any(|sort| !sort.asc) =>
+            {
+                Ok(None)
+            }
             "median" => bigquery_percentile_to_sql(unparser, args, None, distinct),
             "approx_percentile_cont" => {
                 bigquery_percentile_to_sql(unparser, args, Some(1), distinct)
@@ -1333,6 +1482,15 @@ impl Dialect for BigQueryDialect {
         args: &[Expr],
     ) -> Result<Option<ast::Expr>> {
         if func_name == "date_part" {
+            // Tried first, and deliberately not folded into `date_part_to_sql`:
+            // that helper's `Extract` arm is shared with `MySqlDialect`, which
+            // spells these differently or not at all — MySQL has a `DAYOFWEEK()`
+            // *function* rather than an `EXTRACT` field, and its `WEEK` numbering
+            // follows `default_week_format`. Widening the shared arm would emit
+            // invalid SQL for one engine to fix another.
+            if let Some(extracted) = bigquery_date_part_to_sql(unparser, args)? {
+                return Ok(Some(extracted));
+            }
             return date_part_to_sql(unparser, self.date_field_extract_style(), args);
         }
 

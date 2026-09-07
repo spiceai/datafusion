@@ -48,6 +48,38 @@ use datafusion_sql::unparser::dialect::DefaultDialect;
 use itertools::Itertools;
 use recursive::{set_minimum_stack_size, set_stack_allocation_size};
 
+/// Optimized recursive join inputs must keep their definition at the statement
+/// root, including when a projection or repeated reference creates a subquery.
+#[tokio::test]
+async fn bigquery_optimized_recursive_cte_roundtrip() -> Result<()> {
+    use datafusion_sql::unparser::dialect::BigQueryDialect;
+
+    let ctx = SessionContext::new();
+    ctx.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1), (2), (3)) AS rows(id)")
+        .await?
+        .collect()
+        .await?;
+    for query in [
+        "WITH RECURSIVE g AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 3) \
+         SELECT t.id FROM t JOIN (SELECT n FROM g) gg ON t.id = gg.n ORDER BY t.id",
+        "WITH RECURSIVE g AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 3) \
+         SELECT a.n, b.n FROM (SELECT n FROM g WHERE n > 1) a \
+         JOIN (SELECT n FROM g WHERE n < 3) b ON a.n = b.n",
+    ] {
+        let expected = ctx.sql(query).await?.collect().await?;
+        let plan = ctx.sql(query).await?.into_optimized_plan()?;
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(sql.starts_with("WITH RECURSIVE"), "{sql}");
+        assert_eq!(sql.matches("WITH RECURSIVE").count(), 1, "{sql}");
+        assert_eq!(sql.matches("`g` AS (").count(), 1, "{sql}");
+        let actual = ctx.sql(&sql).await?.collect().await?;
+        assert_eq!(actual, expected, "{sql}");
+    }
+    Ok(())
+}
+
 /// Paths to benchmark query files (supports running from repo root or different working directories).
 const BENCHMARK_PATHS: &[&str] = &["../../benchmarks/", "./benchmarks/"];
 
