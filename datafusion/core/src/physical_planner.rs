@@ -3173,7 +3173,7 @@ fn describe_schema_change(schema: &Schema) -> String {
 /// renderings of the same metadata can be compared by eye.
 fn format_metadata(metadata: &HashMap<String, String>) -> String {
     let mut entries: Vec<_> = metadata.iter().collect();
-    entries.sort_unstable_by(|(a, _), (b, _)| a.cmp(b));
+    entries.sort_unstable_by_key(|(a, _)| *a);
     let entries: Vec<_> = entries
         .into_iter()
         .map(|(key, value)| format!("{key}: {value:?}"))

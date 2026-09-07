@@ -742,10 +742,10 @@ impl Unparser<'_> {
                         all_idents.push(name.to_string());
                     }
                 }
-                ast::TableFactor::Derived { alias, .. } => {
-                    if let Some(alias) = alias {
-                        all_idents.push(alias.name.to_string());
-                    }
+                ast::TableFactor::Derived {
+                    alias: Some(alias), ..
+                } => {
+                    all_idents.push(alias.name.to_string());
                 }
                 _ => {}
             });
@@ -1920,9 +1920,8 @@ impl Unparser<'_> {
                     None,
                     select.already_projected(),
                 );
-                let windows: Option<Vec<&Window>> = window_nodes
-                    .as_deref()
-                    .map(|ws| ws.iter().copied().collect());
+                let windows: Option<Vec<&Window>> =
+                    window_nodes.as_deref().map(|ws| ws.to_vec());
                 // unproject sort expressions
                 let sort_exprs: Vec<SortExpr> = sort
                     .expr

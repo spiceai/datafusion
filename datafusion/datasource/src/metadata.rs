@@ -81,7 +81,7 @@ impl MetadataColumn {
             MetadataColumn::Location(prefix) => {
                 let location = meta.location.to_string();
                 let prefix = prefix.as_ref().map(|p| p.as_ref()).unwrap_or("");
-                ScalarValue::Utf8(Some(format!("{}{}", prefix, location)))
+                ScalarValue::Utf8(Some(format!("{prefix}{location}")))
             }
             MetadataColumn::LastModified => ScalarValue::TimestampMicrosecond(
                 Some(meta.last_modified.timestamp_micros()),
@@ -137,7 +137,7 @@ impl MetadataBuilder {
             Self::Location(prefix, builder) => {
                 let location = meta.location.to_string();
                 let prefix = prefix.as_ref().map(|p| p.as_ref()).unwrap_or("");
-                builder.append_value(format!("{}{}", prefix, location))
+                builder.append_value(format!("{prefix}{location}"))
             }
             Self::LastModified(builder) => {
                 builder.append_value(meta.last_modified.timestamp_micros())

@@ -612,10 +612,9 @@ pub fn verify_sort_integrity(file_groups: &[FileGroup]) -> bool {
                 let curr_min = &curr_col_stats.min_value;
                 if let (Some(curr_min_val), Some(prev_max_val)) =
                     (curr_min.get_value(), prev_max.get_value())
+                    && curr_min_val <= prev_max_val
                 {
-                    if curr_min_val <= prev_max_val {
-                        return false;
-                    }
+                    return false;
                 }
             }
         }
