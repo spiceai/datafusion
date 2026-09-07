@@ -217,6 +217,16 @@ impl Unparser<'_> {
                 let l = self.expr_to_sql_inner(left.as_ref())?;
                 let r = self.expr_to_sql_inner(right.as_ref())?;
 
+                if matches!(op, Operator::Divide)
+                    && self
+                        .resolved_data_type(expr)
+                        .is_some_and(|t| t.is_integer())
+                    && let Some(quotient) =
+                        self.dialect.integer_division_to_sql(l.clone(), r.clone())
+                {
+                    return Ok(quotient);
+                }
+
                 // `date - date` is an integer count of days in the plan, which
                 // some dialects spell as a function rather than an operator.
                 if matches!(op, Operator::Minus)
@@ -3703,6 +3713,29 @@ mod tests {
 
             assert_eq!(actual, expected);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn bigquery_integer_division_preserves_cohort_hour_boundaries() -> Result<()> {
+        let schema = Arc::new(datafusion_common::DFSchema::try_from(Schema::new(vec![
+            Field::new("cutoff_seconds", DataType::Int64, false),
+            Field::new("signup_seconds", DataType::Int64, false),
+        ]))?);
+        let dialect = BigQueryDialect::new();
+        let unparser = Unparser::new(&dialect).with_schema(Arc::clone(&schema));
+        let elapsed = col("cutoff_seconds") - col("signup_seconds");
+        let hours = cast(elapsed.clone() / lit(3600_i64), DataType::Int64);
+        assert_eq!(
+            unparser.expr_to_sql(&hours)?.to_string(),
+            "CAST(DIV((`cutoff_seconds` - `signup_seconds`), 3600) AS BIGINT)"
+        );
+        let fractional_hours = cast(elapsed, DataType::Float64) / lit(3600_f64);
+        let fractional_sql = unparser.expr_to_sql(&fractional_hours)?.to_string();
+        assert!(!fractional_sql.contains("DIV("), "{fractional_sql}");
+        assert!(fractional_sql.contains(" / 3600.0"), "{fractional_sql}");
+        let default = Unparser::new(&DefaultDialect {}).with_schema(schema);
+        assert!(default.expr_to_sql(&hours)?.to_string().contains(" / 3600"));
         Ok(())
     }
 

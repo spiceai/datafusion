@@ -336,6 +336,16 @@ pub trait Dialect: Send + Sync {
         BinaryOperator::Divide
     }
 
+    /// Renders division whose result has an integer type in the logical plan.
+    /// `None` uses the dialect's normal division operator.
+    fn integer_division_to_sql(
+        &self,
+        _lhs: ast::Expr,
+        _rhs: ast::Expr,
+    ) -> Option<ast::Expr> {
+        None
+    }
+
     /// Allows the dialect to override scalar function unparsing if the dialect has specific rules.
     /// Returns None if the default unparsing should be used, or Some(ast::Expr) if there is
     /// a custom implementation for the function.
@@ -1310,6 +1320,32 @@ impl Dialect for BigQueryDialect {
     /// there.
     fn supports_distinct_recursive_cte(&self) -> bool {
         false
+    }
+
+    fn integer_division_to_sql(
+        &self,
+        lhs: ast::Expr,
+        rhs: ast::Expr,
+    ) -> Option<ast::Expr> {
+        // BigQuery's `/` produces a fraction and an integer cast rounds it.
+        // DIV preserves the logical plan's integer quotient.
+        Some(ast::Expr::Function(Function {
+            name: ObjectName::from(vec![Ident::new("DIV")]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(lhs)),
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(rhs)),
+                ],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        }))
     }
 
     /// BigQuery has no cast from `DATE` to `INT64` at all — "Invalid cast from
