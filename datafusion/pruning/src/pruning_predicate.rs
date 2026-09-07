@@ -43,12 +43,10 @@ use datafusion_common::{
 };
 use datafusion_expr_common::operator::Operator;
 use datafusion_physical_expr::utils::{
-    Guarantee, LiteralGuarantee, build_balanced_binary_tree, collect_columns,
+    Guarantee, LiteralGuarantee, build_balanced_binary_tree,
 };
 use datafusion_physical_expr::{PhysicalExprRef, expressions as phys_expr};
-use datafusion_physical_expr_common::physical_expr::{
-    snapshot_physical_expr, snapshot_physical_expr_opt,
-};
+use datafusion_physical_expr_common::physical_expr::snapshot_physical_expr_opt;
 use datafusion_physical_plan::{ColumnarValue, PhysicalExpr};
 
 /// Used to prove that arbitrary predicates (boolean expression) can not
