@@ -65,6 +65,9 @@ async fn bigquery_optimized_recursive_cte_roundtrip() -> Result<()> {
         "WITH RECURSIVE g AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 3) \
          SELECT a.n, b.n FROM (SELECT n FROM g WHERE n > 1) a \
          JOIN (SELECT n FROM g WHERE n < 3) b ON a.n = b.n",
+        "WITH RECURSIVE g(n) AS (SELECT CAST(0 AS BIGINT) AS n UNION ALL \
+         SELECT n + 24 FROM g WHERE n < 72) \
+         SELECT grid.n FROM g grid JOIN t ON grid.n = t.id * 24 ORDER BY grid.n",
     ] {
         let expected = ctx.sql(query).await?.collect().await?;
         let plan = ctx.sql(query).await?.into_optimized_plan()?;

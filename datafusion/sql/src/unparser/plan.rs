@@ -3237,6 +3237,14 @@ impl Unparser<'_> {
             // SubqueryAlias could be rewritten to a plan with a projection as the top node by [rewrite::subquery_alias_inner_query_and_columns].
             // The inner table scan could be a scan with pushdown operations.
             LogicalPlan::Projection(projection) => {
+                // A recursive CTE column list projects its unqualified output.
+                // Keep that projection in its own subquery when this SELECT
+                // already projects, rather than rebasing it onto an outer alias.
+                if already_projected
+                    && matches!(projection.input.as_ref(), LogicalPlan::RecursiveQuery(_))
+                {
+                    return Ok(None);
+                }
                 if let Some(plan) = self.unparse_table_scan_pushdown(
                     &projection.input,
                     alias.clone(),
