@@ -48,10 +48,11 @@ pub async fn from_scalar_function(
     let fn_name = substrait_fun_name(fn_signature);
     let args = from_substrait_func_args(consumer, &f.arguments, input_schema).await?;
 
-    // Substrait `extract` is not a plain name alias: DataFusion's `date_part`
-    // returns Int32, while plans (e.g. Isthmus TPC-H) declare i64. Handle it
-    // explicitly and cast to the declared output type.
-    if fn_name == "extract" {
+    // A registered `extract` UDF wins, keeping the exact-name-first order every
+    // other function gets. Otherwise Substrait `extract` maps to DataFusion's
+    // `date_part`, cast to the plan's declared output type (Isthmus declares
+    // i64; `date_part` returns Int32), so it is not a plain name alias.
+    if fn_name == "extract" && consumer.get_function_registry().udf(fn_name).is_err() {
         return build_extract_as_date_part(consumer, f, args);
     }
 
@@ -612,63 +613,104 @@ mod tests {
     }
 
     /// Isthmus TPC-H q07/q08/q09 emit `extract:req_date` with
-    /// `FunctionArgument { enum: "YEAR" }` plus a date Value.
-    #[tokio::test]
-    async fn test_extract_enum_arg() -> Result<()> {
-        let mut extensions = Extensions::default();
-        extensions
-            .functions
-            .insert(0, "extract:req_date".to_string());
-        let consumer = DefaultSubstraitConsumer::new(&extensions, &TEST_SESSION_STATE);
-
-        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
-        let df_schema = DFSchema::try_from(schema).unwrap();
+    /// `FunctionArgument { enum: "YEAR" }` plus a date Value, declared `i64`.
+    fn isthmus_extract_year() -> ScalarFunction {
+        use substrait::proto::expression::field_reference::{
+            ReferenceType, RootReference, RootType,
+        };
+        use substrait::proto::expression::reference_segment::{self, StructField};
+        use substrait::proto::expression::{FieldReference, ReferenceSegment};
+        use substrait::proto::r#type::{I64, Kind, Nullability};
 
         let enum_arg = FunctionArgument {
             arg_type: Some(ArgType::Enum("YEAR".to_string())),
         };
         let date_arg = FunctionArgument {
             arg_type: Some(ArgType::Value(Expression {
-                rex_type: Some(RexType::Selection(Box::new(
-                    substrait::proto::expression::FieldReference {
-                        reference_type: Some(substrait::proto::expression::field_reference::ReferenceType::DirectReference(
-                            substrait::proto::expression::ReferenceSegment {
-                                reference_type: Some(substrait::proto::expression::reference_segment::ReferenceType::StructField(
-                                    Box::new(substrait::proto::expression::reference_segment::StructField {
+                rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                    reference_type: Some(ReferenceType::DirectReference(
+                        ReferenceSegment {
+                            reference_type: Some(
+                                reference_segment::ReferenceType::StructField(Box::new(
+                                    StructField {
                                         field: 0,
                                         child: None,
-                                    })
+                                    },
                                 )),
-                            }
-                        )),
-                        root_type: Some(substrait::proto::expression::field_reference::RootType::RootReference(
-                            substrait::proto::expression::field_reference::RootReference {}
-                        )),
-                    }
-                ))),
+                            ),
+                        },
+                    )),
+                    root_type: Some(RootType::RootReference(RootReference {})),
+                }))),
             })),
         };
-
         let i64_type = substrait::proto::Type {
-            kind: Some(substrait::proto::r#type::Kind::I64(
-                substrait::proto::r#type::I64 {
-                    type_variation_reference: 0,
-                    nullability: substrait::proto::r#type::Nullability::Required as i32,
-                },
-            )),
+            kind: Some(Kind::I64(I64 {
+                type_variation_reference: 0,
+                nullability: Nullability::Required as i32,
+            })),
         };
-        let func = ScalarFunction {
+        ScalarFunction {
             function_reference: 0,
             arguments: vec![enum_arg, date_arg],
             output_type: Some(i64_type),
             ..Default::default()
-        };
+        }
+    }
 
-        let result = consumer.consume_scalar_function(&func, &df_schema).await?;
+    fn extract_extensions() -> Extensions {
+        let mut extensions = Extensions::default();
+        extensions
+            .functions
+            .insert(0, "extract:req_date".to_string());
+        extensions
+    }
+
+    #[tokio::test]
+    async fn test_extract_enum_arg() -> Result<()> {
+        let extensions = extract_extensions();
+        let consumer = DefaultSubstraitConsumer::new(&extensions, &TEST_SESSION_STATE);
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        let result = consumer
+            .consume_scalar_function(&isthmus_extract_year(), &df_schema)
+            .await?;
         assert_eq!(
             result.to_string(),
             r#"CAST(date_part(Utf8("YEAR"), d) AS Int64)"#
         );
+        Ok(())
+    }
+
+    /// A UDF registered under the exact name `extract` keeps precedence over
+    /// the `date_part` mapping, as for every other function name.
+    #[tokio::test]
+    async fn test_extract_prefers_registered_udf() -> Result<()> {
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        ctx.register_udf(create_udf(
+            "extract",
+            vec![DataType::Utf8, DataType::Date32],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|_args: &[ColumnarValue]| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(0))))
+            }),
+        ));
+        let state = ctx.state();
+        let extensions = extract_extensions();
+        let consumer = DefaultSubstraitConsumer::new(&extensions, &state);
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        let result = consumer
+            .consume_scalar_function(&isthmus_extract_year(), &df_schema)
+            .await?;
+        assert_eq!(result.to_string(), r#"extract(Utf8("YEAR"), d)"#);
         Ok(())
     }
 }
