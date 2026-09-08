@@ -4270,7 +4270,6 @@ mod test {
     }
 
     #[test]
-    #[expect(deprecated)]
     fn format_case_when() -> Result<()> {
         let expr = case(col("a"))
             .when(lit(1), lit(true))

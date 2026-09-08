@@ -11181,8 +11181,8 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
                 datafusion_functions_aggregate::expr_fn::count(lit(
                     datafusion_common::ScalarValue::Null,
                 ))
-                    .filter(col("t.v").gt(lit(1i64)))
-                    .build()?,
+                .filter(col("t.v").gt(lit(1i64)))
+                .build()?,
             ],
         )?
         .build()?;
@@ -11216,8 +11216,8 @@ fn test_bigquery_does_not_count_rows_for_a_null_literal() -> Result<()> {
 /// where `array_agg` returns `[1,2,3]` against `[3,2,1]`. So a separate ordering
 /// check would only cost the pushdown.
 #[test]
-fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order()
--> Result<()> {
+fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order() -> Result<()>
+{
     let schema = Schema::new(vec![
         Field::new("g", DataType::Int64, true),
         Field::new("v", DataType::Int64, true),
@@ -11259,6 +11259,461 @@ fn test_bigquery_rewrites_an_ordered_filtered_aggregate_that_ignores_order()
         !ordered_array_agg.contains("CASE WHEN"),
         "an array_agg is declined by the allowlist, ordered or not: \
          {ordered_array_agg}"
+    );
+
+    // A *descending* ordering is no different, and used to be: the descending
+    // check sat above the `FILTER` branch, so this emitted a generic `FILTER`
+    // clause. Measured against a real BigQuery project, that came back
+    // `Syntax error: Expected ")" but got "("` — a failed query, not a lost
+    // pushdown, because a federated statement has no local fallback.
+    let descending_sum = rendered(
+        datafusion_functions_aggregate::expr_fn::sum(col("t.v"))
+            .filter(col("t.v").gt(lit(1i64)))
+            .order_by(vec![col("t.v").sort(false, false)])
+            .build()?,
+    )?;
+    assert!(
+        descending_sum.contains("CASE WHEN") && !descending_sum.contains("FILTER"),
+        "a sum ignores its ordering in either direction, so a descending \
+         filtered sum moves the predicate inside too: {descending_sum}"
+    );
+
+    Ok(())
+}
+
+/// A recursive CTE behind a derived table is hoisted to the top of the statement.
+///
+/// `WITH RECURSIVE` is only legal at the top of a statement on BigQuery. A
+/// generator joined *directly* was already rendered there; the shape that failed
+/// puts it behind a derived table, where it is unparsed by building a whole
+/// statement and embedding that in parentheses:
+///
+/// ```text
+/// ... INNER JOIN (WITH RECURSIVE `g` AS (...) SELECT `g`.`n` FROM `g`) AS `gg`
+///   -> WITH RECURSIVE is only allowed at the top level of the SELECT, CREATE TABLE ...
+/// ```
+///
+/// The optimizer-generated projection/alias shape is exercised by
+/// `bigquery_optimized_recursive_cte_roundtrip` in the core SQL integration suite.
+#[test]
+fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
+    let plan_for = |query: &str| -> Result<String> {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let generator = "WITH RECURSIVE g AS (\
+                       SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 5\
+                     ) ";
+
+    // The shape that failed: the generator behind a derived table.
+    let behind_derived = plan_for(&format!(
+        "{generator}SELECT person.id FROM person JOIN (SELECT n FROM g) gg ON person.id = gg.n"
+    ))?;
+    assert!(
+        behind_derived.starts_with("WITH RECURSIVE"),
+        "the CTE has to open the statement: {behind_derived}"
+    );
+    assert!(
+        !behind_derived.contains("JOIN (WITH"),
+        "a WITH inside a derived table is what BigQuery refuses: {behind_derived}"
+    );
+    assert_eq!(
+        behind_derived.matches("WITH RECURSIVE").count(),
+        1,
+        "exactly one, at the top: {behind_derived}"
+    );
+
+    // The control: joined directly, which already worked and must keep working.
+    let joined_directly = plan_for(&format!(
+        "{generator}SELECT person.id FROM person JOIN g ON person.id = g.n"
+    ))?;
+    assert!(
+        joined_directly.starts_with("WITH RECURSIVE"),
+        "a directly joined generator still opens the statement: {joined_directly}"
+    );
+
+    Ok(())
+}
+
+/// Only a `Date32` cast is parsed as a date; a `Date64` keeps its time of day.
+///
+/// `Date64` is rendered `DATETIME` by `ast_type_for_date64_in_cast`, so routing
+/// it through a parser that yields `DATE` would truncate the time and change the
+/// column's SQL type — with no error, which is the worst way to lose data.
+#[test]
+fn test_bigquery_parses_text_into_a_date_only_for_date32() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("note", DataType::Utf8, true)]);
+    let rendered = |target: DataType| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![cast(col("t.note"), target)])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let as_date = rendered(DataType::Date32)?;
+    assert!(
+        as_date.contains("TIMESTAMP(REGEXP_REPLACE(") && as_date.contains("AS DATE)"),
+        "a Date32 cast is parsed and then narrowed: {as_date}"
+    );
+
+    let as_date64 = rendered(DataType::Date64)?;
+    assert!(
+        !as_date64.contains("AS DATE)"),
+        "a Date64 must not be narrowed to a date, which would drop its time: \
+         {as_date64}"
+    );
+    assert!(
+        as_date64.contains("DATETIME") || as_date64.contains("TIMESTAMP"),
+        "a Date64 keeps a type that carries a time of day: {as_date64}"
+    );
+
+    Ok(())
+}
+
+/// Hoisting a recursive CTE survives the shapes that repeat or nest it.
+///
+/// Each of these produced invalid SQL or contaminated a later statement, and
+/// none is exotic — they are what a real query does with a generator.
+#[test]
+fn test_bigquery_hoisting_handles_repeats_and_nesting() -> Result<()> {
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let plan_for = |query: &str| -> Result<LogicalPlan> {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        SqlToRel::new(&context).sql_statement_to_plan(statement)
+    };
+
+    let generator = "WITH RECURSIVE g AS (\
+                       SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 5\
+                     ) ";
+
+    // Referenced twice: SQL planning clones the stored plan per reference, so
+    // the definition is met twice and used to be emitted twice —
+    // `WITH RECURSIVE g AS (…), g AS (…)`, which no engine accepts.
+    let self_joined = unparser
+        .plan_to_sql(&plan_for(&format!(
+            "{generator}SELECT a.n FROM g a JOIN g b ON a.n = b.n"
+        ))?)?
+        .to_string();
+    assert_eq!(
+        self_joined.matches("WITH RECURSIVE").count(),
+        1,
+        "one WITH clause: {self_joined}"
+    );
+    assert_eq!(
+        self_joined.matches("`g` AS (").count(),
+        1,
+        "the repeated reference must reuse one definition: {self_joined}"
+    );
+
+    // Inside an expression subquery. These render by building a whole statement
+    // too, so a CTE met beneath one has to reach the *outer* statement — the
+    // depth that decides it is only kept if every nested rendering goes through
+    // the same path.
+    let in_subquery = unparser
+        .plan_to_sql(&plan_for(&format!(
+            "{generator}SELECT person.id FROM person WHERE person.id IN (SELECT n FROM g)"
+        ))?)?
+        .to_string();
+    assert!(
+        in_subquery.starts_with("WITH RECURSIVE"),
+        "a CTE under a subquery still opens the statement: {in_subquery}"
+    );
+    assert!(
+        !in_subquery.contains("IN (WITH"),
+        "and is not left inside the subquery: {in_subquery}"
+    );
+
+    // The same unparser, reused after a render that *fails part-way*. The CTE
+    // below is met — and queued — before the outer projection is rendered, and
+    // that projection casts to `TIME`, which `ast_data_type_to_sql` refuses. The
+    // queue is therefore non-empty when the error unwinds, and without the reset
+    // at the top of `plan_to_sql` the next statement inherits it.
+    //
+    // A *successful* render here would prove nothing: the drain at the end of a
+    // finished statement empties the queue anyway, so the assertion would hold
+    // with the reset deleted.
+    let failed = unparser.plan_to_sql(&plan_for(&format!(
+        "SELECT a.n FROM ({generator}SELECT n FROM g) a \
+         JOIN (SELECT CAST(person.id AS TIME) AS n FROM person) b ON a.n = b.n"
+    ))?);
+    assert!(
+        failed.is_err(),
+        "this render has to fail for the reuse below to mean anything: {failed:?}"
+    );
+
+    let plain = unparser
+        .plan_to_sql(&plan_for("SELECT person.id FROM person")?)?
+        .to_string();
+    assert!(
+        !plain.contains("WITH RECURSIVE"),
+        "an unrelated later statement must not inherit a CTE queued by a failed one: {plain}"
+    );
+
+    // A term carrying a clause of its own keeps it. `ORDER BY`/`LIMIT` land on
+    // the term's builder rather than in its body, and taking the body alone
+    // dropped them — the recursion then ran over different rows, with no error.
+    let bounded_seed = unparser
+        .plan_to_sql(&plan_for(
+            "WITH RECURSIVE g AS (\
+               (SELECT 1 AS n ORDER BY n LIMIT 1) \
+               UNION ALL SELECT n + 1 FROM g WHERE n < 5\
+             ) SELECT n FROM g",
+        )?)?
+        .to_string();
+    assert!(
+        bounded_seed.contains("LIMIT 1"),
+        "the seed's LIMIT has to survive into the CTE: {bounded_seed}"
+    );
+
+    Ok(())
+}
+
+/// Hoisting a recursive CTE puts its name in the statement's top-level
+/// namespace, where the statement may already bind it.
+///
+/// The planner accepts a CTE scoped to a derived table that shares a name with an
+/// outer relation, and the two mean different things: the outer `person` is the
+/// table, the inner one the CTE. Hoisting the definition to the top makes the
+/// outer reference read the CTE — wrong rows, no error. Refuse instead, which
+/// leaves the statement to whoever asked for it rather than answering it wrongly.
+#[test]
+fn test_bigquery_refuses_to_hoist_a_cte_over_a_relation_of_the_same_name() -> Result<()> {
+    let plan_for = |query: &str| -> Result<LogicalPlan> {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(query)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        SqlToRel::new(&context).sql_statement_to_plan(statement)
+    };
+    let unparser = Unparser::new(&BigQueryDialect {});
+    let generator = |name: &str| {
+        format!(
+            "WITH RECURSIVE {name} AS (SELECT 1 AS id UNION ALL \
+             SELECT id + 1 FROM {name} WHERE id < 3) SELECT id FROM {name}"
+        )
+    };
+
+    let collides = unparser.plan_to_sql(&plan_for(&format!(
+        "SELECT person.id FROM person JOIN ({}) x ON person.id = x.id",
+        generator("person")
+    ))?);
+    assert!(
+        collides.is_err(),
+        "hoisting `person` over the table of that name must be refused, not \
+         silently rebound: {collides:?}"
+    );
+
+    // The control that matters most: a CTE *referenced by another CTE*, which is
+    // how every recursive generator in the corpus this came from is used. SQL
+    // planning puts a `Projection` between the reference's alias and the
+    // `RecursiveQuery`, and a first version of the guard looked only at the
+    // alias's immediate child — so every such CTE collided with itself and the
+    // whole shape stopped federating. Caught against a live engine, not here,
+    // which is why it is here now.
+    let via_another_cte = unparser
+        .plan_to_sql(&plan_for(
+            "WITH RECURSIVE gen AS (SELECT 1 AS id UNION ALL SELECT id + 1 FROM gen WHERE id < 3), \
+             doubled AS (SELECT gen.id * 2 AS id FROM gen) \
+             SELECT person.id FROM person JOIN doubled ON person.id = doubled.id",
+        )?)?
+        .to_string();
+    assert!(
+        via_another_cte.contains("WITH RECURSIVE `gen`"),
+        "a CTE referenced through another CTE still hoists: {via_another_cte}"
+    );
+
+    // The plain control: a guard that refused every hoist would satisfy the
+    // assertion above and destroy the feature.
+    let clear = unparser
+        .plan_to_sql(&plan_for(&format!(
+            "SELECT person.id FROM person JOIN ({}) x ON person.id = x.id",
+            generator("gen")
+        ))?)?
+        .to_string();
+    assert!(
+        clear.starts_with("WITH RECURSIVE `gen`"),
+        "a CTE whose name binds nothing else still hoists: {clear}"
+    );
+
+    Ok(())
+}
+
+/// `BigQuery` names three `date_part` fields differently, and gets them verbatim
+/// without this.
+///
+/// `date_part_to_sql`'s `Extract` arm renders only year/month/day/hour/minute/
+/// second and answers `Ok(None)` otherwise, so the unparser emits the DataFusion
+/// name and BigQuery answers `Function not found: date_part` — measured against a
+/// real project. A customer statement worked around it by deriving a weekday from
+/// the *text* of a timestamp difference, which is far more fragile.
+///
+/// Every mapping is measured on BigQuery, not assumed. `week` is the trap: the
+/// bare `WEEK` is Sunday-based and answered 13 where DataFusion answered 14, so
+/// this asserts `ISOWEEK` and asserts the bare form is *not* emitted. `dow` is
+/// the field that is deliberately *not* rendered — see the arm that asserts the
+/// decline.
+#[test]
+fn test_bigquery_extracts_the_date_fields_it_spells_differently() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+    let rendered = |field: &str| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![datafusion_functions::expr_fn::date_part(
+                lit(field),
+                col("t.d"),
+            )])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    for (field, expected) in [
+        ("doy", "DAYOFYEAR"),
+        ("week", "ISOWEEK"),
+        ("quarter", "QUARTER"),
+    ] {
+        let sql = rendered(field)?;
+        assert!(
+            sql.contains(&format!("EXTRACT({expected} FROM")),
+            "date_part('{field}') has to reach BigQuery as EXTRACT({expected}): {sql}"
+        );
+        assert!(
+            !sql.contains("date_part"),
+            "the DataFusion name must not survive into BigQuery SQL: {sql}"
+        );
+    }
+
+    // `dow` is declined rather than rendered, and the decline is the point of
+    // this arm. Two spellings of a weekday reach the unparser as the same call —
+    // a `date_part` scalar function — carrying different implementations: a
+    // runtime that registers `datafusion_spark`'s `date_part` over the built-in
+    // has `date_part('dow', c)` count Sunday as 1 while `EXTRACT(DOW FROM c)` is
+    // planned onto DataFusion's and counts Sunday as 0. Measured on a Wednesday:
+    // 4 and 3. No single rendering is right for both, so neither is emitted and
+    // the call evaluates locally, where each spelling keeps the value it has.
+    let dow = rendered("dow")?;
+    assert!(
+        !dow.contains("DAYOFWEEK"),
+        "dow must not be rendered: the two spellings that reach here disagree \
+         by a day and one rendering cannot serve both: {dow}"
+    );
+
+    // Nothing that *is* rendered carries an offset: the three fields above were
+    // measured to agree between the two spellings.
+    for unshifted in ["doy", "week", "quarter"] {
+        let sql = rendered(unshifted)?;
+        assert!(
+            !sql.contains(" - 1"),
+            "{unshifted} agrees on both sides and must not be shifted: {sql}"
+        );
+    }
+
+    // Every string literal type the planner may produce reaches the rewrite.
+    // Matching only `Utf8` meant it silently never fired for a field the planner
+    // spelled as `Utf8View`, and the call reached BigQuery as `date_part(…)`,
+    // which it answers "Function not found".
+    for literal in [
+        datafusion_common::ScalarValue::Utf8(Some("quarter".into())),
+        datafusion_common::ScalarValue::LargeUtf8(Some("quarter".into())),
+        datafusion_common::ScalarValue::Utf8View(Some("quarter".into())),
+    ] {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .project(vec![datafusion_functions::expr_fn::date_part(
+                Expr::Literal(literal.clone(), None),
+                col("t.d"),
+            )])?
+            .build()?;
+        let sql = Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(
+            sql.contains("EXTRACT(QUARTER FROM") && !sql.contains("date_part"),
+            "a {literal:?} field must reach the rewrite too: {sql}"
+        );
+    }
+
+    // The trap, asserted directly: `WEEK` is Sunday-based on BigQuery and
+    // disagrees with DataFusion's ISO weeks by one at a year boundary.
+    let week = rendered("week")?;
+    assert!(
+        !week.contains("EXTRACT(WEEK FROM"),
+        "a bare WEEK is Sunday-based and returns a different week number: {week}"
+    );
+
+    // A field neither engine spells differently still goes through the shared
+    // helper, so this stays a narrowing rather than a replacement.
+    let month = rendered("month")?;
+    assert!(
+        month.contains("EXTRACT(MONTH FROM") && !month.contains("date_part"),
+        "the shared Extract arm still handles the common fields: {month}"
+    );
+
+    Ok(())
+}
+
+/// The percentile rewrites are the ones a descending ordering really does
+/// break, and the only ones that still decline for it.
+///
+/// `median`/`approx_percentile_cont` are rendered by ordering the group, so a
+/// descending sort takes the value from the other end and the rendering would
+/// answer over the wrong row. Declining leaves the `DataFusion` name in place,
+/// which `BigQuery` rejects with `Function not found: median` — loud, where
+/// computing the wrong percentile would be silent.
+#[test]
+fn test_bigquery_declines_only_a_descending_percentile() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("g", DataType::Int64, true),
+        Field::new("v", DataType::Int64, true),
+    ]);
+    let rendered = |aggregate: Expr| -> Result<String> {
+        let plan = table_scan(Some("t"), &schema, None)?
+            .aggregate(vec![col("t.g")], vec![aggregate])?
+            .build()?;
+        Ok(Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)?
+            .to_string())
+    };
+
+    let descending_median = rendered(
+        datafusion_functions_aggregate::expr_fn::median(col("t.v"))
+            .order_by(vec![col("t.v").sort(false, false)])
+            .build()?,
+    )?;
+    assert!(
+        descending_median.contains("median("),
+        "a descending median declines, leaving the DataFusion name for the \
+         remote to reject: {descending_median}"
+    );
+
+    // The control: ascending still renders, so "decline every median" cannot
+    // pass as a fix.
+    let ascending_median = rendered(
+        datafusion_functions_aggregate::expr_fn::median(col("t.v"))
+            .order_by(vec![col("t.v").sort(true, false)])
+            .build()?,
+    )?;
+    assert!(
+        !ascending_median.contains("median("),
+        "an ascending median is still rendered by ordering the group: \
+         {ascending_median}"
     );
 
     Ok(())
@@ -11960,6 +12415,155 @@ fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
     Ok(())
 }
 
+/// A recursive CTE renders as `WITH RECURSIVE`, for a dialect that says it can
+/// run one.
+///
+/// The plan was previously unparseable at all — `LogicalPlan::RecursiveQuery`
+/// reached `not_impl_err` — which kept it out of every pushdown. Measured on
+/// BigQuery, `WITH RECURSIVE counted AS (SELECT 1 AS n UNION ALL SELECT n + 1
+/// FROM counted WHERE n < 5)` returns `1..5`, so it can carry one.
+///
+/// A dialect that has not opted in still refuses, because a federated statement
+/// has no local-execution fallback: emitting `WITH RECURSIVE` to an engine that
+/// cannot run one would turn a query that evaluated locally into a failure.
+#[test]
+fn test_bigquery_renders_a_recursive_cte() -> Result<()> {
+    let query = "WITH RECURSIVE counted AS (\
+                   SELECT 1 AS n \
+                   UNION ALL \
+                   SELECT n + 1 FROM counted WHERE n < 5\
+                 ) SELECT * FROM counted";
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(query)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+
+    let bigquery = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        bigquery.contains("WITH RECURSIVE"),
+        "a recursive CTE has to keep its RECURSIVE keyword: {bigquery}"
+    );
+    assert!(
+        bigquery.contains("UNION ALL"),
+        "the plan is not distinct, so the terms are UNION ALL: {bigquery}"
+    );
+    assert!(
+        bigquery.contains("`counted`"),
+        "the recursive term's self-reference has to name the CTE: {bigquery}"
+    );
+
+    // A dialect that has not opted in keeps refusing, so nothing starts being
+    // pushed down to an engine that cannot evaluate it.
+    let generic = Unparser::new(&DefaultDialect {}).plan_to_sql(&plan);
+    assert!(
+        generic.is_err(),
+        "a dialect that does not support recursive CTEs must still refuse: \
+         {generic:?}"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_bigquery_standalone_recursive_expression_keeps_unparser_reusable() -> Result<()> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(
+            "WITH RECURSIVE g AS (SELECT 1 AS n UNION ALL SELECT n + 1 FROM g WHERE n < 3) SELECT n FROM g",
+        )?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    let unparser = Unparser::new(&BigQueryDialect {});
+    assert!(
+        unparser
+            .expr_to_sql(&scalar_subquery(Arc::new(plan)))
+            .is_err()
+    );
+    assert_eq!(unparser.expr_to_sql(&lit(1_i64))?.to_string(), "1");
+    Ok(())
+}
+
+/// Text cast to a date is *parsed*, not cast, where the dialect says so.
+///
+/// BigQuery's `DATE` cast takes only a bare `YYYY-MM-DD`: measured, it refuses
+/// `'2026-01-15 10:30:00'` and `'2026-01-15T10:30:00.123456789Z'` alike, so a
+/// column holding an ISO instant as text cannot be narrowed to a date at all
+/// through the plain cast. Parsing to an instant first and then narrowing
+/// accepts every form, and agrees with DataFusion on each — including an offset,
+/// where `'2026-01-15T02:30:00+05:00'` is `2026-01-14` on both sides because the
+/// instant is resolved to UTC before the date is taken.
+#[test]
+fn test_bigquery_parses_text_into_a_date_rather_than_casting() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("note", DataType::Utf8, true)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![cast(col("t.note"), DataType::Date32)])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("TIMESTAMP(REGEXP_REPLACE("),
+        "the text has to be parsed, and its sub-second digits truncated to the \
+         six a BigQuery timestamp holds: {sql}"
+    );
+    assert!(
+        sql.contains("AS DATE)"),
+        "the parsed instant still has to be narrowed to a date: {sql}"
+    );
+    assert!(
+        !sql.contains("CAST(`t`.`note` AS DATE)"),
+        "the plain cast is the rendering BigQuery refuses: {sql}"
+    );
+
+    Ok(())
+}
+
+/// Text compared against a temporal value has to be brought to that type, not
+/// left for the engine to coerce.
+///
+/// DataFusion reads the text *as* the temporal type — `string_temporal_coercion`
+/// picks the temporal side — and coerces at execution. BigQuery has no implicit
+/// parse and refuses the pair: measured, `STRING < DATETIME` is "No matching
+/// signature for operator <". This is the shape a federated aggregate reaches,
+/// where `min(<a text column>)` is compared against a computed timestamp.
+#[test]
+fn test_bigquery_agrees_text_compared_against_a_timestamp() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("note", DataType::Utf8, true),
+        Field::new(
+            "naive",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            true,
+        ),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .filter(col("t.note").lt(col("t.naive")))?
+        .project(vec![col("t.note")])?
+        .build()?;
+
+    let sql = Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(
+        sql.contains("TIMESTAMP(REGEXP_REPLACE("),
+        "the text side has to be parsed so both sides are one type: {sql}"
+    );
+    assert!(
+        !sql.contains("`t`.`note` < `t`.`naive`"),
+        "the bare pair is what BigQuery refuses: {sql}"
+    );
+
+    Ok(())
+}
+
 /// A decimal whose *integer* part does not fit `NUMERIC` needs `BIGNUMERIC`
 /// too, not only one whose scale does not.
 ///
@@ -11970,8 +12574,7 @@ fn test_bigquery_spells_a_wide_decimal_bignumeric() -> Result<()> {
 /// alone emits a type the value overflows, for a width that arrives from
 /// arithmetic and appears in no declared column type.
 #[test]
-fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Result<()>
-{
+fn test_bigquery_widens_a_decimal_whose_integer_part_overflows_numeric() -> Result<()> {
     let unparser = Unparser::new(&BigQueryDialect {});
     let rendered = |data_type: DataType| -> Result<String> {
         Ok(unparser

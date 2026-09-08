@@ -765,11 +765,11 @@ pub(crate) fn unproject_sort_expr(
                     if let Some(agg) = agg
                         && agg.schema.is_column_from_schema(&col) =>
                 {
-                    return Ok(Transformed::yes(unproject_agg_exprs(
+                    Ok(Transformed::yes(unproject_agg_exprs(
                         Expr::Column(col),
                         agg,
                         None,
-                    )?));
+                    )?))
                 }
                 Expr::Column(col) => {
                     // When an expression in the `ORDER BY` contains an alias from the `SELECT`
@@ -1708,6 +1708,25 @@ pub(crate) fn bigquery_string_to_timestamp_to_sql(
         parsed
     } else {
         bigquery_call("DATETIME", vec![parsed])
+    }
+}
+
+/// Reads a string as a `DATE` for BigQuery, whose own `DATE` cast takes only a
+/// bare `YYYY-MM-DD`.
+///
+/// Parses to an instant first and then narrows, because that is the cast which
+/// accepts the zoned and space-separated forms. Measured, every form the plain
+/// cast refuses is read correctly this way and agrees with DataFusion, including
+/// an offset: `'2026-01-15T02:30:00+05:00'` is `2026-01-14` on both sides, since
+/// the instant is resolved to UTC before the date is taken. A bare
+/// `'2026-01-15'` is unchanged by the round trip.
+pub(crate) fn bigquery_string_to_date_to_sql(value: ast::Expr) -> ast::Expr {
+    ast::Expr::Cast {
+        kind: ast::CastKind::Cast,
+        expr: Box::new(bigquery_string_to_timestamp_to_sql(value, true)),
+        data_type: ast::DataType::Date,
+        array: false,
+        format: None,
     }
 }
 

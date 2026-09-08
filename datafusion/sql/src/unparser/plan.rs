@@ -60,6 +60,7 @@ use datafusion_expr::{
     LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
     UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
 };
+use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
 use std::{collections::HashSet, sync::Arc, vec};
 
@@ -197,8 +198,179 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     Some(schema)
 }
 
+/// Whether any expression in `plan` reads a column from an enclosing query.
+///
+/// `Expr::OuterReferenceColumn` is how a correlated reference reaches the plan,
+/// and it is only meaningful in the scope that supplies the row.
+fn plan_reads_an_outer_row(plan: &LogicalPlan) -> Result<bool> {
+    let mut correlated = false;
+    plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            expr.apply(|expr| {
+                if matches!(expr, Expr::OuterReferenceColumn(..)) {
+                    correlated = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+        })?;
+        Ok(if correlated {
+            TreeNodeRecursion::Stop
+        } else {
+            TreeNodeRecursion::Continue
+        })
+    })?;
+    Ok(correlated)
+}
+
+/// Whether `plan` holds the definition of a recursive CTE called `name`.
+fn subtree_defines_recursive_cte(plan: &LogicalPlan, name: &str) -> bool {
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        if let LogicalPlan::RecursiveQuery(recursive) = node
+            && recursive.name == name
+        {
+            found = true;
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    });
+    found
+}
+
+/// The relation names `plan` binds that a CTE called `hoisted` would capture.
+///
+/// The invariant, stated once because three earlier versions each lost half of
+/// it: **every name the statement binds anywhere is capturable, except the
+/// hoisted CTE's own.**
+///
+/// So the walk covers the whole statement — including relations held in an
+/// *expression*, which is where a scalar, `IN`, `EXISTS` or set-comparison
+/// subquery keeps its plan — and prunes exactly one thing: the subtree of the
+/// `RecursiveQuery` called `hoisted`. That subtree holds the CTE's own work-table
+/// scan, which carries its name and is not a competing relation.
+///
+/// Pruning is per-CTE rather than global, which is what makes both directions
+/// work. Checking `g` prunes `g`'s own definition, so its work table does not
+/// look like a collision with itself. Checking `h` does *not* prune `g`, so a
+/// physical `h` read inside `g`'s terms is still seen — hoisting `h` over it
+/// would rebind that table.
+fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<String>> {
+    let mut bound = HashSet::new();
+    plan.apply_with_subqueries(|node| {
+        match node {
+            LogicalPlan::RecursiveQuery(recursive) if recursive.name == hoisted => {
+                return Ok(TreeNodeRecursion::Jump);
+            }
+            LogicalPlan::TableScan(scan) => {
+                bound.insert(scan.table_name.table().to_string());
+            }
+            // An alias through which the subtree references its own CTE does
+            // not introduce a competing relation name.
+            LogicalPlan::SubqueryAlias(alias)
+                if !subtree_defines_recursive_cte(node, alias.alias.table()) =>
+            {
+                bound.insert(alias.alias.table().to_string());
+            }
+            _ => {}
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    Ok(bound)
+}
+
 impl Unparser<'_> {
+    /// Queues a recursive CTE for the statement root, keeping one definition per
+    /// name.
+    ///
+    /// Both routes that defer a CTE go through here. A repeated *reference* to
+    /// one CTE reaches the deferring code more than once — SQL planning clones
+    /// the stored plan per reference — and appending each time emits
+    /// `WITH RECURSIVE g AS (…), g AS (…)`, which is invalid. Keep the first and
+    /// drop the repeat.
+    ///
+    /// Two *different* definitions under one name are a different matter: they
+    /// are legal as separate scoped sub-plans and cannot both be hoisted, because
+    /// the references left behind could not say which they meant. Refuse rather
+    /// than emit SQL that binds the wrong one.
+    fn queue_recursive_cte(
+        &self,
+        cte: ast::Cte,
+        recursive: &datafusion_expr::RecursiveQuery,
+    ) -> Result<()> {
+        // Hoisting moves the definition *above* the query that encloses it, which
+        // is a change of scope, not just of position. A term that reads a column
+        // from the enclosing row — a correlated reference — is defined by that
+        // scope, and lifting it to the statement root leaves the reference
+        // pointing at nothing. There is no rendering that repairs this: renaming
+        // the CTE does not move the outer row into view, so this declines.
+        for term in [&recursive.static_term, &recursive.recursive_term] {
+            if plan_reads_an_outer_row(term)? {
+                return not_impl_err!(
+                    "a recursive CTE named `{}` reads a column from the query \
+                     enclosing it, so it cannot be lifted to the top of the \
+                     statement: the reference would no longer be in scope",
+                    cte.alias.name
+                );
+            }
+        }
+
+        let mut pending = self
+            .pending_recursive_ctes
+            .lock()
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        match pending
+            .iter()
+            .find(|held| held.alias.name == cte.alias.name)
+        {
+            Some(held) if *held == cte => Ok(()),
+            Some(_) => not_impl_err!(
+                "two different recursive CTEs are named `{}` in one statement; \
+                 hoisting both to the top level would leave their references \
+                 ambiguous",
+                cte.alias.name
+            ),
+            None => {
+                pending.push(cte);
+                Ok(())
+            }
+        }
+    }
+
     pub fn plan_to_sql(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
+        // A top-level rendering gets traversal state of its own.
+        //
+        // The queue and the depth belong to one render, not to the unparser.
+        // `plan_to_sql` takes `&self` and an `Unparser` is shareable, so without
+        // this two concurrent renders on one instance would drain each other's
+        // queue; and because the queue is drained only when a statement
+        // *finishes*, a render that failed part-way would hand its leftovers to
+        // the next caller, hoisting a CTE from a query that never completed onto
+        // an unrelated statement.
+        //
+        // Every *nested* render shares the state of the render that entered it,
+        // which is what `plan_to_sql_nested` is for: it raises the depth, so the
+        // branch below is not taken and the pending CTEs still reach the root.
+        if self
+            .derived_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            return self.with_own_render_state().render_statement(plan);
+        }
+        self.render_statement(plan)
+    }
+
+    fn render_statement(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
+        self.statements_in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rendered = self.render_statement_inner(plan);
+        self.statements_in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        rendered
+    }
+
+    fn render_statement_inner(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
         let mut plan = normalize_union_schema(plan)?;
         if !self.dialect.supports_qualify() {
             plan = rewrite_qualify(plan)?;
@@ -224,6 +396,11 @@ impl Unparser<'_> {
             LogicalPlan::Dml(_) => self.dml_to_sql(&plan),
             LogicalPlan::Extension(extension) => {
                 self.extension_to_statement(extension.node.as_ref())
+            }
+            LogicalPlan::RecursiveQuery(recursive)
+                if self.dialect.supports_recursive_cte() =>
+            {
+                self.recursive_query_to_sql_statement(&recursive)
             }
             LogicalPlan::Explain(_)
             | LogicalPlan::Analyze(_)
@@ -283,9 +460,239 @@ impl Unparser<'_> {
 
         let body = self.select_to_sql_expr(plan, &mut query_builder)?;
 
-        let query = query_builder.unwrap().body(Box::new(body)).build()?;
+        // Recursive CTEs met anywhere below here belong on *this* query, not on
+        // whichever derived table happened to enclose them — see
+        // `pending_recursive_ctes`. Draining rather than reading also leaves the
+        // unparser reusable for the next statement.
+        let mut query_builder = query_builder.unwrap();
+        if self
+            .derived_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 0
+        {
+            let pending: Vec<_> = self
+                .pending_recursive_ctes
+                .lock()
+                .map_err(|e| internal_datafusion_err!("{e}"))?
+                .drain(..)
+                .collect();
+            if !pending.is_empty() {
+                for cte in &pending {
+                    let bound =
+                        relations_capturable_by(plan, cte.alias.name.value.as_str())?;
+                    // A hoisted CTE keeps its own name, and here that name joins
+                    // the statement's top-level namespace. If the statement
+                    // already binds a relation of that name, hoisting rebinds it:
+                    // the planner accepts
+                    //
+                    //   SELECT t.id FROM t JOIN (
+                    //     WITH RECURSIVE t AS (…) SELECT id FROM t) x ON …
+                    //
+                    // where the outer `t` is the table and the inner one is the
+                    // CTE, and hoisting the CTE to the top makes both read the
+                    // CTE. Refuse the statement rather than emit SQL that binds
+                    // the wrong relation and returns wrong rows.
+                    if bound.contains(cte.alias.name.value.as_str()) {
+                        return not_impl_err!(
+                            "a recursive CTE named `{}` cannot be hoisted to the \
+                             top of this statement: the name already binds a \
+                             relation there, and hoisting would rebind it",
+                            cte.alias.name
+                        );
+                    }
+                }
+                for cte in pending {
+                    query_builder.push_cte(cte, true);
+                }
+            }
+        }
+
+        let query = query_builder.body(Box::new(body)).build()?;
 
         Ok(ast::Statement::Query(Box::new(query)))
+    }
+
+    /// Builds the `<name> AS (<static> UNION [ALL] <recursive>)` a recursive CTE
+    /// contributes to an enclosing query's `WITH`.
+    ///
+    /// The recursive term already refers to the working table as a scan of
+    /// `name`, so it renders as that name without help — the self-reference the
+    /// CTE needs is the ordinary table reference the plan carries.
+    ///
+    /// `is_distinct` picks the set quantifier, and it is the whole difference
+    /// between `UNION` and `UNION ALL` here: DataFusion dedupes the working
+    /// table for the distinct form, which is what `UNION` asks the remote to do.
+    fn recursive_cte(
+        &self,
+        recursive: &datafusion_expr::RecursiveQuery,
+    ) -> Result<(ast::Cte, Ident)> {
+        // A term's `ORDER BY`, `LIMIT` and `OFFSET` land on its *builder*, not in
+        // the `SetExpr` returned — so taking only the body drops them, and the
+        // recursion then runs over different rows with no error. Keep whichever
+        // term carries such a clause as a query of its own.
+        let mut static_query = Some(QueryBuilder::default());
+        let static_term =
+            self.select_to_sql_expr(&recursive.static_term, &mut static_query)?;
+        let static_term = Self::term_with_its_clauses(static_query, static_term)?;
+        let mut recursive_query = Some(QueryBuilder::default());
+        let recursive_term =
+            self.select_to_sql_expr(&recursive.recursive_term, &mut recursive_query)?;
+        let recursive_term =
+            Self::term_with_its_clauses(recursive_query, recursive_term)?;
+
+        let set_quantifier = if recursive.is_distinct {
+            if !self.dialect.supports_distinct_recursive_cte() {
+                return not_impl_err!(
+                    "this dialect runs a recursive CTE only with `UNION ALL`, and \
+                     this one combines its terms with `UNION DISTINCT`"
+                );
+            }
+            self.dialect.union_distinct_set_quantifier()
+        } else {
+            ast::SetQuantifier::All
+        };
+        let body = SetExpr::SetOperation {
+            op: ast::SetOperator::Union,
+            set_quantifier,
+            left: Box::new(static_term),
+            right: Box::new(recursive_term),
+        };
+
+        let name = self.new_ident_quoted_if_needs(recursive.name.clone());
+        let cte = ast::Cte {
+            alias: ast::TableAlias {
+                name: name.clone(),
+                columns: vec![],
+                at: None,
+                explicit: false,
+            },
+            query: Box::new(
+                QueryBuilder::default()
+                    .body(Box::new(body))
+                    .build()
+                    .map_err(|e| internal_datafusion_err!("{e}"))?,
+            ),
+            from: None,
+            materialized: None,
+            closing_paren_token: AttachedToken::empty(),
+        };
+        Ok((cte, name))
+    }
+
+    /// One term of a recursive CTE, carrying any clause its builder collected.
+    ///
+    /// `select_to_sql_expr` returns the term's body and puts `ORDER BY`, `LIMIT`
+    /// and `OFFSET` on the builder it was handed. Using the body alone drops
+    /// them — a bounded seed or a limited recursive step then reads a different
+    /// set of rows, quietly. The body is returned unwrapped when there is
+    /// nothing else to carry, so the common case renders exactly as before.
+    fn term_with_its_clauses(
+        builder: Option<QueryBuilder>,
+        body: SetExpr,
+    ) -> Result<SetExpr> {
+        let Some(mut builder) = builder else {
+            return Ok(body);
+        };
+        let query = builder
+            .body(Box::new(body))
+            .build()
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        let bare = query.order_by.is_none()
+            && query.limit_clause.is_none()
+            && query.fetch.is_none()
+            && query.locks.is_empty()
+            && query.for_clause.is_none()
+            && query.with.is_none();
+        if bare {
+            return Ok(*query.body);
+        }
+        Ok(SetExpr::Query(Box::new(query)))
+    }
+
+    /// A recursive CTE as the whole statement: `WITH RECURSIVE … SELECT * FROM
+    /// <name>`.
+    fn recursive_query_to_sql_statement(
+        &self,
+        recursive: &datafusion_expr::RecursiveQuery,
+    ) -> Result<ast::Statement> {
+        let (cte, name) = self.recursive_cte(recursive)?;
+        let select_all = ast::Select {
+            select_token: AttachedToken::empty(),
+            distinct: None,
+            top: None,
+            top_before_distinct: false,
+            projection: vec![ast::SelectItem::Wildcard(
+                ast::WildcardAdditionalOptions::default(),
+            )],
+            exclude: None,
+            into: None,
+            from: vec![ast::TableWithJoins {
+                relation: ast::TableFactor::Table {
+                    name: ast::ObjectName::from(vec![name]),
+                    alias: None,
+                    args: None,
+                    with_hints: vec![],
+                    version: None,
+                    with_ordinality: false,
+                    partitions: vec![],
+                    json_path: None,
+                    sample: None,
+                    index_hints: vec![],
+                },
+                joins: vec![],
+            }],
+            lateral_views: vec![],
+            prewhere: None,
+            selection: None,
+            group_by: ast::GroupByExpr::Expressions(vec![], vec![]),
+            cluster_by: vec![],
+            distribute_by: vec![],
+            sort_by: vec![],
+            having: None,
+            named_window: vec![],
+            qualify: None,
+            window_before_qualify: false,
+            value_table_mode: None,
+            connect_by: vec![],
+            flavor: ast::SelectFlavor::Standard,
+            optimizer_hints: vec![],
+            select_modifiers: None,
+        };
+
+        let mut query = QueryBuilder::default();
+        // Inside a derived table this is *not* a statement, whatever the entry
+        // point says: a join input is unparsed by building a whole statement and
+        // embedding it in parentheses, and `WITH RECURSIVE` there is what
+        // BigQuery refuses. Defer the CTE to the real statement root and leave
+        // behind the same `SELECT * FROM <name>` that references it.
+        if self
+            .derived_depth
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0
+        {
+            self.queue_recursive_cte(cte, recursive)?;
+        } else {
+            // Rendering this CTE's terms can itself have queued definitions —
+            // an anchor that reads an *earlier* recursive CTE defers that one
+            // here. This is the statement, so they are its to attach; leaving
+            // them queued emits a statement referencing a CTE it never defines.
+            // They go first: a later entry may read an earlier one.
+            let queued: Vec<_> = self
+                .pending_recursive_ctes
+                .lock()
+                .map_err(|e| internal_datafusion_err!("{e}"))?
+                .drain(..)
+                .collect();
+            for queued_cte in queued {
+                query.push_cte(queued_cte, true);
+            }
+            query.push_cte(cte, true);
+        }
+        query.body(Box::new(SetExpr::Select(Box::new(select_all))));
+
+        Ok(ast::Statement::Query(Box::new(
+            query.build().map_err(|e| internal_datafusion_err!("{e}"))?,
+        )))
     }
 
     fn select_to_sql_expr(
@@ -335,10 +742,10 @@ impl Unparser<'_> {
                         all_idents.push(name.to_string());
                     }
                 }
-                ast::TableFactor::Derived { alias, .. } => {
-                    if let Some(alias) = alias {
-                        all_idents.push(alias.name.to_string());
-                    }
+                ast::TableFactor::Derived {
+                    alias: Some(alias), ..
+                } => {
+                    all_idents.push(alias.name.to_string());
                 }
                 _ => {}
             });
@@ -616,7 +1023,10 @@ impl Unparser<'_> {
 
         let mut derived_builder = DerivedRelationBuilder::default();
         derived_builder.lateral(lateral).alias(alias).subquery({
-            let inner_statement = self.plan_to_sql(plan)?;
+            // Unparsing a derived table builds a whole statement, so the drain in
+            // `select_to_sql_statement` would fire here and put the CTE inside
+            // these parentheses. Depth says this is not the top level.
+            let inner_statement = self.plan_to_sql_nested(plan)?;
             if let ast::Statement::Query(inner_query) = inner_statement {
                 inner_query
             } else {
@@ -1510,9 +1920,8 @@ impl Unparser<'_> {
                     None,
                     select.already_projected(),
                 );
-                let windows: Option<Vec<&Window>> = window_nodes
-                    .as_deref()
-                    .map(|ws| ws.iter().copied().collect());
+                let windows: Option<Vec<&Window>> =
+                    window_nodes.as_deref().map(|ws| ws.to_vec());
                 // unproject sort expressions
                 let sort_exprs: Vec<SortExpr> = sort
                     .expr
@@ -2314,6 +2723,44 @@ impl Unparser<'_> {
                     )
                 }
             }
+            LogicalPlan::RecursiveQuery(recursive)
+                if self.dialect.supports_recursive_cte() =>
+            {
+                // A recursive CTE nested inside a larger statement becomes a CTE
+                // on the *statement* and a plain table reference where it stood,
+                // which is the shape the plan already describes: the recursive
+                // term refers to the working table by this same name.
+                //
+                // Deliberately not attached to the nearest enclosing query. That
+                // query is often itself a derived table — a join input, say — and
+                // BigQuery refuses a `WITH RECURSIVE` there outright: "WITH
+                // RECURSIVE is only allowed at the top level of the SELECT,
+                // CREATE TABLE ...". The statement root drains this instead.
+                let (cte, name) = self.recursive_cte(recursive)?;
+                if query.is_none() {
+                    return internal_err!(
+                        "a recursive CTE is only valid in a statement context"
+                    );
+                }
+                // A CTE referenced twice is planned twice — SQL planning clones
+                // the stored plan per reference — so a self-join reaches here
+                // once per reference with an identical definition. Emitting both
+                // gives `WITH RECURSIVE g AS (…), g AS (…)`, which is invalid.
+                // Keep the first and drop the repeat.
+                //
+                // Two *different* definitions under one name are a different
+                // matter: they are legal as separate scoped sub-plans and cannot
+                // both be hoisted, because the references left behind could not
+                // say which they meant. Refuse rather than emit SQL that binds
+                // the wrong one.
+                self.queue_recursive_cte(cte, recursive)?;
+
+                let mut builder = TableRelationBuilder::default();
+                builder.name(ast::ObjectName::from(vec![name]));
+                relation.table(builder);
+
+                Ok(())
+            }
             _ => {
                 not_impl_err!("Unsupported operator: {plan:?}")
             }
@@ -2647,6 +3094,30 @@ impl Unparser<'_> {
         already_projected: bool,
     ) -> Result<Option<LogicalPlan>> {
         match plan {
+            LogicalPlan::RecursiveQuery(recursive)
+                if self.dialect.supports_recursive_cte() =>
+            {
+                if already_projected {
+                    return Ok(Some(plan.clone()));
+                }
+                // A hoisted recursive input is a named relation. Explicit
+                // columns let joins combine each input's projection and let
+                // the surrounding alias rebase its filters.
+                let qualifier =
+                    alias.unwrap_or_else(|| TableReference::bare(recursive.name.clone()));
+                let columns = plan
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| Column::new(Some(qualifier.clone()), field.name()))
+                    .collect::<Vec<_>>();
+                Ok(Some(
+                    LogicalPlanBuilder::from(plan.clone())
+                        .alias(qualifier)?
+                        .project(columns)?
+                        .build()?,
+                ))
+            }
             LogicalPlan::TableScan(table_scan) => {
                 if !Self::is_scan_with_pushdown(table_scan) {
                     return Ok(None);
@@ -2794,6 +3265,14 @@ impl Unparser<'_> {
             // SubqueryAlias could be rewritten to a plan with a projection as the top node by [rewrite::subquery_alias_inner_query_and_columns].
             // The inner table scan could be a scan with pushdown operations.
             LogicalPlan::Projection(projection) => {
+                // A recursive CTE column list projects its unqualified output.
+                // Keep that projection in its own subquery when this SELECT
+                // already projects, rather than rebasing it onto an outer alias.
+                if already_projected
+                    && matches!(projection.input.as_ref(), LogicalPlan::RecursiveQuery(_))
+                {
+                    return Ok(None);
+                }
                 if let Some(plan) = self.unparse_table_scan_pushdown(
                     &projection.input,
                     alias.clone(),
