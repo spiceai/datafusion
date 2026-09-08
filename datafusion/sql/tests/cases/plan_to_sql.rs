@@ -8169,6 +8169,110 @@ fn test_subquery_alias_over_pushed_down_scan_on_dialect_without_column_list() ->
     Ok(())
 }
 
+/// A scan of `t (a, b)` projected out of table order, as `[b, a]`, under a bare
+/// subquery alias — the shape the column list must never be offered to.
+///
+/// With the `SELECT` list taken, the pushdown drops the scan's projection, so
+/// the rewritten scan reports its columns in table order while the alias reports
+/// them in projection order. The names differ positionally, yet nothing was
+/// renamed and every reference binds by name. A list here would rename `t`'s
+/// columns positionally instead — `t AS s (b, a)` — so `s.b` would read `t.a`:
+/// wrong rows, not a failed statement.
+fn reordered_scan_under_alias(
+    filters: Vec<Expr>,
+    fetch: Option<usize>,
+) -> Result<LogicalPlanBuilder> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    table_scan_with_filter_and_fetch(
+        Some("t"),
+        &schema,
+        Some(vec![1, 0]),
+        filters,
+        fetch,
+    )?
+    .alias("s")
+}
+
+#[test]
+fn test_subquery_alias_over_reordered_scan_gets_no_column_list() -> Result<()> {
+    let plan = reordered_scan_under_alias(vec![], None)?
+        .project(vec![col("s.b"), col("s.a")])?
+        .build()?;
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT s.b, s.a FROM t AS s");
+
+    // A pushed-down filter wraps the rewritten scan; it is looked through, and
+    // the scan under it still gets no list.
+    let plan = reordered_scan_under_alias(vec![col("t.a").gt(lit(1))], None)?
+        .project(vec![col("s.b")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s.b FROM t AS s WHERE (s.a > 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_reordered_scan_with_fetch_gets_no_column_list() -> Result<()>
+{
+    // A row limit makes the scan a derived table — `SELECT *`, in table order —
+    // and a list on that derived table would rename the same way.
+    let plan = reordered_scan_under_alias(vec![], Some(10))?
+        .project(vec![col("s.b")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s.b FROM (SELECT * FROM t AS s LIMIT 10) AS s"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_nested_subquery_alias_over_reordered_scan_gets_no_column_list() -> Result<()> {
+    // The pushdown wraps the rewritten scan in the outer alias; that wrapper is
+    // looked through too.
+    let plan = reordered_scan_under_alias(vec![], None)?
+        .alias("u")?
+        .project(vec![col("u.b")])?
+        .build()?;
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT u.b FROM t AS u");
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_filtered_pushed_down_projection_is_named_by_the_alias()
+-> Result<()> {
+    // The control in the other direction: a filter between the alias and the
+    // projection is also a wrapper the pushdown adds, and the relation under it
+    // still exposes the projection's outputs, so the renamed one still gets its
+    // name from the alias.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")), col("t.a")])?
+        .filter(col("t.a").gt(lit(1)))?
+        .alias("s")?
+        .build()?;
+    let outer_name = aliased.schema().field(0).name().clone();
+    let plan = LogicalPlanBuilder::from(aliased)
+        .project(vec![
+            Expr::Column(Column::new(Some(TableReference::bare("s")), outer_name)),
+            col("s.a"),
+        ])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s."t.a + t.b", s.a FROM (SELECT (s.a + s.b), s.a FROM t AS s) AS s ("t.a + t.b", a) WHERE (s.a > 1)"#
+    );
+    Ok(())
+}
+
 #[test]
 fn test_qualified_join_input_fetch_refused_on_full_qualified_col_dialect() -> Result<()> {
     let schema = Schema::new(vec![

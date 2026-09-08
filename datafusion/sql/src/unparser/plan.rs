@@ -3492,15 +3492,21 @@ impl Unparser<'_> {
     /// it, and only the enclosing scope knows the name it will use, so it is the
     /// alias that has to carry the list.
     ///
-    /// Returns nothing when the names already agree, so the emitted SQL is
-    /// unchanged for every alias the rewrite does not rename — and nothing when
-    /// the widths disagree, since a column list must name every output or none.
+    /// Returns nothing when the rewritten relation exposes a scan's own columns
+    /// rather than a projection's outputs, since only a requalified projection
+    /// renames an output (see [`Self::exposes_projection_outputs`]). Nothing
+    /// when the names already agree, so the emitted SQL is unchanged for every
+    /// alias the rewrite does not rename — and nothing when the widths disagree,
+    /// since a column list must name every output or none.
     ///
     /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
     fn alias_columns_renamed_by_pushdown(
         plan_alias: &datafusion_expr::SubqueryAlias,
         rewritten: &LogicalPlan,
     ) -> Vec<Ident> {
+        if !Self::exposes_projection_outputs(rewritten) {
+            return vec![];
+        }
         let outer = plan_alias.schema.fields();
         let inner = rewritten.schema().fields();
         if outer.len() != inner.len()
@@ -3515,6 +3521,29 @@ impl Unparser<'_> {
             .iter()
             .map(|field| Ident::new(field.name().clone()))
             .collect()
+    }
+
+    /// Whether the relation the pushdown rewrote exposes a projection's outputs,
+    /// looking through the alias and filter wrappers the pushdown adds above it,
+    /// rather than a scan's own columns.
+    ///
+    /// Only a requalified projection renames an output. A rewritten scan reports
+    /// its columns in table order, which can differ from the alias's projection
+    /// order while still binding by name, and a column list there would rename
+    /// the table's columns positionally instead: `t AS s (b, a)` over a scan
+    /// projected as `[b, a]` makes `s.b` read `t.a`. Wrong rows, not a failed
+    /// statement, so the list must not be offered for a scan at all.
+    fn exposes_projection_outputs(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Projection(_) => true,
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::exposes_projection_outputs(&alias.input)
+            }
+            LogicalPlan::Filter(filter) => {
+                Self::exposes_projection_outputs(&filter.input)
+            }
+            _ => false,
+        }
     }
 
     fn new_table_alias(&self, alias: String, columns: Vec<Ident>) -> ast::TableAlias {
