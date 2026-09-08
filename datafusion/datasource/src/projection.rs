@@ -160,13 +160,12 @@ fn inject_metadata_columns_into_projection(
             let expr = Arc::clone(&projection.expr)
                 .transform(|expr| {
                     let original_expr = Arc::clone(&expr);
-                    if let Some(column) = expr.downcast_ref::<Column>() {
-                        if let Some((_, literal)) = metadata_literals
+                    if let Some(column) = expr.downcast_ref::<Column>()
+                        && let Some((_, literal)) = metadata_literals
                             .iter()
                             .find(|(idx, _)| *idx == column.index())
-                        {
-                            return Ok(Transformed::yes(Arc::clone(literal)));
-                        }
+                    {
+                        return Ok(Transformed::yes(Arc::clone(literal)));
                     }
                     Ok(Transformed::no(original_expr))
                 })

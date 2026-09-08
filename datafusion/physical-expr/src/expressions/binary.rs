@@ -845,12 +845,11 @@ impl BinaryExpr {
             });
 
             // After combining, check if we can short-circuit based on result
-            if let Some(ref res) = result {
-                if let ShortCircuitStrategy::ReturnLeft =
+            if let Some(ref res) = result
+                && let ShortCircuitStrategy::ReturnLeft =
                     check_short_circuit(res, &self.op)
-                {
-                    return Ok(result.unwrap());
-                }
+            {
+                return Ok(result.unwrap());
             }
         }
 
@@ -5563,27 +5562,38 @@ mod tests {
         let col_c = col("c", &schema).unwrap();
 
         // Single binary expression: depth = 1
-        let expr = BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone());
+        let expr = BinaryExpr::new(Arc::clone(&col_a), Operator::And, Arc::clone(&col_b));
         assert_eq!(expr.estimate_and_or_chain_depth(), 1);
 
         // (a AND b) AND c: depth = 2
-        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
-        let expr = BinaryExpr::new(left, Operator::And, col_c.clone());
+        let left = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_a),
+            Operator::And,
+            Arc::clone(&col_b),
+        ));
+        let expr = BinaryExpr::new(left, Operator::And, Arc::clone(&col_c));
         assert_eq!(expr.estimate_and_or_chain_depth(), 2);
 
         // a AND (b AND c): depth = 2
-        let right =
-            Arc::new(BinaryExpr::new(col_b.clone(), Operator::And, col_c.clone()));
-        let expr = BinaryExpr::new(col_a.clone(), Operator::And, right);
+        let right = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_b),
+            Operator::And,
+            Arc::clone(&col_c),
+        ));
+        let expr = BinaryExpr::new(Arc::clone(&col_a), Operator::And, right);
         assert_eq!(expr.estimate_and_or_chain_depth(), 2);
 
         // Mixed operators don't increase depth: (a AND b) OR c has depth 1 for OR
-        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
-        let expr = BinaryExpr::new(left, Operator::Or, col_c.clone());
+        let left = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_a),
+            Operator::And,
+            Arc::clone(&col_b),
+        ));
+        let expr = BinaryExpr::new(left, Operator::Or, Arc::clone(&col_c));
         assert_eq!(expr.estimate_and_or_chain_depth(), 1);
 
         // Non-AND/OR operator: depth = 1
-        let expr = BinaryExpr::new(col_a.clone(), Operator::Eq, col_b.clone());
+        let expr = BinaryExpr::new(Arc::clone(&col_a), Operator::Eq, Arc::clone(&col_b));
         assert_eq!(expr.estimate_and_or_chain_depth(), 1);
     }
 
@@ -5602,21 +5612,32 @@ mod tests {
         let col_d = col("d", &schema).unwrap();
 
         // Simple: a AND b -> [a, b]
-        let expr = BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone());
+        let expr = BinaryExpr::new(Arc::clone(&col_a), Operator::And, Arc::clone(&col_b));
         let operands = expr.collect_boolean_chain_operands();
         assert_eq!(operands.len(), 2);
 
         // Nested: (a AND b) AND (c AND d) -> [a, b, c, d]
-        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
-        let right =
-            Arc::new(BinaryExpr::new(col_c.clone(), Operator::And, col_d.clone()));
+        let left = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_a),
+            Operator::And,
+            Arc::clone(&col_b),
+        ));
+        let right = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_c),
+            Operator::And,
+            Arc::clone(&col_d),
+        ));
         let expr = BinaryExpr::new(left, Operator::And, right);
         let operands = expr.collect_boolean_chain_operands();
         assert_eq!(operands.len(), 4);
 
         // Mixed: (a AND b) OR c -> [(a AND b), c] (stops at different operator)
-        let left = Arc::new(BinaryExpr::new(col_a.clone(), Operator::And, col_b.clone()));
-        let expr = BinaryExpr::new(left, Operator::Or, col_c.clone());
+        let left = Arc::new(BinaryExpr::new(
+            Arc::clone(&col_a),
+            Operator::And,
+            Arc::clone(&col_b),
+        ));
+        let expr = BinaryExpr::new(left, Operator::Or, Arc::clone(&col_c));
         let operands = expr.collect_boolean_chain_operands();
         assert_eq!(operands.len(), 2);
     }
@@ -5629,15 +5650,15 @@ mod tests {
 
         // Create test data
         let a = BooleanArray::from(vec![true, true, false, true]);
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a)])?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(a)])?;
 
         let col_a = col("a", &schema)?;
 
         // Build a deep chain: a AND a AND a AND ... (depth > threshold)
         let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
-        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        let mut expr: Arc<dyn PhysicalExpr> = Arc::clone(&col_a);
         for _ in 0..depth {
-            expr = Arc::new(BinaryExpr::new(expr, Operator::And, col_a.clone()));
+            expr = Arc::new(BinaryExpr::new(expr, Operator::And, Arc::clone(&col_a)));
         }
 
         // This should use the iterative path and not stack overflow
@@ -5646,10 +5667,10 @@ mod tests {
         let bool_array = result_array.as_boolean();
 
         // a AND a AND ... AND a = a
-        assert_eq!(bool_array.value(0), true);
-        assert_eq!(bool_array.value(1), true);
-        assert_eq!(bool_array.value(2), false);
-        assert_eq!(bool_array.value(3), true);
+        assert!(bool_array.value(0));
+        assert!(bool_array.value(1));
+        assert!(!bool_array.value(2));
+        assert!(bool_array.value(3));
 
         Ok(())
     }
@@ -5660,15 +5681,15 @@ mod tests {
             Arc::new(Schema::new(vec![Field::new("a", DataType::Boolean, false)]));
 
         let a = BooleanArray::from(vec![true, false, false, true]);
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a)])?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(a)])?;
 
         let col_a = col("a", &schema)?;
 
         // Build a deep OR chain
         let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
-        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        let mut expr: Arc<dyn PhysicalExpr> = Arc::clone(&col_a);
         for _ in 0..depth {
-            expr = Arc::new(BinaryExpr::new(expr, Operator::Or, col_a.clone()));
+            expr = Arc::new(BinaryExpr::new(expr, Operator::Or, Arc::clone(&col_a)));
         }
 
         let result = expr.evaluate(&batch)?;
@@ -5676,10 +5697,10 @@ mod tests {
         let bool_array = result_array.as_boolean();
 
         // a OR a OR ... OR a = a
-        assert_eq!(bool_array.value(0), true);
-        assert_eq!(bool_array.value(1), false);
-        assert_eq!(bool_array.value(2), false);
-        assert_eq!(bool_array.value(3), true);
+        assert!(bool_array.value(0));
+        assert!(!bool_array.value(1));
+        assert!(!bool_array.value(2));
+        assert!(bool_array.value(3));
 
         Ok(())
     }
@@ -5694,7 +5715,8 @@ mod tests {
 
         let a = BooleanArray::from(vec![true, true, true, true]);
         let b = BooleanArray::from(vec![false, false, false, false]); // all false
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a), Arc::new(b)])?;
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(a), Arc::new(b)])?;
 
         let col_a = col("a", &schema)?;
         let col_b = col("b", &schema)?;
@@ -5702,12 +5724,12 @@ mod tests {
         // Build deep chain: a AND a AND ... AND b AND a AND ...
         // The b (all false) should short-circuit
         let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
-        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        let mut expr: Arc<dyn PhysicalExpr> = Arc::clone(&col_a);
         for i in 0..depth {
             if i == depth / 2 {
-                expr = Arc::new(BinaryExpr::new(expr, Operator::And, col_b.clone()));
+                expr = Arc::new(BinaryExpr::new(expr, Operator::And, Arc::clone(&col_b)));
             } else {
-                expr = Arc::new(BinaryExpr::new(expr, Operator::And, col_a.clone()));
+                expr = Arc::new(BinaryExpr::new(expr, Operator::And, Arc::clone(&col_a)));
             }
         }
 
@@ -5716,10 +5738,10 @@ mod tests {
         let bool_array = result_array.as_boolean();
 
         // Result should be all false due to short-circuit
-        assert_eq!(bool_array.value(0), false);
-        assert_eq!(bool_array.value(1), false);
-        assert_eq!(bool_array.value(2), false);
-        assert_eq!(bool_array.value(3), false);
+        assert!(!bool_array.value(0));
+        assert!(!bool_array.value(1));
+        assert!(!bool_array.value(2));
+        assert!(!bool_array.value(3));
 
         Ok(())
     }
@@ -5734,19 +5756,20 @@ mod tests {
 
         let a = BooleanArray::from(vec![false, false, false, false]);
         let b = BooleanArray::from(vec![true, true, true, true]); // all true
-        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(a), Arc::new(b)])?;
+        let batch =
+            RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(a), Arc::new(b)])?;
 
         let col_a = col("a", &schema)?;
         let col_b = col("b", &schema)?;
 
         // Build deep chain: a OR a OR ... OR b OR a OR ...
         let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 5;
-        let mut expr: Arc<dyn PhysicalExpr> = col_a.clone();
+        let mut expr: Arc<dyn PhysicalExpr> = Arc::clone(&col_a);
         for i in 0..depth {
             if i == depth / 2 {
-                expr = Arc::new(BinaryExpr::new(expr, Operator::Or, col_b.clone()));
+                expr = Arc::new(BinaryExpr::new(expr, Operator::Or, Arc::clone(&col_b)));
             } else {
-                expr = Arc::new(BinaryExpr::new(expr, Operator::Or, col_a.clone()));
+                expr = Arc::new(BinaryExpr::new(expr, Operator::Or, Arc::clone(&col_a)));
             }
         }
 
@@ -5755,10 +5778,10 @@ mod tests {
         let bool_array = result_array.as_boolean();
 
         // Result should be all true due to short-circuit
-        assert_eq!(bool_array.value(0), true);
-        assert_eq!(bool_array.value(1), true);
-        assert_eq!(bool_array.value(2), true);
-        assert_eq!(bool_array.value(3), true);
+        assert!(bool_array.value(0));
+        assert!(bool_array.value(1));
+        assert!(bool_array.value(2));
+        assert!(bool_array.value(3));
 
         Ok(())
     }
@@ -5776,7 +5799,7 @@ mod tests {
         let b = BooleanArray::from(vec![true, false, true, false]);
         let c = BooleanArray::from(vec![true, true, true, true]);
         let batch = RecordBatch::try_new(
-            schema.clone(),
+            Arc::clone(&schema),
             vec![Arc::new(a), Arc::new(b), Arc::new(c)],
         )?;
 
@@ -5786,10 +5809,14 @@ mod tests {
 
         // Build: a AND b AND c AND a AND b AND ... (deep chain)
         let depth = ITERATIVE_AND_OR_CHAIN_DEPTH_THRESHOLD + 3;
-        let cols = vec![col_a.clone(), col_b.clone(), col_c.clone()];
-        let mut expr: Arc<dyn PhysicalExpr> = cols[0].clone();
+        let cols = [Arc::clone(&col_a), Arc::clone(&col_b), Arc::clone(&col_c)];
+        let mut expr: Arc<dyn PhysicalExpr> = Arc::clone(&cols[0]);
         for i in 1..depth {
-            expr = Arc::new(BinaryExpr::new(expr, Operator::And, cols[i % 3].clone()));
+            expr = Arc::new(BinaryExpr::new(
+                expr,
+                Operator::And,
+                Arc::clone(&cols[i % 3]),
+            ));
         }
 
         let result = expr.evaluate(&batch)?;
@@ -5797,10 +5824,10 @@ mod tests {
         let bool_array = result_array.as_boolean();
 
         // a AND b AND c = [true, false, false, false]
-        assert_eq!(bool_array.value(0), true);
-        assert_eq!(bool_array.value(1), false);
-        assert_eq!(bool_array.value(2), false);
-        assert_eq!(bool_array.value(3), false);
+        assert!(bool_array.value(0));
+        assert!(!bool_array.value(1));
+        assert!(!bool_array.value(2));
+        assert!(!bool_array.value(3));
 
         Ok(())
     }

@@ -625,10 +625,7 @@ pub fn requalify_column_onto_derived_table(
 
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
 /// Removes any table identifiers that are not present in the list of available identifiers, retains original column names.
-pub fn remove_dangling_identifiers(
-    idents: &mut Vec<Ident>,
-    available_idents: &Vec<String>,
-) {
+pub fn remove_dangling_identifiers(idents: &mut Vec<Ident>, available_idents: &[String]) {
     if idents.len() > 1 {
         // sqlparser 0.61 made `display_separated` pub(crate); join via Display instead.
         let ident_source = idents
