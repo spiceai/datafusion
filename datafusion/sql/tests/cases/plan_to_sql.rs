@@ -8048,32 +8048,227 @@ fn test_derived_output_name_carrying_a_quote_is_escaped() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn test_subquery_alias_over_pushed_down_scan_still_unbindable() -> Result<()> {
-    // The scan pushdown requalifies the projection onto the subquery alias before
-    // the derived table is built, so the name the derived table can report for the
-    // output — `s.a + s.b` — is not the one the enclosing scope uses for it,
-    // `t.a + t.b`. Naming the output cannot close that gap: the repair is for the
-    // enclosing scope to name the relation's columns on the alias it attaches.
+/// The plan `Projection(s."<expr>") -> SubqueryAlias(s) -> Projection(<expr>) ->
+/// TableScan(t)`, whose unnamed output is the shape this file is about.
+fn subquery_alias_over_pushed_down_scan(output: Expr) -> Result<LogicalPlan> {
     let schema = Schema::new(vec![
         Field::new("a", DataType::Int32, false),
         Field::new("b", DataType::Int32, false),
     ]);
-    let plan = LogicalPlanBuilder::from(
-        table_scan(Some("t"), &schema, Some(vec![0, 1]))?
-            .project(vec![col("t.a").add(col("t.b"))])?
-            .alias("s")?
-            .build()?,
-    )
-    .project(vec![Expr::Column(Column::new(
-        Some(TableReference::bare("s")),
-        "t.a + t.b",
-    ))])?
-    .build()?;
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![output])?
+        .alias("s")?
+        .build()?;
+    // Read rather than spelled: this is the name the enclosing scope holds for
+    // the output, and the whole question is whether the emitted relation still
+    // answers to it. Spelling it here would let a test pass by agreeing with
+    // itself.
+    let outer_name = aliased.schema().field(0).name().clone();
+    LogicalPlanBuilder::from(aliased)
+        .project(vec![Expr::Column(Column::new(
+            Some(TableReference::bare("s")),
+            outer_name,
+        ))])?
+        .build()
+}
+
+#[test]
+fn test_subquery_alias_over_pushed_down_scan_is_named_by_the_alias() -> Result<()> {
+    // The scan pushdown requalifies the projection onto the subquery alias before
+    // the derived table is built, so the name the relation can report for the
+    // output — `s.a + s.b` — is not the one the enclosing scope uses for it,
+    // `t.a + t.b`. Each is right for its own scope, so naming the output cannot
+    // close the gap and the reference used to bind to nothing; the enclosing
+    // scope says what it calls the columns instead, on the alias it attaches.
+    let plan = subquery_alias_over_pushed_down_scan(col("t.a").add(col("t.b")))?;
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) AS "s.a + s.b" FROM t AS s) AS s"#
+        @r#"SELECT s."t.a + t.b" FROM (SELECT (s.a + s.b) FROM t AS s) AS s ("t.a + t.b")"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_column_list_escapes_a_quote_in_an_output_name() -> Result<()> {
+    // The names on that list come from the plan, so one can carry the quote that
+    // delimits the identifier it is emitted as. Both the list and the reference
+    // to it escape it, so neither closes the identifier early and injects into
+    // the statement.
+    let plan = subquery_alias_over_pushed_down_scan(
+        lit("x\" OR 1=1 --").eq(lit("y")).and(col("t.a").gt(lit(0))),
+    )?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s."Utf8(""x"" OR 1=1 --"") = Utf8(""y"") AND t.a > Int32(0)" FROM (SELECT (('x" OR 1=1 --' = 'y') AND (s.a > 0)) FROM t AS s) AS s ("Utf8(""x"" OR 1=1 --"") = Utf8(""y"") AND t.a > Int32(0)")"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_pushed_down_scan_keeps_a_named_output_unaliased() -> Result<()>
+{
+    // The control for the two above: an output the pushdown does not rename needs
+    // no list, and must not grow one. The column list is what tells the walk the
+    // alias names the relation's outputs, so producing one where nothing is
+    // unbindable would strip qualifiers from references that were binding
+    // perfectly well.
+    let plan =
+        subquery_alias_over_pushed_down_scan(col("t.a").add(col("t.b")).alias("sum"))?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s."sum" FROM (SELECT (s.a + s.b) AS "sum" FROM t AS s) AS s"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_with_a_free_select_list_gets_no_column_list() -> Result<()> {
+    // The same alias and the same rename, with no outer projection to take the
+    // `SELECT` list. The rewritten projection is then merged into this select and
+    // the relation the alias lands on is the bare scan — whose columns the emitted
+    // expression still names, and whose width is not the alias's. Attaching a list
+    // here renamed the scan's columns out from under `(s.a + s.b)` and named one
+    // column where the relation exposes two:
+    //   SELECT (s.a + s.b) FROM (SELECT s.a, s.b FROM t AS s) AS s ("t.a + t.b")
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .alias("s")?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (s.a + s.b) FROM (SELECT s.a, s.b FROM t AS s) AS s"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_pushed_down_scan_on_dialect_without_column_list() -> Result<()>
+{
+    // A dialect that cannot spell a column list in a table alias (SQLite) has an
+    // established fallback — inject the names into the inner projection — and it
+    // is reached here too. Pinned rather than asserted correct: what it renders is
+    // the measure of whether that fallback covers this shape.
+    let plan = subquery_alias_over_pushed_down_scan(col("t.a").add(col("t.b")))?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_supports_column_alias_in_table_alias(false)
+        .with_identifier_quote_style('"')
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @r#"SELECT "s"."t.a + t.b" FROM (SELECT ("s"."a" + "s"."b") AS "t.a + t.b" FROM "t" AS "s") AS "s""#
+    );
+    Ok(())
+}
+
+/// A scan of `t (a, b)` projected out of table order, as `[b, a]`, under a bare
+/// subquery alias — the shape the column list must never be offered to.
+///
+/// With the `SELECT` list taken, the pushdown drops the scan's projection, so
+/// the rewritten scan reports its columns in table order while the alias reports
+/// them in projection order. The names differ positionally, yet nothing was
+/// renamed and every reference binds by name. A list here would rename `t`'s
+/// columns positionally instead — `t AS s (b, a)` — so `s.b` would read `t.a`:
+/// wrong rows, not a failed statement.
+fn reordered_scan_under_alias(
+    filters: Vec<Expr>,
+    fetch: Option<usize>,
+) -> Result<LogicalPlanBuilder> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    table_scan_with_filter_and_fetch(
+        Some("t"),
+        &schema,
+        Some(vec![1, 0]),
+        filters,
+        fetch,
+    )?
+    .alias("s")
+}
+
+#[test]
+fn test_subquery_alias_over_reordered_scan_gets_no_column_list() -> Result<()> {
+    let plan = reordered_scan_under_alias(vec![], None)?
+        .project(vec![col("s.b"), col("s.a")])?
+        .build()?;
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT s.b, s.a FROM t AS s");
+
+    // A pushed-down filter wraps the rewritten scan; it is looked through, and
+    // the scan under it still gets no list.
+    let plan = reordered_scan_under_alias(vec![col("t.a").gt(lit(1))], None)?
+        .project(vec![col("s.b")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s.b FROM t AS s WHERE (s.a > 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_reordered_scan_with_fetch_gets_no_column_list() -> Result<()>
+{
+    // A row limit makes the scan a derived table — `SELECT *`, in table order —
+    // and a list on that derived table would rename the same way.
+    let plan = reordered_scan_under_alias(vec![], Some(10))?
+        .project(vec![col("s.b")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s.b FROM (SELECT * FROM t AS s LIMIT 10) AS s"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_nested_subquery_alias_over_reordered_scan_gets_no_column_list() -> Result<()> {
+    // The pushdown wraps the rewritten scan in the outer alias; that wrapper is
+    // looked through too.
+    let plan = reordered_scan_under_alias(vec![], None)?
+        .alias("u")?
+        .project(vec![col("u.b")])?
+        .build()?;
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT u.b FROM t AS u");
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_over_filtered_pushed_down_projection_is_named_by_the_alias()
+-> Result<()> {
+    // The control in the other direction: a filter between the alias and the
+    // projection is also a wrapper the pushdown adds, and the relation under it
+    // still exposes the projection's outputs, so the renamed one still gets its
+    // name from the alias.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")), col("t.a")])?
+        .filter(col("t.a").gt(lit(1)))?
+        .alias("s")?
+        .build()?;
+    let outer_name = aliased.schema().field(0).name().clone();
+    let plan = LogicalPlanBuilder::from(aliased)
+        .project(vec![
+            Expr::Column(Column::new(Some(TableReference::bare("s")), outer_name)),
+            col("s.a"),
+        ])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s."t.a + t.b", s.a FROM (SELECT (s.a + s.b), s.a FROM t AS s) AS s ("t.a + t.b", a) WHERE (s.a > 1)"#
     );
     Ok(())
 }
