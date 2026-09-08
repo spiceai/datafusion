@@ -15,15 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::logical_plan::consumer::{SubstraitConsumer, from_substrait_func_args};
+use crate::logical_plan::consumer::{
+    SubstraitConsumer, from_substrait_func_args, from_substrait_type_without_names,
+};
+use datafusion::arrow::datatypes::DataType;
 use datafusion::common::Result;
 use datafusion::common::{
     DFSchema, DataFusionError, ScalarValue, not_impl_err, plan_err, substrait_err,
 };
 use datafusion::execution::FunctionRegistry;
-use datafusion::logical_expr::{Between, BinaryExpr, Expr, Like, Operator, expr};
+use datafusion::logical_expr::{
+    Between, BinaryExpr, Cast, Expr, Like, Operator, expr, lit,
+};
 use std::vec::Drain;
 use substrait::proto::expression::ScalarFunction;
+use substrait::proto::function_argument::ArgType;
 
 pub async fn from_scalar_function(
     consumer: &impl SubstraitConsumer,
@@ -43,6 +49,18 @@ pub async fn from_scalar_function(
     };
 
     let fn_name = substrait_fun_name(fn_signature);
+
+    // Substrait `extract` takes its component (`YEAR`, `MONTH`, …) and an
+    // optional `ONE`/`ZERO` indexing option as enum arguments and declares an
+    // i64 result; DataFusion's `date_part` takes a field name, is 1-based for
+    // the calendar fields and returns Int32, so it is translated field by
+    // field rather than by name. A UDF registered under the exact name
+    // `extract` wins, keeping the exact-name-first order every other function
+    // gets.
+    if fn_name == "extract" && consumer.get_function_registry().udf(fn_name).is_err() {
+        return from_substrait_extract(consumer, f, input_schema).await;
+    }
+
     let args = from_substrait_func_args(consumer, &f.arguments, input_schema).await?;
 
     let udf_func = consumer.get_function_registry().udf(fn_name).or_else(|e| {
@@ -125,6 +143,111 @@ pub fn substrait_to_df_name(name: &str) -> Option<&str> {
     match name {
         "is_nan" => Some("isnan"),
         _ => None,
+    }
+}
+
+/// Translate Substrait `extract` (`functions_datetime.yaml`) to DataFusion
+/// `date_part`, cast to the plan's declared output type (i64 unless the plan
+/// says otherwise).
+///
+/// Only components whose `date_part` field has the same definition are
+/// mapped, with the `ONE`/`ZERO` indexing option applied as an offset from
+/// `date_part`'s own base. Everything else is `NotImplemented` rather than a
+/// differently defined number: the week-of-year variants DataFusion does not
+/// compute, `US_YEAR`, `UNIX_TIME`, `TIMEZONE_OFFSET`, the sub-second
+/// components (`date_part` counts those from the start of the minute,
+/// Substrait from the previous whole unit) and the timezone-argument forms.
+async fn from_substrait_extract(
+    consumer: &impl SubstraitConsumer,
+    f: &ScalarFunction,
+    input_schema: &DFSchema,
+) -> Result<Expr> {
+    let mut options: Vec<&str> = Vec::new();
+    let mut values: Vec<Expr> = Vec::new();
+    for arg in &f.arguments {
+        match &arg.arg_type {
+            Some(ArgType::Enum(option)) => options.push(option.as_str()),
+            Some(ArgType::Value(e)) => {
+                values.push(consumer.consume_expression(e, input_schema).await?);
+            }
+            Some(ArgType::Type(_)) | None => {
+                return substrait_err!("Unexpected extract argument {arg:?}");
+            }
+        }
+    }
+    let Some((component, indexing)) = options.split_first() else {
+        return substrait_err!("extract requires a component enum argument");
+    };
+    // The `date_part` field, and the offset from its base to the requested
+    // indexing.
+    let (field, offset) = match (*component, indexing) {
+        ("YEAR", []) => ("year", 0),
+        ("ISO_YEAR", []) => ("isoyear", 0),
+        ("HOUR", []) => ("hour", 0),
+        ("MINUTE", []) => ("minute", 0),
+        ("SECOND", []) => ("second", 0),
+        // 1-based in `date_part`
+        ("QUARTER", [indexing]) => ("quarter", indexing_offset(indexing, 1)?),
+        ("MONTH", [indexing]) => ("month", indexing_offset(indexing, 1)?),
+        ("DAY", [indexing]) => ("day", indexing_offset(indexing, 1)?),
+        ("DAY_OF_YEAR", [indexing]) => ("doy", indexing_offset(indexing, 1)?),
+        ("ISO_WEEK", [indexing]) => ("week", indexing_offset(indexing, 1)?),
+        ("MONDAY_DAY_OF_WEEK", [indexing]) => ("isodow", indexing_offset(indexing, 1)?),
+        // 0-based in `date_part` (Sunday = 0)
+        ("SUNDAY_DAY_OF_WEEK", [indexing]) => ("dow", indexing_offset(indexing, 0)?),
+        _ => {
+            return not_impl_err!(
+                "Substrait extract component {component} with indexing {indexing:?} is not supported"
+            );
+        }
+    };
+    if values.len() != 1 {
+        return not_impl_err!(
+            "Substrait extract with {} value arguments is not supported (timezone forms are not translated)",
+            values.len()
+        );
+    }
+    let value = values.swap_remove(0);
+
+    let date_part = consumer.get_function_registry().udf("date_part")?;
+    let expr = Expr::ScalarFunction(expr::ScalarFunction::new_udf(
+        date_part,
+        vec![lit(field), value],
+    ));
+    let expr = match offset {
+        0 => expr,
+        offset if offset > 0 => Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(expr),
+            Operator::Plus,
+            Box::new(lit(offset)),
+        )),
+        offset => Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(expr),
+            Operator::Minus,
+            Box::new(lit(-offset)),
+        )),
+    };
+
+    // The plan's declared output type; the Substrait datetime `extract`
+    // returns i64, and `date_part` already returns Int32.
+    let target_type = match f.output_type.as_ref() {
+        Some(output_type) => from_substrait_type_without_names(consumer, output_type)?,
+        None => DataType::Int64,
+    };
+    if target_type == DataType::Int32 {
+        Ok(expr)
+    } else {
+        Ok(Expr::Cast(Cast::new(Box::new(expr), target_type)))
+    }
+}
+
+/// Offset added to a `date_part` result whose lowest value is `base` so that
+/// it starts at the requested Substrait `indexing` option.
+fn indexing_offset(indexing: &str, base: i32) -> Result<i32> {
+    match indexing {
+        "ONE" => Ok(1 - base),
+        "ZERO" => Ok(-base),
+        other => substrait_err!("Unsupported extract indexing option {other}"),
     }
 }
 
@@ -370,7 +493,7 @@ mod tests {
     use crate::logical_plan::consumer::tests::TEST_SESSION_STATE;
     use crate::logical_plan::consumer::{DefaultSubstraitConsumer, SubstraitConsumer};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
-    use datafusion::common::{DFSchema, Result, ScalarValue};
+    use datafusion::common::{DFSchema, DataFusionError, Result, ScalarValue};
     use datafusion::logical_expr::{Expr, Operator};
     use insta::assert_snapshot;
     use substrait::proto::expression::literal::LiteralType;
@@ -572,6 +695,209 @@ mod tests {
             panic!("Expected Expr::Like (negated), got {result:?}");
         }
 
+        Ok(())
+    }
+
+    /// An Isthmus-shaped `extract` call: enum `options` (component, then an
+    /// optional indexing option) followed by the `d` column, declared `i64`.
+    /// TPC-H q07/q08/q09 use `["YEAR"]`.
+    fn isthmus_extract(options: &[&str]) -> ScalarFunction {
+        use substrait::proto::expression::field_reference::{
+            ReferenceType, RootReference, RootType,
+        };
+        use substrait::proto::expression::reference_segment::{self, StructField};
+        use substrait::proto::expression::{FieldReference, ReferenceSegment};
+        use substrait::proto::r#type::{I64, Kind, Nullability};
+
+        let mut arguments: Vec<FunctionArgument> = options
+            .iter()
+            .map(|option| FunctionArgument {
+                arg_type: Some(ArgType::Enum((*option).to_string())),
+            })
+            .collect();
+        arguments.push(FunctionArgument {
+            arg_type: Some(ArgType::Value(Expression {
+                rex_type: Some(RexType::Selection(Box::new(FieldReference {
+                    reference_type: Some(ReferenceType::DirectReference(
+                        ReferenceSegment {
+                            reference_type: Some(
+                                reference_segment::ReferenceType::StructField(Box::new(
+                                    StructField {
+                                        field: 0,
+                                        child: None,
+                                    },
+                                )),
+                            ),
+                        },
+                    )),
+                    root_type: Some(RootType::RootReference(RootReference {})),
+                }))),
+            })),
+        });
+        let i64_type = substrait::proto::Type {
+            kind: Some(Kind::I64(I64 {
+                type_variation_reference: 0,
+                nullability: Nullability::Required as i32,
+            })),
+        };
+        ScalarFunction {
+            function_reference: 0,
+            arguments,
+            output_type: Some(i64_type),
+            ..Default::default()
+        }
+    }
+
+    fn isthmus_extract_year() -> ScalarFunction {
+        isthmus_extract(&["YEAR"])
+    }
+
+    fn extract_extensions() -> Extensions {
+        let mut extensions = Extensions::default();
+        extensions
+            .functions
+            .insert(0, "extract:req_date".to_string());
+        extensions
+    }
+
+    #[tokio::test]
+    async fn test_extract_enum_arg() -> Result<()> {
+        let extensions = extract_extensions();
+        let consumer = DefaultSubstraitConsumer::new(&extensions, &TEST_SESSION_STATE);
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        let result = consumer
+            .consume_scalar_function(&isthmus_extract_year(), &df_schema)
+            .await?;
+        assert_eq!(
+            result.to_string(),
+            r#"CAST(date_part(Utf8("year"), d) AS Int64)"#
+        );
+        Ok(())
+    }
+
+    /// The `ONE`/`ZERO` indexing option is an offset from `date_part`'s own
+    /// base: 1 for the calendar fields, 0 for `dow` (Sunday = 0).
+    #[tokio::test]
+    async fn test_extract_indexing_offsets() -> Result<()> {
+        let extensions = extract_extensions();
+        let consumer = DefaultSubstraitConsumer::new(&extensions, &TEST_SESSION_STATE);
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        for (options, expected) in [
+            (
+                &["MONTH", "ONE"][..],
+                r#"CAST(date_part(Utf8("month"), d) AS Int64)"#,
+            ),
+            (
+                &["MONTH", "ZERO"][..],
+                r#"CAST(date_part(Utf8("month"), d) - Int32(1) AS Int64)"#,
+            ),
+            (
+                &["DAY_OF_YEAR", "ZERO"][..],
+                r#"CAST(date_part(Utf8("doy"), d) - Int32(1) AS Int64)"#,
+            ),
+            (
+                &["SUNDAY_DAY_OF_WEEK", "ZERO"][..],
+                r#"CAST(date_part(Utf8("dow"), d) AS Int64)"#,
+            ),
+            (
+                &["SUNDAY_DAY_OF_WEEK", "ONE"][..],
+                r#"CAST(date_part(Utf8("dow"), d) + Int32(1) AS Int64)"#,
+            ),
+            (
+                &["MONDAY_DAY_OF_WEEK", "ONE"][..],
+                r#"CAST(date_part(Utf8("isodow"), d) AS Int64)"#,
+            ),
+            (
+                &["ISO_YEAR"][..],
+                r#"CAST(date_part(Utf8("isoyear"), d) AS Int64)"#,
+            ),
+        ] {
+            let result = consumer
+                .consume_scalar_function(&isthmus_extract(options), &df_schema)
+                .await?;
+            assert_eq!(result.to_string(), expected, "options {options:?}");
+        }
+        Ok(())
+    }
+
+    /// Components `date_part` defines differently (or not at all), a missing
+    /// or misplaced indexing option, and the timezone-argument form must not
+    /// be translated into a differently defined number.
+    #[tokio::test]
+    async fn test_extract_rejects_unmapped_shapes() -> Result<()> {
+        let extensions = extract_extensions();
+        let consumer = DefaultSubstraitConsumer::new(&extensions, &TEST_SESSION_STATE);
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        for options in [
+            &["MILLISECOND"][..],
+            &["UNIX_TIME"][..],
+            &["US_WEEK", "ONE"][..],
+            &["MONTH"][..],
+            &["YEAR", "ONE"][..],
+        ] {
+            let err = consumer
+                .consume_scalar_function(&isthmus_extract(options), &df_schema)
+                .await
+                .expect_err(&format!("options {options:?} must not translate"));
+            assert!(
+                matches!(err, DataFusionError::NotImplemented(_)),
+                "options {options:?}: {err}"
+            );
+        }
+
+        // `extract(component, x, timezone)`: a second value argument.
+        let mut with_timezone = isthmus_extract(&["YEAR"]);
+        with_timezone.arguments.push(FunctionArgument {
+            arg_type: Some(ArgType::Value(Expression {
+                rex_type: Some(RexType::Literal(Literal {
+                    nullable: false,
+                    type_variation_reference: 0,
+                    literal_type: Some(LiteralType::String("Etc/GMT+1".to_string())),
+                })),
+            })),
+        });
+        let err = consumer
+            .consume_scalar_function(&with_timezone, &df_schema)
+            .await
+            .expect_err("timezone form must not translate");
+        assert!(matches!(err, DataFusionError::NotImplemented(_)), "{err}");
+        Ok(())
+    }
+
+    /// A UDF registered under the exact name `extract` keeps precedence over
+    /// the `date_part` mapping, as for every other function name.
+    #[tokio::test]
+    async fn test_extract_prefers_registered_udf() -> Result<()> {
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+        use datafusion::prelude::SessionContext;
+        use std::sync::Arc;
+
+        let ctx = SessionContext::new();
+        ctx.register_udf(create_udf(
+            "extract",
+            vec![DataType::Utf8, DataType::Date32],
+            DataType::Int64,
+            Volatility::Immutable,
+            Arc::new(|_args: &[ColumnarValue]| {
+                Ok(ColumnarValue::Scalar(ScalarValue::Int64(Some(0))))
+            }),
+        ));
+        let state = ctx.state();
+        let extensions = extract_extensions();
+        let consumer = DefaultSubstraitConsumer::new(&extensions, &state);
+        let schema = Schema::new(vec![Field::new("d", DataType::Date32, true)]);
+        let df_schema = DFSchema::try_from(schema)?;
+
+        let result = consumer
+            .consume_scalar_function(&isthmus_extract_year(), &df_schema)
+            .await?;
+        assert_eq!(result.to_string(), r#"extract(Utf8("YEAR"), d)"#);
         Ok(())
     }
 }
