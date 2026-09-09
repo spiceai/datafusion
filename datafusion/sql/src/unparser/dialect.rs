@@ -333,14 +333,14 @@ pub trait Dialect: Send + Sync {
     /// that the query selecting from it sees, for each row, the one value the derived
     /// table's `SELECT` list produced.
     ///
-    /// That is what the SQL standard's scoping says and what PostgreSQL, MySQL and DuckDB
+    /// That is what the SQL standard's scoping says and what PostgreSQL and DuckDB
     /// do: `SELECT r FROM (SELECT random() AS r FROM t) WHERE r > 0.5` returns only rows
     /// whose `r` is above the bound. The unparser relies on it whenever a predicate
     /// reads a volatile projection output, since the expression cannot be repeated at
     /// the point of use without drawing a second value.
     ///
     /// An engine that flattens the derived table and evaluates the expression again for
-    /// the predicate — SQLite does, measured — answers `false` here, and the unparser
+    /// the predicate — SQLite (measured) and MySQL (documented) do — answers `false` here, and the unparser
     /// refuses the shape rather than emit SQL that returns rows the `SELECT` list never
     /// showed.
     fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
@@ -948,6 +948,15 @@ pub struct MySqlDialect {}
 
 impl Dialect for MySqlDialect {
     fn supports_qualify(&self) -> bool {
+        false
+    }
+
+    /// MySQL merges a derived table into the query selecting from it by default
+    /// (`derived_merge`), and the merged query evaluates a volatile expression once
+    /// per reference: `SELECT r FROM (SELECT RAND() AS r FROM t) AS s WHERE r > 0.5`
+    /// returns rows whose `r` fails the predicate
+    /// (<https://bugs.mysql.com/bug.php?id=106198>).
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
         false
     }
 

@@ -7909,11 +7909,24 @@ const VOLATILE_SCOPE_REFUSAL: &str = "This feature is not implemented: Unparsing
 fn test_filter_on_volatile_output_is_refused_where_a_derived_table_does_not_fix_it()
 -> Result<()> {
     // SQLite flattens the derived table and evaluates `random()` again for the
-    // predicate, so the scope that repairs the shape elsewhere returns wrong rows
-    // there. Every route to that scope is refused on such a dialect: the filter
-    // that would build it, the filter already above a derived projection, and the
-    // alias pushdown that would otherwise decline into one.
-    let unparser = Unparser::new(&SqliteDialect {});
+    // predicate, and MySQL merges it the same way, so the scope that repairs the
+    // shape elsewhere returns wrong rows there. Every route to that scope is
+    // refused on such a dialect: the filter that would build it, the filter
+    // already above a derived projection, and the alias pushdown that would
+    // otherwise decline into one.
+    for dialect in [
+        &SqliteDialect {} as &dyn UnparserDialect,
+        &UnparserMySqlDialect {},
+    ] {
+        refuses_every_route_to_the_volatile_scope(dialect)?;
+    }
+    Ok(())
+}
+
+fn refuses_every_route_to_the_volatile_scope(
+    dialect: &dyn UnparserDialect,
+) -> Result<()> {
+    let unparser = Unparser::new(dialect);
     let projection = || -> Result<LogicalPlanBuilder> {
         table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?.project(vec![
             col("t.a"),
@@ -7992,6 +8005,29 @@ fn test_subquery_alias_filter_under_a_projection_keeps_the_output_reference() ->
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT sq.s FROM (SELECT (sq.a + sq.b) AS s FROM t AS sq) AS sq WHERE (sq.s > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_clauses_above_a_scoped_filter_read_the_derived_outputs() -> Result<()> {
+    // A sort above the stack has already put `ORDER BY (t.a + 1)` on the query,
+    // and a filter above that sort has put `t.a > 1` in the WHERE, before the
+    // stack below them is found to need the scope. Both were written against `t`,
+    // which the derived table now hides, so both are re-pointed at its outputs.
+    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .sort(vec![col("t.a").add(lit(1)).sort(true, false)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (a > 1) AND (r > 0.5) ORDER BY (a + 1) ASC NULLS LAST"#
     );
     Ok(())
 }

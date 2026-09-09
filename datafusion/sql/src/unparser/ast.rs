@@ -80,6 +80,29 @@ impl QueryBuilder {
     pub fn get_order_by(&self) -> Option<OrderByKind> {
         self.order_by_kind.clone()
     }
+    /// Applies `f` to every expression in this query's `ORDER BY`, nested ones
+    /// included, so a caller that replaces the relation the `SELECT` reads — unparsing
+    /// a sub-plan as a derived table — can re-point the references that addressed the
+    /// old one. The `SELECT`-level counterpart is
+    /// [`SelectBuilder::visit_expressions_in_clauses_mut`], and an expression holding
+    /// a subquery is skipped whole for the reason given there.
+    pub fn visit_order_by_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut ast::Expr),
+    {
+        let Some(OrderByKind::Expressions(sorts)) = self.order_by_kind.as_mut() else {
+            return;
+        };
+        for sort in sorts {
+            if contains_subquery(&sort.expr) {
+                continue;
+            }
+            let _ = visit_expressions_mut(&mut sort.expr, |expr| {
+                f(expr);
+                ControlFlow::<()>::Continue(())
+            });
+        }
+    }
     pub fn limit(&mut self, value: Option<ast::Expr>) -> &mut Self {
         self.limit = value;
         self

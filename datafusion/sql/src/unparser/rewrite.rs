@@ -623,6 +623,37 @@ pub fn requalify_column_onto_derived_table(
     *idents = vec![alias.clone(), last.clone()];
 }
 
+/// Drops the qualifier of a column reference that names a relation a derived table
+/// now encloses, leaving the bare column name to bind to the derived table's output.
+///
+/// The counterpart of [`requalify_column_onto_derived_table`] for a derived table that
+/// is the `SELECT`'s only relation and carries no alias the reference could be moved
+/// onto: its outputs are addressed by name alone, and a qualifier naming a relation
+/// *inside* it would bind to nothing. Only a qualifier in `hidden_qualifiers` is
+/// dropped, so a reference to a relation the `SELECT` still reads keeps it. The same
+/// caveat about correlated references applies, and the same callers skip them.
+pub fn unqualify_column_into_derived_table(
+    idents: &mut Vec<Ident>,
+    hidden_qualifiers: &HashSet<String>,
+) {
+    if idents.len() < 2 {
+        return;
+    }
+    let qualifier = idents
+        .iter()
+        .take(idents.len() - 1)
+        .map(|ident| ident.value.clone())
+        .collect::<Vec<String>>()
+        .join(".");
+    if !hidden_qualifiers.contains(&qualifier) {
+        return;
+    }
+    let Some(last) = idents.last() else {
+        unreachable!("CompoundIdentifier must have a last element");
+    };
+    *idents = vec![last.clone()];
+}
+
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
 /// Removes any table identifiers that are not present in the list of available identifiers, retains original column names.
 pub fn remove_dangling_identifiers(idents: &mut Vec<Ident>, available_idents: &[String]) {

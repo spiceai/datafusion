@@ -28,7 +28,7 @@ use super::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
         remove_dangling_identifiers, requalify_column_onto_derived_table,
         rewrite_plan_for_sort_on_non_projected_fields,
-        subquery_alias_inner_query_and_columns,
+        subquery_alias_inner_query_and_columns, unqualify_column_into_derived_table,
     },
     utils::{
         expr_contains_subquery, find_agg_node_within_select,
@@ -1830,6 +1830,37 @@ impl Unparser<'_> {
                         && stacked_filters_read_unrepeatable_output(plan, projection)
                     {
                         self.ensure_derived_table_fixes_volatile_outputs()?;
+                        // The clauses this SELECT already carries — an ORDER BY from a
+                        // sort above the stack, a WHERE from a filter above that sort —
+                        // were emitted against the projection's relations, which the
+                        // derived table is about to hide. They read its outputs by
+                        // name now, like the predicates the scope rewrites itself.
+                        let hidden_qualifiers: HashSet<String> = projection
+                            .schema
+                            .iter()
+                            .filter_map(|(qualifier, _)| qualifier)
+                            .flat_map(|qualifier| {
+                                [qualifier.to_string(), qualifier.table().to_string()]
+                            })
+                            .collect();
+                        select.visit_expressions_in_clauses_mut(|expr| {
+                            if let ast::Expr::CompoundIdentifier(idents) = expr {
+                                unqualify_column_into_derived_table(
+                                    idents,
+                                    &hidden_qualifiers,
+                                );
+                            }
+                        });
+                        if let Some(query) = query.as_mut() {
+                            query.visit_order_by_mut(|expr| {
+                                if let ast::Expr::CompoundIdentifier(idents) = expr {
+                                    unqualify_column_into_derived_table(
+                                        idents,
+                                        &hidden_qualifiers,
+                                    );
+                                }
+                            });
+                        }
                         let scoped = scope_filters_over_projection(plan)?;
                         return self
                             .select_to_sql_recursively(&scoped, query, select, relation);
