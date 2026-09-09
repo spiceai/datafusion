@@ -291,6 +291,44 @@ mod tests {
         Ok(())
     }
 
+    /// A correlated `ReadRel.filter` on a table no enclosing scope reads: no
+    /// alias is needed, but the filter still belongs above the scan, because
+    /// a `TableScan`'s filters cannot evaluate an outer reference and the
+    /// decorrelation rules cannot lift one from there.
+    #[tokio::test]
+    async fn correlated_read_filter_on_another_table_stays_above_the_scan() -> Result<()>
+    {
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", three_rows()?)?;
+        ctx.register_batch("u", three_rows()?)?;
+
+        let proto = read_json(
+            "tests/testdata/test_plans/correlated_read_filter_other_table.substrait.json",
+        );
+        let plan = from_substrait_plan(&ctx.state(), &proto).await?;
+        assert_snapshot!(plan.display_indent(), @"
+        Filter: EXISTS (<subquery>)
+          Subquery:
+            Filter: u.a = outer_ref(t.a) AND u.b != outer_ref(t.b)
+              TableScan: u
+          TableScan: t
+        ");
+
+        let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+---+----+",
+                "| a | b  |",
+                "+---+----+",
+                "| 1 | 10 |",
+                "| 1 | 20 |",
+                "+---+----+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
     /// The enclosing scope reads `t` and a table that is already named `t_1`;
     /// the inner scan of `t`, correlated to that `t_1`, must not take the name
     /// `t_1` or the collision comes straight back. It becomes `t_2`.

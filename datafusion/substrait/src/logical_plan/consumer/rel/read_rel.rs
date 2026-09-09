@@ -52,18 +52,29 @@ pub async fn from_read_rel(
     ) -> datafusion::common::Result<LogicalPlan> {
         let schema = schema.replace_qualifier(table_ref.clone());
 
-        // Without an alias the read's own filter is pushed into the scan. With
-        // one it is applied above the alias against the aliased schema, so
-        // its local columns carry the new qualifier and a correlated predicate
-        // stays where the decorrelation rules can lift it (a `TableScan`'s
-        // filters go to the provider, which cannot evaluate an outer
-        // reference); the projection mask then follows by name.
-        let alias = subquery_scan_alias(consumer, &table_ref);
-        let scan_filters = match (&alias, filter) {
-            (None, Some(f)) => {
-                let filter_expr = consumer.consume_expression(f, &schema).await?;
-                split_conjunction_owned(filter_expr)
+        // The scan's qualifier: its own alias when an enclosing scope reads
+        // the same table, else the table name. The read's own filter is
+        // consumed against the Substrait base schema under that qualifier
+        // (its field indices are defined against the base schema, which the
+        // provider's schema may extend or reorder).
+        let alias = subquery_scan_alias(consumer, &table_ref).map(TableReference::bare);
+        let qualifier = alias.clone().unwrap_or_else(|| table_ref.clone());
+        let filter_expr = match filter {
+            Some(f) => {
+                let filter_schema = schema.clone().replace_qualifier(qualifier.clone());
+                Some(consumer.consume_expression(f, &filter_schema).await?)
             }
+            None => None,
+        };
+        // A filter is pushed into the scan unless it belongs above it: above
+        // the alias, so its local columns carry the new qualifier, or above
+        // the scan whenever it holds an outer reference, which a `TableScan`'s
+        // filters cannot evaluate and the decorrelation rules cannot lift from
+        // there. The projection mask then follows by name.
+        let filter_above =
+            alias.is_some() || filter_expr.as_ref().is_some_and(Expr::contains_outer);
+        let scan_filters = match (&filter_expr, filter_above) {
+            (Some(expr), false) => split_conjunction_owned(expr.clone()),
             _ => vec![],
         };
 
@@ -86,21 +97,19 @@ pub async fn from_read_rel(
 
         let masked = apply_masking(schema.clone(), projection)?;
 
-        let Some(alias) = alias else {
+        if !filter_above {
             return apply_projection(plan, masked);
-        };
-        let alias = TableReference::bare(alias);
-        let mut builder = LogicalPlanBuilder::from(plan).alias(alias.clone())?;
-        if let Some(f) = filter {
-            // The filter's field indices are defined against the Substrait
-            // base schema, which the provider's schema may extend or reorder.
-            let filter_schema = schema.replace_qualifier(alias.clone());
-            let filter_expr = consumer.consume_expression(f, &filter_schema).await?;
-            builder = builder.filter(filter_expr)?;
+        }
+        let mut builder = LogicalPlanBuilder::from(plan);
+        if let Some(alias) = &alias {
+            builder = builder.alias(alias.clone())?;
+        }
+        if let Some(expr) = filter_expr {
+            builder = builder.filter(expr)?;
         }
         // Project to the (masked) Substrait schema by name when the provider's
         // schema carries more or differently ordered fields.
-        let target = masked.replace_qualifier(alias.clone());
+        let target = masked.replace_qualifier(qualifier.clone());
         if !builder
             .schema()
             .logically_equivalent_names_and_types(&target)
@@ -108,7 +117,9 @@ pub async fn from_read_rel(
             let columns: Vec<Expr> = target
                 .fields()
                 .iter()
-                .map(|field| Expr::Column(Column::new(Some(alias.clone()), field.name())))
+                .map(|field| {
+                    Expr::Column(Column::new(Some(qualifier.clone()), field.name()))
+                })
                 .collect();
             builder = builder.project(columns)?;
         }
