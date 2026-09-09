@@ -7570,10 +7570,12 @@ fn test_filter_on_unnamed_projection_output_binds() -> Result<()> {
 }
 
 #[test]
-fn test_filter_on_named_projection_output_is_unchanged() -> Result<()> {
-    // An alias gives the output a name the emitted `SELECT` carries, and a bare
-    // column keeps the name it already had. Neither needs repairing, so neither
-    // is inlined.
+fn test_filter_on_aliased_projection_output_is_inlined() -> Result<()> {
+    // An alias names the output in the `SELECT` list, but a `WHERE` in the same
+    // `SELECT` binds against the relations read, not against that list —
+    // PostgreSQL and MySQL reject `WHERE (s > 1)` outright, and the engines that
+    // accept it resolve it by repeating the expression. So the expression is
+    // inlined, exactly as for an output the projection leaves unnamed.
     let schema = Schema::new(vec![
         Field::new("a", DataType::Int32, false),
         Field::new("b", DataType::Int32, false),
@@ -7585,9 +7587,30 @@ fn test_filter_on_named_projection_output_is_unchanged() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&aliased)?,
-        @r#"SELECT (t.a + t.b) AS s FROM t WHERE (s > 1)"#
+        @r#"SELECT (t.a + t.b) AS s FROM t WHERE ((t.a + t.b) > 1)"#
     );
 
+    // A renamed column is an alias too: `WHERE (s > 1)` would not bind, and the
+    // column it renames is what the relation carries.
+    let renamed = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&renamed)?,
+        @r#"SELECT t.a AS s FROM t WHERE (t.a > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_bare_column_projection_output_is_unchanged() -> Result<()> {
+    // A bare column keeps the name it already had, which the relation carries,
+    // so there is nothing to repair.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
     let bare_column = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
         .project(vec![col("t.a")])?
         .filter(col("t.a").gt(lit(1)))?
@@ -7641,20 +7664,197 @@ fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
     Ok(())
 }
 
+/// The schema the volatile-output cases below project from: one column beside
+/// the volatile expression, so the tests can show what happens to a reference
+/// that is *not* the volatile one.
+fn volatile_output_schema() -> Schema {
+    Schema::new(vec![Field::new("a", DataType::Int32, false)])
+}
+
 #[test]
-fn test_filter_on_unnamed_volatile_projection_output_is_not_inlined() -> Result<()> {
-    // Inlining a volatile expression would evaluate it a second time, in a
-    // clause that can see a different value than the `SELECT` list did, turning
-    // an unbindable reference into silently wrong rows. The unbindable
-    // reference is the safer of the two, so it is left in place.
-    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
-    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+fn test_filter_on_unnamed_volatile_projection_output_is_scoped() -> Result<()> {
+    // A volatile output has no faithful form in the `SELECT` that computes it.
+    // The `WHERE` cannot read the `SELECT` list's name for it, and repeating the
+    // expression there draws a second value, so the predicate would filter on a
+    // value the `SELECT` list never showed. The projection therefore becomes a
+    // derived table, whose output the predicate reads by name from the `SELECT`
+    // above it: one evaluation, and a reference that binds.
+    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
         .project(vec![datafusion_functions::math::random().call(vec![])])?
         .filter(col("random()").gt(lit(0.5)))?
         .build()?;
 
-    let sql = plan_to_sql(&plan)?;
-    assert_snapshot!(sql, @r#"SELECT random() FROM t WHERE ("random()" > 0.5)"#);
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "random()" FROM (SELECT random() AS "random()" FROM t) WHERE ("random()" > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_aliased_volatile_projection_output_is_scoped() -> Result<()> {
+    // The alias is what the enclosing `SELECT` reads the output by. This is the
+    // shape `SELECT * FROM (SELECT a, random() AS r FROM t) WHERE r > 0.5` plans
+    // to, since the optimizer cannot push a filter through a volatile
+    // projection: emitted beside the projection as `WHERE (r > 0.5)`, PostgreSQL
+    // rejects the alias and SQLite and DuckDB evaluate `random()` again for it,
+    // returning rows whose `r` the predicate never saw.
+    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_projection_output_over_a_limit_is_scoped() -> Result<()> {
+    // The bound below the projection keeps its own scope, and the projection
+    // still gets the one the predicate needs above it.
+    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
+        .limit(0, Some(5))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT a, random() AS r FROM (SELECT t.a FROM t LIMIT 5)) WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_reads_its_other_references_from_the_scope() -> Result<()>
+{
+    // Every reference in the predicate now reads from the derived table, so a
+    // reference still qualified by the relation inside it — `t.a` — would bind to
+    // nothing. It is unqualified along with the volatile one. An outer reference
+    // names an enclosing query rather than this one, and keeps its qualifier.
+    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(
+            col("t.a")
+                .gt(lit(1))
+                .and(col("r").gt(lit(0.5)))
+                .and(col("r").lt(out_ref_col(DataType::Float64, "o.x"))),
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (((a > 1) AND (r > 0.5)) AND (r < o.x))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_refuses_two_outputs_of_one_name() -> Result<()> {
+    // Two outputs that differ only by qualifier cannot be told apart once the
+    // derived table has replaced the qualifiers, so the shape is refused rather
+    // than emitted with an ambiguous reference.
+    let schema = volatile_output_schema();
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .join_on(
+            table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.a").eq(col("t2.a"))],
+        )?
+        .project(vec![
+            col("t1.a"),
+            col("t2.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("two outputs named a must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a volatile projection output is not supported when the projection has two outputs named a"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_filter_on_volatile_output_derives_the_alias() -> Result<()> {
+    // `SELECT * FROM (SELECT a, random() AS r FROM t) sq WHERE sq.r > 0.5`. The
+    // alias pushdown would fold the projection into the enclosing `SELECT` and
+    // requalify the reference as `sq.r`, a column no relation exposes. A volatile
+    // output declines the pushdown, so the aliased plan is emitted as the derived
+    // table it names, with the predicate reading `r` from outside it.
+    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .alias("sq")?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM (SELECT t.a, random() AS r FROM t) AS sq WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_filter_on_aliased_projection_output_is_inlined() -> Result<()> {
+    // The same pushdown, on an output that can be repeated: the expression is
+    // inlined before the alias rewriter requalifies its columns, so the predicate
+    // reads the relation the folded `SELECT` actually has.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")).alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .alias("sq")?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (sq.a + sq.b) AS s FROM (SELECT sq.a, sq.b FROM t AS sq) AS sq WHERE ((sq.a + sq.b) > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_table_filter_on_a_named_output_is_inlined() -> Result<()> {
+    // Naming a derived table's unnamed outputs happens before the derived plan is
+    // unparsed, so the filter inside it meets the output as an alias. It is
+    // inlined all the same: `WHERE ("t.a + t.b" > 1)` beside the `SELECT` list
+    // that names it does not bind (spiceai/spiceai#13445).
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(col("t.a + t.b").gt(lit(1)))?
+        .limit(0, Some(5))?
+        .project(vec![col("t.a + t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT (t.a + t.b) AS "t.a + t.b" FROM t WHERE ((t.a + t.b) > 1) LIMIT 5)"#
+    );
     Ok(())
 }
 

@@ -34,9 +34,10 @@ use super::{
         expr_contains_subquery, find_agg_node_within_select,
         find_projection_node_within_select, find_unnest_node_within_select,
         find_window_nodes_within_select, name_derived_scope_outputs, name_scope_outputs,
-        partition_subquery_filters, select_list_wraps_a_grouping_expr,
-        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
-        unproject_unnamed_projection_exprs, unproject_unnest_expr,
+        partition_subquery_filters, predicate_reads_volatile_output,
+        scope_filter_over_projection, select_list_wraps_a_grouping_expr,
+        try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
+        unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
     },
 };
@@ -1797,14 +1798,26 @@ impl Unparser<'_> {
                     let filter_expr = self.expr_to_sql(&unprojected)?;
                     select.having(Some(filter_expr));
                 } else {
-                    // A predicate can reference a projection output that the
-                    // projection does not name, whose logical name is not an
-                    // identifier the emitted statement carries.
-                    let predicate = match find_projection_node_within_select(
+                    // A predicate can reference an output of the projection this
+                    // SELECT folds in, which a `WHERE` cannot read by name: it
+                    // binds against the relations read, not the SELECT list. The
+                    // expression producing the output is inlined instead — unless
+                    // it is volatile, when repeating it draws a second value. That
+                    // output is only readable from a SELECT above the one
+                    // computing it, so the projection becomes a derived table.
+                    let projection = find_projection_node_within_select(
                         plan,
                         select.already_projected(),
-                    ) {
-                        Some(projection) => unproject_unnamed_projection_exprs(
+                    );
+                    if let Some(projection) = projection
+                        && predicate_reads_volatile_output(&filter.predicate, projection)
+                    {
+                        let scoped = scope_filter_over_projection(filter)?;
+                        return self
+                            .select_to_sql_recursively(&scoped, query, select, relation);
+                    }
+                    let predicate = match projection {
+                        Some(projection) => unproject_projection_exprs(
                             filter.predicate.clone(),
                             projection,
                         )?,
@@ -3246,14 +3259,39 @@ impl Unparser<'_> {
                     alias.clone(),
                     already_projected,
                 )? {
+                    // The rewritten plan folds into one SELECT, so a predicate
+                    // reading a computed output of the projection below has to be
+                    // repaired the way the Filter arm repairs it: the alias
+                    // rewriter would otherwise requalify the output's name onto
+                    // the alias as though the relation exposed such a column, and
+                    // `sq."random()"` binds to nothing. The expression is inlined
+                    // where repeating it is faithful; a volatile output cannot be,
+                    // and declining the pushdown lets the caller wrap the plan as
+                    // a derived table, where the predicate reads the output by
+                    // name from the SELECT above it.
+                    let predicate = match &plan {
+                        LogicalPlan::Projection(projection) => {
+                            if predicate_reads_volatile_output(
+                                &filter.predicate,
+                                projection,
+                            ) {
+                                return Ok(None);
+                            }
+                            unproject_projection_exprs(
+                                filter.predicate.clone(),
+                                projection,
+                            )?
+                        }
+                        _ => filter.predicate.clone(),
+                    };
                     let predicate = if let Some(ref alias_name) = alias {
                         let mut rewriter = TableAliasRewriter {
                             table_schema: plan.schema().as_arrow(),
                             alias_name: alias_name.clone(),
                         };
-                        filter.predicate.clone().rewrite(&mut rewriter).data()?
+                        predicate.rewrite(&mut rewriter).data()?
                     } else {
-                        filter.predicate.clone()
+                        predicate
                     };
                     Ok(Some(
                         LogicalPlanBuilder::from(plan).filter(predicate)?.build()?,
