@@ -81,19 +81,28 @@ pub async fn from_read_rel(
 
         ensure_schema_compatibility(plan.schema(), schema.clone())?;
 
-        let schema = apply_masking(schema, projection)?;
+        let masked = apply_masking(schema.clone(), projection)?;
 
         let Some(alias) = alias else {
-            return apply_projection(plan, schema);
+            return apply_projection(plan, masked);
         };
         let alias = TableReference::bare(alias);
         let mut builder = LogicalPlanBuilder::from(plan).alias(alias.clone())?;
         if let Some(f) = filter {
-            let filter_expr = consumer.consume_expression(f, builder.schema()).await?;
+            // The filter's field indices are defined against the Substrait
+            // base schema, which the provider's schema may extend or reorder.
+            let filter_schema = schema.replace_qualifier(alias.clone());
+            let filter_expr = consumer.consume_expression(f, &filter_schema).await?;
             builder = builder.filter(filter_expr)?;
         }
-        if projection.is_some() {
-            let columns: Vec<Expr> = schema
+        // Project to the (masked) Substrait schema by name when the provider's
+        // schema carries more or differently ordered fields.
+        let target = masked.replace_qualifier(alias.clone());
+        if !builder
+            .schema()
+            .logically_equivalent_names_and_types(&target)
+        {
+            let columns: Vec<Expr> = target
                 .fields()
                 .iter()
                 .map(|field| Expr::Column(Column::new(Some(alias.clone()), field.name())))

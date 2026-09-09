@@ -132,6 +132,60 @@ mod tests {
         Ok(())
     }
 
+    /// A `ReadRel.filter`'s field indices are defined against the Substrait
+    /// base schema; the provider may carry more, or differently ordered,
+    /// fields (`ensure_schema_compatibility` allows both). The filter must
+    /// bind to the Substrait fields, and the aliased scan must be projected
+    /// to them by name.
+    #[tokio::test]
+    async fn correlated_read_filter_binds_fields_to_the_substrait_schema() -> Result<()> {
+        let ctx = SessionContext::new();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("extra", DataType::Utf8, false),
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                    "x", "y", "z",
+                ])),
+                Arc::new(Int64Array::from(vec![1, 1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )?;
+        ctx.register_batch("t", batch)?;
+
+        let proto = read_json(
+            "tests/testdata/test_plans/self_correlated_exists_read_filter.substrait.json",
+        );
+        let plan = from_substrait_plan(&ctx.state(), &proto).await?;
+        assert_snapshot!(plan.display_indent(), @"
+        Filter: EXISTS (<subquery>)
+          Subquery:
+            Projection: t_1.a, t_1.b
+              Filter: t_1.a = outer_ref(t.a) AND t_1.b != outer_ref(t.b)
+                SubqueryAlias: t_1
+                  TableScan: t
+          TableScan: t projection=[a, b]
+        ");
+
+        let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+---+----+",
+                "| a | b  |",
+                "+---+----+",
+                "| 1 | 10 |",
+                "| 1 | 20 |",
+                "+---+----+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
     /// The enclosing scope reads `t` and a table that is already named `t_1`;
     /// the inner scan of `t`, correlated to that `t_1`, must not take the name
     /// `t_1` or the collision comes straight back. It becomes `t_2`.
