@@ -186,6 +186,59 @@ mod tests {
         Ok(())
     }
 
+    /// Both scopes self-join `t`, so both joins requalify their sides. The
+    /// inner sides must not take the enclosing join's `left`/`right`, or the
+    /// predicate correlating to the outer `left` collapses; they become
+    /// `left_1`/`right_1`.
+    #[tokio::test]
+    async fn requalified_join_inside_a_subquery_avoids_the_enclosing_left_and_right()
+    -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", three_rows()?)?;
+
+        let proto = read_json(
+            "tests/testdata/test_plans/self_correlated_exists_requalified_joins.substrait.json",
+        );
+        let plan = from_substrait_plan(&ctx.state(), &proto).await?;
+        assert_snapshot!(plan.display_indent(), @"
+        Projection: left.a AS a1, left.b AS b1, right.a AS a2, right.b AS b2
+          Filter: EXISTS (<subquery>)
+            Subquery:
+              Filter: left_1.a = outer_ref(left.a) AND left_1.b != outer_ref(left.b)
+                Cross Join:
+                  SubqueryAlias: left_1
+                    TableScan: t
+                  SubqueryAlias: right_1
+                    TableScan: t
+            Cross Join:
+              SubqueryAlias: left
+                TableScan: t
+              SubqueryAlias: right
+                TableScan: t
+        ");
+
+        // The outer `left` rows 1|10 and 1|20 have a partner in `t` with the
+        // same `a` and a different `b`; 2|30 has none. Each keeps its three
+        // outer `right` partners.
+        let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+----+----+",
+                "| a1 | b1 | a2 | b2 |",
+                "+----+----+----+----+",
+                "| 1  | 10 | 1  | 10 |",
+                "| 1  | 10 | 1  | 20 |",
+                "| 1  | 10 | 2  | 30 |",
+                "| 1  | 20 | 1  | 10 |",
+                "| 1  | 20 | 1  | 20 |",
+                "| 1  | 20 | 2  | 30 |",
+                "+----+----+----+----+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
     /// The enclosing scope reads `t` and a table that is already named `t_1`;
     /// the inner scan of `t`, correlated to that `t_1`, must not take the name
     /// `t_1` or the collision comes straight back. It becomes `t_2`.

@@ -18,7 +18,10 @@
 use crate::logical_plan::consumer::SubstraitConsumer;
 use crate::logical_plan::consumer::from_substrait_literal;
 use crate::logical_plan::consumer::from_substrait_named_struct;
-use crate::logical_plan::consumer::utils::ensure_schema_compatibility;
+use crate::logical_plan::consumer::utils::{
+    enclosing_scope_reads, ensure_schema_compatibility,
+    qualifier_unused_by_enclosing_scopes,
+};
 use datafusion::common::{
     Column, DFSchema, DFSchemaRef, TableReference, not_impl_err, plan_err,
     substrait_datafusion_err, substrait_err,
@@ -327,45 +330,23 @@ pub fn apply_masking(
 }
 
 /// The qualifier a scan gets when it sits in a subquery and an enclosing scope
-/// already reads the same table: the table name with the scan's nesting depth
-/// appended (`LINEITEM` inside one subquery becomes `LINEITEM_1`), advanced
-/// past any name an enclosing scope happens to use. `None` when no enclosing
-/// scope reads the table, so plans without the collision keep their
-/// qualifiers.
+/// already reads the same table: the first of `t_1`, `t_2`, … no enclosing
+/// scope uses (`LINEITEM` inside a subquery becomes `LINEITEM_1`). `None` when
+/// no enclosing scope reads the table, so plans without the collision keep
+/// their qualifiers.
 ///
 /// SQL gives such a scan its own name (`lineitem l2`); Substrait has no alias,
-/// so both scans would be `LINEITEM`. The decorrelation rules match a pulled-up
-/// correlated predicate's columns by qualified name, so
-/// `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` resolved both sides to
-/// the subquery's own scan: the join condition was dropped and
+/// so both scans would be `LINEITEM`, and decorrelation resolved
+/// `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` to the subquery's own
+/// scan: the join condition was dropped and
 /// `LINEITEM.L_SUPPKEY != LINEITEM.L_SUPPKEY` stayed behind as a filter, so
 /// TPC-H q21 returned no rows.
 fn subquery_scan_alias(
     consumer: &impl SubstraitConsumer,
     table_ref: &TableReference,
 ) -> Option<String> {
-    let mut enclosing = Vec::new();
-    while let Some(outer) = consumer.get_outer_schema(enclosing.len() + 1) {
-        enclosing.push(outer);
-    }
-    let qualifier_in_use = |name: &str| {
-        enclosing.iter().any(|outer| {
-            outer
-                .iter()
-                .any(|(qualifier, _)| qualifier.is_some_and(|q| q.table() == name))
-        })
-    };
-    let reads_table = enclosing.iter().any(|outer| {
-        outer
-            .iter()
-            .any(|(qualifier, _)| qualifier.is_some_and(|q| q == table_ref))
-    });
-    if !reads_table {
-        return None;
-    }
-    (enclosing.len()..)
-        .map(|depth| format!("{}_{depth}", table_ref.table()))
-        .find(|candidate| !qualifier_in_use(candidate))
+    enclosing_scope_reads(consumer, table_ref)
+        .then(|| qualifier_unused_by_enclosing_scopes(consumer, table_ref.table()))
 }
 
 /// This function returns a DataFrame with fields adjusted if necessary in the event that the
