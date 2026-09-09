@@ -22,7 +22,9 @@ use datafusion::common::{
     substrait_err,
 };
 use datafusion::logical_expr::expr::Sort;
-use datafusion::logical_expr::{Cast, Expr, ExprSchemable};
+use datafusion::logical_expr::{
+    Cast, Expr, ExprSchemable, LogicalPlanBuilder, requalify_sides_if_needed,
+};
 use datafusion::sql::TableReference;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -562,6 +564,73 @@ pub(crate) fn from_substrait_precision(
             not_impl_err!("Unsupported Substrait precision {precision}, for {type_name}")
         }
     }
+}
+
+/// `requalify_sides_if_needed` names conflicting sides `left` and `right`.
+/// Inside a subquery those can collide with an enclosing join's `left` and
+/// `right` — the same qualified-name collision a subquery scan's alias
+/// avoids — so conflicting sides take the first unused `left`/`left_1`/…
+/// and `right`/`right_1`/… instead. Sides that do not conflict are untouched.
+pub(crate) fn requalify_sides_for_scope(
+    consumer: &impl SubstraitConsumer,
+    left: LogicalPlanBuilder,
+    right: LogicalPlanBuilder,
+) -> datafusion::common::Result<(LogicalPlanBuilder, LogicalPlanBuilder)> {
+    let (_, _, requalified) = requalify_sides_if_needed(left.clone(), right.clone())?;
+    if !requalified {
+        return Ok((left, right));
+    }
+    let left_name = qualifier_unused_by_enclosing_scopes(consumer, "left");
+    let right_name = qualifier_unused_by_enclosing_scopes(consumer, "right");
+    Ok((
+        left.alias(TableReference::bare(left_name))?,
+        right.alias(TableReference::bare(right_name))?,
+    ))
+}
+
+/// Whether any enclosing scope's schema reads `table_ref`: the schemas pushed
+/// while a subquery is consumed, nearest first.
+pub(crate) fn enclosing_scope_reads(
+    consumer: &impl SubstraitConsumer,
+    table_ref: &TableReference,
+) -> bool {
+    enclosing_schemas(consumer).iter().any(|outer| {
+        outer
+            .iter()
+            .any(|(qualifier, _)| qualifier.is_some_and(|q| q == table_ref))
+    })
+}
+
+/// The first of `base`, `base_1`, `base_2`, … that no enclosing scope uses as
+/// a table qualifier. The decorrelation rules match a pulled-up correlated
+/// predicate's columns by qualified name, so a qualifier a subquery shares
+/// with an enclosing scope makes `x.a = outer_ref(x.a)` resolve both sides to
+/// the subquery; every qualifier the consumer invents inside a subquery — a
+/// scan's alias, a requalified join side — is chosen here.
+pub(crate) fn qualifier_unused_by_enclosing_scopes(
+    consumer: &impl SubstraitConsumer,
+    base: &str,
+) -> String {
+    let enclosing = enclosing_schemas(consumer);
+    let in_use = |name: &str| {
+        enclosing.iter().any(|outer| {
+            outer
+                .iter()
+                .any(|(qualifier, _)| qualifier.is_some_and(|q| q.table() == name))
+        })
+    };
+    std::iter::once(base.to_string())
+        .chain((1..).map(|n| format!("{base}_{n}")))
+        .find(|candidate| !in_use(candidate))
+        .unwrap_or_else(|| base.to_string())
+}
+
+fn enclosing_schemas(consumer: &impl SubstraitConsumer) -> Vec<Arc<DFSchema>> {
+    let mut enclosing = Vec::new();
+    while let Some(outer) = consumer.get_outer_schema(enclosing.len() + 1) {
+        enclosing.push(outer);
+    }
+    enclosing
 }
 
 #[cfg(test)]

@@ -105,16 +105,20 @@ mod tests {
             Projection: SUPPLIER.S_ACCTBAL, SUPPLIER.S_NAME, NATION.N_NAME, PART.P_PARTKEY, PART.P_MFGR, SUPPLIER.S_ADDRESS, SUPPLIER.S_PHONE, SUPPLIER.S_COMMENT
               Filter: PART.P_PARTKEY = PARTSUPP.PS_PARTKEY AND SUPPLIER.S_SUPPKEY = PARTSUPP.PS_SUPPKEY AND PART.P_SIZE = Int32(15) AND PART.P_TYPE LIKE CAST(Utf8("%BRASS") AS Utf8) AND SUPPLIER.S_NATIONKEY = NATION.N_NATIONKEY AND NATION.N_REGIONKEY = REGION.R_REGIONKEY AND REGION.R_NAME = Utf8("EUROPE") AND PARTSUPP.PS_SUPPLYCOST = (<subquery>)
                 Subquery:
-                  Aggregate: groupBy=[[]], aggr=[[min(PARTSUPP.PS_SUPPLYCOST)]]
-                    Projection: PARTSUPP.PS_SUPPLYCOST
-                      Filter: outer_ref(PART.P_PARTKEY) = PARTSUPP.PS_PARTKEY AND SUPPLIER.S_SUPPKEY = PARTSUPP.PS_SUPPKEY AND SUPPLIER.S_NATIONKEY = NATION.N_NATIONKEY AND NATION.N_REGIONKEY = REGION.R_REGIONKEY AND REGION.R_NAME = Utf8("EUROPE")
+                  Aggregate: groupBy=[[]], aggr=[[min(PARTSUPP_1.PS_SUPPLYCOST)]]
+                    Projection: PARTSUPP_1.PS_SUPPLYCOST
+                      Filter: outer_ref(PART.P_PARTKEY) = PARTSUPP_1.PS_PARTKEY AND SUPPLIER_1.S_SUPPKEY = PARTSUPP_1.PS_SUPPKEY AND SUPPLIER_1.S_NATIONKEY = NATION_1.N_NATIONKEY AND NATION_1.N_REGIONKEY = REGION_1.R_REGIONKEY AND REGION_1.R_NAME = Utf8("EUROPE")
                         Cross Join:
                           Cross Join:
                             Cross Join:
-                              TableScan: PARTSUPP
-                              TableScan: SUPPLIER
-                            TableScan: NATION
-                          TableScan: REGION
+                              SubqueryAlias: PARTSUPP_1
+                                TableScan: PARTSUPP
+                              SubqueryAlias: SUPPLIER_1
+                                TableScan: SUPPLIER
+                            SubqueryAlias: NATION_1
+                              TableScan: NATION
+                          SubqueryAlias: REGION_1
+                            TableScan: REGION
                 Cross Join:
                   Cross Join:
                     Cross Join:
@@ -339,13 +343,14 @@ mod tests {
           Sort: sum(PARTSUPP.PS_SUPPLYCOST * PARTSUPP.PS_AVAILQTY) DESC NULLS FIRST
             Filter: sum(PARTSUPP.PS_SUPPLYCOST * PARTSUPP.PS_AVAILQTY) > (<subquery>)
               Subquery:
-                Projection: sum(PARTSUPP.PS_SUPPLYCOST * PARTSUPP.PS_AVAILQTY) * Decimal128(Some(1000000),11,10)
-                  Aggregate: groupBy=[[]], aggr=[[sum(PARTSUPP.PS_SUPPLYCOST * PARTSUPP.PS_AVAILQTY)]]
-                    Projection: PARTSUPP.PS_SUPPLYCOST * CAST(PARTSUPP.PS_AVAILQTY AS Decimal128(19, 0))
-                      Filter: PARTSUPP.PS_SUPPKEY = SUPPLIER.S_SUPPKEY AND SUPPLIER.S_NATIONKEY = NATION.N_NATIONKEY AND NATION.N_NAME = Utf8("JAPAN")
+                Projection: sum(PARTSUPP_1.PS_SUPPLYCOST * PARTSUPP_1.PS_AVAILQTY) * Decimal128(Some(1000000),11,10)
+                  Aggregate: groupBy=[[]], aggr=[[sum(PARTSUPP_1.PS_SUPPLYCOST * PARTSUPP_1.PS_AVAILQTY)]]
+                    Projection: PARTSUPP_1.PS_SUPPLYCOST * CAST(PARTSUPP_1.PS_AVAILQTY AS Decimal128(19, 0))
+                      Filter: PARTSUPP_1.PS_SUPPKEY = SUPPLIER.S_SUPPKEY AND SUPPLIER.S_NATIONKEY = NATION.N_NATIONKEY AND NATION.N_NAME = Utf8("JAPAN")
                         Cross Join:
                           Cross Join:
-                            TableScan: PARTSUPP
+                            SubqueryAlias: PARTSUPP_1
+                              TableScan: PARTSUPP
                             TableScan: SUPPLIER
                           TableScan: NATION
               Aggregate: groupBy=[[PARTSUPP.PS_PARTKEY]], aggr=[[sum(PARTSUPP.PS_SUPPLYCOST * PARTSUPP.PS_AVAILQTY)]]
@@ -460,11 +465,12 @@ mod tests {
             Projection: LINEITEM.L_EXTENDEDPRICE
               Filter: PART.P_PARTKEY = LINEITEM.L_PARTKEY AND PART.P_BRAND = Utf8("Brand#23") AND PART.P_CONTAINER = Utf8("MED BOX") AND LINEITEM.L_QUANTITY < (<subquery>)
                 Subquery:
-                  Projection: Decimal128(Some(2),2,1) * avg(LINEITEM.L_QUANTITY)
-                    Aggregate: groupBy=[[]], aggr=[[avg(LINEITEM.L_QUANTITY)]]
-                      Projection: LINEITEM.L_QUANTITY
-                        Filter: LINEITEM.L_PARTKEY = outer_ref(PART.P_PARTKEY)
-                          TableScan: LINEITEM
+                  Projection: Decimal128(Some(2),2,1) * avg(LINEITEM_1.L_QUANTITY)
+                    Aggregate: groupBy=[[]], aggr=[[avg(LINEITEM_1.L_QUANTITY)]]
+                      Projection: LINEITEM_1.L_QUANTITY
+                        Filter: LINEITEM_1.L_PARTKEY = outer_ref(PART.P_PARTKEY)
+                          SubqueryAlias: LINEITEM_1
+                            TableScan: LINEITEM
                 Cross Join:
                   TableScan: LINEITEM
                   TableScan: PART
@@ -478,7 +484,7 @@ mod tests {
         let plan_str = tpch_plan_to_string(18).await?;
         assert_snapshot!(
         plan_str,
-        @r"
+        @"
         Projection: CUSTOMER.C_NAME, CUSTOMER.C_CUSTKEY, ORDERS.O_ORDERKEY, ORDERS.O_ORDERDATE, ORDERS.O_TOTALPRICE, sum(LINEITEM.L_QUANTITY) AS EXPR$5
           Limit: skip=0, fetch=100
             Sort: ORDERS.O_TOTALPRICE DESC NULLS FIRST, ORDERS.O_ORDERDATE ASC NULLS LAST
@@ -486,11 +492,12 @@ mod tests {
                 Projection: CUSTOMER.C_NAME, CUSTOMER.C_CUSTKEY, ORDERS.O_ORDERKEY, ORDERS.O_ORDERDATE, ORDERS.O_TOTALPRICE, LINEITEM.L_QUANTITY
                   Filter: ORDERS.O_ORDERKEY IN (<subquery>) AND CUSTOMER.C_CUSTKEY = ORDERS.O_CUSTKEY AND ORDERS.O_ORDERKEY = LINEITEM.L_ORDERKEY
                     Subquery:
-                      Projection: LINEITEM.L_ORDERKEY
-                        Filter: sum(LINEITEM.L_QUANTITY) > CAST(Int32(300) AS Decimal128(15, 2))
-                          Aggregate: groupBy=[[LINEITEM.L_ORDERKEY]], aggr=[[sum(LINEITEM.L_QUANTITY)]]
-                            Projection: LINEITEM.L_ORDERKEY, LINEITEM.L_QUANTITY
-                              TableScan: LINEITEM
+                      Projection: LINEITEM_1.L_ORDERKEY
+                        Filter: sum(LINEITEM_1.L_QUANTITY) > CAST(Int32(300) AS Decimal128(15, 2))
+                          Aggregate: groupBy=[[LINEITEM_1.L_ORDERKEY]], aggr=[[sum(LINEITEM_1.L_QUANTITY)]]
+                            Projection: LINEITEM_1.L_ORDERKEY, LINEITEM_1.L_QUANTITY
+                              SubqueryAlias: LINEITEM_1
+                                TableScan: LINEITEM
                     Cross Join:
                       Cross Join:
                         TableScan: CUSTOMER
@@ -561,11 +568,13 @@ mod tests {
                 Projection: SUPPLIER.S_NAME
                   Filter: SUPPLIER.S_SUPPKEY = LINEITEM.L_SUPPKEY AND ORDERS.O_ORDERKEY = LINEITEM.L_ORDERKEY AND ORDERS.O_ORDERSTATUS = Utf8("F") AND LINEITEM.L_RECEIPTDATE > LINEITEM.L_COMMITDATE AND EXISTS (<subquery>) AND NOT EXISTS (<subquery>) AND SUPPLIER.S_NATIONKEY = NATION.N_NATIONKEY AND NATION.N_NAME = Utf8("SAUDI ARABIA")
                     Subquery:
-                      Filter: LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY) AND LINEITEM.L_SUPPKEY != outer_ref(LINEITEM.L_SUPPKEY)
-                        TableScan: LINEITEM
+                      Filter: LINEITEM_1.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY) AND LINEITEM_1.L_SUPPKEY != outer_ref(LINEITEM.L_SUPPKEY)
+                        SubqueryAlias: LINEITEM_1
+                          TableScan: LINEITEM
                     Subquery:
-                      Filter: LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY) AND LINEITEM.L_SUPPKEY != outer_ref(LINEITEM.L_SUPPKEY) AND LINEITEM.L_RECEIPTDATE > LINEITEM.L_COMMITDATE
-                        TableScan: LINEITEM
+                      Filter: LINEITEM_1.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY) AND LINEITEM_1.L_SUPPKEY != outer_ref(LINEITEM.L_SUPPKEY) AND LINEITEM_1.L_RECEIPTDATE > LINEITEM_1.L_COMMITDATE
+                        SubqueryAlias: LINEITEM_1
+                          TableScan: LINEITEM
                     Cross Join:
                       Cross Join:
                         Cross Join:
@@ -590,10 +599,11 @@ mod tests {
               Projection: substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)), CUSTOMER.C_ACCTBAL
                 Filter: (substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("13") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("31") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("23") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("29") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("30") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("18") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("17") AS Utf8)) AND CUSTOMER.C_ACCTBAL > (<subquery>) AND NOT EXISTS (<subquery>)
                   Subquery:
-                    Aggregate: groupBy=[[]], aggr=[[avg(CUSTOMER.C_ACCTBAL)]]
-                      Projection: CUSTOMER.C_ACCTBAL
-                        Filter: CUSTOMER.C_ACCTBAL > Decimal128(Some(0),3,2) AND (substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("13") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("31") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("23") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("29") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("30") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("18") AS Utf8) OR substr(CUSTOMER.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("17") AS Utf8))
-                          TableScan: CUSTOMER
+                    Aggregate: groupBy=[[]], aggr=[[avg(CUSTOMER_1.C_ACCTBAL)]]
+                      Projection: CUSTOMER_1.C_ACCTBAL
+                        Filter: CUSTOMER_1.C_ACCTBAL > Decimal128(Some(0),3,2) AND (substr(CUSTOMER_1.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("13") AS Utf8) OR substr(CUSTOMER_1.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("31") AS Utf8) OR substr(CUSTOMER_1.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("23") AS Utf8) OR substr(CUSTOMER_1.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("29") AS Utf8) OR substr(CUSTOMER_1.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("30") AS Utf8) OR substr(CUSTOMER_1.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("18") AS Utf8) OR substr(CUSTOMER_1.C_PHONE, Int32(1), Int32(2)) = CAST(Utf8("17") AS Utf8))
+                          SubqueryAlias: CUSTOMER_1
+                            TableScan: CUSTOMER
                   Subquery:
                     Filter: ORDERS.O_CUSTKEY = outer_ref(CUSTOMER.C_CUSTKEY)
                       TableScan: ORDERS

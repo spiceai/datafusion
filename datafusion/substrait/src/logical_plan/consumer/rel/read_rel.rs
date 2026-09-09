@@ -18,9 +18,12 @@
 use crate::logical_plan::consumer::SubstraitConsumer;
 use crate::logical_plan::consumer::from_substrait_literal;
 use crate::logical_plan::consumer::from_substrait_named_struct;
-use crate::logical_plan::consumer::utils::ensure_schema_compatibility;
+use crate::logical_plan::consumer::utils::{
+    enclosing_scope_reads, ensure_schema_compatibility,
+    qualifier_unused_by_enclosing_scopes,
+};
 use datafusion::common::{
-    DFSchema, DFSchemaRef, TableReference, not_impl_err, plan_err,
+    Column, DFSchema, DFSchemaRef, TableReference, not_impl_err, plan_err,
     substrait_datafusion_err, substrait_err,
 };
 use datafusion::datasource::provider_as_source;
@@ -49,11 +52,30 @@ pub async fn from_read_rel(
     ) -> datafusion::common::Result<LogicalPlan> {
         let schema = schema.replace_qualifier(table_ref.clone());
 
-        let filters = if let Some(f) = filter {
-            let filter_expr = consumer.consume_expression(f, &schema).await?;
-            split_conjunction_owned(filter_expr)
-        } else {
-            vec![]
+        // The scan's qualifier: its own alias when an enclosing scope reads
+        // the same table, else the table name. The read's own filter is
+        // consumed against the Substrait base schema under that qualifier
+        // (its field indices are defined against the base schema, which the
+        // provider's schema may extend or reorder).
+        let alias = subquery_scan_alias(consumer, &table_ref).map(TableReference::bare);
+        let qualifier = alias.clone().unwrap_or_else(|| table_ref.clone());
+        let filter_expr = match filter {
+            Some(f) => {
+                let filter_schema = schema.clone().replace_qualifier(qualifier.clone());
+                Some(consumer.consume_expression(f, &filter_schema).await?)
+            }
+            None => None,
+        };
+        // A filter is pushed into the scan unless it belongs above it: above
+        // the alias, so its local columns carry the new qualifier, or above
+        // the scan whenever it holds an outer reference, which a `TableScan`'s
+        // filters cannot evaluate and the decorrelation rules cannot lift from
+        // there. The projection mask then follows by name.
+        let filter_above =
+            alias.is_some() || filter_expr.as_ref().is_some_and(Expr::contains_outer);
+        let scan_filters = match (&filter_expr, filter_above) {
+            (Some(expr), false) => split_conjunction_owned(expr.clone()),
+            _ => vec![],
         };
 
         let plan = {
@@ -63,19 +85,45 @@ pub async fn from_read_rel(
             };
 
             LogicalPlanBuilder::scan_with_filters(
-                table_ref,
+                table_ref.clone(),
                 provider_as_source(Arc::clone(&provider)),
                 None,
-                filters,
+                scan_filters,
             )?
             .build()?
         };
 
         ensure_schema_compatibility(plan.schema(), schema.clone())?;
 
-        let schema = apply_masking(schema, projection)?;
+        let masked = apply_masking(schema.clone(), projection)?;
 
-        apply_projection(plan, schema)
+        if !filter_above {
+            return apply_projection(plan, masked);
+        }
+        let mut builder = LogicalPlanBuilder::from(plan);
+        if let Some(alias) = &alias {
+            builder = builder.alias(alias.clone())?;
+        }
+        if let Some(expr) = filter_expr {
+            builder = builder.filter(expr)?;
+        }
+        // Project to the (masked) Substrait schema by name when the provider's
+        // schema carries more or differently ordered fields.
+        let target = masked.replace_qualifier(qualifier.clone());
+        if !builder
+            .schema()
+            .logically_equivalent_names_and_types(&target)
+        {
+            let columns: Vec<Expr> = target
+                .fields()
+                .iter()
+                .map(|field| {
+                    Expr::Column(Column::new(Some(qualifier.clone()), field.name()))
+                })
+                .collect();
+            builder = builder.project(columns)?;
+        }
+        builder.build()
     }
 
     let named_struct = read.base_schema.as_ref().ok_or_else(|| {
@@ -290,6 +338,26 @@ pub fn apply_masking(
         },
         None => Ok(schema),
     }
+}
+
+/// The qualifier a scan gets when it sits in a subquery and an enclosing scope
+/// already reads the same table: the first of `t_1`, `t_2`, … no enclosing
+/// scope uses (`LINEITEM` inside a subquery becomes `LINEITEM_1`). `None` when
+/// no enclosing scope reads the table, so plans without the collision keep
+/// their qualifiers.
+///
+/// SQL gives such a scan its own name (`lineitem l2`); Substrait has no alias,
+/// so both scans would be `LINEITEM`, and decorrelation resolved
+/// `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` to the subquery's own
+/// scan: the join condition was dropped and
+/// `LINEITEM.L_SUPPKEY != LINEITEM.L_SUPPKEY` stayed behind as a filter, so
+/// TPC-H q21 returned no rows.
+fn subquery_scan_alias(
+    consumer: &impl SubstraitConsumer,
+    table_ref: &TableReference,
+) -> Option<String> {
+    enclosing_scope_reads(consumer, table_ref)
+        .then(|| qualifier_unused_by_enclosing_scopes(consumer, table_ref.table()))
 }
 
 /// This function returns a DataFrame with fields adjusted if necessary in the event that the
