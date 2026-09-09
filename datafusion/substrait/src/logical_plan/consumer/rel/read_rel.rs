@@ -63,7 +63,7 @@ pub async fn from_read_rel(
             };
 
             LogicalPlanBuilder::scan_with_filters(
-                table_ref,
+                table_ref.clone(),
                 provider_as_source(Arc::clone(&provider)),
                 None,
                 filters,
@@ -75,7 +75,13 @@ pub async fn from_read_rel(
 
         let schema = apply_masking(schema, projection)?;
 
-        apply_projection(plan, schema)
+        let plan = apply_projection(plan, schema)?;
+        match subquery_scan_alias(consumer, &table_ref) {
+            Some(alias) => LogicalPlanBuilder::from(plan)
+                .alias(TableReference::bare(alias))?
+                .build(),
+            None => Ok(plan),
+        }
     }
 
     let named_struct = read.base_schema.as_ref().ok_or_else(|| {
@@ -294,6 +300,34 @@ pub fn apply_masking(
 
 /// This function returns a DataFrame with fields adjusted if necessary in the event that the
 /// Substrait schema is a subset of the DataFusion schema.
+/// The qualifier a scan gets when it sits in a subquery and an enclosing scope
+/// already reads the same table: the table name with the scan's nesting depth
+/// appended (`LINEITEM` inside one subquery becomes `LINEITEM_1`), which no
+/// enclosing scope can carry. `None` when no enclosing scope reads the table,
+/// so plans without the collision keep their qualifiers.
+///
+/// SQL gives such a scan its own name (`lineitem l2`); Substrait has no alias,
+/// so both scans would be `LINEITEM`. The decorrelation rules match a pulled-up
+/// correlated predicate's columns by qualified name, so
+/// `LINEITEM.L_ORDERKEY = outer_ref(LINEITEM.L_ORDERKEY)` resolved both sides to
+/// the subquery's own scan: the join condition was dropped and
+/// `LINEITEM.L_SUPPKEY != LINEITEM.L_SUPPKEY` stayed behind as a filter, so
+/// TPC-H q21 returned no rows.
+fn subquery_scan_alias(
+    consumer: &impl SubstraitConsumer,
+    table_ref: &TableReference,
+) -> Option<String> {
+    let mut depth = 0;
+    let mut enclosing_scope_reads_table = false;
+    while let Some(outer) = consumer.get_outer_schema(depth + 1) {
+        depth += 1;
+        enclosing_scope_reads_table |= outer
+            .iter()
+            .any(|(qualifier, _)| qualifier.is_some_and(|q| q == table_ref));
+    }
+    enclosing_scope_reads_table.then(|| format!("{}_{depth}", table_ref.table()))
+}
+
 fn apply_projection(
     plan: LogicalPlan,
     substrait_schema: DFSchema,
