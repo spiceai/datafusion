@@ -8033,6 +8033,63 @@ fn test_clauses_above_a_scoped_filter_read_the_derived_outputs() -> Result<()> {
 }
 
 #[test]
+fn test_filter_on_volatile_output_is_refused_inside_a_join_input() -> Result<()> {
+    // A join walks both inputs into one SELECT, so the derived table the scope
+    // builds would sit beside `u`: the `ON` would still name the hidden `t`, and
+    // `a` is exposed by both sides. Refused rather than emitted ambiguous.
+    let schema = volatile_output_schema();
+    let left = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(left)
+        .join_on(
+            table_scan(Some("u"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a scoped join input must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is an input of a join"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_is_refused_under_a_clause_holding_a_subquery()
+-> Result<()> {
+    // A filter above the sort has already put `t.a > 1 AND EXISTS (...)` in the
+    // WHERE. The rewrite that re-points clauses at the derived table skips an
+    // expression holding a subquery, so `t.a` there would keep naming the hidden
+    // relation — refused, rather than emitted unbindable.
+    let schema = volatile_output_schema();
+    let subquery = Arc::new(table_scan(Some("u"), &schema, Some(vec![0]))?.build()?);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .sort(vec![col("t.a").sort(true, false)])?
+        .filter(col("t.a").gt(lit(1)).and(exists(subquery)))?
+        .build()?;
+
+    let err =
+        plan_to_sql(&plan).expect_err("a subquery in a clause above must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when a clause above it holds a subquery"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_derived_table_filter_on_a_named_output_is_inlined() -> Result<()> {
     // Naming a derived table's unnamed outputs happens before the derived plan is
     // unparsed, so the filter inside it meets the output as an alias. It is

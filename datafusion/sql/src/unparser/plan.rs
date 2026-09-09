@@ -1830,6 +1830,29 @@ impl Unparser<'_> {
                         && stacked_filters_read_unrepeatable_output(plan, projection)
                     {
                         self.ensure_derived_table_fixes_volatile_outputs()?;
+                        // The scope addresses the derived table's outputs by bare name
+                        // and takes this SELECT's list for them, which is right only
+                        // while the derived table is the SELECT's sole relation. A
+                        // join input sits beside another relation — its `ON` still
+                        // names the hidden one, and a bare name can be ambiguous.
+                        if select.within_join_input() {
+                            return not_impl_err!(
+                                "Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is an input of a join"
+                            );
+                        }
+                        // The clause rewrite below skips an expression holding a
+                        // subquery, whose correlated references cannot be told from
+                        // ones to this SELECT's relations. Such a clause would keep
+                        // naming the hidden relation, so it is refused instead.
+                        if select.clauses_hold_a_subquery()
+                            || query
+                                .as_ref()
+                                .is_some_and(|query| query.order_by_holds_a_subquery())
+                        {
+                            return not_impl_err!(
+                                "Unparsing a filter on a projection output that cannot be repeated is not supported when a clause above it holds a subquery"
+                            );
+                        }
                         // The clauses this SELECT already carries — an ORDER BY from a
                         // sort above the stack, a WHERE from a filter above that sort —
                         // were emitted against the projection's relations, which the
@@ -2217,12 +2240,15 @@ impl Unparser<'_> {
                     None
                 };
 
-                self.select_to_sql_recursively(
+                select.enter_join_input();
+                let walked_left = self.select_to_sql_recursively(
                     left_plan.as_ref(),
                     query,
                     select,
                     relation,
-                )?;
+                );
+                select.exit_join_input();
+                walked_left?;
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
@@ -2309,12 +2335,15 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
-                    self.select_to_sql_recursively(
+                    select.enter_join_input();
+                    let walked_right = self.select_to_sql_recursively(
                         right_plan.as_ref(),
                         query,
                         select,
                         &mut right_relation,
-                    )?;
+                    );
+                    select.exit_join_input();
+                    walked_right?;
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full
                             && !right_scan_filters.is_empty())

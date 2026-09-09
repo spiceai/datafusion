@@ -86,6 +86,16 @@ impl QueryBuilder {
     /// old one. The `SELECT`-level counterpart is
     /// [`SelectBuilder::visit_expressions_in_clauses_mut`], and an expression holding
     /// a subquery is skipped whole for the reason given there.
+    /// Whether any `ORDER BY` expression holds a subquery, which
+    /// [`Self::visit_order_by_mut`] would leave untouched.
+    pub fn order_by_holds_a_subquery(&self) -> bool {
+        match self.order_by_kind.as_ref() {
+            Some(OrderByKind::Expressions(sorts)) => {
+                sorts.iter().any(|sort| contains_subquery(&sort.expr))
+            }
+            _ => false,
+        }
+    }
     pub fn visit_order_by_mut<F>(&mut self, mut f: F)
     where
         F: FnMut(&mut ast::Expr),
@@ -248,6 +258,10 @@ pub struct SelectBuilder {
     /// Table aliases that correspond to LATERAL FLATTEN relations.
     /// Column references into these aliases must use `VALUE` as the column name.
     flatten_table_aliases: Vec<String>,
+    /// How many join inputs the walk is currently inside. A join walks both of its
+    /// inputs with this one builder, so while this is non-zero the relation being
+    /// unparsed is not the SELECT's only one — see [`Self::within_join_input`].
+    join_inputs_in_progress: usize,
     /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
     /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so
     /// a second aggregate below it belongs in a derived table.
@@ -361,6 +375,52 @@ impl SelectBuilder {
             DERIVED_AGGREGATE_ALIAS_PREFIX,
             self.derived_aggregate_alias_counter,
         )
+    }
+
+    /// Marks the start of walking one input of a join into this SELECT; paired with
+    /// [`Self::exit_join_input`].
+    pub fn enter_join_input(&mut self) {
+        self.join_inputs_in_progress += 1;
+    }
+
+    pub fn exit_join_input(&mut self) {
+        self.join_inputs_in_progress = self.join_inputs_in_progress.saturating_sub(1);
+    }
+
+    /// Whether the node being unparsed is an input of a join this SELECT reads, so
+    /// the relation it produces will sit beside at least one other. A rewrite that
+    /// assumes its derived table is the SELECT's only relation — addressing the
+    /// outputs by bare name, taking the SELECT list for itself — is wrong here.
+    pub fn within_join_input(&self) -> bool {
+        self.join_inputs_in_progress > 0
+    }
+
+    /// Whether any expression this SELECT already carries holds a subquery.
+    /// [`Self::visit_expressions_in_clauses_mut`] leaves such an expression untouched,
+    /// so a rewrite that has to reach every reference asks this first.
+    pub fn clauses_hold_a_subquery(&self) -> bool {
+        let projection =
+            self.projection
+                .iter()
+                .flatten()
+                .filter_map(|item| match item {
+                    ast::SelectItem::UnnamedExpr(expr)
+                    | ast::SelectItem::ExprWithAlias { expr, .. }
+                    | ast::SelectItem::ExprWithAliases { expr, .. } => Some(expr),
+                    ast::SelectItem::QualifiedWildcard(..)
+                    | ast::SelectItem::Wildcard(_) => None,
+                });
+        let group_by = match self.group_by.as_ref() {
+            Some(ast::GroupByExpr::Expressions(exprs, _)) => exprs.iter().collect(),
+            _ => Vec::new(),
+        };
+        projection
+            .chain(self.selection.iter())
+            .chain(self.having.iter())
+            .chain(self.qualify.iter())
+            .chain(group_by)
+            .chain(self.sort_by.iter().map(|sort| &sort.expr))
+            .any(contains_subquery)
     }
 
     /// Register a table alias as pointing to a LATERAL FLATTEN relation.
@@ -694,6 +754,7 @@ impl SelectBuilder {
             flatten_alias_counter: 0,
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
+            join_inputs_in_progress: 0,
             aggregated: false,
         }
     }
