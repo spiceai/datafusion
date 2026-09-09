@@ -7834,6 +7834,123 @@ fn test_subquery_alias_filter_on_aliased_projection_output_is_inlined() -> Resul
     Ok(())
 }
 
+/// `Projection(t.a, random() AS r)` with two filters stacked on it, `first` nearer
+/// the projection and `second` above it.
+fn stacked_filters_over_volatile_projection(
+    first: Expr,
+    second: Expr,
+) -> Result<LogicalPlan> {
+    table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(first)?
+        .filter(second)?
+        .build()
+}
+
+#[test]
+fn test_stacked_filters_on_a_volatile_projection_output_are_scoped_together() -> Result<()>
+{
+    // The stack is emitted as one `WHERE`, so every filter in it moves above the
+    // derived table with the one that reads the volatile output — a filter left
+    // beside the projection would put `t.a` in a `WHERE` whose `FROM` no longer
+    // exposes `t`. Whichever of the two reads the volatile output.
+    let volatile_on_top = stacked_filters_over_volatile_projection(
+        col("t.a").gt(lit(1)),
+        col("r").gt(lit(0.5)),
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&volatile_on_top)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE ((r > 0.5) AND (a > 1))"#
+    );
+
+    let volatile_below = stacked_filters_over_volatile_projection(
+        col("r").gt(lit(0.5)),
+        col("t.a").gt(lit(1)),
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&volatile_below)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE ((a > 1) AND (r > 0.5))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
+    // A subquery in the predicate may correlate against the relation the derived
+    // table would hide, and its outer references cannot be told from ones that
+    // reach further out, so the shape is refused rather than rebound blindly.
+    let schema = volatile_output_schema();
+    let subquery = Arc::new(table_scan(Some("u"), &schema, Some(vec![0]))?.build()?);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)).and(exists(subquery)))?
+        .build()?;
+
+    let err =
+        plan_to_sql(&plan).expect_err("a predicate holding a subquery must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a volatile projection output is not supported when the predicate holds a subquery"
+    );
+    Ok(())
+}
+
+/// The refusal a dialect whose derived tables do not fix a volatile value must produce
+/// for every shape that would read one through a derived table, spelled once.
+const VOLATILE_SCOPE_REFUSAL: &str = "This feature is not implemented: Unparsing a filter on a volatile projection output is not supported for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded";
+
+#[test]
+fn test_filter_on_volatile_output_is_refused_where_a_derived_table_does_not_fix_it()
+-> Result<()> {
+    // SQLite flattens the derived table and evaluates `random()` again for the
+    // predicate, so the scope that repairs the shape elsewhere returns wrong rows
+    // there. Every route to that scope is refused on such a dialect: the filter
+    // that would build it, the filter already above a derived projection, and the
+    // alias pushdown that would otherwise decline into one.
+    let unparser = Unparser::new(&SqliteDialect {});
+    let projection = || -> Result<LogicalPlanBuilder> {
+        Ok(
+            table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?.project(
+                vec![
+                    col("t.a"),
+                    datafusion_functions::math::random().call(vec![]).alias("r"),
+                ],
+            )?,
+        )
+    };
+
+    let scoped_here = projection()?.filter(col("r").gt(lit(0.5)))?.build()?;
+    let err = unparser
+        .plan_to_sql(&scoped_here)
+        .expect_err("a filter that would build the scope must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    let already_derived = projection()?
+        .filter(col("r").gt(lit(0.5)))?
+        .project(vec![col("t.a")])?
+        .build()?;
+    let err = unparser
+        .plan_to_sql(&already_derived)
+        .expect_err("a filter above a derived projection must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    let aliased = projection()?
+        .filter(col("r").gt(lit(0.5)))?
+        .alias("sq")?
+        .build()?;
+    let err = unparser.plan_to_sql(&aliased).expect_err(
+        "an alias pushdown that would decline into the scope must be refused",
+    );
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+    Ok(())
+}
+
 #[test]
 fn test_derived_table_filter_on_a_named_output_is_inlined() -> Result<()> {
     // Naming a derived table's unnamed outputs happens before the derived plan is

@@ -686,6 +686,35 @@ fn find_repeatable_projection_expr<'a>(
     (!computed.is_volatile()).then_some(computed)
 }
 
+/// The [Projection] under `plan` and the `Filter`s stacked directly on it, if that is
+/// what `plan` is: the shape one `SELECT` folds into a single `WHERE`.
+///
+/// [`find_projection_node_within_select`] answers the same question from the node
+/// above the stack and with the `SELECT` list's state in hand; this one is for a caller
+/// already holding the stack's top.
+pub(crate) fn projection_below_filters(plan: &LogicalPlan) -> Option<&Projection> {
+    let mut node = plan;
+    loop {
+        match node {
+            LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
+            LogicalPlan::Projection(projection) => return Some(projection),
+            _ => return None,
+        }
+    }
+}
+
+/// The predicates of `plan` and of every `Filter` stacked directly beneath it, top
+/// first — the ones a single `WHERE` folds together.
+fn stacked_predicates(plan: &LogicalPlan) -> Vec<&Expr> {
+    let mut predicates = Vec::new();
+    let mut node = plan;
+    while let LogicalPlan::Filter(filter) = node {
+        predicates.push(&filter.predicate);
+        node = filter.input.as_ref();
+    }
+    predicates
+}
+
 /// Whether `predicate` reads a [Projection] output computed by a volatile expression.
 ///
 /// Such an output has no faithful form in the `SELECT` that computes it: the
@@ -695,7 +724,7 @@ fn find_repeatable_projection_expr<'a>(
 /// alias — SQLite and DuckDB among them — resolve it by that same repetition, and
 /// return rows the plan filtered out. The predicate has to be applied from a
 /// `SELECT` that reads the projection's *result*, which is what
-/// [`scope_filter_over_projection`] builds.
+/// [`scope_filters_over_projection`] builds.
 pub(crate) fn predicate_reads_volatile_output(
     predicate: &Expr,
     projection: &Projection,
@@ -715,24 +744,65 @@ pub(crate) fn predicate_reads_volatile_output(
         .unwrap_or(false)
 }
 
-/// A [`LogicalPlan::Filter`] over a [Projection], re-expressed so the projection
-/// is emitted as a derived table and the predicate is applied to its outputs from
-/// the `SELECT` that reads them.
+/// [`predicate_reads_volatile_output`] over every `Filter` stacked on `projection`
+/// from `plan` down. The stack is emitted as one `WHERE`, so one predicate reading a
+/// volatile output puts the whole stack above the projection's scope.
+pub(crate) fn stacked_filters_read_volatile_output(
+    plan: &LogicalPlan,
+    projection: &Projection,
+) -> bool {
+    stacked_predicates(plan)
+        .into_iter()
+        .any(|predicate| predicate_reads_volatile_output(predicate, projection))
+}
+
+/// A stack of `Filter`s over a [Projection], re-expressed so the projection is emitted
+/// as a derived table and the predicates are applied to its outputs from the `SELECT`
+/// that reads them.
 ///
-/// The filter is given an identity projection above it, one bare column per output
-/// under the name the filter's schema reports. Unparsed, that projection becomes
-/// this `SELECT`'s list, the filter its `WHERE`, and the projection below — met with
-/// the list already taken — a derived table, whose outputs [`name_derived_scope_outputs`]
-/// names on the way in. The predicate's references then bind to those names.
+/// The stack is folded into one `Filter` and given an identity projection above it,
+/// one bare column per output under the name the schema reports. Unparsed, that
+/// projection becomes this `SELECT`'s list, the folded filter its `WHERE`, and the
+/// projection below — met with the list already taken — a derived table, whose outputs
+/// [`name_derived_scope_outputs`] names on the way in. The predicates' references then
+/// bind to those names. Every filter in the stack moves together: one left in place
+/// would be emitted into the same `WHERE` with references the derived table has
+/// hidden.
 ///
-/// Every reference is unqualified, in the predicate as well as in the list: the
+/// Every reference is unqualified, in the predicates as well as in the list: the
 /// derived table is the only relation this `SELECT` reads, so its columns are
 /// addressed by name alone, and a qualifier naming a relation *inside* the derived
 /// table would bind to nothing. Outer references are left as they are — they name
 /// an enclosing query, not this one. Two outputs of one name cannot be told apart
-/// once the qualifiers are gone, so a filter whose schema carries any is refused.
-pub(crate) fn scope_filter_over_projection(filter: &Filter) -> Result<LogicalPlan> {
-    let schema = filter.input.schema();
+/// once the qualifiers are gone, so a projection carrying any is refused.
+///
+/// A predicate holding a subquery is refused too. Its body may correlate against the
+/// relation the derived table is about to hide, and nothing here can tell such a
+/// reference from one that reaches further out — the same reason the alias pushdown
+/// declines a predicate holding one.
+pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    let predicates = stacked_predicates(plan);
+    let Some(input) = predicates.len().checked_sub(1).and_then(|_| {
+        let mut node = plan;
+        while let LogicalPlan::Filter(filter) = node {
+            node = filter.input.as_ref();
+        }
+        Some(node)
+    }) else {
+        return internal_err!(
+            "scope_filters_over_projection called on a plan that is not a Filter"
+        );
+    };
+    if predicates
+        .iter()
+        .any(|predicate| expr_contains_subquery(predicate))
+    {
+        return not_impl_err!(
+            "Unparsing a filter on a volatile projection output is not supported when the predicate holds a subquery"
+        );
+    }
+
+    let schema = input.schema();
     let mut names = HashSet::with_capacity(schema.fields().len());
     for field in schema.fields() {
         if !names.insert(field.name()) {
@@ -743,22 +813,34 @@ pub(crate) fn scope_filter_over_projection(filter: &Filter) -> Result<LogicalPla
         }
     }
 
-    let predicate = filter
-        .predicate
-        .clone()
-        .transform(|sub_expr| {
-            Ok(match sub_expr {
-                Expr::Column(column) if column.relation.is_some() => {
-                    Transformed::yes(Expr::Column(Column::new_unqualified(column.name)))
-                }
-                sub_expr => Transformed::no(sub_expr),
+    let unqualified = |predicate: &Expr| {
+        predicate
+            .clone()
+            .transform(|sub_expr| {
+                Ok(match sub_expr {
+                    Expr::Column(column) if column.relation.is_some() => {
+                        Transformed::yes(Expr::Column(Column::new_unqualified(
+                            column.name,
+                        )))
+                    }
+                    sub_expr => Transformed::no(sub_expr),
+                })
             })
-        })
-        .data()?;
+            .data()
+    };
+    let Some(predicate) = predicates
+        .into_iter()
+        .map(unqualified)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .reduce(Expr::and)
+    else {
+        return internal_err!("a filter stack has at least one predicate");
+    };
     // `Filter::try_new` rather than the builder, whose `filter` normalizes every
     // column back to its qualified form and would undo the rewrite above.
     let filtered =
-        LogicalPlan::Filter(Filter::try_new(predicate, Arc::clone(&filter.input))?);
+        LogicalPlan::Filter(Filter::try_new(predicate, Arc::new(input.clone()))?);
     let outputs = schema
         .fields()
         .iter()
