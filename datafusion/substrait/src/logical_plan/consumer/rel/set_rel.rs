@@ -16,6 +16,7 @@
 // under the License.
 
 use crate::logical_plan::consumer::SubstraitConsumer;
+use crate::logical_plan::consumer::utils::requalify_sides_for_scope;
 use datafusion::common::{not_impl_err, substrait_err};
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
 use substrait::proto::set_rel::SetOp;
@@ -31,11 +32,14 @@ pub async fn from_set_rel(
         match set.op() {
             SetOp::UnionAll => union_rels(consumer, &set.inputs, true).await,
             SetOp::UnionDistinct => union_rels(consumer, &set.inputs, false).await,
-            SetOp::IntersectionPrimary => LogicalPlanBuilder::intersect(
-                consumer.consume_rel(&set.inputs[0]).await?,
-                union_rels(consumer, &set.inputs[1..], true).await?,
-                false,
-            ),
+            SetOp::IntersectionPrimary => {
+                let (left, right) = scoped_sides(
+                    consumer,
+                    consumer.consume_rel(&set.inputs[0]).await?,
+                    union_rels(consumer, &set.inputs[1..], true).await?,
+                )?;
+                LogicalPlanBuilder::intersect(left, right, false)
+            }
             SetOp::IntersectionMultiset => {
                 intersect_rels(consumer, &set.inputs, false).await
             }
@@ -77,11 +81,9 @@ async fn intersect_rels(
     let mut rel = consumer.consume_rel(&rels[0]).await?;
 
     for input in &rels[1..] {
-        rel = LogicalPlanBuilder::intersect(
-            rel,
-            consumer.consume_rel(input).await?,
-            is_all,
-        )?;
+        let (left, right) =
+            scoped_sides(consumer, rel, consumer.consume_rel(input).await?)?;
+        rel = LogicalPlanBuilder::intersect(left, right, is_all)?;
     }
 
     Ok(rel)
@@ -95,9 +97,27 @@ async fn except_rels(
     let mut rel = consumer.consume_rel(&rels[0]).await?;
 
     for input in &rels[1..] {
-        rel =
-            LogicalPlanBuilder::except(rel, consumer.consume_rel(input).await?, is_all)?;
+        let (left, right) =
+            scoped_sides(consumer, rel, consumer.consume_rel(input).await?)?;
+        rel = LogicalPlanBuilder::except(left, right, is_all)?;
     }
 
     Ok(rel)
+}
+
+/// `LogicalPlanBuilder::intersect` / `except` requalify conflicting sides to
+/// the fixed `left`/`right`; inside a subquery those can collide with the
+/// enclosing scope's, so the sides are requalified for the scope first and
+/// the builder then finds nothing left to rename.
+fn scoped_sides(
+    consumer: &impl SubstraitConsumer,
+    left: LogicalPlan,
+    right: LogicalPlan,
+) -> datafusion::common::Result<(LogicalPlan, LogicalPlan)> {
+    let (left, right) = requalify_sides_for_scope(
+        consumer,
+        LogicalPlanBuilder::from(left),
+        LogicalPlanBuilder::from(right),
+    )?;
+    Ok((left.build()?, right.build()?))
 }

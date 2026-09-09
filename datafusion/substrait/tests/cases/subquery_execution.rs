@@ -239,6 +239,58 @@ mod tests {
         Ok(())
     }
 
+    /// A self-`INTERSECT` inside the subquery: `intersect`/`except` also
+    /// requalify their sides, so the sides must keep clear of the enclosing
+    /// join's `left`/`right` as a join's do.
+    #[tokio::test]
+    async fn intersect_inside_a_subquery_avoids_the_enclosing_left_and_right()
+    -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", three_rows()?)?;
+
+        let proto = read_json(
+            "tests/testdata/test_plans/self_correlated_exists_intersect.substrait.json",
+        );
+        let plan = from_substrait_plan(&ctx.state(), &proto).await?;
+        assert_snapshot!(plan.display_indent(), @"
+        Projection: left.a AS a1, left.b AS b1, right.a AS a2, right.b AS b2
+          Filter: EXISTS (<subquery>)
+            Subquery:
+              Filter: left_1.a = outer_ref(left.a) AND left_1.b != outer_ref(left.b)
+                LeftSemi Join: left_1.a = right_1.a, left_1.b = right_1.b
+                  Distinct:
+                    SubqueryAlias: left_1
+                      TableScan: t
+                  SubqueryAlias: right_1
+                    TableScan: t
+            Cross Join:
+              SubqueryAlias: left
+                TableScan: t
+              SubqueryAlias: right
+                TableScan: t
+        ");
+
+        // `t INTERSECT t` is `t`; the outer `left` rows 1|10 and 1|20 have a
+        // partner with the same `a` and a different `b`, 2|30 has none.
+        let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+----+----+----+----+",
+                "| a1 | b1 | a2 | b2 |",
+                "+----+----+----+----+",
+                "| 1  | 10 | 1  | 10 |",
+                "| 1  | 10 | 1  | 20 |",
+                "| 1  | 10 | 2  | 30 |",
+                "| 1  | 20 | 1  | 10 |",
+                "| 1  | 20 | 1  | 20 |",
+                "| 1  | 20 | 2  | 30 |",
+                "+----+----+----+----+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
     /// The enclosing scope reads `t` and a table that is already named `t_1`;
     /// the inner scan of `t`, correlated to that `t_1`, must not take the name
     /// `t_1` or the collision comes straight back. It becomes `t_2`.
