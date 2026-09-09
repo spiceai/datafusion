@@ -79,4 +79,102 @@ mod tests {
         );
         Ok(())
     }
+
+    fn three_rows() -> Result<RecordBatch> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        Ok(RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+            ],
+        )?)
+    }
+
+    /// The same correlated predicate carried as the inner `ReadRel.filter`
+    /// rather than a `FilterRel`: it must be applied above the alias, against
+    /// the aliased schema, not pushed into the scan where the decorrelation
+    /// rules cannot reach it.
+    #[tokio::test]
+    async fn correlated_read_filter_over_the_same_table_keeps_its_correlation()
+    -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", three_rows()?)?;
+
+        let proto = read_json(
+            "tests/testdata/test_plans/self_correlated_exists_read_filter.substrait.json",
+        );
+        let plan = from_substrait_plan(&ctx.state(), &proto).await?;
+        assert_snapshot!(plan.display_indent(), @"
+        Filter: EXISTS (<subquery>)
+          Subquery:
+            Filter: t_1.a = outer_ref(t.a) AND t_1.b != outer_ref(t.b)
+              SubqueryAlias: t_1
+                TableScan: t
+          TableScan: t
+        ");
+
+        let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+---+----+",
+                "| a | b  |",
+                "+---+----+",
+                "| 1 | 10 |",
+                "| 1 | 20 |",
+                "+---+----+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
+
+    /// The enclosing scope reads `t` and a table that is already named `t_1`;
+    /// the inner scan of `t`, correlated to that `t_1`, must not take the name
+    /// `t_1` or the collision comes straight back. It becomes `t_2`.
+    #[tokio::test]
+    async fn subquery_scan_alias_skips_a_name_an_enclosing_scope_uses() -> Result<()> {
+        let ctx = SessionContext::new();
+        ctx.register_batch("t", three_rows()?)?;
+        ctx.register_batch("t_1", three_rows()?)?;
+
+        let proto = read_json(
+            "tests/testdata/test_plans/self_correlated_exists_alias_taken.substrait.json",
+        );
+        let plan = from_substrait_plan(&ctx.state(), &proto).await?;
+        assert_snapshot!(plan.display_indent(), @"
+        Projection: t.a, t.b, t_1.a AS a1, t_1.b AS b1
+          Filter: EXISTS (<subquery>)
+            Subquery:
+              Filter: t_2.a = outer_ref(t_1.a) AND t_2.b != outer_ref(t_1.b)
+                SubqueryAlias: t_2
+                  TableScan: t
+            Cross Join:
+              TableScan: t
+              TableScan: t_1
+        ");
+
+        // Every `t` row pairs with the two `t_1` rows that have a partner in
+        // `t` with the same `a` and a different `b`; `t_1`'s 2|30 has none.
+        let batches = ctx.execute_logical_plan(plan).await?.collect().await?;
+        assert_batches_sorted_eq!(
+            [
+                "+---+----+----+----+",
+                "| a | b  | a1 | b1 |",
+                "+---+----+----+----+",
+                "| 1 | 10 | 1  | 10 |",
+                "| 1 | 10 | 1  | 20 |",
+                "| 1 | 20 | 1  | 10 |",
+                "| 1 | 20 | 1  | 20 |",
+                "| 2 | 30 | 1  | 10 |",
+                "| 2 | 30 | 1  | 20 |",
+                "+---+----+----+----+",
+            ],
+            &batches
+        );
+        Ok(())
+    }
 }

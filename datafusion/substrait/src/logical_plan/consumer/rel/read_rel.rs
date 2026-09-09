@@ -20,7 +20,7 @@ use crate::logical_plan::consumer::from_substrait_literal;
 use crate::logical_plan::consumer::from_substrait_named_struct;
 use crate::logical_plan::consumer::utils::ensure_schema_compatibility;
 use datafusion::common::{
-    DFSchema, DFSchemaRef, TableReference, not_impl_err, plan_err,
+    Column, DFSchema, DFSchemaRef, TableReference, not_impl_err, plan_err,
     substrait_datafusion_err, substrait_err,
 };
 use datafusion::datasource::provider_as_source;
@@ -49,11 +49,19 @@ pub async fn from_read_rel(
     ) -> datafusion::common::Result<LogicalPlan> {
         let schema = schema.replace_qualifier(table_ref.clone());
 
-        let filters = if let Some(f) = filter {
-            let filter_expr = consumer.consume_expression(f, &schema).await?;
-            split_conjunction_owned(filter_expr)
-        } else {
-            vec![]
+        // Without an alias the read's own filter is pushed into the scan. With
+        // one it is applied above the alias against the aliased schema, so
+        // its local columns carry the new qualifier and a correlated predicate
+        // stays where the decorrelation rules can lift it (a `TableScan`'s
+        // filters go to the provider, which cannot evaluate an outer
+        // reference); the projection mask then follows by name.
+        let alias = subquery_scan_alias(consumer, &table_ref);
+        let scan_filters = match (&alias, filter) {
+            (None, Some(f)) => {
+                let filter_expr = consumer.consume_expression(f, &schema).await?;
+                split_conjunction_owned(filter_expr)
+            }
+            _ => vec![],
         };
 
         let plan = {
@@ -66,7 +74,7 @@ pub async fn from_read_rel(
                 table_ref.clone(),
                 provider_as_source(Arc::clone(&provider)),
                 None,
-                filters,
+                scan_filters,
             )?
             .build()?
         };
@@ -75,13 +83,24 @@ pub async fn from_read_rel(
 
         let schema = apply_masking(schema, projection)?;
 
-        let plan = apply_projection(plan, schema)?;
-        match subquery_scan_alias(consumer, &table_ref) {
-            Some(alias) => LogicalPlanBuilder::from(plan)
-                .alias(TableReference::bare(alias))?
-                .build(),
-            None => Ok(plan),
+        let Some(alias) = alias else {
+            return apply_projection(plan, schema);
+        };
+        let alias = TableReference::bare(alias);
+        let mut builder = LogicalPlanBuilder::from(plan).alias(alias.clone())?;
+        if let Some(f) = filter {
+            let filter_expr = consumer.consume_expression(f, builder.schema()).await?;
+            builder = builder.filter(filter_expr)?;
         }
+        if projection.is_some() {
+            let columns: Vec<Expr> = schema
+                .fields()
+                .iter()
+                .map(|field| Expr::Column(Column::new(Some(alias.clone()), field.name())))
+                .collect();
+            builder = builder.project(columns)?;
+        }
+        builder.build()
     }
 
     let named_struct = read.base_schema.as_ref().ok_or_else(|| {
@@ -298,13 +317,12 @@ pub fn apply_masking(
     }
 }
 
-/// This function returns a DataFrame with fields adjusted if necessary in the event that the
-/// Substrait schema is a subset of the DataFusion schema.
 /// The qualifier a scan gets when it sits in a subquery and an enclosing scope
 /// already reads the same table: the table name with the scan's nesting depth
-/// appended (`LINEITEM` inside one subquery becomes `LINEITEM_1`), which no
-/// enclosing scope can carry. `None` when no enclosing scope reads the table,
-/// so plans without the collision keep their qualifiers.
+/// appended (`LINEITEM` inside one subquery becomes `LINEITEM_1`), advanced
+/// past any name an enclosing scope happens to use. `None` when no enclosing
+/// scope reads the table, so plans without the collision keep their
+/// qualifiers.
 ///
 /// SQL gives such a scan its own name (`lineitem l2`); Substrait has no alias,
 /// so both scans would be `LINEITEM`. The decorrelation rules match a pulled-up
@@ -317,17 +335,32 @@ fn subquery_scan_alias(
     consumer: &impl SubstraitConsumer,
     table_ref: &TableReference,
 ) -> Option<String> {
-    let mut depth = 0;
-    let mut enclosing_scope_reads_table = false;
-    while let Some(outer) = consumer.get_outer_schema(depth + 1) {
-        depth += 1;
-        enclosing_scope_reads_table |= outer
-            .iter()
-            .any(|(qualifier, _)| qualifier.is_some_and(|q| q == table_ref));
+    let mut enclosing = Vec::new();
+    while let Some(outer) = consumer.get_outer_schema(enclosing.len() + 1) {
+        enclosing.push(outer);
     }
-    enclosing_scope_reads_table.then(|| format!("{}_{depth}", table_ref.table()))
+    let qualifier_in_use = |name: &str| {
+        enclosing.iter().any(|outer| {
+            outer
+                .iter()
+                .any(|(qualifier, _)| qualifier.is_some_and(|q| q.table() == name))
+        })
+    };
+    let reads_table = enclosing.iter().any(|outer| {
+        outer
+            .iter()
+            .any(|(qualifier, _)| qualifier.is_some_and(|q| q == table_ref))
+    });
+    if !reads_table {
+        return None;
+    }
+    (enclosing.len()..)
+        .map(|depth| format!("{}_{depth}", table_ref.table()))
+        .find(|candidate| !qualifier_in_use(candidate))
 }
 
+/// This function returns a DataFrame with fields adjusted if necessary in the event that the
+/// Substrait schema is a subset of the DataFusion schema.
 fn apply_projection(
     plan: LogicalPlan,
     substrait_schema: DFSchema,
