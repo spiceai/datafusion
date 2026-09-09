@@ -34,9 +34,9 @@ use super::{
         expr_contains_subquery, find_agg_node_within_select,
         find_projection_node_within_select, find_unnest_node_within_select,
         find_window_nodes_within_select, name_derived_scope_outputs, name_scope_outputs,
-        partition_subquery_filters, predicate_reads_volatile_output,
+        partition_subquery_filters, predicate_reads_unrepeatable_output,
         projection_below_filters, scope_filters_over_projection,
-        select_list_wraps_a_grouping_expr, stacked_filters_read_volatile_output,
+        select_list_wraps_a_grouping_expr, stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -1042,8 +1042,9 @@ impl Unparser<'_> {
         Ok(())
     }
 
-    /// Refuses to read a volatile projection output through a derived table on a
-    /// dialect whose engine does not fix the value there.
+    /// Refuses to read a projection output that cannot be repeated — a volatile
+    /// expression, or a subquery — through a derived table on a dialect whose engine
+    /// does not fix the value there.
     ///
     /// Emitting the scope anyway would answer with rows the `SELECT` list never
     /// showed — see [`Dialect::derived_table_evaluates_volatile_outputs_once`] —
@@ -1053,7 +1054,7 @@ impl Unparser<'_> {
             return Ok(());
         }
         not_impl_err!(
-            "Unparsing a filter on a volatile projection output is not supported for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded"
+            "Unparsing a filter on a projection output that cannot be repeated is not supported for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded"
         )
     }
 
@@ -1826,7 +1827,7 @@ impl Unparser<'_> {
                         select.already_projected(),
                     );
                     if let Some(projection) = projection
-                        && stacked_filters_read_volatile_output(plan, projection)
+                        && stacked_filters_read_unrepeatable_output(plan, projection)
                     {
                         self.ensure_derived_table_fixes_volatile_outputs()?;
                         let scoped = scope_filters_over_projection(plan)?;
@@ -1839,7 +1840,7 @@ impl Unparser<'_> {
                     // projection produced. Either way it rests on the same guarantee.
                     if select.already_projected()
                         && let Some(projection) = projection_below_filters(plan)
-                        && stacked_filters_read_volatile_output(plan, projection)
+                        && stacked_filters_read_unrepeatable_output(plan, projection)
                     {
                         self.ensure_derived_table_fixes_volatile_outputs()?;
                     }
@@ -3297,20 +3298,27 @@ impl Unparser<'_> {
                     // a derived table, where the predicate reads the output by
                     // name from the SELECT above it.
                     let predicate = match projection_below_filters(&plan) {
-                        Some(projection) => {
-                            if predicate_reads_volatile_output(
+                        Some(projection)
+                            if predicate_reads_unrepeatable_output(
                                 &filter.predicate,
                                 projection,
-                            ) {
-                                self.ensure_derived_table_fixes_volatile_outputs()?;
-                                return Ok(None);
-                            }
+                            ) =>
+                        {
+                            self.ensure_derived_table_fixes_volatile_outputs()?;
+                            return Ok(None);
+                        }
+                        // Inlined only where the projection folds into this SELECT.
+                        // With the list already taken it becomes a derived table
+                        // exposing the output under its own name, which the
+                        // requalified reference binds to; the inlined expression's
+                        // columns would be hidden inside it.
+                        Some(projection) if !already_projected => {
                             unproject_projection_exprs(
                                 filter.predicate.clone(),
                                 projection,
                             )?
                         }
-                        None => filter.predicate.clone(),
+                        _ => filter.predicate.clone(),
                     };
                     let predicate = if let Some(ref alias_name) = alias {
                         let mut rewriter = TableAliasRewriter {

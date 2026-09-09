@@ -646,7 +646,7 @@ fn output_is_unnamed(expr: &Expr) -> bool {
 /// as it is: the relation carries that name already.
 ///
 /// A volatile output is not inlined, because repeating it draws a second value —
-/// see [`predicate_reads_volatile_output`], which the caller asks first so that
+/// see [`predicate_reads_unrepeatable_output`], which the caller asks first so that
 /// such a predicate never reaches this function.
 pub(crate) fn unproject_projection_exprs(
     expr: Expr,
@@ -663,14 +663,27 @@ pub(crate) fn unproject_projection_exprs(
     .map(|e| e.data)
 }
 
+/// Whether repeating `expr` at a second point of use draws the same value.
+///
+/// A volatile expression does not. Neither, for this purpose, does one holding a
+/// subquery: [`Expr::is_volatile`] walks expression children, and a subquery's plan
+/// is not one of them, so `(SELECT random())` reads as repeatable while repeating
+/// it draws a second value. A deterministic subquery could be repeated, but telling
+/// the two apart means reading the plan, and re-running one is never free — so a
+/// subquery is treated as the volatile case and evaluated once, in a scope of its
+/// own.
+fn output_is_repeatable(expr: &Expr) -> bool {
+    !expr.is_volatile() && !expr_contains_subquery(expr)
+}
+
 /// The expression behind `column`, when the projection computes it and repeating it
 /// at the point of use draws the same value.
 ///
 /// An alias is looked through rather than kept: the output's name is what the
 /// enclosing `SELECT` list will carry, but a `WHERE` in the same `SELECT` cannot
 /// read that name, so it is the expression that binds there. A bare column needs
-/// no repair, and a volatile expression must not be repeated — that one is
-/// [`predicate_reads_volatile_output`]'s to report.
+/// no repair, and an expression that cannot be repeated must not be — that one is
+/// [`predicate_reads_unrepeatable_output`]'s to report.
 fn find_repeatable_projection_expr<'a>(
     projection: &'a Projection,
     column: &Column,
@@ -683,7 +696,7 @@ fn find_repeatable_projection_expr<'a>(
         Expr::Column(_) => return None,
         expr => expr,
     };
-    (!computed.is_volatile()).then_some(computed)
+    output_is_repeatable(computed).then_some(computed)
 }
 
 /// The [Projection] under `plan` and the `Filter`s stacked directly on it, if that is
@@ -715,7 +728,9 @@ fn stacked_predicates(plan: &LogicalPlan) -> Vec<&Expr> {
     predicates
 }
 
-/// Whether `predicate` reads a [Projection] output computed by a volatile expression.
+/// Whether `predicate` reads a [Projection] output that cannot be repeated at the
+/// point of use — a volatile expression, or one holding a subquery
+/// ([`output_is_repeatable`]).
 ///
 /// Such an output has no faithful form in the `SELECT` that computes it: the
 /// `WHERE` cannot read the `SELECT` list's name for it, and repeating the
@@ -725,7 +740,7 @@ fn stacked_predicates(plan: &LogicalPlan) -> Vec<&Expr> {
 /// return rows the plan filtered out. The predicate has to be applied from a
 /// `SELECT` that reads the projection's *result*, which is what
 /// [`scope_filters_over_projection`] builds.
-pub(crate) fn predicate_reads_volatile_output(
+pub(crate) fn predicate_reads_unrepeatable_output(
     predicate: &Expr,
     projection: &Projection,
 ) -> bool {
@@ -737,28 +752,30 @@ pub(crate) fn predicate_reads_volatile_output(
                     .index_of_column(column)
                     .ok()
                     .and_then(|index| projection.expr.get(index))
-                    .is_some_and(Expr::is_volatile),
+                    .is_some_and(|expr| !output_is_repeatable(expr)),
                 _ => false,
             })
         })
         .unwrap_or(false)
 }
 
-/// [`predicate_reads_volatile_output`] over every `Filter` stacked on `projection`
-/// from `plan` down. The stack is emitted as one `WHERE`, so one predicate reading a
-/// volatile output puts the whole stack above the projection's scope.
-pub(crate) fn stacked_filters_read_volatile_output(
+/// [`predicate_reads_unrepeatable_output`] over every `Filter` stacked on
+/// `projection` from `plan` down. The stack is emitted as one `WHERE`, so one
+/// predicate reading such an output puts the whole stack above the projection's
+/// scope.
+pub(crate) fn stacked_filters_read_unrepeatable_output(
     plan: &LogicalPlan,
     projection: &Projection,
 ) -> bool {
     stacked_predicates(plan)
         .into_iter()
-        .any(|predicate| predicate_reads_volatile_output(predicate, projection))
+        .any(|predicate| predicate_reads_unrepeatable_output(predicate, projection))
 }
 
 /// A stack of `Filter`s over a [Projection], re-expressed so the projection is emitted
 /// as a derived table and the predicates are applied to its outputs from the `SELECT`
-/// that reads them.
+/// that reads them — the form a predicate on an output that cannot be repeated
+/// ([`output_is_repeatable`]) has to take.
 ///
 /// The stack is folded into one `Filter` and given an identity projection above it,
 /// one bare column per output under the name the schema reports. Unparsed, that
@@ -782,23 +799,21 @@ pub(crate) fn stacked_filters_read_volatile_output(
 /// declines a predicate holding one.
 pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<LogicalPlan> {
     let predicates = stacked_predicates(plan);
-    let Some(input) = predicates.len().checked_sub(1).and_then(|_| {
-        let mut node = plan;
-        while let LogicalPlan::Filter(filter) = node {
-            node = filter.input.as_ref();
-        }
-        Some(node)
-    }) else {
+    if predicates.is_empty() {
         return internal_err!(
             "scope_filters_over_projection called on a plan that is not a Filter"
         );
-    };
+    }
+    let mut input = plan;
+    while let LogicalPlan::Filter(filter) = input {
+        input = filter.input.as_ref();
+    }
     if predicates
         .iter()
         .any(|predicate| expr_contains_subquery(predicate))
     {
         return not_impl_err!(
-            "Unparsing a filter on a volatile projection output is not supported when the predicate holds a subquery"
+            "Unparsing a filter on a projection output that cannot be repeated is not supported when the predicate holds a subquery"
         );
     }
 
@@ -807,7 +822,7 @@ pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<Logica
     for field in schema.fields() {
         if !names.insert(field.name()) {
             return not_impl_err!(
-                "Unparsing a filter on a volatile projection output is not supported when the projection has two outputs named {}",
+                "Unparsing a filter on a projection output that cannot be repeated is not supported when the projection has two outputs named {}",
                 field.name()
             );
         }

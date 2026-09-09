@@ -7784,7 +7784,7 @@ fn test_filter_on_volatile_output_refuses_two_outputs_of_one_name() -> Result<()
     let err = plan_to_sql(&plan).expect_err("two outputs named a must be refused");
     assert_snapshot!(
         err,
-        @"This feature is not implemented: Unparsing a filter on a volatile projection output is not supported when the projection has two outputs named a"
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection has two outputs named a"
     );
     Ok(())
 }
@@ -7896,14 +7896,14 @@ fn test_filter_on_volatile_output_holding_a_subquery_is_refused() -> Result<()> 
         plan_to_sql(&plan).expect_err("a predicate holding a subquery must be refused");
     assert_snapshot!(
         err,
-        @"This feature is not implemented: Unparsing a filter on a volatile projection output is not supported when the predicate holds a subquery"
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the predicate holds a subquery"
     );
     Ok(())
 }
 
 /// The refusal a dialect whose derived tables do not fix a volatile value must produce
 /// for every shape that would read one through a derived table, spelled once.
-const VOLATILE_SCOPE_REFUSAL: &str = "This feature is not implemented: Unparsing a filter on a volatile projection output is not supported for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded";
+const VOLATILE_SCOPE_REFUSAL: &str = "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded";
 
 #[test]
 fn test_filter_on_volatile_output_is_refused_where_a_derived_table_does_not_fix_it()
@@ -7915,14 +7915,10 @@ fn test_filter_on_volatile_output_is_refused_where_a_derived_table_does_not_fix_
     // alias pushdown that would otherwise decline into one.
     let unparser = Unparser::new(&SqliteDialect {});
     let projection = || -> Result<LogicalPlanBuilder> {
-        Ok(
-            table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?.project(
-                vec![
-                    col("t.a"),
-                    datafusion_functions::math::random().call(vec![]).alias("r"),
-                ],
-            )?,
-        )
+        table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?.project(vec![
+            col("t.a"),
+            datafusion_functions::math::random().call(vec![]).alias("r"),
+        ])
     };
 
     let scoped_here = projection()?.filter(col("r").gt(lit(0.5)))?.build()?;
@@ -7948,6 +7944,55 @@ fn test_filter_on_volatile_output_is_refused_where_a_derived_table_does_not_fix_
         "an alias pushdown that would decline into the scope must be refused",
     );
     assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_a_scalar_subquery_output_is_scoped() -> Result<()> {
+    // `Expr::is_volatile` does not look inside a subquery, so `(SELECT random())`
+    // reads as repeatable while repeating it draws a second value. An output
+    // holding a subquery is therefore never inlined: it takes the scope a
+    // volatile output takes, and is evaluated once.
+    let schema = volatile_output_schema();
+    let random_row = table_scan(Some("u"), &schema, Some(vec![0]))?
+        .project(vec![datafusion_functions::math::random().call(vec![])])?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            scalar_subquery(Arc::new(random_row)).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, (SELECT random() FROM u) AS r FROM t) WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_filter_under_a_projection_keeps_the_output_reference() -> Result<()>
+{
+    // With the enclosing SELECT list already taken, the aliased projection becomes
+    // a derived table exposing `s`, so the predicate keeps reading `s` — inlining
+    // `sq.a + sq.b` there would name columns the derived table hides.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")).alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .alias("sq")?
+        .project(vec![col("sq.s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT sq.s FROM (SELECT (sq.a + sq.b) AS s FROM t AS sq) AS sq WHERE (sq.s > 1)"#
+    );
     Ok(())
 }
 
