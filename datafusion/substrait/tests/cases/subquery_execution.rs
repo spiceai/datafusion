@@ -241,7 +241,7 @@ mod tests {
 
     /// A self-`INTERSECT` inside the subquery: `intersect`/`except` also
     /// requalify their sides, so the sides must keep clear of the enclosing
-    /// join's `left`/`right` as a join's do.
+    /// join's `left`/`right` as joins do.
     #[tokio::test]
     async fn intersect_inside_a_subquery_avoids_the_enclosing_left_and_right()
     -> Result<()> {
