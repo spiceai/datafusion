@@ -8043,18 +8043,29 @@ fn test_filter_on_volatile_output_is_refused_inside_a_join_input() -> Result<()>
         .project(vec![col("t.a"), random().alias("r")])?
         .filter(col("r").gt(lit(0.5)))?
         .build()?;
-    let plan = LogicalPlanBuilder::from(left)
-        .join_on(
-            table_scan(Some("u"), &schema, Some(vec![0]))?.build()?,
-            datafusion_expr::JoinType::Inner,
-            vec![col("t.a").eq(col("u.a"))],
-        )?
-        .build()?;
+    let joined = LogicalPlanBuilder::from(left).join_on(
+        table_scan(Some("u"), &schema, Some(vec![0]))?.build()?,
+        datafusion_expr::JoinType::Inner,
+        vec![col("t.a").eq(col("u.a"))],
+    )?;
 
-    let err = plan_to_sql(&plan).expect_err("a scoped join input must be refused");
+    let err = plan_to_sql(&joined.clone().build()?)
+        .expect_err("a scoped join input must be refused");
     assert_snapshot!(
         err,
         @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is an input of a join"
+    );
+
+    // An enclosing projection takes the SELECT list first, and the input projection
+    // becomes a derived table beside `u` all the same — the predicate would land in
+    // the shared `WHERE` as a bare `r`, so the refusal must not depend on the list
+    // being free.
+    let err = plan_to_sql(&joined.project(vec![col("t.a"), col("u.a")])?.build()?)
+        .expect_err("a scoped join input under a projection must be refused too");
+    assert!(
+        err.to_string()
+            .ends_with("when the projection is an input of a join"),
+        "{err}"
     );
     Ok(())
 }

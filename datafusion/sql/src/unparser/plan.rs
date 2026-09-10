@@ -1846,17 +1846,20 @@ impl Unparser<'_> {
                         // predicate reads the output through a derived table, on the
                         // same guarantee.
                         self.ensure_derived_table_fixes_volatile_outputs()?;
+                        // The predicate ends up in this SELECT's `WHERE` addressing the
+                        // derived table's output by bare name — whether the scope is
+                        // built below or an enclosing projection has already made the
+                        // projection a derived table — which is right only while that
+                        // derived table is the SELECT's sole relation. A join input sits
+                        // beside another relation: its `ON` still names the hidden one,
+                        // and a bare name can be ambiguous. Through an alias the
+                        // reference binds to the alias instead, so that shape is kept.
+                        if select.within_join_input() && filtered.alias.is_none() {
+                            return unrepeatable_output_refusal(
+                                "when the projection is an input of a join",
+                            );
+                        }
                         if !select.already_projected() && filtered.alias.is_none() {
-                            // The scope addresses the derived table's outputs by bare
-                            // name and takes this SELECT's list for them, which is right
-                            // only while the derived table is the SELECT's sole relation.
-                            // A join input sits beside another relation — its `ON` still
-                            // names the hidden one, and a bare name can be ambiguous.
-                            if select.within_join_input() {
-                                return unrepeatable_output_refusal(
-                                    "when the projection is an input of a join",
-                                );
-                            }
                             // The clauses this SELECT already carries — an ORDER BY from
                             // a sort above the stack, a WHERE from a filter above that
                             // sort — were emitted against the projection's relations,
