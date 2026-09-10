@@ -7931,6 +7931,37 @@ fn refuses_every_route_to_the_volatile_scope(
         "an alias pushdown that would decline into the scope must be refused",
     );
     assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    // The filter above the alias, under a taken SELECT list: the shape Spice's
+    // federation path presents for `SELECT * FROM (…) sq WHERE sq.r > 0.5`.
+    let above_the_alias = projection()?
+        .alias("sq")?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .project(vec![col("sq.a"), col("sq.r")])?
+        .build()?;
+    let err = unparser
+        .plan_to_sql(&above_the_alias)
+        .expect_err("a filter above the alias reading the output must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_subquery_alias_on_a_volatile_output_binds_to_the_alias()
+-> Result<()> {
+    // The same shape on a dialect whose derived tables fix the value: the alias arm
+    // derives the projection and the filter reads `sq.r` from it, evaluated once, so
+    // nothing needs rewriting — only the dialect gate above applies.
+    let plan = volatile_projection("t")?
+        .alias("sq")?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .project(vec![col("sq.a"), col("sq.r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT sq.a, sq.r FROM (SELECT sq.a, random() AS r FROM t AS sq) AS sq WHERE (sq.r > 0.5)"#
+    );
     Ok(())
 }
 

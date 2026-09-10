@@ -1837,14 +1837,16 @@ impl Unparser<'_> {
                     // output is only readable from a SELECT above the one
                     // computing it, so the projection becomes a derived table.
                     let below = projection_below_filters(plan);
-                    if let Some(projection) = below
-                        && stacked_filters_read_unrepeatable_output(plan, projection)
+                    if let Some(filtered) = &below
+                        && stacked_filters_read_unrepeatable_output(plan, filtered)
                     {
-                        // Whether the scope is built here or the projection is already
-                        // a derived table from an enclosing projection, the predicate
-                        // reads the output through one, on the same guarantee.
+                        // Whether the scope is built here, the projection is already a
+                        // derived table from an enclosing projection, or the filters
+                        // read it through a `SubqueryAlias` the alias arm derives, the
+                        // predicate reads the output through a derived table, on the
+                        // same guarantee.
                         self.ensure_derived_table_fixes_volatile_outputs()?;
-                        if !select.already_projected() {
+                        if !select.already_projected() && filtered.alias.is_none() {
                             // The scope addresses the derived table's outputs by bare
                             // name and takes this SELECT's list for them, which is right
                             // only while the derived table is the SELECT's sole relation.
@@ -1863,7 +1865,7 @@ impl Unparser<'_> {
                             // itself. A clause holding a subquery is left alone by the
                             // visitors, and would keep naming the hidden relation: refused.
                             let hidden_qualifiers =
-                                enclosed_qualifiers(&projection.schema);
+                                enclosed_qualifiers(&filtered.projection.schema);
                             let mut repoint = |expr: &mut ast::Expr| {
                                 if let ast::Expr::CompoundIdentifier(idents) = expr {
                                     requalify_column_onto_derived_table(
@@ -1889,10 +1891,15 @@ impl Unparser<'_> {
                             );
                         }
                     }
-                    let predicate = match below.filter(|_| !select.already_projected()) {
-                        Some(projection) => unproject_projection_exprs(
+                    // Inlined only where the projection folds into this SELECT: not
+                    // under a taken list, and not through an alias, whose arm derives
+                    // the projection and lets the reference bind to the alias.
+                    let predicate = match below.as_ref().filter(|filtered| {
+                        !select.already_projected() && filtered.alias.is_none()
+                    }) {
+                        Some(filtered) => unproject_projection_exprs(
                             filter.predicate.clone(),
-                            projection,
+                            filtered.projection,
                         )?,
                         None => filter.predicate.clone(),
                     };
@@ -3331,10 +3338,10 @@ impl Unparser<'_> {
                     // a derived table, where the predicate reads the output by
                     // name from the SELECT above it.
                     let predicate = match projection_below_filters(&plan) {
-                        Some(projection)
+                        Some(filtered)
                             if predicate_reads_unrepeatable_output(
                                 &filter.predicate,
-                                projection,
+                                &filtered,
                             ) =>
                         {
                             // Declined, and the derived path the caller takes re-enters
@@ -3346,10 +3353,10 @@ impl Unparser<'_> {
                         // exposing the output under its own name, which the
                         // requalified reference binds to; the inlined expression's
                         // columns would be hidden inside it.
-                        Some(projection) if !already_projected => {
+                        Some(filtered) if !already_projected => {
                             unproject_projection_exprs(
                                 filter.predicate.clone(),
-                                projection,
+                                filtered.projection,
                             )?
                         }
                         _ => filter.predicate.clone(),
@@ -3715,8 +3722,8 @@ impl Unparser<'_> {
         // whose filter reads an output that cannot be repeated would move its
         // projection into a derived table, and the predicates appended below
         // would then name the relation that table hides.
-        if let Some(projection) = projection_below_filters(right_plan)
-            && stacked_filters_read_unrepeatable_output(right_plan, projection)
+        if let Some(filtered) = projection_below_filters(right_plan)
+            && stacked_filters_read_unrepeatable_output(right_plan, &filtered)
         {
             return unrepeatable_output_refusal(
                 "when the projection is the build side of an EXISTS-style join",

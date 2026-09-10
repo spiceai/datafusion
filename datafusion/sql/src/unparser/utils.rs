@@ -33,7 +33,7 @@ use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_expr::type_coercion::functions::fields_with_udf;
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, Filter, LogicalPlan, LogicalPlanBuilder,
-    Projection, ReturnFieldArgs, SortExpr, Unnest, Window, expr,
+    Projection, ReturnFieldArgs, SortExpr, SubqueryAlias, Unnest, Window, expr,
     expr::{Cast, TryCast},
     utils::{conjunction, grouping_set_to_exprlist},
 };
@@ -659,7 +659,11 @@ fn find_repeatable_projection_expr<'a>(
     projection: &'a Projection,
     column: &Column,
 ) -> Option<&'a Expr> {
-    let output = projection_output(projection, column)?;
+    let output = FilteredProjection {
+        projection,
+        alias: None,
+    }
+    .output(column)?;
     // A bare column needs no repair: the relation carries its name. A renamed one
     // is an alias like any other, and the column it renames is what binds.
     if matches!(output, Expr::Column(_)) {
@@ -685,21 +689,49 @@ fn filter_stack(plan: &LogicalPlan) -> (Vec<&Filter>, &LogicalPlan) {
     (filters, node)
 }
 
-/// The [Projection] under `plan`'s stack of `Filter`s, if that is what `plan` is.
-pub(crate) fn projection_below_filters(plan: &LogicalPlan) -> Option<&Projection> {
-    match filter_stack(plan).1 {
-        LogicalPlan::Projection(projection) => Some(projection),
-        _ => None,
+/// The [Projection] under a stack of `Filter`s, and the alias the filters read its
+/// outputs through when a `SubqueryAlias` sits between them.
+///
+/// `Filter → SubqueryAlias → Projection` is the shape a filter above a named
+/// subquery keeps while the optimizer has not pushed it below the alias, and the
+/// one Spice's federation path presents for `SELECT * FROM (…) sq WHERE sq.r > …`.
+/// The outputs are then named with the alias's qualifier, so a reference is looked
+/// up in the alias's schema — same positions, different names.
+pub(crate) struct FilteredProjection<'a> {
+    pub(crate) projection: &'a Projection,
+    pub(crate) alias: Option<&'a SubqueryAlias>,
+}
+
+impl<'a> FilteredProjection<'a> {
+    /// The expression the projection computes for the output `column` names.
+    fn output(&self, column: &Column) -> Option<&'a Expr> {
+        let schema = self
+            .alias
+            .map_or(&self.projection.schema, |alias| &alias.schema);
+        let index = schema.index_of_column(column).ok()?;
+        self.projection.expr.get(index)
     }
 }
 
-/// The expression `projection` computes the output `column` names.
-fn projection_output<'a>(
-    projection: &'a Projection,
-    column: &Column,
-) -> Option<&'a Expr> {
-    let index = projection.schema.index_of_column(column).ok()?;
-    projection.expr.get(index)
+/// The [Projection] under `plan`'s stack of `Filter`s, if that is what `plan` is —
+/// directly, or through one `SubqueryAlias`.
+pub(crate) fn projection_below_filters(
+    plan: &LogicalPlan,
+) -> Option<FilteredProjection<'_>> {
+    match filter_stack(plan).1 {
+        LogicalPlan::Projection(projection) => Some(FilteredProjection {
+            projection,
+            alias: None,
+        }),
+        LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
+            LogicalPlan::Projection(projection) => Some(FilteredProjection {
+                projection,
+                alias: Some(alias),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// The refusal every shape that cannot scope such an output reports; `detail` says
@@ -735,12 +767,13 @@ pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> HashSet<String> {
 /// [`scope_filters_over_projection`] builds.
 pub(crate) fn predicate_reads_unrepeatable_output(
     predicate: &Expr,
-    projection: &Projection,
+    projection: &FilteredProjection<'_>,
 ) -> bool {
     predicate
         .exists(|sub_expr| {
             Ok(match sub_expr {
-                Expr::Column(column) => projection_output(projection, column)
+                Expr::Column(column) => projection
+                    .output(column)
                     .is_some_and(|expr| !output_is_repeatable(expr)),
                 _ => false,
             })
@@ -754,7 +787,7 @@ pub(crate) fn predicate_reads_unrepeatable_output(
 /// scope.
 pub(crate) fn stacked_filters_read_unrepeatable_output(
     plan: &LogicalPlan,
-    projection: &Projection,
+    projection: &FilteredProjection<'_>,
 ) -> bool {
     filter_stack(plan)
         .0
