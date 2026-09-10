@@ -28,18 +28,19 @@ use super::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
         remove_dangling_identifiers, requalify_column_onto_derived_table,
         rewrite_plan_for_sort_on_non_projected_fields,
-        subquery_alias_inner_query_and_columns, unqualify_column_into_derived_table,
+        subquery_alias_inner_query_and_columns,
     },
     utils::{
-        expr_contains_subquery, find_agg_node_within_select,
-        find_projection_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, name_derived_scope_outputs, name_scope_outputs,
-        partition_subquery_filters, predicate_reads_unrepeatable_output,
-        projection_below_filters, scope_filters_over_projection,
-        select_list_wraps_a_grouping_expr, stacked_filters_read_unrepeatable_output,
+        enclosed_qualifiers, expr_contains_subquery, find_agg_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
+        predicate_reads_unrepeatable_output, projection_below_filters,
+        scope_filters_over_projection, select_list_wraps_a_grouping_expr,
+        stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
+        unrepeatable_output_refusal,
     },
 };
 use crate::unparser::extension_unparser::{
@@ -960,16 +961,14 @@ impl Unparser<'_> {
         // reference still qualified by a relation the derived table encloses binds
         // to nothing. DataFusion re-plans such SQL, but a stricter remote binder
         // rejects it, which is what breaks a federated pushdown.
-        let derived_qualifiers: HashSet<String> = p
-            .input
-            .schema()
-            .iter()
-            .filter_map(|(qualifier, _)| qualifier)
-            .flat_map(|qualifier| [qualifier.to_string(), qualifier.table().to_string()])
-            .collect();
+        let derived_qualifiers = enclosed_qualifiers(p.input.schema());
         select.visit_expressions_in_clauses_mut(|expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
-                requalify_column_onto_derived_table(idents, &derived_qualifiers, &alias);
+                requalify_column_onto_derived_table(
+                    idents,
+                    &derived_qualifiers,
+                    Some(&alias),
+                );
             }
         });
 
@@ -1053,9 +1052,24 @@ impl Unparser<'_> {
         if self.dialect.derived_table_evaluates_volatile_outputs_once() {
             return Ok(());
         }
-        not_impl_err!(
-            "Unparsing a filter on a projection output that cannot be repeated is not supported for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded"
+        unrepeatable_output_refusal(
+            "for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded",
         )
+    }
+
+    /// Unparses one input of a join into the shared `select`, marked as such for
+    /// the duration — see [`SelectBuilder::within_join_input`].
+    fn walk_join_input(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        select.enter_join_input();
+        let walked = self.select_to_sql_recursively(plan, query, select, relation);
+        select.exit_join_input();
+        walked
     }
 
     fn derive_with_dialect_alias(
@@ -1822,83 +1836,60 @@ impl Unparser<'_> {
                     // it is volatile, when repeating it draws a second value. That
                     // output is only readable from a SELECT above the one
                     // computing it, so the projection becomes a derived table.
-                    let projection = find_projection_node_within_select(
-                        plan,
-                        select.already_projected(),
-                    );
-                    if let Some(projection) = projection
+                    let below = projection_below_filters(plan);
+                    if let Some(projection) = below
                         && stacked_filters_read_unrepeatable_output(plan, projection)
                     {
+                        // Whether the scope is built here or the projection is already
+                        // a derived table from an enclosing projection, the predicate
+                        // reads the output through one, on the same guarantee.
                         self.ensure_derived_table_fixes_volatile_outputs()?;
-                        // The scope addresses the derived table's outputs by bare name
-                        // and takes this SELECT's list for them, which is right only
-                        // while the derived table is the SELECT's sole relation. A
-                        // join input sits beside another relation — its `ON` still
-                        // names the hidden one, and a bare name can be ambiguous.
-                        if select.within_join_input() {
-                            return not_impl_err!(
-                                "Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is an input of a join"
-                            );
-                        }
-                        // The clause rewrite below skips an expression holding a
-                        // subquery, whose correlated references cannot be told from
-                        // ones to this SELECT's relations. Such a clause would keep
-                        // naming the hidden relation, so it is refused instead.
-                        if select.clauses_hold_a_subquery()
-                            || query
-                                .as_ref()
-                                .is_some_and(|query| query.order_by_holds_a_subquery())
-                        {
-                            return not_impl_err!(
-                                "Unparsing a filter on a projection output that cannot be repeated is not supported when a clause above it holds a subquery"
-                            );
-                        }
-                        // The clauses this SELECT already carries — an ORDER BY from a
-                        // sort above the stack, a WHERE from a filter above that sort —
-                        // were emitted against the projection's relations, which the
-                        // derived table is about to hide. They read its outputs by
-                        // name now, like the predicates the scope rewrites itself.
-                        let hidden_qualifiers: HashSet<String> = projection
-                            .schema
-                            .iter()
-                            .filter_map(|(qualifier, _)| qualifier)
-                            .flat_map(|qualifier| {
-                                [qualifier.to_string(), qualifier.table().to_string()]
-                            })
-                            .collect();
-                        select.visit_expressions_in_clauses_mut(|expr| {
-                            if let ast::Expr::CompoundIdentifier(idents) = expr {
-                                unqualify_column_into_derived_table(
-                                    idents,
-                                    &hidden_qualifiers,
+                        if !select.already_projected() {
+                            // The scope addresses the derived table's outputs by bare
+                            // name and takes this SELECT's list for them, which is right
+                            // only while the derived table is the SELECT's sole relation.
+                            // A join input sits beside another relation — its `ON` still
+                            // names the hidden one, and a bare name can be ambiguous.
+                            if select.within_join_input() {
+                                return unrepeatable_output_refusal(
+                                    "when the projection is an input of a join",
                                 );
                             }
-                        });
-                        if let Some(query) = query.as_mut() {
-                            query.visit_order_by_mut(|expr| {
+                            // The clauses this SELECT already carries — an ORDER BY from
+                            // a sort above the stack, a WHERE from a filter above that
+                            // sort — were emitted against the projection's relations,
+                            // which the derived table is about to hide. They read its
+                            // outputs by name now, like the predicates the scope rewrites
+                            // itself. A clause holding a subquery is left alone by the
+                            // visitors, and would keep naming the hidden relation: refused.
+                            let hidden_qualifiers =
+                                enclosed_qualifiers(&projection.schema);
+                            let mut repoint = |expr: &mut ast::Expr| {
                                 if let ast::Expr::CompoundIdentifier(idents) = expr {
-                                    unqualify_column_into_derived_table(
+                                    requalify_column_onto_derived_table(
                                         idents,
                                         &hidden_qualifiers,
+                                        None,
                                     );
                                 }
-                            });
+                            };
+                            let mut skipped =
+                                select.visit_expressions_in_clauses_mut(&mut repoint);
+                            if let Some(query) = query.as_mut() {
+                                skipped |= query.visit_order_by_mut(&mut repoint);
+                            }
+                            if skipped {
+                                return unrepeatable_output_refusal(
+                                    "when a clause above it holds a subquery",
+                                );
+                            }
+                            let scoped = scope_filters_over_projection(plan)?;
+                            return self.select_to_sql_recursively(
+                                &scoped, query, select, relation,
+                            );
                         }
-                        let scoped = scope_filters_over_projection(plan)?;
-                        return self
-                            .select_to_sql_recursively(&scoped, query, select, relation);
                     }
-                    // With the list already taken, the projection below becomes a
-                    // derived table and the predicate reads its outputs by name — the
-                    // scope built above, met on the way down, or one an enclosing
-                    // projection produced. Either way it rests on the same guarantee.
-                    if select.already_projected()
-                        && let Some(projection) = projection_below_filters(plan)
-                        && stacked_filters_read_unrepeatable_output(plan, projection)
-                    {
-                        self.ensure_derived_table_fixes_volatile_outputs()?;
-                    }
-                    let predicate = match projection {
+                    let predicate = match below.filter(|_| !select.already_projected()) {
                         Some(projection) => unproject_projection_exprs(
                             filter.predicate.clone(),
                             projection,
@@ -2073,20 +2064,13 @@ impl Unparser<'_> {
                     // reference still qualified by a relation the derived table encloses
                     // binds to nothing. DataFusion re-plans such SQL, but a stricter remote
                     // binder rejects it, which is what breaks a federated pushdown.
-                    let derived_qualifiers: HashSet<String> = plan
-                        .schema()
-                        .iter()
-                        .filter_map(|(qualifier, _)| qualifier)
-                        .flat_map(|qualifier| {
-                            [qualifier.to_string(), qualifier.table().to_string()]
-                        })
-                        .collect();
+                    let derived_qualifiers = enclosed_qualifiers(plan.schema());
                     select.visit_expressions_in_clauses_mut(|expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
                             requalify_column_onto_derived_table(
                                 idents,
                                 &derived_qualifiers,
-                                &alias,
+                                Some(&alias),
                             );
                         }
                     });
@@ -2240,15 +2224,7 @@ impl Unparser<'_> {
                     None
                 };
 
-                select.enter_join_input();
-                let walked_left = self.select_to_sql_recursively(
-                    left_plan.as_ref(),
-                    query,
-                    select,
-                    relation,
-                );
-                select.exit_join_input();
-                walked_left?;
+                self.walk_join_input(left_plan.as_ref(), query, select, relation)?;
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
@@ -2335,15 +2311,12 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
-                    select.enter_join_input();
-                    let walked_right = self.select_to_sql_recursively(
+                    self.walk_join_input(
                         right_plan.as_ref(),
                         query,
                         select,
                         &mut right_relation,
-                    );
-                    select.exit_join_input();
-                    walked_right?;
+                    )?;
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full
                             && !right_scan_filters.is_empty())
@@ -3364,7 +3337,8 @@ impl Unparser<'_> {
                                 projection,
                             ) =>
                         {
-                            self.ensure_derived_table_fixes_volatile_outputs()?;
+                            // Declined, and the derived path the caller takes re-enters
+                            // the Filter arm, which applies the dialect gate.
                             return Ok(None);
                         }
                         // Inlined only where the projection folds into this SELECT.
@@ -3744,8 +3718,8 @@ impl Unparser<'_> {
         if let Some(projection) = projection_below_filters(right_plan)
             && stacked_filters_read_unrepeatable_output(right_plan, projection)
         {
-            return not_impl_err!(
-                "Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is the build side of an EXISTS-style join"
+            return unrepeatable_output_refusal(
+                "when the projection is the build side of an EXISTS-style join",
             );
         }
 

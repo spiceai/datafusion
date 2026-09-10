@@ -84,34 +84,21 @@ impl QueryBuilder {
     /// included, so a caller that replaces the relation the `SELECT` reads — unparsing
     /// a sub-plan as a derived table — can re-point the references that addressed the
     /// old one. The `SELECT`-level counterpart is
-    /// [`SelectBuilder::visit_expressions_in_clauses_mut`], and an expression holding
-    /// a subquery is skipped whole for the reason given there.
-    /// Whether any `ORDER BY` expression holds a subquery, which
-    /// [`Self::visit_order_by_mut`] would leave untouched.
-    pub fn order_by_holds_a_subquery(&self) -> bool {
-        match self.order_by_kind.as_ref() {
-            Some(OrderByKind::Expressions(sorts)) => {
-                sorts.iter().any(|sort| contains_subquery(&sort.expr))
-            }
-            _ => false,
-        }
-    }
-    pub fn visit_order_by_mut<F>(&mut self, mut f: F)
+    /// [`SelectBuilder::visit_expressions_in_clauses_mut`]; an expression holding a
+    /// subquery is skipped whole for the reason given there, and the return says
+    /// whether any was.
+    pub fn visit_order_by_mut<F>(&mut self, mut f: F) -> bool
     where
         F: FnMut(&mut ast::Expr),
     {
         let Some(OrderByKind::Expressions(sorts)) = self.order_by_kind.as_mut() else {
-            return;
+            return false;
         };
+        let mut skipped = false;
         for sort in sorts {
-            if contains_subquery(&sort.expr) {
-                continue;
-            }
-            let _ = visit_expressions_mut(&mut sort.expr, |expr| {
-                f(expr);
-                ControlFlow::<()>::Continue(())
-            });
+            skipped |= visit_unless_subquery(&mut sort.expr, &mut f);
         }
+        skipped
     }
     pub fn limit(&mut self, value: Option<ast::Expr>) -> &mut Self {
         self.limit = value;
@@ -205,6 +192,22 @@ impl Default for QueryBuilder {
     fn default() -> Self {
         Self::create_empty()
     }
+}
+
+/// Applies `f` to `expr` and every expression nested in it, unless `expr` holds a
+/// subquery — then leaves it untouched and returns `true`.
+fn visit_unless_subquery(
+    expr: &mut ast::Expr,
+    f: &mut impl FnMut(&mut ast::Expr),
+) -> bool {
+    if contains_subquery(expr) {
+        return true;
+    }
+    let _ = visit_expressions_mut(expr, |expr| {
+        f(expr);
+        ControlFlow::<()>::Continue(())
+    });
+    false
 }
 
 /// Returns true if `expr` holds a subquery anywhere within it.
@@ -393,34 +396,6 @@ impl SelectBuilder {
     /// outputs by bare name, taking the SELECT list for itself — is wrong here.
     pub fn within_join_input(&self) -> bool {
         self.join_inputs_in_progress > 0
-    }
-
-    /// Whether any expression this SELECT already carries holds a subquery.
-    /// [`Self::visit_expressions_in_clauses_mut`] leaves such an expression untouched,
-    /// so a rewrite that has to reach every reference asks this first.
-    pub fn clauses_hold_a_subquery(&self) -> bool {
-        let projection =
-            self.projection
-                .iter()
-                .flatten()
-                .filter_map(|item| match item {
-                    ast::SelectItem::UnnamedExpr(expr)
-                    | ast::SelectItem::ExprWithAlias { expr, .. }
-                    | ast::SelectItem::ExprWithAliases { expr, .. } => Some(expr),
-                    ast::SelectItem::QualifiedWildcard(..)
-                    | ast::SelectItem::Wildcard(_) => None,
-                });
-        let group_by = match self.group_by.as_ref() {
-            Some(ast::GroupByExpr::Expressions(exprs, _)) => exprs.iter().collect(),
-            _ => Vec::new(),
-        };
-        projection
-            .chain(self.selection.iter())
-            .chain(self.having.iter())
-            .chain(self.qualify.iter())
-            .chain(group_by)
-            .chain(self.sort_by.iter().map(|sort| &sort.expr))
-            .any(contains_subquery)
     }
 
     /// Register a table alias as pointing to a LATERAL FLATTEN relation.
@@ -616,20 +591,16 @@ impl SelectBuilder {
     /// references an enclosing query's relation, which stays in scope and is
     /// indistinguishable by name from a reference to this SELECT's own relation, so
     /// rewriting inside one would silently change which column the subquery reads. That
-    /// leaves such an expression untouched rather than risk rewriting it wrongly.
-    pub fn visit_expressions_in_clauses_mut<F>(&mut self, mut f: F)
+    /// leaves such an expression untouched rather than risk rewriting it wrongly — and is
+    /// reported: the return is `true` when at least one expression was skipped, for a
+    /// caller whose rewrite has to reach every reference to be sound.
+    pub fn visit_expressions_in_clauses_mut<F>(&mut self, mut f: F) -> bool
     where
         F: FnMut(&mut ast::Expr),
     {
-        let mut visit = |expr: &mut ast::Expr| {
-            if contains_subquery(expr) {
-                return;
-            }
-            let _ = visit_expressions_mut(expr, |expr| {
-                f(expr);
-                ControlFlow::<()>::Continue(())
-            });
-        };
+        let mut skipped = false;
+        let mut visit =
+            |expr: &mut ast::Expr| skipped |= visit_unless_subquery(expr, &mut f);
 
         for item in self.projection.iter_mut().flatten() {
             match item {
@@ -656,6 +627,7 @@ impl SelectBuilder {
         for sort in &mut self.sort_by {
             visit(&mut sort.expr);
         }
+        skipped
     }
 
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {

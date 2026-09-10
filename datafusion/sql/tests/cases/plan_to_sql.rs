@@ -7664,11 +7664,16 @@ fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
     Ok(())
 }
 
-/// The schema the volatile-output cases below project from: one column beside
-/// the volatile expression, so the tests can show what happens to a reference
-/// that is *not* the volatile one.
-fn volatile_output_schema() -> Schema {
-    Schema::new(vec![Field::new("a", DataType::Int32, false)])
+/// The volatile call the cases below project.
+fn random() -> Expr {
+    datafusion_functions::math::random().call(vec![])
+}
+
+/// `Projection(<table>.a, random() AS r)` over a one-column scan of `table`: the
+/// projection whose output `r` the cases below filter on.
+fn volatile_projection(table: &str) -> Result<LogicalPlanBuilder> {
+    table_scan(Some(table), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col(format!("{table}.a")), random().alias("r")])
 }
 
 #[test]
@@ -7679,8 +7684,8 @@ fn test_filter_on_unnamed_volatile_projection_output_is_scoped() -> Result<()> {
     // value the `SELECT` list never showed. The projection therefore becomes a
     // derived table, whose output the predicate reads by name from the `SELECT`
     // above it: one evaluation, and a reference that binds.
-    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
-        .project(vec![datafusion_functions::math::random().call(vec![])])?
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![random()])?
         .filter(col("random()").gt(lit(0.5)))?
         .build()?;
 
@@ -7699,11 +7704,7 @@ fn test_filter_on_aliased_volatile_projection_output_is_scoped() -> Result<()> {
     // projection: emitted beside the projection as `WHERE (r > 0.5)`, PostgreSQL
     // rejects the alias and SQLite and DuckDB evaluate `random()` again for it,
     // returning rows whose `r` the predicate never saw.
-    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+    let plan = volatile_projection("t")?
         .filter(col("r").gt(lit(0.5)))?
         .build()?;
 
@@ -7718,12 +7719,9 @@ fn test_filter_on_aliased_volatile_projection_output_is_scoped() -> Result<()> {
 fn test_filter_on_volatile_projection_output_over_a_limit_is_scoped() -> Result<()> {
     // The bound below the projection keeps its own scope, and the projection
     // still gets the one the predicate needs above it.
-    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
         .limit(0, Some(5))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+        .project(vec![col("t.a"), random().alias("r")])?
         .filter(col("r").gt(lit(0.5)))?
         .build()?;
 
@@ -7741,11 +7739,7 @@ fn test_filter_on_volatile_output_reads_its_other_references_from_the_scope() ->
     // reference still qualified by the relation inside it — `t.a` — would bind to
     // nothing. It is unqualified along with the volatile one. An outer reference
     // names an enclosing query rather than this one, and keeps its qualifier.
-    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+    let plan = volatile_projection("t")?
         .filter(
             col("t.a")
                 .gt(lit(1))
@@ -7766,18 +7760,14 @@ fn test_filter_on_volatile_output_refuses_two_outputs_of_one_name() -> Result<()
     // Two outputs that differ only by qualifier cannot be told apart once the
     // derived table has replaced the qualifiers, so the shape is refused rather
     // than emitted with an ambiguous reference.
-    let schema = volatile_output_schema();
+    let schema = int32_schema(&["a"]);
     let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
         .join_on(
             table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?,
             datafusion_expr::JoinType::Inner,
             vec![col("t1.a").eq(col("t2.a"))],
         )?
-        .project(vec![
-            col("t1.a"),
-            col("t2.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+        .project(vec![col("t1.a"), col("t2.a"), random().alias("r")])?
         .filter(col("r").gt(lit(0.5)))?
         .build()?;
 
@@ -7796,11 +7786,7 @@ fn test_subquery_alias_filter_on_volatile_output_derives_the_alias() -> Result<(
     // requalify the reference as `sq.r`, a column no relation exposes. A volatile
     // output declines the pushdown, so the aliased plan is emitted as the derived
     // table it names, with the predicate reading `r` from outside it.
-    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+    let plan = volatile_projection("t")?
         .filter(col("r").gt(lit(0.5)))?
         .alias("sq")?
         .build()?;
@@ -7840,11 +7826,7 @@ fn stacked_filters_over_volatile_projection(
     first: Expr,
     second: Expr,
 ) -> Result<LogicalPlan> {
-    table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+    volatile_projection("t")?
         .filter(first)?
         .filter(second)?
         .build()
@@ -7882,13 +7864,10 @@ fn test_filter_on_volatile_output_holding_a_subquery_is_refused() -> Result<()> 
     // A subquery in the predicate may correlate against the relation the derived
     // table would hide, and its outer references cannot be told from ones that
     // reach further out, so the shape is refused rather than rebound blindly.
-    let schema = volatile_output_schema();
+    let schema = int32_schema(&["a"]);
     let subquery = Arc::new(table_scan(Some("u"), &schema, Some(vec![0]))?.build()?);
     let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+        .project(vec![col("t.a"), random().alias("r")])?
         .filter(col("r").gt(lit(0.5)).and(exists(subquery)))?
         .build()?;
 
@@ -7927,12 +7906,7 @@ fn refuses_every_route_to_the_volatile_scope(
     dialect: &dyn UnparserDialect,
 ) -> Result<()> {
     let unparser = Unparser::new(dialect);
-    let projection = || -> Result<LogicalPlanBuilder> {
-        table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?.project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])
-    };
+    let projection = || volatile_projection("t");
 
     let scoped_here = projection()?.filter(col("r").gt(lit(0.5)))?.build()?;
     let err = unparser
@@ -7966,9 +7940,9 @@ fn test_filter_on_a_scalar_subquery_output_is_scoped() -> Result<()> {
     // reads as repeatable while repeating it draws a second value. An output
     // holding a subquery is therefore never inlined: it takes the scope a
     // volatile output takes, and is evaluated once.
-    let schema = volatile_output_schema();
+    let schema = int32_schema(&["a"]);
     let random_row = table_scan(Some("u"), &schema, Some(vec![0]))?
-        .project(vec![datafusion_functions::math::random().call(vec![])])?
+        .project(vec![random()])?
         .build()?;
     let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
         .project(vec![
@@ -8015,11 +7989,7 @@ fn test_clauses_above_a_scoped_filter_read_the_derived_outputs() -> Result<()> {
     // and a filter above that sort has put `t.a > 1` in the WHERE, before the
     // stack below them is found to need the scope. Both were written against `t`,
     // which the derived table now hides, so both are re-pointed at its outputs.
-    let plan = table_scan(Some("t"), &volatile_output_schema(), Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+    let plan = volatile_projection("t")?
         .filter(col("r").gt(lit(0.5)))?
         .sort(vec![col("t.a").add(lit(1)).sort(true, false)])?
         .filter(col("t.a").gt(lit(1)))?
@@ -8037,12 +8007,9 @@ fn test_filter_on_volatile_output_is_refused_inside_a_join_input() -> Result<()>
     // A join walks both inputs into one SELECT, so the derived table the scope
     // builds would sit beside `u`: the `ON` would still name the hidden `t`, and
     // `a` is exposed by both sides. Refused rather than emitted ambiguous.
-    let schema = volatile_output_schema();
+    let schema = int32_schema(&["a"]);
     let left = table_scan(Some("t"), &schema, Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+        .project(vec![col("t.a"), random().alias("r")])?
         .filter(col("r").gt(lit(0.5)))?
         .build()?;
     let plan = LogicalPlanBuilder::from(left)
@@ -8068,13 +8035,10 @@ fn test_filter_on_volatile_output_is_refused_under_a_clause_holding_a_subquery()
     // WHERE. The rewrite that re-points clauses at the derived table skips an
     // expression holding a subquery, so `t.a` there would keep naming the hidden
     // relation — refused, rather than emitted unbindable.
-    let schema = volatile_output_schema();
+    let schema = int32_schema(&["a"]);
     let subquery = Arc::new(table_scan(Some("u"), &schema, Some(vec![0]))?.build()?);
     let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
-        .project(vec![
-            col("t.a"),
-            datafusion_functions::math::random().call(vec![]).alias("r"),
-        ])?
+        .project(vec![col("t.a"), random().alias("r")])?
         .filter(col("r").gt(lit(0.5)))?
         .sort(vec![col("t.a").sort(true, false)])?
         .filter(col("t.a").gt(lit(1)).and(exists(subquery)))?
@@ -8095,16 +8059,13 @@ fn test_filter_on_volatile_output_is_refused_on_an_exists_build_side() -> Result
     // `t.a = u.a` is appended after it, so a scoped build side would leave that
     // predicate naming the `u` the derived table hides. Refused, for semi and
     // anti joins alike.
-    let schema = volatile_output_schema();
+    let schema = int32_schema(&["a"]);
     for join_type in [
         datafusion_expr::JoinType::LeftSemi,
         datafusion_expr::JoinType::LeftAnti,
     ] {
         let build = table_scan(Some("u"), &schema, Some(vec![0]))?
-            .project(vec![
-                col("u.a"),
-                datafusion_functions::math::random().call(vec![]).alias("r"),
-            ])?
+            .project(vec![col("u.a"), random().alias("r")])?
             .filter(col("r").gt(lit(0.5)))?
             .build()?;
         let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
@@ -8217,7 +8178,7 @@ fn test_derived_volatile_output_is_named_and_evaluated_once() -> Result<()> {
     // case that inlining cannot.
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
-        .project(vec![datafusion_functions::math::random().call(vec![])])?
+        .project(vec![random()])?
         .filter(col("random()").gt(lit(0.5)))?
         .project(vec![col("random()")])?
         .build()?;
