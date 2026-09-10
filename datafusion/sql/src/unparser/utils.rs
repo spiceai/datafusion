@@ -18,8 +18,10 @@
 use std::{cmp::Ordering, collections::HashSet, sync::Arc, vec};
 
 use super::{
-    Unparser, dialect::CharacterLengthStyle, dialect::DateFieldExtractStyle,
-    rewrite::TableAliasRewriter,
+    Unparser,
+    dialect::CharacterLengthStyle,
+    dialect::DateFieldExtractStyle,
+    rewrite::{TableAliasRewriter, unqualify_columns},
 };
 use arrow::datatypes::DataType;
 use datafusion_common::{
@@ -30,10 +32,10 @@ use datafusion_common::{
 use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_expr::type_coercion::functions::fields_with_udf;
 use datafusion_expr::{
-    Aggregate, Distinct, DistinctOn, Expr, LogicalPlan, LogicalPlanBuilder, Projection,
-    ReturnFieldArgs, SortExpr, Unnest, Window, expr,
+    Aggregate, Distinct, DistinctOn, Expr, Filter, LogicalPlan, LogicalPlanBuilder,
+    Projection, ReturnFieldArgs, SortExpr, SubqueryAlias, Unnest, Window, expr,
     expr::{Cast, TryCast},
-    utils::grouping_set_to_exprlist,
+    utils::{conjunction, grouping_set_to_exprlist},
 };
 
 use indexmap::IndexSet;
@@ -369,37 +371,6 @@ pub(crate) fn unproject_window_exprs(expr: Expr, windows: &[&Window]) -> Result<
     .map(|e| e.data)
 }
 
-/// Recursively searches children of [LogicalPlan] for the [Projection] that will be
-/// flattened into the same `SELECT` as `plan`, if there is one.
-///
-/// Stops at a node that opens a scope of its own: the columns of a relation, a
-/// subquery, or a derived table are addressable by name from outside, so a
-/// reference to one of them already binds.
-pub(crate) fn find_projection_node_within_select(
-    plan: &LogicalPlan,
-    already_projected: bool,
-) -> Option<&Projection> {
-    // A projection reached once the `SELECT` list is taken becomes a derived
-    // table rather than part of this statement, so it is not what a predicate
-    // here would be referring to.
-    if already_projected {
-        return None;
-    }
-    let input = plan.inputs();
-    if input.len() > 1 {
-        return None;
-    }
-    let input = input.first()?;
-    match input {
-        LogicalPlan::Projection(projection) => Some(projection),
-        // Stacked filters collapse into one `WHERE`, so keep looking through them.
-        LogicalPlan::Filter(_) => {
-            find_projection_node_within_select(input, already_projected)
-        }
-        _ => None,
-    }
-}
-
 /// Names the outputs a derived table exposes, where the [Projection] that supplies
 /// them leaves them unnamed.
 ///
@@ -437,9 +408,9 @@ pub(crate) fn name_derived_scope_outputs(
 /// list, rebuilding the nodes walked through on the way down to it.
 ///
 /// The nodes walked through are the ones that carry the projection's output names
-/// out to the derived table unchanged. [`find_projection_node_within_select`] walks
-/// the same way for a different purpose and stops at a narrower set, because a
-/// predicate can only reach a projection that stays in its own `SELECT`.
+/// out to the derived table unchanged. [`projection_below_filters`] walks the same
+/// way for a different purpose and stops at a narrower set, because a predicate can
+/// only reach a projection that stays in its own `SELECT`.
 fn name_scope_projection_outputs(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
     // Each node is rebuilt by replacing its input and leaving every other field as
     // it stands. `LogicalPlan::with_new_exprs` is the shorter spelling and the
@@ -634,21 +605,27 @@ fn output_is_unnamed(expr: &Expr) -> bool {
     )
 }
 
-/// Replaces a reference to a [Projection] output that the projection does not name
-/// with the expression that produces it.
+/// Replaces a reference to a [Projection] output with the expression that produces
+/// it, wherever the emitted `WHERE` could not read the output by name.
 ///
-/// The unparser names such an output by its logical name — `t.a + t.b` for
-/// `Projection: t.a + t.b` — which is a description of the expression, not an
-/// identifier the emitted statement carries. Emitting it as one yields SQL that
-/// no engine can bind, so the expression is inlined at the point of use instead,
-/// which needs no name at all.
-pub(crate) fn unproject_unnamed_projection_exprs(
+/// A `WHERE` beside the projection binds against the relations the `SELECT` reads,
+/// not against its own `SELECT` list, so an output reaches it only as the
+/// expression producing it. The reference the plan holds is either the output's
+/// logical name — `t.a + t.b` for `Projection: t.a + t.b`, a description no engine
+/// carries as an identifier — or its alias, which PostgreSQL and MySQL do not let a
+/// `WHERE` see at all. Inlining the expression needs neither. A bare column is left
+/// as it is: the relation carries that name already.
+///
+/// A volatile output is not inlined, because repeating it draws a second value —
+/// see [`predicate_reads_unrepeatable_output`], which the caller asks first so that
+/// such a predicate never reaches this function.
+pub(crate) fn unproject_projection_exprs(
     expr: Expr,
     projection: &Projection,
 ) -> Result<Expr> {
     expr.transform(|sub_expr| {
         if let Expr::Column(c) = &sub_expr
-            && let Some(unprojected) = find_unnamed_projection_expr(projection, c)
+            && let Some(unprojected) = find_repeatable_projection_expr(projection, c)
         {
             return Ok(Transformed::yes(unprojected.clone()));
         }
@@ -657,26 +634,235 @@ pub(crate) fn unproject_unnamed_projection_exprs(
     .map(|e| e.data)
 }
 
-/// The expression behind `column`, but only when the projection leaves it unnamed.
+/// Whether repeating `expr` at a second point of use draws the same value.
 ///
-/// An alias names the output explicitly and a bare column carries the name it
-/// already had, so in both cases the emitted `SELECT` carries a name matching the
-/// reference and there is nothing to repair.
+/// A volatile expression does not. Neither, for this purpose, does one holding a
+/// subquery: [`Expr::is_volatile`] walks expression children, and a subquery's plan
+/// is not one of them, so `(SELECT random())` reads as repeatable while repeating
+/// it draws a second value. A deterministic subquery could be repeated, but telling
+/// the two apart means reading the plan, and re-running one is never free — so a
+/// subquery is treated as the volatile case and evaluated once, in a scope of its
+/// own.
+fn output_is_repeatable(expr: &Expr) -> bool {
+    !expr.is_volatile() && !expr_contains_subquery(expr)
+}
+
+/// The expression behind `column`, when the projection computes it and repeating it
+/// at the point of use draws the same value.
 ///
-/// A volatile expression is left alone as well. Inlining evaluates it a second
-/// time, in a clause that may see a different value than the `SELECT` list did,
-/// which would answer the query with silently wrong rows. The unbindable
-/// reference this repairs is at least a loud failure, so it is the safer of the
-/// two to leave in place. Volatility is a fact about whether inlining is safe, not
-/// about whether the output is named, so it is checked separately from
-/// [`output_is_unnamed`].
-fn find_unnamed_projection_expr<'a>(
+/// An alias is looked through rather than kept: the output's name is what the
+/// enclosing `SELECT` list will carry, but a `WHERE` in the same `SELECT` cannot
+/// read that name, so it is the expression that binds there. A bare column needs
+/// no repair, and an expression that cannot be repeated must not be — that one is
+/// [`predicate_reads_unrepeatable_output`]'s to report.
+fn find_repeatable_projection_expr<'a>(
     projection: &'a Projection,
     column: &Column,
 ) -> Option<&'a Expr> {
-    let index = projection.schema.index_of_column(column).ok()?;
-    let expr = projection.expr.get(index)?;
-    (output_is_unnamed(expr) && !expr.is_volatile()).then_some(expr)
+    let output = FilteredProjection {
+        projection,
+        alias: None,
+    }
+    .output(column)?;
+    // A bare column needs no repair: the relation carries its name. A renamed one
+    // is an alias like any other, and the column it renames is what binds.
+    if matches!(output, Expr::Column(_)) {
+        return None;
+    }
+    let computed = strip_aliases(output);
+    output_is_repeatable(computed).then_some(computed)
+}
+
+/// The `Filter`s stacked on `plan`, top first, and the node beneath them — the shape
+/// one `SELECT` folds into a single `WHERE`.
+///
+/// Stacked filters collapse into one `WHERE`, which is why the walk looks through
+/// them; a node that opens a scope of its own — a relation, a subquery, a derived
+/// table — is addressable by name from outside, so the walk stops there.
+fn filter_stack(plan: &LogicalPlan) -> (Vec<&Filter>, &LogicalPlan) {
+    let mut filters = Vec::new();
+    let mut node = plan;
+    while let LogicalPlan::Filter(filter) = node {
+        filters.push(filter);
+        node = filter.input.as_ref();
+    }
+    (filters, node)
+}
+
+/// The [Projection] under a stack of `Filter`s, and the alias the filters read its
+/// outputs through when a `SubqueryAlias` sits between them.
+///
+/// `Filter → SubqueryAlias → Projection` is the shape a filter above a named
+/// subquery keeps while the optimizer has not pushed it below the alias, and the
+/// one Spice's federation path presents for `SELECT * FROM (…) sq WHERE sq.r > …`.
+/// The outputs are then named with the alias's qualifier, so a reference is looked
+/// up in the alias's schema — same positions, different names.
+pub(crate) struct FilteredProjection<'a> {
+    pub(crate) projection: &'a Projection,
+    pub(crate) alias: Option<&'a SubqueryAlias>,
+}
+
+impl<'a> FilteredProjection<'a> {
+    /// The expression the projection computes for the output `column` names.
+    fn output(&self, column: &Column) -> Option<&'a Expr> {
+        let schema = self
+            .alias
+            .map_or(&self.projection.schema, |alias| &alias.schema);
+        let index = schema.index_of_column(column).ok()?;
+        self.projection.expr.get(index)
+    }
+}
+
+/// The [Projection] under `plan`'s stack of `Filter`s, if that is what `plan` is —
+/// directly, or through one `SubqueryAlias`.
+pub(crate) fn projection_below_filters(
+    plan: &LogicalPlan,
+) -> Option<FilteredProjection<'_>> {
+    match filter_stack(plan).1 {
+        LogicalPlan::Projection(projection) => Some(FilteredProjection {
+            projection,
+            alias: None,
+        }),
+        LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
+            LogicalPlan::Projection(projection) => Some(FilteredProjection {
+                projection,
+                alias: Some(alias),
+            }),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The refusal every shape that cannot scope such an output reports; `detail` says
+/// which shape, so the message is worded once.
+pub(crate) fn unrepeatable_output_refusal<T>(detail: &str) -> Result<T> {
+    not_impl_err!(
+        "Unparsing a filter on a projection output that cannot be repeated is not supported {detail}"
+    )
+}
+
+/// The qualifiers a derived table built from a plan with `schema` hides from the
+/// `SELECT` reading it, in both the full and the bare-table spelling a reference may
+/// carry.
+pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> HashSet<String> {
+    schema
+        .iter()
+        .filter_map(|(qualifier, _)| qualifier)
+        .flat_map(|qualifier| [qualifier.to_string(), qualifier.table().to_string()])
+        .collect()
+}
+
+/// Whether `predicate` reads a [Projection] output that cannot be repeated at the
+/// point of use — a volatile expression, or one holding a subquery
+/// ([`output_is_repeatable`]).
+///
+/// Such an output has no faithful form in the `SELECT` that computes it: the
+/// `WHERE` cannot read the `SELECT` list's name for it, and repeating the
+/// expression evaluates it a second time, so the predicate filters on a value the
+/// `SELECT` list never showed. Engines that do let a `WHERE` read a `SELECT`-list
+/// alias — SQLite and DuckDB among them — resolve it by that same repetition, and
+/// return rows the plan filtered out. The predicate has to be applied from a
+/// `SELECT` that reads the projection's *result*, which is what
+/// [`scope_filters_over_projection`] builds.
+pub(crate) fn predicate_reads_unrepeatable_output(
+    predicate: &Expr,
+    projection: &FilteredProjection<'_>,
+) -> bool {
+    predicate
+        .exists(|sub_expr| {
+            Ok(match sub_expr {
+                Expr::Column(column) => projection
+                    .output(column)
+                    .is_some_and(|expr| !output_is_repeatable(expr)),
+                _ => false,
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// [`predicate_reads_unrepeatable_output`] over every `Filter` stacked on
+/// `projection` from `plan` down. The stack is emitted as one `WHERE`, so one
+/// predicate reading such an output puts the whole stack above the projection's
+/// scope.
+pub(crate) fn stacked_filters_read_unrepeatable_output(
+    plan: &LogicalPlan,
+    projection: &FilteredProjection<'_>,
+) -> bool {
+    filter_stack(plan)
+        .0
+        .into_iter()
+        .any(|filter| predicate_reads_unrepeatable_output(&filter.predicate, projection))
+}
+
+/// A stack of `Filter`s over a [Projection], re-expressed so the projection is emitted
+/// as a derived table and the predicates are applied to its outputs from the `SELECT`
+/// that reads them — the form a predicate on an output that cannot be repeated
+/// ([`output_is_repeatable`]) has to take.
+///
+/// The stack is folded into one `Filter` and given an identity projection above it,
+/// one bare column per output under the name the schema reports. Unparsed, that
+/// projection becomes this `SELECT`'s list, the folded filter its `WHERE`, and the
+/// projection below — met with the list already taken — a derived table, whose outputs
+/// [`name_derived_scope_outputs`] names on the way in. The predicates' references then
+/// bind to those names. Every filter in the stack moves together: one left in place
+/// would be emitted into the same `WHERE` with references the derived table has
+/// hidden.
+///
+/// Every reference is unqualified, in the predicates as well as in the list: the
+/// derived table is the only relation this `SELECT` reads, so its columns are
+/// addressed by name alone, and a qualifier naming a relation *inside* the derived
+/// table would bind to nothing. Outer references are left as they are — they name
+/// an enclosing query, not this one. Two outputs of one name cannot be told apart
+/// once the qualifiers are gone, so a projection carrying any is refused.
+///
+/// A predicate holding a subquery is refused too. Its body may correlate against the
+/// relation the derived table is about to hide, and nothing here can tell such a
+/// reference from one that reaches further out — the same reason the alias pushdown
+/// declines a predicate holding one.
+pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    let (filters, input) = filter_stack(plan);
+    let Some(bottom) = filters.last() else {
+        return internal_err!(
+            "scope_filters_over_projection called on a plan that is not a Filter"
+        );
+    };
+    if filters
+        .iter()
+        .any(|filter| expr_contains_subquery(&filter.predicate))
+    {
+        return unrepeatable_output_refusal("when the predicate holds a subquery");
+    }
+
+    let schema = input.schema();
+    let mut names = HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if !names.insert(field.name()) {
+            return unrepeatable_output_refusal(&format!(
+                "when the projection has two outputs named {}",
+                field.name()
+            ));
+        }
+    }
+
+    let Some(predicate) = conjunction(
+        filters
+            .iter()
+            .map(|filter| unqualify_columns(filter.predicate.clone()))
+            .collect::<Result<Vec<_>>>()?,
+    ) else {
+        return internal_err!("a filter stack has at least one predicate");
+    };
+    // `Filter::try_new` rather than the builder, whose `filter` normalizes every
+    // column back to its qualified form and would undo the rewrite above.
+    let filtered =
+        LogicalPlan::Filter(Filter::try_new(predicate, Arc::clone(&bottom.input))?);
+    let outputs = schema
+        .fields()
+        .iter()
+        .map(|field| Expr::Column(Column::new_unqualified(field.name())))
+        .collect::<Vec<_>>();
+    Projection::try_new(outputs, Arc::new(filtered)).map(LogicalPlan::Projection)
 }
 
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {

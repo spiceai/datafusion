@@ -329,6 +329,24 @@ pub trait Dialect: Send + Sync {
         false
     }
 
+    /// Whether a derived table fixes the value of a volatile expression it computes, so
+    /// that the query selecting from it sees, for each row, the one value the derived
+    /// table's `SELECT` list produced.
+    ///
+    /// That is what the SQL standard's scoping says and what PostgreSQL and DuckDB
+    /// do: `SELECT r FROM (SELECT random() AS r FROM t) WHERE r > 0.5` returns only rows
+    /// whose `r` is above the bound. The unparser relies on it whenever a predicate
+    /// reads a volatile projection output, since the expression cannot be repeated at
+    /// the point of use without drawing a second value.
+    ///
+    /// An engine that flattens the derived table and evaluates the expression again for
+    /// the predicate — SQLite (measured) and MySQL (documented) do — answers `false` here, and the unparser
+    /// refuses the shape rather than emit SQL that returns rows the `SELECT` list never
+    /// showed.
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        true
+    }
+
     /// The division operator for the dialect
     /// Most dialect uses ` BinaryOperator::Divide` (/)
     /// But DuckDB dialect uses `BinaryOperator::DuckIntegerDivide` (//)
@@ -933,6 +951,15 @@ impl Dialect for MySqlDialect {
         false
     }
 
+    /// MySQL merges a derived table into the query selecting from it by default
+    /// (`derived_merge`), and the merged query evaluates a volatile expression once
+    /// per reference: `SELECT r FROM (SELECT RAND() AS r FROM t) AS s WHERE r > 0.5`
+    /// returns rows whose `r` fails the predicate
+    /// (<https://bugs.mysql.com/bug.php?id=106198>).
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        false
+    }
+
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
     }
@@ -1004,6 +1031,14 @@ pub struct SqliteDialect {}
 
 impl Dialect for SqliteDialect {
     fn supports_qualify(&self) -> bool {
+        false
+    }
+
+    /// SQLite flattens a derived table into the query selecting from it and evaluates a
+    /// volatile expression separately for the `SELECT` list and for a predicate reading
+    /// it: `SELECT r FROM (SELECT random() AS r FROM t) WHERE r > 0.5` returns rows whose
+    /// `r` is below the bound (measured on SQLite 3.51: 492 of 990 returned rows).
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
         false
     }
 
@@ -1652,6 +1687,7 @@ pub struct CustomDialect {
     date32_cast_dtype: ast::DataType,
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
+    derived_table_evaluates_volatile_outputs_once: bool,
     division_operator: BinaryOperator,
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
@@ -1683,6 +1719,7 @@ impl Default for CustomDialect {
             date32_cast_dtype: ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
+            derived_table_evaluates_volatile_outputs_once: true,
             division_operator: BinaryOperator::Divide,
             window_func_support_window_frame: true,
             full_qualified_col: false,
@@ -1797,6 +1834,10 @@ impl Dialect for CustomDialect {
         self.requires_derived_table_alias
     }
 
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        self.derived_table_evaluates_volatile_outputs_once
+    }
+
     fn division_operator(&self) -> BinaryOperator {
         self.division_operator.clone()
     }
@@ -1855,6 +1896,7 @@ pub struct CustomDialectBuilder {
     date32_cast_dtype: ast::DataType,
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
+    derived_table_evaluates_volatile_outputs_once: bool,
     division_operator: BinaryOperator,
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
@@ -1892,6 +1934,7 @@ impl CustomDialectBuilder {
             date32_cast_dtype: ast::DataType::Date,
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
+            derived_table_evaluates_volatile_outputs_once: true,
             division_operator: BinaryOperator::Divide,
             window_func_support_window_frame: true,
             full_qualified_col: false,
@@ -1921,6 +1964,8 @@ impl CustomDialectBuilder {
             supports_column_alias_in_table_alias: self
                 .supports_column_alias_in_table_alias,
             requires_derived_table_alias: self.requires_derived_table_alias,
+            derived_table_evaluates_volatile_outputs_once: self
+                .derived_table_evaluates_volatile_outputs_once,
             division_operator: self.division_operator,
             window_func_support_window_frame: self.window_func_support_window_frame,
             full_qualified_col: self.full_qualified_col,
@@ -2056,6 +2101,18 @@ impl CustomDialectBuilder {
         requires_derived_table_alias: bool,
     ) -> Self {
         self.requires_derived_table_alias = requires_derived_table_alias;
+        self
+    }
+
+    /// Customize the dialect to say whether a derived table fixes the value of a
+    /// volatile expression it computes; see
+    /// [`Dialect::derived_table_evaluates_volatile_outputs_once`].
+    pub fn with_derived_table_evaluates_volatile_outputs_once(
+        mut self,
+        derived_table_evaluates_volatile_outputs_once: bool,
+    ) -> Self {
+        self.derived_table_evaluates_volatile_outputs_once =
+            derived_table_evaluates_volatile_outputs_once;
         self
     }
 
