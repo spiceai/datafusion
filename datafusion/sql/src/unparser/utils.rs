@@ -33,7 +33,7 @@ use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_expr::type_coercion::functions::fields_with_udf;
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, Filter, LogicalPlan, LogicalPlanBuilder,
-    Projection, ReturnFieldArgs, SortExpr, SubqueryAlias, Unnest, Window, expr,
+    Projection, ReturnFieldArgs, Sort, SortExpr, SubqueryAlias, Unnest, Window, expr,
     expr::{Cast, TryCast},
     utils::{conjunction, grouping_set_to_exprlist},
 };
@@ -715,10 +715,20 @@ impl<'a> FilteredProjection<'a> {
 
 /// The [Projection] under `plan`'s stack of `Filter`s, if that is what `plan` is —
 /// directly, or through one `SubqueryAlias`.
+///
+/// A `DISTINCT` between the stack and the projection folds into the `SELECT` that
+/// computes the projection and keeps its outputs and their names, so the filters
+/// read those outputs through it unchanged; the walk looks through it, and the
+/// repair below the filters applies to the same `SELECT` either way. A `DISTINCT
+/// ON` computes a list of its own, so the walk stops there.
 pub(crate) fn projection_below_filters(
     plan: &LogicalPlan,
 ) -> Option<FilteredProjection<'_>> {
-    match filter_stack(plan).1 {
+    let mut node = filter_stack(plan).1;
+    while let LogicalPlan::Distinct(Distinct::All(input)) = node {
+        node = input.as_ref();
+    }
+    match node {
         LogicalPlan::Projection(projection) => Some(FilteredProjection {
             projection,
             alias: None,
@@ -732,6 +742,53 @@ pub(crate) fn projection_below_filters(
         },
         _ => None,
     }
+}
+
+/// `plan`'s stack of `Filter`s moved beneath the sort at its foot, when that sort
+/// carries no fetch and the stack reads an output the projection under it computes.
+///
+/// A sort without a fetch reorders nothing a `WHERE` can see — `ORDER BY` is
+/// evaluated after `WHERE` either way — so the filters select the same rows, in the
+/// same order, on either side of it. Above the sort, though, the stack is emitted
+/// before the projection is reached, and a reference to a computed output is left
+/// as the plan holds it: a name the `WHERE` cannot bind, or a volatile expression
+/// it would have to repeat. Beneath the sort the stack meets the projection and is
+/// repaired the way a stack over a bare projection is, and the sort, now above it,
+/// emits its keys first, so a scope built for that repair re-points them together
+/// with the other clauses above it.
+///
+/// A sort carrying a fetch bounds its rows before the filters, and is left where it
+/// is for the `Sort` arm to refuse. A stack reading only bare columns is left alone
+/// too: nothing in it needs the projection, and the emitted SQL is the same on
+/// either side of the sort.
+pub(crate) fn hoist_unfetched_sort_above_filters(
+    plan: &LogicalPlan,
+) -> Result<Option<LogicalPlan>> {
+    let (filters, foot) = filter_stack(plan);
+    let LogicalPlan::Sort(sort) = foot else {
+        return Ok(None);
+    };
+    if sort.fetch.is_some() {
+        return Ok(None);
+    }
+    let mut lowered = Arc::clone(&sort.input);
+    for filter in filters.iter().rev() {
+        lowered = Arc::new(LogicalPlan::Filter(Filter::try_new(
+            filter.predicate.clone(),
+            lowered,
+        )?));
+    }
+    let reads_computed = projection_below_filters(&lowered).is_some_and(|filtered| {
+        stacked_filters_read_computed_output(&lowered, &filtered)
+    });
+    if !reads_computed {
+        return Ok(None);
+    }
+    Ok(Some(LogicalPlan::Sort(Sort {
+        expr: sort.expr.clone(),
+        input: lowered,
+        fetch: None,
+    })))
 }
 
 /// The refusal every shape that cannot scope such an output reports; `detail` says
@@ -781,6 +838,28 @@ pub(crate) fn predicate_reads_unrepeatable_output(
         .unwrap_or(false)
 }
 
+/// Whether any `Filter` stacked on `projection` from `plan` down reads an output of
+/// it for which `output_needs` holds.
+fn stacked_filters_read_output(
+    plan: &LogicalPlan,
+    projection: &FilteredProjection<'_>,
+    output_needs: impl Fn(&Expr) -> bool,
+) -> bool {
+    filter_stack(plan).0.into_iter().any(|filter| {
+        filter
+            .predicate
+            .exists(|sub_expr| {
+                Ok(match sub_expr {
+                    Expr::Column(column) => {
+                        projection.output(column).is_some_and(&output_needs)
+                    }
+                    _ => false,
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
 /// [`predicate_reads_unrepeatable_output`] over every `Filter` stacked on
 /// `projection` from `plan` down. The stack is emitted as one `WHERE`, so one
 /// predicate reading such an output puts the whole stack above the projection's
@@ -789,10 +868,27 @@ pub(crate) fn stacked_filters_read_unrepeatable_output(
     plan: &LogicalPlan,
     projection: &FilteredProjection<'_>,
 ) -> bool {
-    filter_stack(plan)
-        .0
-        .into_iter()
-        .any(|filter| predicate_reads_unrepeatable_output(&filter.predicate, projection))
+    stacked_filters_read_output(plan, projection, |output| !output_is_repeatable(output))
+}
+
+/// Whether any `Filter` stacked on `projection` from `plan` down reads an output the
+/// projection computes — anything but a bare column, whose name the relation
+/// beneath the projection carries already. A renamed column counts: the relation
+/// knows it by its old name only.
+///
+/// Such an output is readable by name only from a `SELECT` above the one computing
+/// it. Where the projection folds into the `SELECT` emitting the stack, a repeatable
+/// output is inlined instead ([`unproject_projection_exprs`]); where it is read
+/// through a `SubqueryAlias` the enclosing `SELECT` has not yet made a derived table,
+/// the alias folds onto the scan and the name binds to nothing — the stack then
+/// needs the scope [`scope_filters_over_projection`] builds, repeatable or not.
+pub(crate) fn stacked_filters_read_computed_output(
+    plan: &LogicalPlan,
+    projection: &FilteredProjection<'_>,
+) -> bool {
+    stacked_filters_read_output(plan, projection, |output| {
+        !matches!(output, Expr::Column(_))
+    })
 }
 
 /// A stack of `Filter`s over a [Projection], re-expressed so the projection is emitted
@@ -803,7 +899,8 @@ pub(crate) fn stacked_filters_read_unrepeatable_output(
 /// The stack is folded into one `Filter` and given an identity projection above it,
 /// one bare column per output under the name the schema reports. Unparsed, that
 /// projection becomes this `SELECT`'s list, the folded filter its `WHERE`, and the
-/// projection below — met with the list already taken — a derived table, whose outputs
+/// node below — the projection, or the `DISTINCT` or `SubqueryAlias` it is read
+/// through, met with the list already taken — a derived table, whose outputs
 /// [`name_derived_scope_outputs`] names on the way in. The predicates' references then
 /// bind to those names. Every filter in the stack moves together: one left in place
 /// would be emitted into the same `WHERE` with references the derived table has

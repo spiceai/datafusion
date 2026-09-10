@@ -33,10 +33,11 @@ use super::{
     utils::{
         enclosed_qualifiers, expr_contains_subquery, find_agg_node_within_select,
         find_unnest_node_within_select, find_window_nodes_within_select,
-        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
+        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
+        name_scope_outputs, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, select_list_wraps_a_grouping_expr,
-        stacked_filters_read_unrepeatable_output,
+        stacked_filters_read_computed_output, stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -1829,6 +1830,16 @@ impl Unparser<'_> {
                     let filter_expr = self.expr_to_sql(&unprojected)?;
                     select.having(Some(filter_expr));
                 } else {
+                    // A sort without a fetch beneath the stack folds into this
+                    // SELECT as its ORDER BY, evaluated after the WHERE either way,
+                    // so the filters select the same rows on either side of it —
+                    // but only beneath it do they meet the projection whose
+                    // outputs they read, where the repairs below apply.
+                    if let Some(hoisted) = hoist_unfetched_sort_above_filters(plan)? {
+                        return self.select_to_sql_recursively(
+                            &hoisted, query, select, relation,
+                        );
+                    }
                     // A predicate can reference an output of the projection this
                     // SELECT folds in, which a `WHERE` cannot read by name: it
                     // binds against the relations read, not the SELECT list. The
@@ -1837,29 +1848,54 @@ impl Unparser<'_> {
                     // output is only readable from a SELECT above the one
                     // computing it, so the projection becomes a derived table.
                     let below = projection_below_filters(plan);
-                    if let Some(filtered) = &below
-                        && stacked_filters_read_unrepeatable_output(plan, filtered)
-                    {
-                        // Whether the scope is built here, the projection is already a
-                        // derived table from an enclosing projection, or the filters
-                        // read it through a `SubqueryAlias` the alias arm derives, the
-                        // predicate reads the output through a derived table, on the
-                        // same guarantee.
-                        self.ensure_derived_table_fixes_volatile_outputs()?;
+                    if let Some(filtered) = &below {
+                        let unrepeatable =
+                            stacked_filters_read_unrepeatable_output(plan, filtered);
+                        // Through a `SubqueryAlias` the alias arm derives the
+                        // projection only under a taken list; with the list free it
+                        // folds the projection into this SELECT and pushes the alias
+                        // onto the scan, so a computed output read as `alias.name`
+                        // binds to nothing, repeatable or not. Taking the list here
+                        // makes the alias the derived table the reference needs.
+                        let scoped_here = !select.already_projected()
+                            && if filtered.alias.is_some() {
+                                stacked_filters_read_computed_output(plan, filtered)
+                            } else {
+                                unrepeatable
+                            };
+                        if unrepeatable {
+                            // Whether the scope is built here, the projection is
+                            // already a derived table from an enclosing projection,
+                            // or the filters read it through a `SubqueryAlias` the
+                            // alias arm derives, the predicate reads the output
+                            // through a derived table, on the same guarantee.
+                            self.ensure_derived_table_fixes_volatile_outputs()?;
+                        }
                         // The predicate ends up in this SELECT's `WHERE` addressing the
                         // derived table's output by bare name — whether the scope is
                         // built below or an enclosing projection has already made the
                         // projection a derived table — which is right only while that
                         // derived table is the SELECT's sole relation. A join input sits
                         // beside another relation: its `ON` still names the hidden one,
-                        // and a bare name can be ambiguous. Through an alias the
-                        // reference binds to the alias instead, so that shape is kept.
-                        if select.within_join_input() && filtered.alias.is_none() {
-                            return unrepeatable_output_refusal(
-                                "when the projection is an input of a join",
-                            );
+                        // and a bare name can be ambiguous. Through an alias under a
+                        // taken list the reference binds to the alias instead, so that
+                        // shape is kept; with the list free the alias folds onto the
+                        // scan, and a join input has no list of its own to take.
+                        if (unrepeatable || scoped_here)
+                            && select.within_join_input()
+                            && (filtered.alias.is_none() || !select.already_projected())
+                        {
+                            return if unrepeatable {
+                                unrepeatable_output_refusal(
+                                    "when the projection is an input of a join",
+                                )
+                            } else {
+                                not_impl_err!(
+                                    "Unparsing a filter on a computed output of an aliased projection is not supported when the projection is an input of a join"
+                                )
+                            };
                         }
-                        if !select.already_projected() && filtered.alias.is_none() {
+                        if scoped_here {
                             // The clauses this SELECT already carries — an ORDER BY from
                             // a sort above the stack, a WHERE from a filter above that
                             // sort — were emitted against the projection's relations,
