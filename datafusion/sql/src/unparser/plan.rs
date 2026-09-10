@@ -3735,6 +3735,20 @@ impl Unparser<'_> {
         // found below.
         self.ensure_exists_correlation_not_shadowed(join)?;
 
+        // The body is built with a builder of its own, so the join-input mark
+        // the shared builder carries does not reach it, and the correlated
+        // predicates are appended after the body is unparsed. A build side
+        // whose filter reads an output that cannot be repeated would move its
+        // projection into a derived table, and the predicates appended below
+        // would then name the relation that table hides.
+        if let Some(projection) = projection_below_filters(right_plan)
+            && stacked_filters_read_unrepeatable_output(right_plan, projection)
+        {
+            return not_impl_err!(
+                "Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is the build side of an EXISTS-style join"
+            );
+        }
+
         let mut query_builder = Some(QueryBuilder::default());
         let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
         let mut query_builder = query_builder.unwrap();

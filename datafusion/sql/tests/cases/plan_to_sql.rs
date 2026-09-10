@@ -8090,6 +8090,39 @@ fn test_filter_on_volatile_output_is_refused_under_a_clause_holding_a_subquery()
 }
 
 #[test]
+fn test_filter_on_volatile_output_is_refused_on_an_exists_build_side() -> Result<()> {
+    // The EXISTS body is built with a builder of its own and the correlation
+    // `t.a = u.a` is appended after it, so a scoped build side would leave that
+    // predicate naming the `u` the derived table hides. Refused, for semi and
+    // anti joins alike.
+    let schema = volatile_output_schema();
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
+    ] {
+        let build = table_scan(Some("u"), &schema, Some(vec![0]))?
+            .project(vec![
+                col("u.a"),
+                datafusion_functions::math::random().call(vec![]).alias("r"),
+            ])?
+            .filter(col("r").gt(lit(0.5)))?
+            .build()?;
+        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+            .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
+            .build()?;
+
+        let err =
+            plan_to_sql(&plan).expect_err("a scoped EXISTS build side must be refused");
+        assert_eq!(
+            err.to_string(),
+            "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is the build side of an EXISTS-style join",
+            "{join_type:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_derived_table_filter_on_a_named_output_is_inlined() -> Result<()> {
     // Naming a derived table's unnamed outputs happens before the derived plan is
     // unparsed, so the filter inside it meets the output as an alias. It is
