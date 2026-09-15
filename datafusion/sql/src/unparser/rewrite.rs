@@ -85,19 +85,26 @@ pub(super) fn normalize_union_schema(plan: &LogicalPlan) -> Result<LogicalPlan> 
 /// Rewrite sort expressions that have a UNION plan as their input to remove the table reference.
 fn rewrite_sort_expr_for_union(exprs: Vec<SortExpr>) -> Result<Vec<SortExpr>> {
     let sort_exprs = exprs
-        .map_elements(&mut |expr: Expr| {
-            expr.transform_up(|expr| {
-                if let Expr::Column(mut col) = expr {
-                    col.relation = None;
-                    Ok(Transformed::yes(Expr::Column(col)))
-                } else {
-                    Ok(Transformed::no(expr))
-                }
-            })
-        })
+        .map_elements(&mut |expr: Expr| expr.transform_up(unqualify_column))
         .data()?;
 
     Ok(sort_exprs)
+}
+
+/// Drops the relation qualifier from every column reference in `expr`, so each binds
+/// by name to whatever the `SELECT` reads — a set operation's output, or a derived
+/// table that is the `SELECT`'s only relation.
+pub(super) fn unqualify_columns(expr: Expr) -> Result<Expr> {
+    expr.transform_up(unqualify_column).data()
+}
+
+fn unqualify_column(expr: Expr) -> Result<Transformed<Expr>> {
+    if let Expr::Column(mut col) = expr {
+        col.relation = None;
+        Ok(Transformed::yes(Expr::Column(col)))
+    } else {
+        Ok(Transformed::no(expr))
+    }
 }
 
 /// Rewrite Filter plans that have a Window as their input by inserting a SubqueryAlias.
@@ -589,10 +596,11 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 ///
 /// A reference is rewritten only when its qualifier names one of the relations the derived
 /// table encloses (`derived_qualifiers`), so a reference to a relation the SELECT still
-/// reads directly — the other side of a join, say — keeps the qualifier it needs. The
-/// column is then addressed through `alias`, which the derived table always carries, rather
-/// than reduced to a bare name: bare would be ambiguous wherever the derived table is not
-/// the SELECT's only relation.
+/// reads directly — the other side of a join, say — keeps the qualifier it needs. With
+/// `Some(alias)` the column is then addressed through `alias`, which the derived table
+/// carries, rather than reduced to a bare name: bare would be ambiguous wherever the derived
+/// table is not the SELECT's only relation. `None` is for a derived table that *is* the
+/// SELECT's only relation and carries no alias: its outputs are addressed by name alone.
 ///
 /// Both tests are on names alone, so neither distinguishes a correlated reference to an
 /// enclosing query — that qualifier can name the very same relation. A caller must not
@@ -603,24 +611,27 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 pub fn requalify_column_onto_derived_table(
     idents: &mut Vec<Ident>,
     derived_qualifiers: &HashSet<String>,
-    alias: &Ident,
+    alias: Option<&Ident>,
 ) {
-    if idents.len() < 2 {
+    let Some((last, qualifier)) = idents.split_last() else {
+        return;
+    };
+    if qualifier.is_empty() {
         return;
     }
-    let qualifier = idents
+    let qualifier = qualifier
         .iter()
-        .take(idents.len() - 1)
         .map(|ident| ident.value.clone())
         .collect::<Vec<String>>()
         .join(".");
     if !derived_qualifiers.contains(&qualifier) {
         return;
     }
-    let Some(last) = idents.last() else {
-        unreachable!("CompoundIdentifier must have a last element");
+    let last = last.clone();
+    *idents = match alias {
+        Some(alias) => vec![alias.clone(), last],
+        None => vec![last],
     };
-    *idents = vec![alias.clone(), last.clone()];
 }
 
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
