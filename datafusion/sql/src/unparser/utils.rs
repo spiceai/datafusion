@@ -33,7 +33,7 @@ use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_expr::type_coercion::functions::fields_with_udf;
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, Filter, LogicalPlan, LogicalPlanBuilder,
-    Projection, ReturnFieldArgs, Sort, SortExpr, SubqueryAlias, Unnest, Window, expr,
+    Projection, ReturnFieldArgs, SortExpr, SubqueryAlias, Unnest, Window, expr,
     expr::{Cast, TryCast},
     utils::{conjunction, grouping_set_to_exprlist},
 };
@@ -662,6 +662,7 @@ fn find_repeatable_projection_expr<'a>(
     let output = FilteredProjection {
         projection,
         alias: None,
+        through_distinct: false,
     }
     .output(column)?;
     // A bare column needs no repair: the relation carries its name. A renamed one
@@ -700,6 +701,10 @@ fn filter_stack(plan: &LogicalPlan) -> (Vec<&Filter>, &LogicalPlan) {
 pub(crate) struct FilteredProjection<'a> {
     pub(crate) projection: &'a Projection,
     pub(crate) alias: Option<&'a SubqueryAlias>,
+    /// Whether a `DISTINCT` sits between the filters and the projection. The
+    /// filters are then applied to the deduplicated rows, which a `WHERE` in the
+    /// `SELECT` carrying the `DISTINCT` is not.
+    pub(crate) through_distinct: bool,
 }
 
 impl<'a> FilteredProjection<'a> {
@@ -725,18 +730,22 @@ pub(crate) fn projection_below_filters(
     plan: &LogicalPlan,
 ) -> Option<FilteredProjection<'_>> {
     let mut node = filter_stack(plan).1;
+    let mut through_distinct = false;
     while let LogicalPlan::Distinct(Distinct::All(input)) = node {
+        through_distinct = true;
         node = input.as_ref();
     }
     match node {
         LogicalPlan::Projection(projection) => Some(FilteredProjection {
             projection,
             alias: None,
+            through_distinct,
         }),
         LogicalPlan::SubqueryAlias(alias) => match alias.input.as_ref() {
             LogicalPlan::Projection(projection) => Some(FilteredProjection {
                 projection,
                 alias: Some(alias),
+                through_distinct,
             }),
             _ => None,
         },
@@ -761,9 +770,17 @@ pub(crate) fn projection_below_filters(
 /// is for the `Sort` arm to refuse. A stack reading only bare columns is left alone
 /// too: nothing in it needs the projection, and the emitted SQL is the same on
 /// either side of the sort.
+///
+/// The sort node and the lowered stack are handed back separately rather than
+/// assembled here, because the sort's keys are resolved against the projection — and
+/// once the stack is lowered the sort's input is a `Filter`, so
+/// [`unproject_sort_expr`] no longer finds it. The caller, which has the aggregate
+/// and window context that resolution also needs, does it while the projection is
+/// still the sort's input. The node is returned whole because those lookups count
+/// the projections between it and what they are searching for.
 pub(crate) fn hoist_unfetched_sort_above_filters(
     plan: &LogicalPlan,
-) -> Result<Option<LogicalPlan>> {
+) -> Result<Option<(&LogicalPlan, Arc<LogicalPlan>)>> {
     let (filters, foot) = filter_stack(plan);
     let LogicalPlan::Sort(sort) = foot else {
         return Ok(None);
@@ -784,11 +801,7 @@ pub(crate) fn hoist_unfetched_sort_above_filters(
     if !reads_computed {
         return Ok(None);
     }
-    Ok(Some(LogicalPlan::Sort(Sort {
-        expr: sort.expr.clone(),
-        input: lowered,
-        fetch: None,
-    })))
+    Ok(Some((foot, lowered)))
 }
 
 /// The refusal every shape that cannot scope such an output reports; `detail` says
@@ -889,6 +902,58 @@ pub(crate) fn stacked_filters_read_computed_output(
     stacked_filters_read_output(plan, projection, |output| {
         !matches!(output, Expr::Column(_))
     })
+}
+
+/// Whether any `Filter` stacked from `plan` down holds a predicate that cannot be
+/// repeated — a volatile expression, or a subquery.
+///
+/// This asks about the predicate itself, not the outputs it reads: a repeatable
+/// output read by a volatile predicate still has to be emitted where the predicate
+/// is evaluated as often as the plan evaluates it.
+pub(crate) fn stacked_predicates_are_unrepeatable(plan: &LogicalPlan) -> bool {
+    filter_stack(plan)
+        .0
+        .into_iter()
+        .any(|filter| !output_is_repeatable(&filter.predicate))
+}
+
+/// Whether the stack of `Filter`s from `plan` down takes this `SELECT`'s list to put
+/// the node under it in a derived table, rather than folding that node in and
+/// repairing the predicates against it.
+///
+/// The two repairs place the predicates' references differently — a scope leaves
+/// them naming the derived table's outputs, while folding inlines the expressions
+/// those outputs stand for — so anything emitted above the stack has to know which
+/// one is coming. `already_projected` is the enclosing `SELECT`'s: with the list
+/// already taken there is none left to build a scope with.
+///
+/// The three shapes that need one:
+///
+/// - An output that cannot be repeated, which has no faithful form in the `SELECT`
+///   computing it.
+/// - A computed output read through a `SubqueryAlias`: the alias arm derives the
+///   projection only under a taken list, so with the list free it folds the
+///   projection in and pushes the alias onto the scan, leaving `alias.name` bound to
+///   nothing, repeatable or not. Taking the list here makes the alias the derived
+///   table the reference needs.
+/// - A predicate that cannot be repeated, reading through a `DISTINCT`: the
+///   `DISTINCT` folds into the same `SELECT`, where a `WHERE` is evaluated once per
+///   *input* row, while the plan applies the filters above the dedup, once per
+///   surviving row. The same rows for a repeatable predicate, a different answer for
+///   one that is not.
+pub(crate) fn filters_scope_their_projection(
+    plan: &LogicalPlan,
+    already_projected: bool,
+) -> bool {
+    !already_projected
+        && projection_below_filters(plan).is_some_and(|filtered| {
+            (filtered.through_distinct && stacked_predicates_are_unrepeatable(plan))
+                || if filtered.alias.is_some() {
+                    stacked_filters_read_computed_output(plan, &filtered)
+                } else {
+                    stacked_filters_read_unrepeatable_output(plan, &filtered)
+                }
+        })
 }
 
 /// A stack of `Filter`s over a [Projection], re-expressed so the projection is emitted

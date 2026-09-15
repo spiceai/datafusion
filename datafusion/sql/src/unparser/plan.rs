@@ -31,13 +31,13 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        enclosed_qualifiers, expr_contains_subquery, find_agg_node_within_select,
-        find_unnest_node_within_select, find_window_nodes_within_select,
-        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
-        name_scope_outputs, partition_subquery_filters,
+        enclosed_qualifiers, expr_contains_subquery, filters_scope_their_projection,
+        find_agg_node_within_select, find_unnest_node_within_select,
+        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
+        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, select_list_wraps_a_grouping_expr,
-        stacked_filters_read_computed_output, stacked_filters_read_unrepeatable_output,
+        stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -61,8 +61,8 @@ use datafusion_common::{
 use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
-    LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
-    UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
+    LogicalPlanBuilder, Operator, Projection, Sort, SortExpr, Subquery, TableScan,
+    Unnest, UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
@@ -1835,7 +1835,64 @@ impl Unparser<'_> {
                     // so the filters select the same rows on either side of it —
                     // but only beneath it do they meet the projection whose
                     // outputs they read, where the repairs below apply.
-                    if let Some(hoisted) = hoist_unfetched_sort_above_filters(plan)? {
+                    if let Some((sort_plan, lowered)) =
+                        hoist_unfetched_sort_above_filters(plan)?
+                    {
+                        let LogicalPlan::Sort(sort) = sort_plan else {
+                            return internal_err!(
+                                "hoist_unfetched_sort_above_filters returned a plan that is not a Sort"
+                            );
+                        };
+                        // Where the lowered stack folds the projection into this
+                        // SELECT, the keys are resolved here, before the lowering
+                        // puts a `Filter` where the projection was: a key naming a
+                        // projection output is looked up in the sort's input, so
+                        // afterwards `b + 1` would keep a `b` that binds to the
+                        // relation rather than to the output the SELECT list shows.
+                        //
+                        // Where the stack scopes the projection instead, the keys
+                        // must stay as they are: the derived table shows the outputs
+                        // under their own names, and the ORDER BY above it reads
+                        // them there. Resolving them would inline the expression
+                        // outside that scope — for a volatile output, a second draw
+                        // ordering by a value the SELECT list never showed.
+                        //
+                        // The scope to read the keys against is the one the
+                        // hoisted sort lands in, not the one it was hoisted from:
+                        // with this SELECT's list already taken the `Sort` arm
+                        // derives a table of its own, so either way the stack below
+                        // it meets a SELECT whose list is free.
+                        let sorted = sort.input.as_ref();
+                        let expr = if filters_scope_their_projection(&lowered, false) {
+                            sort.expr.clone()
+                        } else {
+                            let agg =
+                                if self.projection_scopes_its_aggregate(sorted, select) {
+                                    None
+                                } else {
+                                    find_agg_node_within_select(sort_plan, false)
+                                };
+                            let window_nodes =
+                                find_window_nodes_within_select(sort_plan, None, false);
+                            let windows: Option<Vec<&Window>> =
+                                window_nodes.as_deref().map(|ws| ws.to_vec());
+                            sort.expr
+                                .iter()
+                                .map(|sort_expr| {
+                                    unproject_sort_expr(
+                                        sort_expr.clone(),
+                                        agg,
+                                        windows.as_deref(),
+                                        sorted,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>>>()?
+                        };
+                        let hoisted = LogicalPlan::Sort(Sort {
+                            expr,
+                            input: lowered,
+                            fetch: None,
+                        });
                         return self.select_to_sql_recursively(
                             &hoisted, query, select, relation,
                         );
@@ -1851,18 +1908,13 @@ impl Unparser<'_> {
                     if let Some(filtered) = &below {
                         let unrepeatable =
                             stacked_filters_read_unrepeatable_output(plan, filtered);
-                        // Through a `SubqueryAlias` the alias arm derives the
-                        // projection only under a taken list; with the list free it
-                        // folds the projection into this SELECT and pushes the alias
-                        // onto the scan, so a computed output read as `alias.name`
-                        // binds to nothing, repeatable or not. Taking the list here
-                        // makes the alias the derived table the reference needs.
-                        let scoped_here = !select.already_projected()
-                            && if filtered.alias.is_some() {
-                                stacked_filters_read_computed_output(plan, filtered)
-                            } else {
-                                unrepeatable
-                            };
+                        // Whether the scope is built here. Read from the same
+                        // helper the sort hoist above consults, so the ORDER BY it
+                        // emits cannot disagree with the repair chosen here.
+                        let scoped_here = filters_scope_their_projection(
+                            plan,
+                            select.already_projected(),
+                        );
                         if unrepeatable {
                             // Whether the scope is built here, the projection is
                             // already a derived table from an enclosing projection,
@@ -1889,9 +1941,13 @@ impl Unparser<'_> {
                                 unrepeatable_output_refusal(
                                     "when the projection is an input of a join",
                                 )
-                            } else {
+                            } else if filtered.alias.is_some() {
                                 not_impl_err!(
                                     "Unparsing a filter on a computed output of an aliased projection is not supported when the projection is an input of a join"
+                                )
+                            } else {
+                                not_impl_err!(
+                                    "Unparsing a filter that cannot be repeated over a DISTINCT is not supported when the DISTINCT is an input of a join"
                                 )
                             };
                         }
@@ -1903,8 +1959,22 @@ impl Unparser<'_> {
                             // outputs by name now, like the predicates the scope rewrites
                             // itself. A clause holding a subquery is left alone by the
                             // visitors, and would keep naming the hidden relation: refused.
-                            let hidden_qualifiers =
+                            // The derived table is built around whatever the
+                            // filters stand on. That is the `SubqueryAlias` itself
+                            // when one is directly below them, and the derived table
+                            // then carries its name, so `alias.output` still binds —
+                            // to the derived table now. Read through a `DISTINCT`
+                            // the alias is a level further down, enclosed by an
+                            // unnamed derived table, and the name it gave those
+                            // outputs is hidden like the relation's own.
+                            let mut hidden_qualifiers =
                                 enclosed_qualifiers(&filtered.projection.schema);
+                            if let Some(alias) = filtered.alias
+                                && filtered.through_distinct
+                            {
+                                hidden_qualifiers
+                                    .extend(enclosed_qualifiers(&alias.schema));
+                            }
                             let mut repoint = |expr: &mut ast::Expr| {
                                 if let ast::Expr::CompoundIdentifier(idents) = expr {
                                     requalify_column_onto_derived_table(

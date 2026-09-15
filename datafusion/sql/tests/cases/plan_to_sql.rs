@@ -13699,3 +13699,180 @@ fn test_filter_above_a_distinct_under_a_taken_list_is_gated() -> Result<()> {
     assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
     Ok(())
 }
+
+#[test]
+fn test_a_hoisted_sort_keeps_its_alias_resolution() -> Result<()> {
+    // Lowering the stack beneath the sort leaves the sort's input a `Filter`, and a
+    // sort key that names a projection output is resolved against the projection —
+    // so the key must be unprojected before the lowering, not after it. Inside the
+    // compound key `b + 1`, `b` is the SELECT-list alias for `0 - t.b`; left
+    // unresolved it binds the scan's `b` instead, which is a different order and,
+    // under the `LIMIT`, a different row.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            (lit(0) - col("t.b")).alias("b"),
+        ])?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("a").gt(lit(0)))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a AS a, (0 - t.b) AS b FROM t WHERE (t.a > 0) ORDER BY ((0 - t.b) + 1) ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_keeps_a_bare_alias_key_as_the_alias() -> Result<()> {
+    // The companion to the case above: a key that is the alias alone stays the
+    // alias, which every dialect reads as the output column. Unprojecting it into
+    // the expression would be the same needless inlining the un-hoisted path
+    // already avoids.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            (lit(0) - col("t.b")).alias("b"),
+        ])?
+        .sort(vec![col("b").sort(true, true)])?
+        .filter(col("a").gt(lit(0)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a AS a, (0 - t.b) AS b FROM t WHERE (t.a > 0) ORDER BY b ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_volatile_predicate_over_a_distinct_is_scoped_above_it() -> Result<()> {
+    // The plan applies the predicate above the `Distinct`, so its `random()` is
+    // drawn once per surviving distinct row. Folded into the same SELECT as the
+    // `DISTINCT` it would be drawn once per input row instead — a different
+    // probability, silently. The `DISTINCT` becomes a derived table so the draw
+    // stays above the dedup.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s")])?
+        .distinct()?
+        .filter(col("s").gt(lit(0)).and(random().lt(lit(0.5))))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s FROM (SELECT DISTINCT (t.a + 1) AS s FROM t) WHERE ((s > 0) AND (random() < 0.5))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_over_a_scope_keeps_its_key_on_the_output() -> Result<()> {
+    // The companion constraint to resolving a hoisted key: when the lowered stack
+    // scopes the projection, the derived table shows `r` and the ORDER BY above it
+    // must keep naming it. Resolving the key here would inline `random()` outside
+    // that scope, drawing a second value and ordering by something the SELECT list
+    // never showed — under the `LIMIT`, a different row.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_volatile_predicate_over_a_distinct_in_a_join_input_is_refused() -> Result<()> {
+    // A join input has no SELECT list of its own to take, so the DISTINCT cannot
+    // become the derived table the predicate needs to sit above. Refused by name
+    // rather than emitted into the DISTINCT's own WHERE, where the draw would move
+    // below the dedup.
+    let right = table_scan(Some("u"), &int32_schema(&["k"]), Some(vec![0]))?.build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s")])?
+        .distinct()?
+        .filter(col("s").gt(lit(0)).and(random().lt(lit(0.5))))?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            [col("s").eq(col("u.k"))],
+        )?
+        .build()?;
+
+    let err =
+        plan_to_sql(&plan).expect_err("a join input has no list to take for the scope");
+    assert_eq!(
+        err.to_string(),
+        "This feature is not implemented: Unparsing a filter that cannot be repeated over a DISTINCT is not supported when the DISTINCT is an input of a join"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_under_an_outer_projection_keeps_its_key_on_the_output()
+-> Result<()> {
+    // The enclosing projection has taken this SELECT's list, so the hoisted sort
+    // opens one of its own — and inside that SELECT the stack is free to scope the
+    // projection. The key must be read against the scope the sort ends up in, not
+    // the one it was hoisted from, or `r + 1` is inlined to `random() + 1` above a
+    // derived table that already holds the single draw.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .project(vec![col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @r#"SELECT a FROM (SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY (r + 1.0) ASC NULLS FIRST)"#);
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_reads_its_aggregate_from_the_sort_down() -> Result<()> {
+    // The aggregate lookup counts the projections it passes, so it has to start at
+    // the sort rather than at the sort's input: starting a projection lower walks
+    // past the boundary the derived table draws and unprojects the key against an
+    // aggregate that table hides. `s0` is what the derived table shows, and what
+    // both the WHERE and the ORDER BY above it read.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .project(vec![col("t.a"), col("sum(t.b)").alias("s0")])?
+        .project(vec![col("t.a"), (col("s0") + lit(1)).alias("s")])?
+        .sort(vec![(col("s") + lit(1)).sort(true, true)])?
+        .filter(col("s").gt(lit(0)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, (s0 + 1) AS s FROM (SELECT t.a, sum(t.b) AS s0 FROM t GROUP BY t.a) WHERE ((s0 + 1) > 0) ORDER BY ((s0 + 1) + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_distinct_scope_repoints_a_clause_naming_its_alias() -> Result<()> {
+    // The derived table is built around whatever the filters stand on, so the
+    // `SubqueryAlias` under the DISTINCT is enclosed with it and the name it gave
+    // the outputs goes out of scope. The ORDER BY above, emitted before the scope
+    // existed, still spelled `sq.a` — a column the enclosing SELECT has no relation
+    // for. It reads the derived table's `a` now, like the predicates the scope
+    // rewrites itself.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a")])?
+        .alias("sq")?
+        .distinct()?
+        .filter(random().lt(lit(0.5)))?
+        .sort(vec![(col("sq.a") + lit(1)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a FROM (SELECT DISTINCT sq.a FROM (SELECT sq.a FROM t AS sq) AS sq) WHERE (random() < 0.5) ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
