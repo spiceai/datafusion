@@ -3702,6 +3702,131 @@ mod tests {
             )?)
         }
 
+        /// `a IN (1, 2, 3) OR a = 4` — the two spellings mixed in one predicate.
+        /// The simplifier produces this whenever an `OR` chain is long enough for
+        /// part of it to have been merged into an `InList` but not all of it.
+        #[test]
+        fn a_mixed_in_list_and_equality_disjunction_unions_its_values() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                in_list(col("k", &schema)?, keys(3), &false, &schema)?,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Eq, lit(3i64), &schema)?,
+                &schema,
+            )?;
+            // keys(3) is 0..2, plus the literal 3 => four distinct values.
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(4_000));
+            Ok(())
+        }
+
+        /// A disjunction nests to the left as the parser builds it, so the
+        /// normalizer has to recurse rather than look only one level down.
+        #[test]
+        fn a_nested_disjunction_collects_every_arm() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                binary(
+                    binary(col("k", &schema)?, Operator::Eq, lit(0i64), &schema)?,
+                    Operator::Or,
+                    binary(col("k", &schema)?, Operator::Eq, lit(1i64), &schema)?,
+                    &schema,
+                )?,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Eq, lit(2i64), &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(3_000));
+            Ok(())
+        }
+
+        /// `1 = k` is the same predicate as `k = 1`; the simplifier does not
+        /// always put the column on the left.
+        #[test]
+        fn a_reversed_equality_is_recognized() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                binary(lit(0i64), Operator::Eq, col("k", &schema)?, &schema)?,
+                Operator::Or,
+                binary(lit(1i64), Operator::Eq, col("k", &schema)?, &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// One arm that is not a distinct-value test makes the whole disjunction
+        /// unbounded: `k IN (1, 2) OR k > 5` can match anything `k > 5` matches.
+        #[test]
+        fn a_disjunction_with_a_range_arm_falls_back() -> Result<()> {
+            let schema = schema();
+            assert_falls_back_to_default(binary(
+                in_list(col("k", &schema)?, keys(2), &false, &schema)?,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Gt, lit(5i64), &schema)?,
+                &schema,
+            )?)
+        }
+
+        /// Two conjuncts constraining the SAME column take the tighter one, like
+        /// any other pair: the result is a subset of each.
+        #[test]
+        fn a_conjunction_on_one_column_takes_the_tighter_arm() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                in_list(col("k", &schema)?, keys(8), &false, &schema)?,
+                Operator::And,
+                in_list(col("k", &schema)?, keys(2), &false, &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// A `NULL` literal matches nothing, so counting it over-states the
+        /// result by one value. That is the safe direction, and it keeps the
+        /// normalizer from having to reason about three-valued logic.
+        #[test]
+        fn a_null_literal_is_counted_rather_than_dropped() -> Result<()> {
+            let schema = schema();
+            let predicate = in_list(
+                col("k", &schema)?,
+                vec![lit(1i64), lit(ScalarValue::Int64(None))],
+                &false,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// The estimate is uniformity-based, which is what NDV supports and no
+        /// more: it divides the rows evenly among the distinct values. On a
+        /// skewed column the true count for a hot key is higher than this, in
+        /// the same way and for the same reason as the `col = literal` estimate
+        /// the branch already computes. Pinned so that the limitation is visible
+        /// and so a histogram-aware estimate has a test to update.
+        #[test]
+        fn the_estimate_divides_rows_evenly_and_does_not_model_skew() -> Result<()> {
+            // 1M rows over two values: the estimate for one of them is 500k,
+            // whatever the real split between them is.
+            let schema = schema();
+            let predicate = binary(col("k", &schema)?, Operator::Eq, lit(0i64), &schema)?;
+            let predicate = binary(
+                predicate,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Eq, lit(0i64), &schema)?,
+                &schema,
+            )?;
+            // Both arms name the same value, so the group holds one value.
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(2)))?;
+            assert_eq!(rows, Precision::Inexact(500_000));
+            Ok(())
+        }
+
         #[test]
         fn an_absent_ndv_falls_back() -> Result<()> {
             let rows =
