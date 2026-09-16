@@ -60,7 +60,9 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
-use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal, lit};
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, InListExpr, Literal, lit,
+};
 use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::utils::{collect_columns, reassign_expr_columns};
 use datafusion_physical_expr::{
@@ -350,9 +352,9 @@ impl FilterExec {
             // (which collapses badly on correlated columns such as a composite
             // key). `max` over the *known* NDVs stays a valid upper bound
             // even when some columns' NDV is absent (an extra equality can only
-            // shrink the result), so fall back to the default only when NO column
-            // has a usable NDV. Then pin NDV=1 for every `col = literal` column
-            // (the equality leaves a single value).
+            // shrink the result), so fall back to the default only when nothing
+            // here yields a usable NDV. Then pin NDV=1 for every `col = literal`
+            // column (the equality leaves a single value).
             let mut cs = input_stats.to_inexact().column_statistics;
             let mut max_ndv: Option<usize> = None;
             for &idx in &eq_columns {
@@ -364,10 +366,39 @@ impl FilterExec {
                     max_ndv = Some(max_ndv.map_or(n, |m| m.max(n)));
                 }
             }
-            let selectivity = match max_ndv {
-                Some(n) => 1.0 / n as f64,
-                None => default_selectivity as f64 / 100.0,
-            };
+            // Generalize that rule from one value to n: a `col IN (k1, .., kn)`
+            // or `col = k1 OR .. OR col = kn` conjunct is n equalities over a
+            // single column, so it matches at most `n / NDV` of the rows.
+            // Interval analysis cannot supply this and extending it would not
+            // help — a disjunction of scattered keys is not an interval
+            // (`k = 5 OR k = 400000000` widens to nearly the whole domain), and
+            // what makes such a predicate selective is distinctness, not range.
+            // A bare `col = literal` is the n = 1 case and so is counted by both
+            // this loop and `max_ndv` above, at the same value; `min` is
+            // idempotent, so it is not double-counted.
+            let mut selectivity = max_ndv.map(|n| 1.0 / n as f64);
+            for conjunct in split_conjunction(predicate) {
+                let Some((idx, values)) = collect_distinct_value_group(conjunct) else {
+                    continue;
+                };
+                if idx >= cs.len() {
+                    continue;
+                }
+                let (Precision::Exact(ndv) | Precision::Inexact(ndv)) =
+                    cs[idx].distinct_count
+                else {
+                    continue;
+                };
+                if ndv == 0 {
+                    continue;
+                }
+                let group_selectivity = (values.len() as f64 / ndv as f64).min(1.0);
+                selectivity = Some(
+                    selectivity
+                        .map_or(group_selectivity, |s: f64| s.min(group_selectivity)),
+                );
+            }
+            let selectivity = selectivity.unwrap_or(default_selectivity as f64 / 100.0);
             for &idx in &eq_columns {
                 if idx < cs.len() && cs[idx].distinct_count != Precision::Exact(0) {
                     cs[idx].distinct_count = Precision::Exact(1);
@@ -884,6 +915,78 @@ fn collect_equality_columns(predicate: &Arc<dyn PhysicalExpr>) -> (HashSet<usize
     }
 
     (eq_values.into_keys().collect(), infeasible)
+}
+
+/// Extracts the set of literals a conjunct admits for a single column, from
+/// either physical spelling of the same predicate.
+///
+/// `col IN (k1, .., kn)` and `col = k1 OR .. OR col = kn` express one predicate,
+/// and the optimizer rewrites between them in both directions around a list
+/// length of three: the expression simplifier merges an `OR` chain of equalities
+/// into an `InList`, and the `InList` simplifier expands a short `InList` back
+/// into an `OR` chain. Neither spelling is analyzable by interval arithmetic, so
+/// recognizing only one of them would leave the other estimated at the flat
+/// default on the far side of that threshold.
+///
+/// Returns the column's index in the input schema and the distinct literals
+/// compared against it. Duplicates collapse, so `col IN (1, 1, 2)` admits two
+/// values, and a `NULL` literal is counted even though it matches nothing —
+/// over-counting by one keeps the estimate on the safe side.
+///
+/// Returns `None` for anything else, in particular:
+///
+/// * a negated list — `NOT IN` excludes n values out of an unknown number, which
+///   bounds nothing;
+/// * a list whose elements are not all literals, such as a subquery or an
+///   expression list, whose cardinality is not known here;
+/// * a disjunction spanning more than one column — `a = 1 OR b = 2` is a union
+///   of two row sets, and neither column's distinctness limits it.
+fn collect_distinct_value_group(
+    expr: &Arc<dyn PhysicalExpr>,
+) -> Option<(usize, HashSet<ScalarValue>)> {
+    if let Some(in_list) = expr.downcast_ref::<InListExpr>() {
+        if in_list.negated() {
+            return None;
+        }
+        let column = in_list.expr().downcast_ref::<Column>()?;
+        let mut values = HashSet::with_capacity(in_list.list().len());
+        for element in in_list.list() {
+            values.insert(element.downcast_ref::<Literal>()?.value().clone());
+        }
+        return Some((column.index(), values));
+    }
+
+    let binary = expr.downcast_ref::<BinaryExpr>()?;
+    match binary.op() {
+        Operator::Eq => {
+            let (column, literal) = if let Some(column) =
+                binary.left().downcast_ref::<Column>()
+                && let Some(literal) = binary.right().downcast_ref::<Literal>()
+            {
+                (column, literal)
+            } else if let Some(column) = binary.right().downcast_ref::<Column>()
+                && let Some(literal) = binary.left().downcast_ref::<Literal>()
+            {
+                (column, literal)
+            } else {
+                return None;
+            };
+            let mut values = HashSet::with_capacity(1);
+            values.insert(literal.value().clone());
+            Some((column.index(), values))
+        }
+        Operator::Or => {
+            let (column, mut values) = collect_distinct_value_group(binary.left())?;
+            let (other_column, other_values) =
+                collect_distinct_value_group(binary.right())?;
+            if column != other_column {
+                return None;
+            }
+            values.extend(other_values);
+            Some((column, values))
+        }
+        _ => None,
+    }
 }
 
 /// Removes exact duplicates from `exprs`, keeping the first occurrence of
@@ -3389,5 +3492,223 @@ mod tests {
             "Expected NDV <= 10 (filtered row count), got {ndv:?}"
         );
         Ok(())
+    }
+
+    /// `col IN (..)` and `col = k1 OR col = k2` are the same predicate in two
+    /// physical spellings, neither analyzable by interval arithmetic. Without a
+    /// distinctness-based estimate both fall to the flat default selectivity,
+    /// which on a large table over-states the surviving rows by orders of
+    /// magnitude and mis-sizes whatever consumes the estimate — the join build
+    /// side, most damagingly.
+    mod distinct_value_selectivity {
+        use super::*;
+
+        const BYTES_PER_ROW: usize = 8;
+
+        /// One `Int64` column `k` with `rows` rows and `ndv` distinct values,
+        /// plus a second column `other` used by the multi-column cases.
+        fn schema() -> Schema {
+            Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("other", DataType::Int64, false),
+            ])
+        }
+
+        fn input(rows: usize, ndv: Precision<usize>) -> Arc<StatisticsExec> {
+            let column = ColumnStatistics {
+                distinct_count: ndv,
+                ..Default::default()
+            };
+            Arc::new(StatisticsExec::new(
+                Statistics {
+                    num_rows: Precision::Exact(rows),
+                    total_byte_size: Precision::Exact(rows * BYTES_PER_ROW),
+                    column_statistics: vec![column.clone(), column],
+                },
+                schema(),
+            ))
+        }
+
+        fn keys(n: usize) -> Vec<Arc<dyn PhysicalExpr>> {
+            (0..n).map(|i| lit(i as i64)).collect()
+        }
+
+        /// `k IN (0, .., n-1)`, as the planner builds it for n >= 4.
+        fn in_list_predicate(n: usize, negated: bool) -> Arc<dyn PhysicalExpr> {
+            let schema = schema();
+            in_list(col("k", &schema).unwrap(), keys(n), &negated, &schema).unwrap()
+        }
+
+        /// `k = 0 OR .. OR k = n-1`, as the planner builds it for n <= 3.
+        fn or_chain_predicate(n: usize) -> Arc<dyn PhysicalExpr> {
+            let schema = schema();
+            keys(n)
+                .into_iter()
+                .map(|key| {
+                    binary(col("k", &schema).unwrap(), Operator::Eq, key, &schema)
+                        .unwrap()
+                })
+                .reduce(|left, right| binary(left, Operator::Or, right, &schema).unwrap())
+                .expect("at least one key")
+        }
+
+        fn rows_after(
+            predicate: Arc<dyn PhysicalExpr>,
+            input: Arc<StatisticsExec>,
+        ) -> Result<Precision<usize>> {
+            let filter = FilterExec::try_new(predicate, input)?;
+            Ok(filter.partition_statistics(None)?.num_rows)
+        }
+
+        #[test]
+        fn in_list_on_a_unique_column_estimates_the_list_length() -> Result<()> {
+            // 150M rows, every value distinct: 128 keys reach at most 128 rows.
+            // The flat default would have claimed 30M.
+            let rows = rows_after(
+                in_list_predicate(128, false),
+                input(150_000_000, Precision::Exact(150_000_000)),
+            )?;
+            assert_eq!(rows, Precision::Inexact(128));
+            Ok(())
+        }
+
+        #[test]
+        fn or_chain_and_in_list_agree() -> Result<()> {
+            // The optimizer rewrites between these two spellings around a list
+            // length of three, so an estimate that recognized only one of them
+            // would break on the far side of that threshold.
+            let stats = || input(150_000_000, Precision::Exact(150_000_000));
+            for n in [2, 3] {
+                assert_eq!(
+                    rows_after(or_chain_predicate(n), stats())?,
+                    Precision::Inexact(n),
+                    "OR chain of {n} equalities"
+                );
+                assert_eq!(
+                    rows_after(in_list_predicate(n, false), stats())?,
+                    Precision::Inexact(n),
+                    "IN list of {n} keys"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn a_non_unique_column_scales_by_rows_per_value() -> Result<()> {
+            // 1M rows over 1000 distinct values is 1000 rows per value.
+            let rows = rows_after(
+                in_list_predicate(3, false),
+                input(1_000_000, Precision::Exact(1_000)),
+            )?;
+            assert_eq!(rows, Precision::Inexact(3_000));
+            Ok(())
+        }
+
+        #[test]
+        fn duplicate_literals_collapse() -> Result<()> {
+            let schema = schema();
+            // k IN (7, 7, 7) reaches one value, not three.
+            let predicate = in_list(
+                col("k", &schema)?,
+                vec![lit(7i64), lit(7i64), lit(7i64)],
+                &false,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(1_000));
+            Ok(())
+        }
+
+        #[test]
+        fn a_conjunction_takes_the_tightest_estimate() -> Result<()> {
+            let schema = schema();
+            // k IN (4 of 1000 values) AND other IN (2 of 1000): the result is a
+            // subset of each side, so the tighter of the two bounds it.
+            let predicate = binary(
+                in_list(col("k", &schema)?, keys(4), &false, &schema)?,
+                Operator::And,
+                in_list(col("other", &schema)?, keys(2), &false, &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        #[test]
+        fn an_estimate_never_exceeds_the_input() -> Result<()> {
+            // 50 keys over 10 distinct values would extrapolate past the table.
+            let rows = rows_after(
+                in_list_predicate(50, false),
+                input(100, Precision::Exact(10)),
+            )?;
+            assert_eq!(rows, Precision::Inexact(100));
+            Ok(())
+        }
+
+        #[test]
+        fn the_byte_size_scales_with_the_rows() -> Result<()> {
+            let filter = FilterExec::try_new(
+                in_list_predicate(128, false),
+                input(150_000_000, Precision::Exact(150_000_000)),
+            )?;
+            let statistics = filter.partition_statistics(None)?;
+            assert_eq!(statistics.num_rows, Precision::Inexact(128));
+            // NDV is an estimate, so nothing derived from it may claim Exact.
+            assert_eq!(
+                statistics.total_byte_size,
+                Precision::Inexact(128 * BYTES_PER_ROW)
+            );
+            Ok(())
+        }
+
+        /// Everything below must fall back to the default selectivity: the
+        /// predicate's distinctness says nothing about how many rows survive.
+        fn assert_falls_back_to_default(predicate: Arc<dyn PhysicalExpr>) -> Result<()> {
+            let default = FILTER_EXEC_DEFAULT_SELECTIVITY as usize;
+            let rows = rows_after(predicate, input(1_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(1_000 * default / 100));
+            Ok(())
+        }
+
+        #[test]
+        fn negated_in_list_falls_back() -> Result<()> {
+            // NOT IN excludes n values out of an unknown number.
+            assert_falls_back_to_default(in_list_predicate(5, true))
+        }
+
+        #[test]
+        fn a_disjunction_across_columns_falls_back() -> Result<()> {
+            // k = 1 OR other = 2 is a union of two row sets; neither column's
+            // distinctness limits it.
+            let schema = schema();
+            assert_falls_back_to_default(binary(
+                binary(col("k", &schema)?, Operator::Eq, lit(1i64), &schema)?,
+                Operator::Or,
+                binary(col("other", &schema)?, Operator::Eq, lit(2i64), &schema)?,
+                &schema,
+            )?)
+        }
+
+        #[test]
+        fn a_non_literal_list_element_falls_back() -> Result<()> {
+            // The list's cardinality is not known from the expression alone.
+            let schema = schema();
+            assert_falls_back_to_default(in_list(
+                col("k", &schema)?,
+                vec![lit(1i64), col("other", &schema)?],
+                &false,
+                &schema,
+            )?)
+        }
+
+        #[test]
+        fn an_absent_ndv_falls_back() -> Result<()> {
+            let rows =
+                rows_after(in_list_predicate(5, false), input(1_000, Precision::Absent))?;
+            let default = FILTER_EXEC_DEFAULT_SELECTIVITY as usize;
+            assert_eq!(rows, Precision::Inexact(1_000 * default / 100));
+            Ok(())
+        }
     }
 }
