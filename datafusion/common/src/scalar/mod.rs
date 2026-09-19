@@ -888,20 +888,29 @@ fn partial_cmp_map(m1: &Arc<MapArray>, m2: &Arc<MapArray>) -> Option<Ordering> {
         return None;
     }
 
-    for col_index in 0..m1.len() {
-        let arr1 = m1.entries().column(col_index);
-        let arr2 = m2.entries().column(col_index);
+    // Compare one map value against its counterpart at a time.
+    //
+    // `entries()` exposes the whole backing entries array. Every
+    // `ScalarValue::Map` taken out of a column is a slice of that column, so
+    // reading through `entries()` walks every pair in the source batch rather
+    // than the handful this value owns. `value(row)` slices to this row's
+    // offsets. Indexing it by `col_index` compounded that: the loop was bounded
+    // by the map's ROW count while indexing the entries struct's COLUMNS, so it
+    // only ever reached column 0 (the keys) and never compared values at all,
+    // and a map array of three or more rows indexed out of bounds.
+    for row in 0..m1.len() {
+        let entries1 = m1.value(row);
+        let entries2 = m2.value(row);
 
-        let lt_res = arrow::compute::kernels::cmp::lt(arr1, arr2).ok()?;
-        let eq_res = arrow::compute::kernels::cmp::eq(arr1, arr2).ok()?;
+        // Differing pair counts have no element-wise comparison; order by count
+        // so the result is still a total order rather than "incomparable".
+        if entries1.len() != entries2.len() {
+            return entries1.len().partial_cmp(&entries2.len());
+        }
 
-        for j in 0..lt_res.len() {
-            if lt_res.is_valid(j) && lt_res.value(j) {
-                return Some(Ordering::Less);
-            }
-            if eq_res.is_valid(j) && !eq_res.value(j) {
-                return Some(Ordering::Greater);
-            }
+        match partial_cmp_struct(&entries1, &entries2)? {
+            Ordering::Equal => continue,
+            non_equal => return Some(non_equal),
         }
     }
     Some(Ordering::Equal)
@@ -9620,6 +9629,50 @@ mod tests {
         |   |
         +---+
         ");
+    }
+
+    /// `partial_cmp_map` must compare a map's VALUES, not only its keys.
+    ///
+    /// The original read through `entries()` — the whole backing array, not this
+    /// value's slice — and bounded its loop by the map's ROW count while indexing
+    /// the entries struct's COLUMNS. It therefore only ever reached column 0, the
+    /// keys, so two maps with identical keys and different values compared Equal.
+    /// That is a silent wrong answer wherever min/max statistics order a Map, and
+    /// nothing else in this suite asserts on values, so a fork re-cut that dropped
+    /// this patch would go unnoticed without it.
+    #[test]
+    fn map_comparison_distinguishes_values_not_just_keys() {
+        fn map_of(pairs: &[(&str, &str)]) -> ScalarValue {
+            let mut builder = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
+            for (k, v) in pairs {
+                builder.keys().append_value(k);
+                builder.values().append_value(v);
+            }
+            builder.append(true).unwrap();
+            ScalarValue::Map(Arc::new(builder.finish()))
+        }
+
+        // THE GUARD. Same key, different value: this is the case the broken
+        // version answered Equal, and the only one that catches its return.
+        let json = map_of(&[("content-type", "application/json")]);
+        let text = map_of(&[("content-type", "text/plain")]);
+        assert_eq!(json.partial_cmp(&text), Some(Ordering::Less));
+        assert_eq!(text.partial_cmp(&json), Some(Ordering::Greater));
+
+        // Identical maps still compare Equal.
+        assert_eq!(json.partial_cmp(&map_of(&[("content-type", "application/json")])),
+                   Some(Ordering::Equal));
+
+        // Differing keys are still ordered by key.
+        let other_key = map_of(&[("accept", "application/json")]);
+        assert_eq!(other_key.partial_cmp(&json), Some(Ordering::Less));
+
+        // Differing pair counts are ORDERED rather than incomparable. This is a
+        // deliberate semantic change: the original returned None here.
+        let two = map_of(&[("a", "1"), ("b", "2")]);
+        let one = map_of(&[("a", "1")]);
+        assert_eq!(one.partial_cmp(&two), Some(Ordering::Less));
+        assert_eq!(two.partial_cmp(&one), Some(Ordering::Greater));
     }
 
     #[test]
