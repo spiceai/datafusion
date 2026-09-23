@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::config::SchemaSource;
-use crate::helpers::{expr_applicable_for_cols, pruned_partition_list};
+use crate::helpers::{
+    expr_applicable_for_cols, pruned_partition_list, pruned_partition_list_with_metadata,
+};
 use crate::{ListingOptions, ListingTableConfig};
 use arrow::datatypes::{Field, Schema, SchemaBuilder, SchemaRef};
 use async_trait::async_trait;
@@ -29,6 +31,7 @@ use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_groups::FileGroup;
 use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuilder};
 use datafusion_datasource::file_sink_config::{FileOutputMode, FileSinkConfig};
+use datafusion_datasource::metadata::MetadataColumn;
 #[expect(deprecated)]
 use datafusion_datasource::schema_adapter::SchemaAdapterFactory;
 use datafusion_datasource::{
@@ -474,6 +477,17 @@ fn can_be_evaluated_for_partition_pruning(
         && expr_applicable_for_cols(partition_column_names, expr)
 }
 
+// Expressions can be used to prune the file listing if they can be evaluated using
+// only metadata columns (materialized from each file's `ObjectMeta`) and there are
+// metadata columns. Such predicates are applied during listing and reported `Exact`.
+fn can_be_evaluated_for_metadata_pruning(
+    metadata_column_names: &[&str],
+    expr: &Expr,
+) -> bool {
+    !metadata_column_names.is_empty()
+        && expr_applicable_for_cols(metadata_column_names, expr)
+}
+
 #[async_trait]
 impl TableProvider for ListingTable {
     fn schema(&self) -> SchemaRef {
@@ -524,11 +538,26 @@ impl TableProvider for ListingTable {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
 
+        let metadata_col_names = self
+            .options
+            .metadata_cols
+            .iter()
+            .map(MetadataColumn::name)
+            .collect::<Vec<_>>();
+
         // If the filters can be resolved using only partition cols, there is no need to
         // pushdown it to TableScan, otherwise, `unhandled` pruning predicates will be generated
         let (partition_filters, filters): (Vec<_>, Vec<_>) =
             filters.iter().cloned().partition(|filter| {
                 can_be_evaluated_for_partition_pruning(&table_partition_col_names, filter)
+            });
+
+        // Filters resolvable purely from metadata columns are applied during listing
+        // (see `pruned_partition_list_with_metadata`) and reported `Exact`, so they
+        // prune the file list before any file is opened rather than filtering rows.
+        let (metadata_filters, filters): (Vec<_>, Vec<_>) =
+            filters.into_iter().partition(|filter| {
+                can_be_evaluated_for_metadata_pruning(&metadata_col_names, filter)
             });
 
         // We should not limit the number of partitioned files to scan if there are filters and limit
@@ -540,7 +569,12 @@ impl TableProvider for ListingTable {
             statistics,
             grouped_by_partition: partitioned_by_file_group,
         } = self
-            .list_files_for_scan(state, &partition_filters, statistic_file_limit)
+            .list_files_for_scan_with_metadata(
+                state,
+                &partition_filters,
+                &metadata_filters,
+                statistic_file_limit,
+            )
             .await?;
 
         // if no files need to be read, return an `EmptyExec`
@@ -627,12 +661,24 @@ impl TableProvider for ListingTable {
             .iter()
             .map(|col| col.0.as_str())
             .collect::<Vec<_>>();
+        let metadata_column_names = self
+            .options
+            .metadata_cols
+            .iter()
+            .map(MetadataColumn::name)
+            .collect::<Vec<_>>();
         filters
             .iter()
             .map(|filter| {
+                // A filter handled by partition pruning, or fully evaluable from
+                // metadata columns (pruned at listing time), is exact — no residual
+                // `FilterExec` is needed above the scan.
                 if can_be_evaluated_for_partition_pruning(&partition_column_names, filter)
+                    || can_be_evaluated_for_metadata_pruning(
+                        &metadata_column_names,
+                        filter,
+                    )
                 {
-                    // if filter can be handled by partition pruning, it is exact
                     return Ok(TableProviderFilterPushDown::Exact);
                 }
 
@@ -723,10 +769,28 @@ impl ListingTable {
     /// Get the list of files for a scan as well as the file level statistics.
     /// The list is grouped to let the execution plan know how the files should
     /// be distributed to different threads / executors.
+    ///
+    /// `filters` must reference only partition columns (see
+    /// [`list_files_for_scan_with_metadata`](Self::list_files_for_scan_with_metadata)
+    /// to additionally prune by metadata columns).
     pub async fn list_files_for_scan<'a>(
         &'a self,
         ctx: &'a dyn Session,
         filters: &'a [Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<ListFilesResult> {
+        self.list_files_for_scan_with_metadata(ctx, filters, &[], limit)
+            .await
+    }
+
+    /// Like [`list_files_for_scan`](Self::list_files_for_scan), but additionally prunes
+    /// the listing by `metadata_filters` — predicates resolvable purely from each file's
+    /// `ObjectMeta` (`_last_modified`, `_size`, `_location`) — before any file is opened.
+    pub async fn list_files_for_scan_with_metadata<'a>(
+        &'a self,
+        ctx: &'a dyn Session,
+        filters: &'a [Expr],
+        metadata_filters: &'a [Expr],
         limit: Option<usize>,
     ) -> datafusion_common::Result<ListFilesResult> {
         let store = if let Some(url) = self.table_paths.first() {
@@ -738,15 +802,17 @@ impl ListingTable {
                 grouped_by_partition: false,
             });
         };
-        // list files (with partitions)
+        // list files (with partitions), pruning by metadata columns before opening files
         let file_list = future::try_join_all(self.table_paths.iter().map(|table_path| {
-            pruned_partition_list(
+            pruned_partition_list_with_metadata(
                 ctx,
                 store.as_ref(),
                 table_path,
                 filters,
                 &self.options.file_extension,
                 &self.options.table_partition_cols,
+                metadata_filters,
+                &self.options.metadata_cols,
             )
         }))
         .await?;

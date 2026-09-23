@@ -24,9 +24,11 @@ use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use datafusion::execution::SessionStateBuilder;
 use datafusion_catalog_listing::helpers::{
     describe_partition, list_partitions, pruned_partition_list,
+    pruned_partition_list_with_metadata,
 };
 use datafusion_common::ScalarValue;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_expr::{Expr, col, lit};
 use datafusion_session::Session;
 
@@ -231,6 +233,66 @@ async fn test_list_partition() {
             ("tablepath/part1=p1v3/part2=p2v1", 2, vec!["file3.parquet"]),
         ]
     );
+}
+
+#[tokio::test]
+async fn test_pruned_partition_list_metadata_size() {
+    // Unpartitioned table pruned by a `_size` metadata predicate: only the large
+    // object survives, and it is filtered from the listing without being opened.
+    let (store, state) = make_test_store_and_state(&[
+        ("tablepath/small.jsonl", 10),
+        ("tablepath/big.jsonl", 500),
+    ]);
+    let filter = col("_size").gt(lit(100u64));
+    let pruned = pruned_partition_list_with_metadata(
+        state.as_ref(),
+        store.as_ref(),
+        &ListingTableUrl::parse("file:///tablepath/").unwrap(),
+        &[], // no partition filters
+        ".jsonl",
+        &[], // unpartitioned
+        &[filter],
+        &[MetadataColumn::Size],
+    )
+    .await
+    .expect("metadata pruning failed")
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(
+        pruned[0].object_meta.location.as_ref(),
+        "tablepath/big.jsonl"
+    );
+}
+
+#[tokio::test]
+async fn test_pruned_partition_list_metadata_location() {
+    let (store, state) = make_test_store_and_state(&[
+        ("tablepath/a.jsonl", 10),
+        ("tablepath/b.jsonl", 10),
+        ("tablepath/c.jsonl", 10),
+    ]);
+    let filter = col("_location").eq(lit("tablepath/b.jsonl"));
+    let pruned = pruned_partition_list_with_metadata(
+        state.as_ref(),
+        store.as_ref(),
+        &ListingTableUrl::parse("file:///tablepath/").unwrap(),
+        &[],
+        ".jsonl",
+        &[],
+        &[filter],
+        &[MetadataColumn::Location(None)],
+    )
+    .await
+    .expect("metadata pruning failed")
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap();
+
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0].object_meta.location.as_ref(), "tablepath/b.jsonl");
 }
 
 pub fn make_test_store_and_state(

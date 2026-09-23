@@ -25,11 +25,12 @@ use datafusion_common::{
     HashMap, Result, ScalarValue, TableReference, assert_or_internal_err,
 };
 use datafusion_datasource::PartitionedFile;
+use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::{FileExtensions, ListingTableUrl};
 use datafusion_expr::{BinaryExpr, Operator, lit, utils};
 
 use arrow::{
-    array::AsArray,
+    array::{Array, AsArray},
     datatypes::{DataType, Field},
     record_batch::RecordBatch,
 };
@@ -402,6 +403,43 @@ pub async fn pruned_partition_list<'a>(
     file_extension: &'a str,
     partition_cols: &'a [(String, DataType)],
 ) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
+    pruned_partition_list_with_metadata(
+        ctx,
+        store,
+        table_path,
+        filters,
+        file_extension,
+        partition_cols,
+        &[],
+        &[],
+    )
+    .await
+}
+
+/// Like [`pruned_partition_list`], but additionally prunes the file listing by
+/// metadata-column predicates (`_last_modified`, `_size`, `_location`) before any
+/// file is opened.
+///
+/// Metadata columns are materialized from each object's [`ObjectMeta`] (mtime, size,
+/// location) already returned by the listing, so a bound such as
+/// `_last_modified > <watermark>` prunes the file list at listing time rather than
+/// opening and row-filtering every file. `metadata_filters` must reference only
+/// metadata columns (see `expr_applicable_for_cols`); the caller reports those
+/// predicates as `Exact` so no redundant `FilterExec` is planted above the scan.
+///
+/// Metadata pruning is orthogonal to partition pruning and is applied to both
+/// partitioned and unpartitioned tables.
+#[expect(clippy::too_many_arguments)]
+pub async fn pruned_partition_list_with_metadata<'a>(
+    ctx: &'a dyn Session,
+    store: &'a dyn ObjectStore,
+    table_path: &'a ListingTableUrl,
+    filters: &'a [Expr],
+    file_extension: &'a str,
+    partition_cols: &'a [(String, DataType)],
+    metadata_filters: &'a [Expr],
+    metadata_cols: &'a [MetadataColumn],
+) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
     let prefix = if !partition_cols.is_empty() {
         evaluate_partition_prefix(partition_cols, filters)
     } else {
@@ -411,7 +449,14 @@ pub async fn pruned_partition_list<'a>(
     let objects = table_path
         .list_prefixed_files(ctx, store, prefix, file_extension)
         .await?
-        .try_filter(|object_meta| futures::future::ready(object_meta.size > 0));
+        .try_filter(|object_meta| futures::future::ready(object_meta.size > 0))
+        .try_filter_map(move |object_meta| {
+            futures::future::ready(filter_by_metadata(
+                object_meta,
+                metadata_filters,
+                metadata_cols,
+            ))
+        });
 
     if partition_cols.is_empty() {
         assert_or_internal_err!(
@@ -450,6 +495,51 @@ pub async fn pruned_partition_list<'a>(
                 futures::future::ready(filter_partitions(pf, filters, &df_schema))
             })
             .boxed())
+    }
+}
+
+/// Evaluate metadata-column predicates against a single file's [`ObjectMeta`], without
+/// opening the file. Returns `Some(object_meta)` when the object satisfies every predicate,
+/// or `None` when it should be pruned from the listing.
+///
+/// The metadata columns (`_last_modified`, `_size`, `_location`) are materialized from
+/// `object_meta` via [`MetadataColumn::to_scalar_value`], then the conjunction of
+/// `metadata_filters` is compiled to a physical expression and evaluated against a one-row
+/// batch. Reusing the expression evaluator gives correct `>`, `>=`, `<`, `<=`, `=`,
+/// `BETWEEN`, `IN`, `LIKE`, cast and NULL semantics identical to a row-level `WHERE`.
+fn filter_by_metadata(
+    object_meta: ObjectMeta,
+    metadata_filters: &[Expr],
+    metadata_cols: &[MetadataColumn],
+) -> Result<Option<ObjectMeta>> {
+    if metadata_filters.is_empty() || metadata_cols.is_empty() {
+        return Ok(Some(object_meta));
+    }
+
+    let df_schema = DFSchema::from_unqualified_fields(
+        metadata_cols.iter().map(MetadataColumn::field).collect(),
+        Default::default(),
+    )?;
+
+    let arrays = metadata_cols
+        .iter()
+        .map(|col| col.to_scalar_value(&object_meta).to_array())
+        .collect::<Result<Vec<_>>>()?;
+    let batch = RecordBatch::try_new(Arc::clone(df_schema.inner()), arrays)?;
+
+    let filter =
+        utils::conjunction(metadata_filters.iter().cloned()).unwrap_or_else(|| lit(true));
+    let props = ExecutionProps::new();
+    let expr = create_physical_expr(&filter, &df_schema, &props)?;
+
+    // A single object => a single-row result. Keep the file only on an explicit TRUE;
+    // a NULL (unknown) result must prune it, matching SQL `WHERE` semantics.
+    let matches = expr.evaluate(&batch)?.into_array(1)?;
+    let matches = matches.as_boolean();
+    if matches.is_valid(0) && matches.value(0) {
+        Ok(Some(object_meta))
+    } else {
+        Ok(None)
     }
 }
 
@@ -514,7 +604,110 @@ mod tests {
     use std::ops::Not;
 
     use super::*;
+    use chrono::TimeZone;
     use datafusion_expr::{case, col};
+
+    fn meta_at(path: &str, size: u64, year: i32) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from(path),
+            last_modified: chrono::Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap(),
+            size,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    fn ts_lit(year: i32) -> Expr {
+        let dt = chrono::Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+        lit(ScalarValue::TimestampMicrosecond(
+            Some(dt.timestamp_micros()),
+            Some("UTC".into()),
+        ))
+    }
+
+    #[test]
+    fn filter_by_metadata_prunes_stale_last_modified() {
+        // Reproduces github.com/spiceai/spiceai#14264: a file whose mtime is below the
+        // watermark must be pruned from the listing, never opened.
+        let cols = [MetadataColumn::LastModified];
+        let filters = [col("_last_modified").gt(ts_lit(2023))];
+
+        let stale =
+            filter_by_metadata(meta_at("old.jsonl.gz", 10, 2020), &filters, &cols)
+                .expect("eval");
+        assert!(stale.is_none(), "2020 file must be pruned by > 2023");
+
+        let fresh =
+            filter_by_metadata(meta_at("new.jsonl.gz", 10, 2024), &filters, &cols)
+                .expect("eval");
+        assert!(fresh.is_some(), "2024 file must survive > 2023");
+    }
+
+    #[test]
+    fn filter_by_metadata_prunes_by_size() {
+        let cols = [MetadataColumn::Size];
+        let filters = [col("_size").lt(lit(100u64))];
+        assert!(
+            filter_by_metadata(meta_at("big", 500, 2024), &filters, &cols)
+                .expect("eval")
+                .is_none()
+        );
+        assert!(
+            filter_by_metadata(meta_at("small", 50, 2024), &filters, &cols)
+                .expect("eval")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn filter_by_metadata_between_bounds() {
+        let cols = [MetadataColumn::LastModified];
+        let filters = [col("_last_modified").between(ts_lit(2022), ts_lit(2025))];
+        assert!(
+            filter_by_metadata(meta_at("in", 10, 2023), &filters, &cols)
+                .expect("eval")
+                .is_some()
+        );
+        assert!(
+            filter_by_metadata(meta_at("out", 10, 2019), &filters, &cols)
+                .expect("eval")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filter_by_metadata_null_comparison_prunes() {
+        // `_last_modified > NULL` is unknown → the file is pruned, matching `WHERE` semantics.
+        let cols = [MetadataColumn::LastModified];
+        let null_ts = lit(ScalarValue::TimestampMicrosecond(None, Some("UTC".into())));
+        let filters = [col("_last_modified").gt(null_ts)];
+        assert!(
+            filter_by_metadata(meta_at("f", 10, 2024), &filters, &cols)
+                .expect("eval")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn filter_by_metadata_noop_without_filters_or_cols() {
+        let cols = [MetadataColumn::LastModified];
+        // No filters → file kept.
+        assert!(
+            filter_by_metadata(meta_at("f", 10, 2020), &[], &cols)
+                .expect("eval")
+                .is_some()
+        );
+        // No metadata columns configured → nothing to prune on, file kept.
+        assert!(
+            filter_by_metadata(
+                meta_at("f", 10, 2020),
+                &[col("_last_modified").gt(ts_lit(2099))],
+                &[]
+            )
+            .expect("eval")
+            .is_some()
+        );
+    }
 
     #[test]
     fn test_split_files() {
