@@ -1436,14 +1436,6 @@ mod tests {
             self
         }
 
-        /// Sets `datafusion.execution.enable_file_stream_work_stealing`. When
-        /// disabled, each stream keeps its own files local instead of sharing a
-        /// work queue with its siblings.
-        fn with_enable_file_stream_work_stealing(mut self, enable: bool) -> Self {
-            self.enable_file_stream_work_stealing = enable;
-            self
-        }
-
         /// Controls whether scheduler events are included in the snapshot.
         ///
         /// When disabled, `run()` still includes the event section header but

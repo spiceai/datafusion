@@ -2305,20 +2305,6 @@ impl Expr {
                         rewrite_placeholder_field(pattern.as_mut(), &like_field)?;
                     }
                 }
-                Expr::InSubquery(InSubquery {
-                    expr,
-                    subquery,
-                    negated: _,
-                }) => {
-                    let subquery_schema = subquery.subquery.schema();
-                    let fields = subquery_schema.fields();
-
-                    // Subqueries used in IN expressions must have exactly 1 field
-                    // i.e. `SELECT * FROM foo WHERE 'some_val' IN (SELECT val FROM bar)`
-                    if let [first_field] = &fields[..] {
-                        rewrite_placeholder_field(expr.as_mut(), first_field)?;
-                    }
-                }
                 Expr::Case(Case {
                     expr,
                     when_then_expr,
@@ -2400,7 +2386,6 @@ impl Expr {
                 | Expr::Wildcard { .. }
                 | Expr::GroupingSet(_)
                 | Expr::OuterReferenceColumn(_, _)
-                | Expr::SetComparison(_)
                 | Expr::HigherOrderFunction(_)
                 | Expr::Lambda(_)
                 | Expr::LambdaVariable(_)
@@ -3161,11 +3146,7 @@ fn rewrite_placeholder_from_subquery(
 ) -> Result<()> {
     let subquery_schema = subquery.subquery.schema();
     match &subquery_schema.fields()[..] {
-        [subquery_field] => {
-            let column =
-                Expr::Column(Column::new_unqualified(subquery_field.name().clone()));
-            rewrite_placeholder(expr, &column, subquery_schema)
-        }
+        [subquery_field] => rewrite_placeholder_field(expr, subquery_field),
         _ => plan_err!(
             "{kind} should only return one column, but found {}: {}",
             subquery_schema.fields().len(),
@@ -4156,6 +4137,7 @@ mod test {
             projection: None,
             filters: vec![subquery_filter.clone()],
             fetch: None,
+            statistics_requests: Default::default(),
         });
 
         let projected_fields = vec![Field::new("A", DataType::Int32, true)];

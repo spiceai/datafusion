@@ -1027,6 +1027,7 @@ mod tests {
     use crate::filter::FilterExec;
     use crate::projection::ProjectionExec;
     use crate::statistics::StatisticsArgs;
+    use datafusion_common::tree_node::TreeNodeRecursion;
     use crate::{
         ChildrenPropertiesMode, DisplayAs, DisplayFormatType, PlanProperties,
         ReplaceChildrenOptions,

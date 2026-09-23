@@ -62,14 +62,15 @@ use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::stream::EmptyRecordBatchStream;
 use crate::{
     ChildrenPropertiesMode, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
-    ExecutionPlanProperties, Partitioning, PlanProperties, ReplaceChildrenOptions,
-    SendableRecordBatchStream, Statistics, validate_child_count,
+    ExecutionPlanProperties, Partitioning, PhysicalExpr, PlanProperties,
+    ReplaceChildrenOptions, SendableRecordBatchStream, Statistics, validate_child_count,
 };
 
 use arrow::compute::concat_batches;
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::Result;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::utils::evaluate_partition_ranges;
 use datafusion_execution::{RecordBatchStream, TaskContext};
 use datafusion_physical_expr::LexOrdering;

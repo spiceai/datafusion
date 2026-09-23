@@ -39,6 +39,7 @@ use datafusion_datasource::morsel::Morselizer;
 use arrow::array::timezone::Tz;
 use arrow::datatypes::TimeUnit;
 use datafusion_common::DataFusionError;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::config::TableParquetOptions;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;

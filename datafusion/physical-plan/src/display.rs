@@ -1504,8 +1504,10 @@ mod tests {
     use std::fmt::Write;
     use std::sync::Arc;
 
+    use datafusion_common::tree_node::TreeNodeRecursion;
     use datafusion_common::{Result, Statistics, internal_datafusion_err};
     use datafusion_execution::{SendableRecordBatchStream, TaskContext};
+    use datafusion_physical_expr::PhysicalExpr;
 
     use crate::statistics::StatisticsArgs;
     use crate::{

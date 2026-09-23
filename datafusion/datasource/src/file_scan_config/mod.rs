@@ -38,6 +38,7 @@ use crate::{
 use arrow::datatypes::Fields;
 use arrow::datatypes::{DataType, Schema, SchemaRef};
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Constraints, Result, ScalarValue, Statistics, internal_datafusion_err, internal_err,
 };
@@ -695,6 +696,11 @@ impl From<FileScanConfig> for FileScanConfigBuilder {
 /// (as `try_collapse_projection_chain` does), so a self-duplicating expression
 /// such as `r + r` counts as two references. A volatile expression referenced
 /// exactly once has nothing to duplicate and is left to merge.
+///
+/// Superseded in production code by [`would_duplicate_costly_exprs`], which
+/// also protects non-trivial deterministic expressions; kept for the narrower
+/// volatile-only assertions in the tests below.
+#[cfg(test)]
 fn would_duplicate_volatile_exprs(
     inner: &ProjectionExprs,
     outer: &ProjectionExprs,
@@ -1750,7 +1756,6 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::TableSchema;
     use crate::metadata::MetadataColumn;
     use crate::source::DataSourceExec;
     use crate::test_util::col;

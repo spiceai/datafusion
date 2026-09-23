@@ -28,7 +28,9 @@ pub use crate::stream::EmptyRecordBatchStream;
 
 use arrow_schema::Schema;
 pub use datafusion_common::hash_utils;
-use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
+};
 pub use datafusion_common::utils::project_schema;
 pub use datafusion_common::{ColumnStatistics, Statistics, internal_err};
 pub use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream};
@@ -2735,66 +2737,6 @@ mod tests {
         assert!(!Arc::ptr_eq(out.properties(), parent.properties()));
 
         Ok(())
-    }
-
-    #[derive(Debug)]
-    struct DowncastDelegatingExec(Arc<dyn ExecutionPlan>);
-
-    impl DisplayAs for DowncastDelegatingExec {
-        fn fmt_as(
-            &self,
-            _t: DisplayFormatType,
-            _f: &mut std::fmt::Formatter,
-        ) -> std::fmt::Result {
-            unimplemented!()
-        }
-    }
-
-    impl ExecutionPlan for DowncastDelegatingExec {
-        fn name(&self) -> &'static str {
-            Self::static_name()
-        }
-
-        fn properties(&self) -> &Arc<PlanProperties> {
-            unimplemented!()
-        }
-
-        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-            vec![]
-        }
-
-        fn with_new_children(
-            self: Arc<Self>,
-            _: Vec<Arc<dyn ExecutionPlan>>,
-        ) -> Result<Arc<dyn ExecutionPlan>> {
-            unimplemented!()
-        }
-
-        fn apply_expressions(
-            &self,
-            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
-        ) -> Result<TreeNodeRecursion> {
-            Ok(TreeNodeRecursion::Continue)
-        }
-
-        fn downcast_delegate(&self) -> Option<&dyn ExecutionPlan> {
-            Some(self.0.as_ref())
-        }
-
-        fn execute(
-            &self,
-            _partition: usize,
-            _context: Arc<TaskContext>,
-        ) -> Result<SendableRecordBatchStream> {
-            unimplemented!()
-        }
-
-        fn partition_statistics(
-            &self,
-            _partition: Option<usize>,
-        ) -> Result<Arc<Statistics>> {
-            unimplemented!()
-        }
     }
 
     #[derive(Debug)]

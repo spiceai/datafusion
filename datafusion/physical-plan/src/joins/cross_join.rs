@@ -35,15 +35,16 @@ use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::stream::EmptyRecordBatchStream;
 use crate::{
     ChildrenPropertiesMode, ColumnStatistics, DisplayAs, DisplayFormatType, Distribution,
-    ExecutionPlan, ExecutionPlanProperties, PlanProperties, RecordBatchStream,
-    ReplaceChildrenOptions, SendableRecordBatchStream, Statistics, handle_state,
-    validate_child_count,
+    ExecutionPlan, ExecutionPlanProperties, PhysicalExpr, PlanProperties,
+    RecordBatchStream, ReplaceChildrenOptions, SendableRecordBatchStream, Statistics,
+    handle_state, validate_child_count,
 };
 
 use arrow::array::{RecordBatch, RecordBatchOptions};
 use arrow::compute::concat_batches;
 use arrow::datatypes::{Fields, Schema, SchemaRef};
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     JoinType, Result, ScalarValue, assert_eq_or_internal_err, internal_err,
 };

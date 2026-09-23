@@ -27,7 +27,6 @@ use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
-use futures::TryFutureExt;
 use futures::future::BoxFuture;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
@@ -482,7 +481,7 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use datafusion_execution::cache::DefaultFilesMetadataCache;
+    use datafusion_execution::cache::default_cache::DefaultCache;
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
     use object_store::path::Path;
@@ -638,7 +637,7 @@ mod tests {
         });
         let factory = CachedParquetFileReaderFactory::new(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
-            Arc::new(DefaultFilesMetadataCache::new(64 * 1024 * 1024)),
+            Arc::new(DefaultCache::new(64 * 1024 * 1024)),
         )
         .with_object_versioning_type(Some(ObjectVersionType::Version));
         let file = PartitionedFile::new_from_meta(listed);
@@ -702,7 +701,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             PartitionedFile::new_from_meta(listed),
         )
-        .with_metadata_cache(Some(Arc::new(DefaultFilesMetadataCache::new(
+        .with_metadata_cache(Some(Arc::new(DefaultCache::new(
             64 * 1024 * 1024,
         ))))
         .with_object_versioning_type(Some(ObjectVersionType::ETag));

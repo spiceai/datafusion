@@ -171,6 +171,7 @@ use crate::{
     InputOrderMode, SendableRecordBatchStream, Statistics,
 };
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet};
 

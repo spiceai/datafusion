@@ -6743,6 +6743,7 @@ mod tests {
                 projection: None,
                 filters: vec![],
                 fetch: None,
+                statistics_requests: Default::default(),
             })),
         });
 

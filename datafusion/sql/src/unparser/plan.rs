@@ -3768,8 +3768,9 @@ impl Unparser<'_> {
                 )? {
                     let predicate = if let Some(ref alias_name) = alias {
                         let mut rewriter = TableAliasRewriter {
-                            table_schema: plan.schema().as_arrow(),
+                            table_schema: plan.schema().as_ref(),
                             alias_name: alias_name.clone(),
+                            rewrite_unqualified: true,
                         };
                         filter.predicate.clone().rewrite(&mut rewriter).data()?
                     } else {

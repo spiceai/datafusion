@@ -437,9 +437,6 @@ impl SelectBuilder {
     pub fn pop_from(&mut self) -> Option<TableWithJoinsBuilder> {
         self.from.pop()
     }
-    pub fn has_selection(&self) -> bool {
-        self.selection.is_some()
-    }
     pub fn lateral_views(&mut self, value: Vec<ast::LateralView>) -> &mut Self {
         self.lateral_views = value;
         self

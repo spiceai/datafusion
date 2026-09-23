@@ -31,11 +31,14 @@ use crate::metrics::MetricsSet;
 use crate::statistics::StatisticsArgs;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::streaming::PartitionStream;
-use crate::{ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions};
+use crate::{
+    ChildrenPropertiesMode, ExecutionPlan, PhysicalExpr, ReplaceChildrenOptions,
+};
 use crate::{DisplayAs, DisplayFormatType, PlanProperties};
 
 use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Result, Statistics, assert_or_internal_err, config::ConfigOptions, project_schema,
 };

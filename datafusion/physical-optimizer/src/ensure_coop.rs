@@ -27,8 +27,8 @@ use crate::PhysicalOptimizerRule;
 
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TreeNode};
-use datafusion_physical_plan::ExecutionPlan;
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion_physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::execution_plan::{EvaluationType, SchedulingType};
 

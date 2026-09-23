@@ -29,14 +29,14 @@ use super::{
 use crate::execution_plan::{Boundedness, CardinalityEffect};
 use crate::statistics::{ChildStats, StatisticsArgs};
 use crate::{
-    ChildrenPropertiesMode, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
-    ReplaceChildrenOptions, validate_child_count,
+    ChildrenPropertiesMode, DisplayFormatType, Distribution, ExecutionPlan,
+    Partitioning, PhysicalExpr, ReplaceChildrenOptions, validate_child_count,
 };
 
 use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use datafusion_common::tree_node::TreeNodeRecursion;
-use datafusion_common::{Result, assert_eq_or_internal_err, internal_err};
+use datafusion_common::{Result, assert_eq_or_internal_err};
 use datafusion_execution::TaskContext;
 
 use datafusion_physical_expr::LexOrdering;
@@ -720,7 +720,6 @@ mod tests {
     use arrow::compute::SortOptions;
     use arrow::datatypes::Schema;
     use datafusion_common::stats::Precision;
-    use datafusion_physical_expr::PhysicalExpr;
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr::{PhysicalExpr, PhysicalSortExpr};
 

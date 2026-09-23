@@ -298,7 +298,7 @@ impl ListingTable {
     fn statistics_cache(
         &self,
         has_table_reference: bool,
-    ) -> Option<&Arc<dyn FileStatisticsCache>> {
+    ) -> Option<&Arc<FileStatisticsCache>> {
         let shared_cache = self.collected_statistics.as_ref()?;
         if has_table_reference || self.schema_source == SchemaSource::Inferred {
             Some(shared_cache)

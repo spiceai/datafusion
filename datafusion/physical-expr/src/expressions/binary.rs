@@ -1231,7 +1231,7 @@ impl BinaryExpr {
                     // Skip this operand as it doesn't affect result
                     continue;
                 }
-                ShortCircuitStrategy::PreSelection(_) | ShortCircuitStrategy::None => {
+                ShortCircuitStrategy::PreSelection { .. } | ShortCircuitStrategy::None => {
                     // Can't short-circuit, need to combine with accumulated result
                 }
             }

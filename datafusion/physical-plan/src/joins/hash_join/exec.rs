@@ -2082,7 +2082,8 @@ impl HashJoinExec {
             })
             .transpose()?;
 
-        let mut hash_join = HashJoinExecBuilder::new(left, right, on, join_type)
+        let mut hash_join =
+            HashJoinExecBuilder::<MinMaxLeftAccumulator>::new(left, right, on, join_type)
             .with_filter(filter)
             .with_projection(projection)
             .with_partition_mode(partition_mode)

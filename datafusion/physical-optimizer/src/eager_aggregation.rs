@@ -18,7 +18,7 @@
 //! [`EagerAggregation`]: a **cost-based**, physical alternative to the logical
 //! eager-aggregation rule. It pushes a partial aggregation below a join when a
 //! statistics-based cost model predicts a win, then lets the existing two-phase
-//! aggregate machinery (and `EnforceDistribution`) finalize the result.
+//! aggregate machinery (and `EnsureRequirements`) finalize the result.
 //!
 //! # Why physical / cost-based
 //!
@@ -149,6 +149,7 @@ use datafusion_physical_plan::joins::utils::{
     ColumnIndex, JoinFilter, build_join_schema,
 };
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 
 /// Cost-based physical eager-aggregation rule. See the [module docs](self).
 #[derive(Debug, Default)]
@@ -591,7 +592,10 @@ fn try_push_aggregate(
             Side::Left => right,
             Side::Right => left,
         };
-        match other_plan.partition_statistics(None)?.num_rows {
+        match StatisticsContext::new()
+            .compute(other_plan.as_ref(), &StatisticsArgs::new())?
+            .num_rows
+        {
             Precision::Exact(n) | Precision::Inexact(n) => Some(n),
             Precision::Absent => None,
         }
@@ -687,7 +691,7 @@ fn try_push_aggregate(
 
     let pushdown_group_by = PhysicalGroupBy::new_single(pushdown_group);
 
-    // Pre-aggregation as Partial -> FinalPartitioned (EnforceDistribution will
+    // Pre-aggregation as Partial -> FinalPartitioned (EnsureRequirements will
     // insert the hash repartition between them).
     let pre_partial = Arc::new(AggregateExec::try_new(
         AggregateMode::Partial,
@@ -1024,14 +1028,18 @@ fn cost_gate(
         .eager_aggregation_min_reduction_factor
         .max(1);
     let max_groups = config.optimizer.eager_aggregation_max_pushed_groups;
-    let push_stats = push_plan.partition_statistics(None)?;
+    let push_stats =
+        StatisticsContext::new().compute(push_plan.as_ref(), &StatisticsArgs::new())?;
     let push_rows = match push_stats.num_rows {
         Precision::Exact(n) | Precision::Inexact(n) => n,
         Precision::Absent => {
             return Ok(CostGate::Decline("push side num_rows absent".into()));
         }
     };
-    let join_out = match join.partition_statistics(None)?.num_rows {
+    let join_out = match StatisticsContext::new()
+        .compute(join, &StatisticsArgs::new())?
+        .num_rows
+    {
         Precision::Exact(n) | Precision::Inexact(n) => n,
         Precision::Absent => {
             return Ok(CostGate::Decline("join output num_rows absent".into()));
@@ -1121,7 +1129,7 @@ mod tests {
     use super::*;
     use crate::PhysicalOptimizerRule;
 
-    use crate::enforce_distribution::EnforceDistribution;
+    use crate::ensure_requirements::EnsureRequirements;
     use arrow::array::{Decimal128Array, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
@@ -1129,12 +1137,14 @@ mod tests {
     use datafusion_common::ScalarValue;
     use datafusion_common::config::ConfigOptions;
     use datafusion_common::stats::{ColumnStatistics, Statistics};
+    use datafusion_common::tree_node::TreeNodeRecursion;
     use datafusion_execution::TaskContext;
     use datafusion_functions_aggregate::average::avg_udaf;
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::sum::sum_udaf;
     use datafusion_physical_expr::EquivalenceProperties;
     use datafusion_physical_expr::expressions::{BinaryExpr, Literal, lit};
+    use datafusion_physical_plan::PhysicalExpr;
     use datafusion_physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion_physical_plan::joins::PartitionMode;
     use datafusion_physical_plan::memory::MemoryStream;
@@ -1377,7 +1387,7 @@ mod tests {
     // pre-aggregation over the fact's join key (`f_dim`) below the join, so the
     // join probes ~100 pre-aggregated rows instead of 10M, and the original top
     // aggregate merges the partial sums. The pushed aggregate is emitted as
-    // Partial -> FinalPartitioned; `EnforceDistribution` (which runs after this
+    // Partial -> FinalPartitioned; `EnsureRequirements` (which runs after this
     // rule) inserts the hash repartition between the two halves.
     #[test]
     fn example_sum_push_plan() {
@@ -2402,6 +2412,14 @@ mod tests {
                 self.stats.clone()
             }))
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+        ) -> Result<TreeNodeRecursion> {
+            // Leaf plan (no children) that reads from in-memory batches: no
+            // physical expressions to visit.
+            Ok(TreeNodeRecursion::Continue)
+        }
     }
 
     fn stats_with(num_rows: usize, distinct: &[Option<usize>]) -> Statistics {
@@ -2433,9 +2451,9 @@ mod tests {
     }
 
     fn enforce_distribution(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        // EnforceDistribution inserts the repartitioning the pushed/top
+        // EnsureRequirements inserts the repartitioning the pushed/top
         // FinalPartitioned aggregates require to execute correctly.
-        EnforceDistribution::new()
+        EnsureRequirements::new()
             .optimize(plan, &ConfigOptions::default())
             .unwrap()
     }
@@ -2545,7 +2563,7 @@ mod tests {
             .unwrap(),
         ) as Arc<dyn ExecutionPlan>;
 
-        // Run the rule, assert it fired (before EnforceDistribution inserts a
+        // Run the rule, assert it fired (before EnsureRequirements inserts a
         // RepartitionExec between the join and the pushed aggregate), then
         // distribute both plans so they execute correctly.
         let eager_on = run_rule(Arc::clone(&plan));

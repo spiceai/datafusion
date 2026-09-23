@@ -522,7 +522,9 @@ mod tests {
     use super::*;
 
     use arrow::datatypes::{DataType, Field, Schema};
-    use datafusion_expr::execution_props::{ScalarSubqueryResults, SubqueryIndex};
+    use datafusion_expr::physical_planning_context::{
+        ScalarSubqueryResults, SubqueryIndex,
+    };
     use datafusion_physical_expr::expressions::col;
     use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
     use datafusion_physical_plan::displayable;
