@@ -3280,6 +3280,58 @@ fn test_unparse_right_semi_join_scopes_build_side_fetch() -> Result<()> {
     Ok(())
 }
 
+/// `RightMark` returns a record for each record from the *right* input, so like
+/// `RightSemi` and `RightAnti` its probe side is `join.right` and the `EXISTS`
+/// body is built from `join.left`. Omitting it from that swap unparsed the join
+/// against the wrong relation entirely (spiceai/spiceai#13022): the outer query
+/// read `t1`, the correlation named the rows the outer query was not selecting,
+/// and the projection asked a bounded `t1` for a column it does not carry.
+///
+/// Bounded, so the swap and the scope are asserted together: the `LIMIT` has to
+/// land inside the derived table the `EXISTS` body reads, under the name the
+/// correlation uses.
+#[test]
+fn test_unparse_right_mark_join_swaps_inputs_with_build_side_fetch() -> Result<()> {
+    let plan = LogicalPlanBuilder::from(exists_join_with_probe_side_fetch(
+        datafusion_expr::JoinType::RightMark,
+    )?)
+    .filter(col("mark").or(col("t2.d").lt(lit(0))))?
+    .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t2"."d" FROM "t2" WHERE (EXISTS (SELECT 1 FROM (SELECT "t1"."c" FROM "t1" LIMIT 5) AS "t1" WHERE ("t1"."c" = "t2"."c")) OR ("t2"."d" < 0))"#
+    );
+    Ok(())
+}
+
+/// The same swap without a bound, so the unscoped shape is pinned too: the outer
+/// `FROM` names `join.right` and the `EXISTS` body reads `join.left` directly.
+#[test]
+fn test_unparse_right_mark_join_swaps_inputs() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let build = table_scan(Some("t1"), &schema, Some(vec![0]))?.build()?;
+    let probe = table_scan(Some("t2"), &schema, Some(vec![0, 1]))?.build()?;
+
+    let plan = LogicalPlanBuilder::from(build)
+        .join_on(
+            probe,
+            datafusion_expr::JoinType::RightMark,
+            vec![col("t1.c").eq(col("t2.c"))],
+        )?
+        .project(vec![col("t2.d")])?
+        .filter(col("mark").or(col("t2.d").lt(lit(0))))?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t2"."d" FROM "t2" WHERE (EXISTS (SELECT 1 FROM "t1" WHERE ("t1"."c" = "t2"."c")) OR ("t2"."d" < 0))"#
+    );
+    Ok(())
+}
+
 /// The right anti join takes the same swap, and inherits it from the same place.
 #[test]
 fn test_unparse_right_anti_join_scopes_build_side_fetch() -> Result<()> {

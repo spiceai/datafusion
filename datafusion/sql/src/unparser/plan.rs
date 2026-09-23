@@ -2341,12 +2341,14 @@ impl Unparser<'_> {
 
                         match join.join_type {
                             JoinType::LeftMark | JoinType::RightMark => {
-                                let source_schema =
-                                    if join.join_type == JoinType::LeftMark {
-                                        right_plan.schema()
-                                    } else {
-                                        left_plan.schema()
-                                    };
+                                // The mark is qualified by the build side, which
+                                // is `right_plan` for both mark joins once the
+                                // swap above has been applied — the same plan
+                                // `build_exists_subquery` was just given. Reading
+                                // `join.right`/`join.left` directly here instead
+                                // is what lets the qualifier disagree with the
+                                // body it marks.
+                                let source_schema = right_plan.schema();
                                 let (table_ref, _) = source_schema.qualified_field(0);
                                 let column = self.col_to_sql(&Column::new(
                                     table_ref.cloned(),
@@ -3712,15 +3714,24 @@ impl Unparser<'_> {
     }
 
     /// Whether a join presents its inputs to the unparser the other way round
-    /// from the way the plan holds them: `RightSemi` and `RightAnti` correlate
-    /// `join.right` and build the `EXISTS` body from `join.left`.
+    /// from the way the plan holds them: the `Right*` half of the `EXISTS`
+    /// family correlates `join.right` and builds the `EXISTS` body from
+    /// `join.left`.
+    ///
+    /// The membership is what `JoinType`'s own documentation says about which
+    /// input the rows come from: `RightSemi`, `RightAnti` and `RightMark` each
+    /// "return a record for each record from the right input", so `join.right`
+    /// is the probe side for all three.
     ///
     /// Read from here rather than restated, so that everything deciding which
     /// side is which agrees — the join arm swaps the plans, and anything
     /// reading `join.on` has to take the key from the matching side of each
     /// pair or it will name the relation the correlation does not.
     const fn swaps_join_inputs(join_type: JoinType) -> bool {
-        matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+        matches!(
+            join_type,
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+        )
     }
 
     /// Whether `qualifier`, as the emitted SQL spells it, is a name the unparser
