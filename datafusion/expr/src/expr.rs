@@ -92,7 +92,7 @@ impl From<sqlparser::ast::NullTreatment> for NullTreatment {
 ///
 /// For example the expression `A + 1` will be represented as
 ///
-///```text
+/// ```text
 ///  BinaryExpr {
 ///    left: Expr::Column("A"),
 ///    op: Operator::Plus,
@@ -265,7 +265,7 @@ impl From<sqlparser::ast::NullTreatment> for NullTreatment {
 ///
 /// [`ExplainFormat::Tree`]: crate::logical_plan::ExplainFormat::Tree
 ///
-///```
+/// ```
 /// # use datafusion_expr::{lit, col};
 /// let expr = col("c1") + lit(42);
 /// assert_eq!(format!("{}", expr.human_display()), "c1 + 42");
@@ -301,7 +301,7 @@ impl From<sqlparser::ast::NullTreatment> for NullTreatment {
 /// Rewrite an expression, replacing references to column "a" in an
 /// to the literal `42`:
 ///
-///  ```
+/// ```
 /// # use datafusion_common::tree_node::{Transformed, TreeNode};
 /// # use datafusion_expr::{col, Expr, lit};
 /// // expression a = 5 AND b = 6
@@ -662,7 +662,7 @@ pub fn intersect_metadata_for_union<'a>(
             }
             Some(current) => {
                 // Only keep keys that exist in both with the same value
-                current.retain(|k, v| metadata.get(k) == Some(v));
+                current.retain(|k, v| metadata.get(k) == Some(&*v));
             }
         }
     }
@@ -671,22 +671,43 @@ pub fn intersect_metadata_for_union<'a>(
 }
 
 /// UNNEST expression.
+///
+/// When `outer` is `true`, the unnest should preserve `NULL` and empty input
+/// lists by emitting a single `NULL` output row for each. When `false` (the
+/// historical default), the behavior is identical to the plain `UNNEST(col)`
+/// SQL form: `NULL` and empty input lists are dropped from the output.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Hash, Debug)]
 pub struct Unnest {
     pub expr: Box<Expr>,
+    /// Outer-unnest behavior: also expand empty input lists into a single
+    /// `NULL` output row (in addition to preserving `NULL` input rows).
+    pub outer: bool,
 }
 
 impl Unnest {
-    /// Create a new Unnest expression.
+    /// Create a new Unnest expression with default (non-outer) semantics.
     pub fn new(expr: Expr) -> Self {
         Self {
             expr: Box::new(expr),
+            outer: false,
         }
     }
 
-    /// Create a new Unnest expression.
+    /// Create a new Unnest expression with default (non-outer) semantics.
     pub fn new_boxed(boxed: Box<Expr>) -> Self {
-        Self { expr: boxed }
+        Self {
+            expr: boxed,
+            outer: false,
+        }
+    }
+
+    /// Create a new Unnest expression with outer-unnest semantics: `NULL`
+    /// and empty input lists each produce a single `NULL` output row.
+    pub fn new_outer(expr: Expr) -> Self {
+        Self {
+            expr: Box::new(expr),
+            outer: true,
+        }
     }
 }
 
@@ -2250,6 +2271,29 @@ impl Expr {
                         }
                     }
                 }
+                Expr::InSubquery(InSubquery {
+                    expr,
+                    subquery,
+                    negated: _,
+                }) => {
+                    rewrite_placeholder_from_subquery(
+                        "InSubquery",
+                        expr.as_mut(),
+                        subquery,
+                    )?;
+                }
+                Expr::SetComparison(SetComparison {
+                    expr,
+                    subquery,
+                    op: _,
+                    quantifier: _,
+                }) => {
+                    rewrite_placeholder_from_subquery(
+                        "SetComparison",
+                        expr.as_mut(),
+                        subquery,
+                    )?;
+                }
                 Expr::Like(Like { expr, pattern, .. })
                 | Expr::SimilarTo(Like { expr, pattern, .. }) => {
                     let like_field = find_first_non_null_field_expr_placeholder(
@@ -2427,6 +2471,7 @@ impl Expr {
     pub fn spans(&self) -> Option<&Spans> {
         match self {
             Expr::Column(col) => Some(&col.spans),
+            Expr::Not(inner) | Expr::Negative(inner) => inner.spans(),
             _ => None,
         }
     }
@@ -2574,11 +2619,19 @@ impl NormalizeEq for Expr {
             | (Expr::IsNotTrue(self_expr), Expr::IsNotTrue(other_expr))
             | (Expr::IsNotFalse(self_expr), Expr::IsNotFalse(other_expr))
             | (Expr::IsNotUnknown(self_expr), Expr::IsNotUnknown(other_expr))
-            | (Expr::Negative(self_expr), Expr::Negative(other_expr))
-            | (
-                Expr::Unnest(Unnest { expr: self_expr }),
-                Expr::Unnest(Unnest { expr: other_expr }),
-            ) => self_expr.normalize_eq(other_expr),
+            | (Expr::Negative(self_expr), Expr::Negative(other_expr)) => {
+                self_expr.normalize_eq(other_expr)
+            }
+            (
+                Expr::Unnest(Unnest {
+                    expr: self_expr,
+                    outer: self_outer,
+                }),
+                Expr::Unnest(Unnest {
+                    expr: other_expr,
+                    outer: other_outer,
+                }),
+            ) => self_outer == other_outer && self_expr.normalize_eq(other_expr),
             (
                 Expr::Between(Between {
                     expr: self_expr,
@@ -3026,7 +3079,9 @@ impl HashNode for Expr {
                 field.hash(state);
                 column.hash(state);
             }
-            Expr::Unnest(Unnest { expr: _expr }) => {}
+            Expr::Unnest(Unnest { expr: _expr, outer }) => {
+                outer.hash(state);
+            }
             Expr::HigherOrderFunction(HigherOrderFunction { func, args: _args }) => {
                 func.hash(state);
             }
@@ -3097,6 +3152,26 @@ macro_rules! expr_vec_fmt {
             .collect::<Vec<String>>()
             .join(", ")
     }};
+}
+/// Infer an untyped placeholder on the left of a single-column subquery predicate from the subquery projection
+fn rewrite_placeholder_from_subquery(
+    kind: &str,
+    expr: &mut Expr,
+    subquery: &Subquery,
+) -> Result<()> {
+    let subquery_schema = subquery.subquery.schema();
+    match &subquery_schema.fields()[..] {
+        [subquery_field] => {
+            let column =
+                Expr::Column(Column::new_unqualified(subquery_field.name().clone()));
+            rewrite_placeholder(expr, &column, subquery_schema)
+        }
+        _ => plan_err!(
+            "{kind} should only return one column, but found {}: {}",
+            subquery_schema.fields().len(),
+            subquery_schema.field_names().join(", ")
+        ),
+    }
 }
 
 struct SchemaDisplay<'a>(&'a Expr);
@@ -3266,8 +3341,9 @@ impl Display for SchemaDisplay<'_> {
             }
             Expr::Negative(expr) => write!(f, "(- {})", SchemaDisplay(expr)),
             Expr::Not(expr) => write!(f, "NOT {}", SchemaDisplay(expr)),
-            Expr::Unnest(Unnest { expr }) => {
-                write!(f, "UNNEST({})", SchemaDisplay(expr))
+            Expr::Unnest(Unnest { expr, outer }) => {
+                let name = if *outer { "UNNEST_OUTER" } else { "UNNEST" };
+                write!(f, "{name}({})", SchemaDisplay(expr))
             }
             Expr::ScalarFunction(ScalarFunction { func, args }) => {
                 match func.schema_name(args) {
@@ -3541,8 +3617,9 @@ impl Display for SqlDisplay<'_> {
             }
             Expr::Negative(expr) => write!(f, "(- {})", SqlDisplay(expr)),
             Expr::Not(expr) => write!(f, "NOT {}", SqlDisplay(expr)),
-            Expr::Unnest(Unnest { expr }) => {
-                write!(f, "UNNEST({})", SqlDisplay(expr))
+            Expr::Unnest(Unnest { expr, outer }) => {
+                let name = if *outer { "UNNEST_OUTER" } else { "UNNEST" };
+                write!(f, "{name}({})", SqlDisplay(expr))
             }
             Expr::SimilarTo(Like {
                 negated,
@@ -3895,7 +3972,7 @@ impl Display for Expr {
                 }
             },
             Expr::Placeholder(Placeholder { id, .. }) => write!(f, "{id}"),
-            Expr::Unnest(Unnest { expr }) => {
+            Expr::Unnest(Unnest { expr, .. }) => {
                 write!(f, "{UNNEST_COLUMN_PREFIX}({expr})")
             }
             Expr::HigherOrderFunction(fun) => {
@@ -4116,11 +4193,13 @@ mod test {
         match inferred_expr {
             Expr::InSubquery(in_subquery) => match *in_subquery.expr {
                 Expr::Placeholder(placeholder) => {
+                    let inferred = placeholder.field.as_ref().unwrap();
                     assert_eq!(
-                        placeholder.field.as_ref().unwrap().data_type(),
+                        inferred.data_type(),
                         &DataType::Int32,
                         "Placeholder $1 should infer Int32"
                     );
+                    assert!(inferred.is_nullable());
                 }
                 _ => panic!("Expected Placeholder expression in InSubquery"),
             },
@@ -4128,6 +4207,166 @@ mod test {
         }
 
         Ok(())
+    }
+
+    #[test]
+    fn infer_placeholder_not_in_subquery() {
+        // WHERE $1 NOT IN (SELECT a FROM t)
+        let subquery_field = Field::new("a", DataType::Int32, false);
+        let subquery_schema = Arc::new(
+            DFSchema::from_unqualified_fields(
+                vec![subquery_field].into(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let subquery = Subquery {
+            subquery: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: subquery_schema,
+            })),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        };
+
+        let not_in_subquery = Expr::InSubquery(InSubquery {
+            expr: Box::new(Expr::Placeholder(Placeholder {
+                id: "$1".to_string(),
+                field: None,
+            })),
+            subquery,
+            negated: true,
+        });
+
+        let outer_schema = DFSchema::empty();
+        let (inferred_expr, contains_placeholder) = not_in_subquery
+            .infer_placeholder_types(&outer_schema)
+            .unwrap();
+
+        assert!(contains_placeholder);
+
+        match inferred_expr {
+            Expr::InSubquery(in_subquery) => {
+                assert!(in_subquery.negated, "negated flag must be preserved");
+                match *in_subquery.expr {
+                    Expr::Placeholder(placeholder) => {
+                        let inferred = placeholder.field.expect("placeholder field");
+                        assert_eq!(inferred.data_type(), &DataType::Int32);
+                        assert!(inferred.is_nullable());
+                    }
+                    _ => {
+                        panic!("Expected Placeholder expression in InSubquery")
+                    }
+                }
+            }
+            _ => panic!("Expected InSubquery expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_set_comparison_any() {
+        // WHERE $1 = ANY (SELECT a FROM t) -- parallel to infer_placeholder_in_subquery
+        let subquery_field = Field::new("a", DataType::Int32, false);
+        let subquery_schema = Arc::new(
+            DFSchema::from_unqualified_fields(
+                vec![subquery_field].into(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let subquery = Subquery {
+            subquery: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: subquery_schema,
+            })),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        };
+
+        let set_cmp = Expr::SetComparison(SetComparison {
+            expr: Box::new(Expr::Placeholder(Placeholder {
+                id: "$1".to_string(),
+                field: None,
+            })),
+            subquery,
+            op: Operator::Eq,
+            quantifier: SetQuantifier::Any,
+        });
+
+        let outer_schema = DFSchema::empty();
+        let (inferred_expr, contains_placeholder) =
+            set_cmp.infer_placeholder_types(&outer_schema).unwrap();
+
+        assert!(contains_placeholder);
+
+        match inferred_expr {
+            Expr::SetComparison(sc) => {
+                assert_eq!(sc.quantifier, SetQuantifier::Any);
+                match *sc.expr {
+                    Expr::Placeholder(p) => {
+                        let inferred =
+                            p.field.expect("placeholder field should be Int32");
+                        assert_eq!(inferred.data_type(), &DataType::Int32);
+                        assert!(inferred.is_nullable());
+                    }
+                    _ => panic!("Expected Placeholder expression in SetComparison"),
+                }
+            }
+            _ => panic!("Expected SetComparison expression"),
+        }
+    }
+
+    #[test]
+    fn infer_placeholder_set_comparison_all() {
+        // WHERE $1 <> ALL (SELECT a FROM t)
+        let subquery_field = Field::new("a", DataType::Int32, false);
+        let subquery_schema = Arc::new(
+            DFSchema::from_unqualified_fields(
+                vec![subquery_field].into(),
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let subquery = Subquery {
+            subquery: Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
+                produce_one_row: false,
+                schema: subquery_schema,
+            })),
+            outer_ref_columns: vec![],
+            spans: Spans::new(),
+        };
+
+        let set_cmp = Expr::SetComparison(SetComparison {
+            expr: Box::new(Expr::Placeholder(Placeholder {
+                id: "$1".to_string(),
+                field: None,
+            })),
+            subquery,
+            op: Operator::NotEq,
+            quantifier: SetQuantifier::All,
+        });
+
+        let outer_schema = DFSchema::empty();
+        let (inferred_expr, contains_placeholder) =
+            set_cmp.infer_placeholder_types(&outer_schema).unwrap();
+
+        assert!(contains_placeholder);
+
+        match inferred_expr {
+            Expr::SetComparison(sc) => {
+                assert_eq!(sc.quantifier, SetQuantifier::All);
+                match *sc.expr {
+                    Expr::Placeholder(p) => {
+                        let inferred =
+                            p.field.expect("placeholder field should be Int32");
+                        assert_eq!(inferred.data_type(), &DataType::Int32);
+                        assert!(inferred.is_nullable());
+                    }
+                    _ => panic!("Expected Placeholder expression in SetComparison"),
+                }
+            }
+            _ => panic!("Expected SetComparison expression"),
+        }
     }
 
     #[test]
@@ -4292,6 +4531,24 @@ mod test {
         // representation. CAST does not change the name of expressions.
         assert_eq!("Float32(1.23)", expr.schema_name().to_string());
         Ok(())
+    }
+
+    #[test]
+    fn format_decimal_literal() {
+        let expr = lit(ScalarValue::Decimal128(Some(1), 1, 1));
+        assert_eq!("Decimal128(0.1,1,1)", format!("{expr}"));
+        assert_eq!("Decimal128(0.1,1,1)", expr.schema_name().to_string());
+        assert_eq!("0.1", expr.human_display().to_string());
+
+        let expr = lit(ScalarValue::Decimal128(Some(120), 3, 2));
+        assert_eq!("Decimal128(1.20,3,2)", format!("{expr}"));
+        assert_eq!("Decimal128(1.20,3,2)", expr.schema_name().to_string());
+        assert_eq!("1.20", expr.human_display().to_string());
+
+        let null_expr = lit(ScalarValue::Decimal128(None, 10, 2));
+        assert_eq!("Decimal128(NULL,10,2)", format!("{null_expr}"));
+        assert_eq!("Decimal128(NULL,10,2)", null_expr.schema_name().to_string());
+        assert_eq!("NULL", null_expr.human_display().to_string());
     }
 
     #[test]

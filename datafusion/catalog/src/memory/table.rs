@@ -31,14 +31,15 @@ use arrow::compute::{and, filter_record_batch};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::error::Result;
+use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
     Constraints, DFSchema, DataFusionError, SchemaExt, not_impl_err, plan_err,
 };
-use datafusion_common_runtime::JoinSet;
 use datafusion_datasource::memory::{MemSink, MemorySourceConfig};
 use datafusion_datasource::sink::DataSinkExec;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::dml::InsertOp;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::{Expr, SortExpr, TableType};
 use datafusion_physical_expr::{
     LexOrdering, PhysicalExpr, create_physical_expr, create_physical_sort_exprs,
@@ -46,13 +47,12 @@ use datafusion_physical_expr::{
 use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, Partitioning,
-    PlanProperties, common,
+    ChildrenPropertiesMode, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+    PlanProperties, ReplaceChildrenOptions, collect_partitioned,
 };
 use datafusion_session::Session;
 
 use async_trait::async_trait;
-use futures::StreamExt;
 use log::debug;
 use parking_lot::Mutex;
 use tokio::sync::RwLock;
@@ -147,62 +147,28 @@ impl MemTable {
         state: &dyn Session,
     ) -> Result<Self> {
         let schema = t.schema();
-        let constraints = t.constraints();
+        let constraints = t.constraints().cloned().unwrap_or_default();
+
         let exec = t.scan(state, None, &[], None).await?;
-        let partition_count = exec.output_partitioning().partition_count();
+        let data = collect_partitioned(exec, state.task_ctx()).await?;
 
-        let mut join_set = JoinSet::new();
-
-        for part_idx in 0..partition_count {
-            let task = state.task_ctx();
-            let exec = Arc::clone(&exec);
-            join_set.spawn(async move {
-                let stream = exec.execute(part_idx, task)?;
-                common::collect(stream).await
-            });
-        }
-
-        let mut data: Vec<Vec<RecordBatch>> =
-            Vec::with_capacity(exec.output_partitioning().partition_count());
-
-        while let Some(result) = join_set.join_next().await {
-            match result {
-                Ok(res) => data.push(res?),
-                Err(e) => return Err(DataFusionError::from_join_error(e)),
-            }
-        }
-
-        let mut exec = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
-            &data,
-            Arc::clone(&schema),
-            None,
-        )?));
-        if let Some(cons) = constraints {
-            exec = exec.with_constraints(cons.clone());
-        }
-
-        if let Some(num_partitions) = output_partitions {
+        // Optionally repartition the collected batches.
+        let data = if let Some(num_partitions) = output_partitions {
+            let source = DataSourceExec::new(Arc::new(MemorySourceConfig::try_new(
+                &data,
+                Arc::clone(&schema),
+                None,
+            )?));
             let exec = RepartitionExec::try_new(
-                Arc::new(exec),
+                Arc::new(source),
                 Partitioning::RoundRobinBatch(num_partitions),
             )?;
+            collect_partitioned(Arc::new(exec), state.task_ctx()).await?
+        } else {
+            data
+        };
 
-            // execute and collect results
-            let mut output_partitions = vec![];
-            for i in 0..exec.properties().output_partitioning().partition_count() {
-                // execute this *output* partition and collect all batches
-                let task_ctx = state.task_ctx();
-                let mut stream = exec.execute(i, task_ctx)?;
-                let mut batches = vec![];
-                while let Some(result) = stream.next().await {
-                    batches.push(result?);
-                }
-                output_partitions.push(batches);
-            }
-
-            return MemTable::try_new(Arc::clone(&schema), output_partitions);
-        }
-        MemTable::try_new(Arc::clone(&schema), data)
+        MemTable::try_new(schema, data).map(|table| table.with_constraints(constraints))
     }
 }
 
@@ -247,8 +213,12 @@ impl TableProvider for MemTable {
             let eqp = state.execution_props();
             let mut file_sort_order = vec![];
             for sort_exprs in sort_order.iter() {
-                let physical_exprs =
-                    create_physical_sort_exprs(sort_exprs, &df_schema, eqp)?;
+                let physical_exprs = create_physical_sort_exprs(
+                    sort_exprs,
+                    &df_schema,
+                    eqp,
+                    &PhysicalPlanningContext::default(),
+                )?;
                 file_sort_order.extend(LexOrdering::new(physical_exprs));
             }
             source = source.try_with_sort_information(file_sort_order)?;
@@ -394,8 +364,12 @@ impl TableProvider for MemTable {
         let physical_assignments: HashMap<String, Arc<dyn PhysicalExpr>> = assignments
             .iter()
             .map(|(name, expr)| {
-                let physical_expr =
-                    create_physical_expr(expr, &df_schema, state.execution_props())?;
+                let physical_expr = create_physical_expr(
+                    expr,
+                    &df_schema,
+                    state.execution_props(),
+                    &PhysicalPlanningContext::default(),
+                )?;
                 Ok((name.clone(), physical_expr))
             })
             .collect::<Result<_>>()?;
@@ -508,8 +482,12 @@ fn evaluate_filters_to_mask(
     let mut combined_mask: Option<BooleanArray> = None;
 
     for filter_expr in filters {
-        let physical_expr =
-            create_physical_expr(filter_expr, df_schema, execution_props)?;
+        let physical_expr = create_physical_expr(
+            filter_expr,
+            df_schema,
+            execution_props,
+            &PhysicalPlanningContext::default(),
+        )?;
 
         let result = physical_expr.evaluate(batch)?;
         let array = result.into_array(batch.num_rows())?;
@@ -596,11 +574,22 @@ impl ExecutionPlan for DmlResultExec {
         vec![]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
-        _children: Vec<Arc<dyn ExecutionPlan>>,
+        _: Vec<Arc<dyn ExecutionPlan>>,
+        _: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn execute(
@@ -621,5 +610,12 @@ impl ExecutionPlan for DmlResultExec {
             Arc::clone(&self.schema),
             stream,
         )))
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
     }
 }

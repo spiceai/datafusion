@@ -53,12 +53,14 @@ use datafusion_common::{
     Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
+    utils::combine_limit,
 };
 use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
-    Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
-    LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
-    UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
+    Aggregate, BinaryExpr, Distinct, Expr, FetchType, Join, JoinConstraint, JoinType,
+    LogicalPlan, LogicalPlanBuilder, Operator, Projection, SkipType, Sort, SortExpr,
+    Subquery, TableScan, Unnest, UserDefinedLogicalNode, Window, expr::Alias,
+    utils::split_conjunction,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
@@ -277,6 +279,70 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
         Ok(TreeNodeRecursion::Continue)
     })?;
     Ok(bound)
+}
+
+/// Aggregate-expression scope for one rendered SELECT block.
+///
+/// When an aggregate's input is itself emitted as a derived subquery (a
+/// projection sits between the aggregate and its relation), the input columns
+/// are only reachable by that derived table's output names. Base-table
+/// qualifiers like `t.col` name a relation that is out of scope above the
+/// boundary, so emitting them produces SQL a strict engine rejects.
+///
+/// Every clause that renders an aggregate expression (SELECT / GROUP BY /
+/// HAVING / QUALIFY / ORDER BY) has to apply the same rule. Detect the
+/// boundary once here and reuse it, so the clauses can't drift apart (which is
+/// how earlier fixes left some clauses correct and others not).
+struct UnparserAggScope<'a> {
+    agg: &'a Aggregate,
+    /// `agg.input` renders as a derived projection, so out-of-scope qualifiers
+    /// must be stripped from expressions in this scope.
+    input_is_derived_projection: bool,
+}
+
+impl<'a> UnparserAggScope<'a> {
+    fn new(agg: &'a Aggregate) -> Self {
+        Self {
+            agg,
+            input_is_derived_projection: Unparser::contains_projection_before_relation(
+                agg.input.as_ref(),
+            ),
+        }
+    }
+
+    /// Prepare a projected column or predicate that still references the
+    /// aggregate by its output columns: unproject it back onto the aggregate
+    /// (and `windows`) expressions, then normalize it for this scope.
+    fn prepare(&self, expr: Expr, windows: Option<&[&Window]>) -> Result<Expr> {
+        self.normalize(unproject_agg_exprs(expr, self.agg, windows)?)
+    }
+
+    /// Normalize an expression that is already in aggregate form (group / aggr
+    /// exprs, or an unprojected sort expr): strip the qualifiers that fall out
+    /// of scope once the input is a derived projection. No-op otherwise.
+    fn normalize(&self, expr: Expr) -> Result<Expr> {
+        if self.input_is_derived_projection {
+            Unparser::strip_column_qualifiers_for_schema(
+                expr,
+                self.agg.input.schema().as_ref(),
+            )
+        } else {
+            Ok(expr)
+        }
+    }
+
+    /// Unproject a sort expression onto this aggregate, then normalize it so
+    /// ORDER BY uses the same scope as the other clauses.
+    fn prepare_sort_expr(
+        &self,
+        sort_expr: SortExpr,
+        windows: Option<&[&Window]>,
+        input: &LogicalPlan,
+    ) -> Result<SortExpr> {
+        let mut sort_expr = unproject_sort_expr(sort_expr, Some(self.agg), windows, input)?;
+        sort_expr.expr = self.normalize(sort_expr.expr)?;
+        Ok(sort_expr)
+    }
 }
 
 impl Unparser<'_> {
@@ -789,15 +855,29 @@ impl Unparser<'_> {
         Ok(SetExpr::Select(Box::new(select_builder.build()?)))
     }
 
-    /// Reconstructs a SELECT SQL statement from a logical plan by unprojecting column expressions
-    /// found in a [Projection] node. This requires scanning the plan tree for relevant Aggregate
-    /// and Window nodes and matching column expressions to the appropriate agg or window expressions.
+    /// Reconstructs a SELECT SQL statement from a logical plan by
+    /// unprojecting column expressions found in a [Projection] node. This
+    /// requires scanning the plan tree for relevant Aggregate and Window
+    /// nodes and matching column expressions to the appropriate agg or
+    /// window expressions.
+    ///
+    /// `fully_absorbed` reports whether the Projection arm was able to
+    /// absorb every `Sort`/`Limit` node between this Projection and the
+    /// Aggregate/Window into the current SELECT. When `false`, the
+    /// Aggregate/Window will end up in a derived subquery, so we fall
+    /// back to passthrough column references that resolve against that
+    /// subquery's output instead of unprojecting onto the original
+    /// aggregate expressions.
+    ///
+    /// Returns `true` if an Aggregate node was found and claimed for this
+    /// SELECT.
     fn reconstruct_select_statement(
         &self,
         plan: &LogicalPlan,
         p: &Projection,
         select: &mut SelectBuilder,
-    ) -> Result<()> {
+        fully_absorbed: bool,
+    ) -> Result<bool> {
         let mut exprs = p.expr.clone();
 
         // A projection with no output expressions (e.g. `count(*)` over a view
@@ -813,7 +893,7 @@ impl Unparser<'_> {
                 .map(|e| self.select_item_to_sql(e))
                 .collect::<Result<Vec<_>>>()?;
             select.projection(items);
-            return Ok(());
+            return Ok(false);
         }
 
         // If an Unnest node is found within the select, find and unproject the unnest column
@@ -856,25 +936,48 @@ impl Unparser<'_> {
                 .collect::<Result<Vec<_>>>()?;
         }
 
-        match (
-            find_agg_node_within_select(plan, true),
-            find_window_nodes_within_select(plan, None, true),
-        ) {
+        // When some Sort/Limit nodes between this Projection and the
+        // Aggregate/Window couldn't be absorbed into the current SELECT,
+        // the Aggregate/Window will live inside a derived subquery. In
+        // that case we use the passthrough projection path — column refs
+        // resolve against the derived subquery's output columns instead
+        // of being unprojected onto the original aggregate/window
+        // expressions.
+        let agg = if fully_absorbed {
+            find_agg_node_within_select(plan, true)
+        } else {
+            None
+        };
+        let window = if fully_absorbed {
+            find_window_nodes_within_select(plan, None, true)
+        } else {
+            None
+        };
+        match (agg, window) {
             (Some(agg), window) => {
                 let window_option = window.as_deref();
+                let unparser_agg_scope = UnparserAggScope::new(agg);
                 let items = exprs
                     .into_iter()
                     .map(|proj_expr| {
-                        let unproj = unproject_agg_exprs(proj_expr, agg, window_option)?;
+                        let unproj =
+                            unparser_agg_scope.prepare(proj_expr, window_option)?;
                         self.select_item_to_sql(&unproj)
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 select.projection(items);
                 select.group_by(ast::GroupByExpr::Expressions(
-                    self.group_by_keys(agg)?,
+                    agg.group_expr
+                        .iter()
+                        .cloned()
+                        .map(|expr| {
+                            self.group_by_key_to_sql(&unparser_agg_scope.normalize(expr)?)
+                        })
+                        .collect::<Result<Vec<_>>>()?,
                     vec![],
                 ));
+                Ok(true)
             }
             (None, Some(window)) => {
                 let items = exprs
@@ -886,6 +989,7 @@ impl Unparser<'_> {
                     .collect::<Result<Vec<_>>>()?;
 
                 select.projection(items);
+                Ok(false)
             }
             _ => {
                 let items = exprs
@@ -904,9 +1008,63 @@ impl Unparser<'_> {
                     })
                     .collect::<Result<Vec<_>>>()?;
                 select.projection(items);
+                Ok(false)
             }
         }
-        Ok(())
+    }
+
+    fn contains_projection_before_relation(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Projection(_) => true,
+            LogicalPlan::TableScan(_)
+            | LogicalPlan::Subquery(_)
+            | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::Join(_)
+            | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Values(_) => false,
+            _ => {
+                let inputs = plan.inputs();
+                matches!(
+                    inputs.as_slice(),
+                    [input] if Self::contains_projection_before_relation(input)
+                )
+            }
+        }
+    }
+
+    fn contains_aggregate_before_relation(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Aggregate(_) => true,
+            LogicalPlan::TableScan(_)
+            | LogicalPlan::Subquery(_)
+            | LogicalPlan::SubqueryAlias(_)
+            | LogicalPlan::Join(_)
+            | LogicalPlan::EmptyRelation(_)
+            | LogicalPlan::Values(_) => false,
+            _ => {
+                let inputs = plan.inputs();
+                matches!(
+                    inputs.as_slice(),
+                    [input] if Self::contains_aggregate_before_relation(input)
+                )
+            }
+        }
+    }
+
+    /// Unproject a sort expression; normalize it when the sort is above an
+    /// aggregate, otherwise just unproject (no scope to normalize against).
+    fn unproject_sort_expr_in_scope(
+        sort_expr: SortExpr,
+        agg: Option<&Aggregate>,
+        windows: Option<&[&Window]>,
+        input: &LogicalPlan,
+    ) -> Result<SortExpr> {
+        match agg {
+            Some(agg) => {
+                UnparserAggScope::new(agg).prepare_sort_expr(sort_expr, windows, input)
+            }
+            None => unproject_sort_expr(sort_expr, None, windows, input),
+        }
     }
 
     /// Unparses a `Projection` over an `Aggregate` as two scopes: this `SELECT`'s
@@ -1462,7 +1620,7 @@ impl Unparser<'_> {
                 }));
 
                 if !select.already_projected() {
-                    self.reconstruct_select_statement(plan, p, select)?;
+                    self.reconstruct_select_statement(plan, p, select, true)?;
                 }
 
                 if matches!(
@@ -1520,6 +1678,9 @@ impl Unparser<'_> {
             window_expr
                 .iter()
                 .map(|expr| {
+                    // No normalization: this agg branch is only reachable from a
+                    // hand-built plan. SQL wraps windows in a projection, which
+                    // reconstruct_select_statement handles (and normalizes).
                     let expr = if let Some(agg) = agg {
                         unproject_agg_exprs(expr.clone(), agg, None)?
                     } else {
@@ -1564,8 +1725,9 @@ impl Unparser<'_> {
 
         let input_schema = window.input.schema();
         let mut alias_rewriter = TableAliasRewriter {
-            table_schema: input_schema.as_arrow(),
+            table_schema: input_schema.as_ref(),
             alias_name: TableReference::bare(input_alias),
+            rewrite_unqualified: true,
         };
         let window_expr = window
             .window_expr
@@ -1576,7 +1738,7 @@ impl Unparser<'_> {
         self.project_window_output(&window_expr, select, None)
     }
 
-    /// The `GROUP BY` keys to emit, with a constant key cast to its own type.
+    /// Render one `GROUP BY` key, casting a constant key to its own type.
     ///
     /// A bare literal is not a portable grouping key. BigQuery refuses one
     /// outright ("Cannot GROUP BY literal values"), and an engine that reads a
@@ -1587,18 +1749,14 @@ impl Unparser<'_> {
     /// The key is kept rather than dropped, because dropping the last one turns
     /// a grouped aggregate into a global one: over an empty input the first
     /// yields no rows and the second yields a row of zeros.
-    fn group_by_keys(&self, aggregate: &Aggregate) -> Result<Vec<ast::Expr>> {
-        aggregate
-            .group_expr
-            .iter()
-            .map(|expr| match expr {
-                Expr::Literal(value, _) => self.expr_to_sql(&Expr::Cast(Cast::new(
-                    Box::new(expr.clone()),
-                    value.data_type(),
-                ))),
-                _ => self.expr_to_sql(expr),
-            })
-            .collect()
+    fn group_by_key_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
+        match expr {
+            Expr::Literal(value, _) => self.expr_to_sql(&Expr::Cast(Cast::new(
+                Box::new(expr.clone()),
+                value.data_type(),
+            ))),
+            _ => self.expr_to_sql(expr),
+        }
     }
 
     #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
@@ -1770,8 +1928,231 @@ impl Unparser<'_> {
                 if self.projection_scopes_its_aggregate(plan, select) {
                     return self.projection_over_scoped_aggregate(p, select, relation);
                 }
-                self.reconstruct_select_statement(plan, p, select)?;
-                self.select_to_sql_recursively(p.input.as_ref(), query, select, relation)
+
+                // Walk down through consecutive Sort/Limit nodes, greedily
+                // absorbing what can be folded into the SELECT we're
+                // building around the Aggregate. A single SQL SELECT can
+                // carry at most one `ORDER BY` (applied before `LIMIT`),
+                // so the safe shape between us and the Aggregate is
+                // `Limit* Sort?` (outer→inner). We stop at the first node
+                // that would violate this; that node becomes the
+                // subquery boundary, and recursion (seeing
+                // `already_projected = true`) wraps it in a derived
+                // relation. If we walk all the way to a non-Sort/non-Limit
+                // terminator, the entire chain folds into one SELECT.
+                //
+                // Stacked Sorts with nothing between them collapse to the
+                // outermost — the same simplification `EnforceSorting`
+                // applies on the physical side — but only when no Limit
+                // has been absorbed since the previous Sort, since the
+                // inner Sort would otherwise be determining which rows
+                // the Limit keeps.
+                //
+                // The fold is collected here without touching `query`
+                // (apart from non-literal direct Limits, which don't
+                // depend on projection form). Once we know whether every
+                // Sort/Limit was absorbed we can pick the right
+                // projection form and emit `ORDER BY` with or without
+                // unprojection.
+                let mut cur = p.input.as_ref();
+                let mut absorbed_sort: Option<&Sort> = None;
+                let mut combined_skip: usize = 0;
+                let mut combined_fetch: Option<usize> = None;
+                let mut have_combined_limit = false;
+                let mut have_direct_limit = false;
+                let mut have_order_by = false;
+                loop {
+                    match cur {
+                        LogicalPlan::Limit(limit) => {
+                            if have_order_by {
+                                // Limit-below-Sort: `ORDER BY … LIMIT N`
+                                // would apply the sort first, but the
+                                // logical plan applies the Limit first.
+                                break;
+                            }
+                            let skip_lit = limit.get_skip_type()?;
+                            let fetch_lit = limit.get_fetch_type()?;
+                            match (skip_lit, fetch_lit) {
+                                (SkipType::Literal(s), FetchType::Literal(f)) => {
+                                    if have_direct_limit {
+                                        break;
+                                    }
+                                    if have_combined_limit {
+                                        // outer = already-accumulated;
+                                        // inner = this Limit. Same merge
+                                        // rule as the optimizer.
+                                        let (cs, cf) = combine_limit(
+                                            combined_skip,
+                                            combined_fetch,
+                                            s,
+                                            f,
+                                        );
+                                        combined_skip = cs;
+                                        combined_fetch = cf;
+                                    } else {
+                                        combined_skip = s;
+                                        combined_fetch = f;
+                                        have_combined_limit = true;
+                                    }
+                                }
+                                _ => {
+                                    if have_combined_limit || have_direct_limit {
+                                        // Cannot safely merge a
+                                        // non-literal Limit with a prior
+                                        // one; let recursion handle it.
+                                        break;
+                                    }
+                                    let Some(query_ref) = query.as_mut() else {
+                                        return internal_err!(
+                                            "Limit operator only valid in a statement context."
+                                        );
+                                    };
+                                    if let Some(fetch) = &limit.fetch {
+                                        query_ref.limit(Some(self.expr_to_sql(fetch)?));
+                                    }
+                                    if let Some(skip) = &limit.skip {
+                                        query_ref.offset(Some(ast::Offset {
+                                            rows: ast::OffsetRows::None,
+                                            value: self.expr_to_sql(skip)?,
+                                        }));
+                                    }
+                                    have_direct_limit = true;
+                                }
+                            }
+                            cur = limit.input.as_ref();
+                        }
+                        LogicalPlan::Sort(sort) if sort.fetch.is_some() => {
+                            // `Sort { fetch }` is logically
+                            // `Limit(fetch) -> Sort`. Try to absorb the
+                            // virtual Limit first; only if that succeeds
+                            // do we absorb the Sort. Otherwise we'd
+                            // silently drop the fetch.
+                            let fetch = sort.fetch.expect("guarded above");
+                            if have_order_by {
+                                // The virtual Limit would sit below an
+                                // already-absorbed outer Sort.
+                                break;
+                            }
+                            if have_direct_limit {
+                                // Cannot combine a literal fetch with a
+                                // non-literal direct Limit; let the
+                                // derived subquery preserve both.
+                                break;
+                            }
+                            if have_combined_limit {
+                                let (cs, cf) = combine_limit(
+                                    combined_skip,
+                                    combined_fetch,
+                                    0,
+                                    Some(fetch),
+                                );
+                                combined_skip = cs;
+                                combined_fetch = cf;
+                            } else {
+                                combined_skip = 0;
+                                combined_fetch = Some(fetch);
+                                have_combined_limit = true;
+                            }
+                            // Now the Sort itself. We know
+                            // `!have_order_by` from the check above.
+                            absorbed_sort = Some(sort);
+                            have_order_by = true;
+                            cur = sort.input.as_ref();
+                        }
+                        LogicalPlan::Sort(sort) => {
+                            // Sort without `fetch`.
+                            if have_order_by {
+                                // Outer Sort already absorbed; the inner
+                                // Sort is reordered by it and is
+                                // conventionally dropped, matching
+                                // `EnforceSorting` on the physical side.
+                                cur = sort.input.as_ref();
+                                continue;
+                            }
+                            absorbed_sort = Some(sort);
+                            have_order_by = true;
+                            cur = sort.input.as_ref();
+                        }
+                        _ => break,
+                    }
+                }
+
+                // `fully_absorbed` is the bottom-up algorithm's "walked
+                // all the way to the terminator without stopping": the
+                // Aggregate/Window will live in the same SELECT as this
+                // Projection, so we can unproject sort exprs and let
+                // `reconstruct_select_statement` claim it.
+                let fully_absorbed =
+                    !matches!(cur, LogicalPlan::Limit(_) | LogicalPlan::Sort(_));
+                let found_agg =
+                    self.reconstruct_select_statement(plan, p, select, fully_absorbed)?;
+
+                // Whether to bother emitting the absorbed clauses: only
+                // if there's an Aggregate either claimed in this SELECT
+                // or about to live in a derived subquery below us. If
+                // there's nothing aggregate-like to fold over, fall
+                // through and let the normal recursion handle the
+                // Projection's input.
+                let agg_below =
+                    !fully_absorbed && find_agg_node_within_select(plan, true).is_some();
+                if !(found_agg || agg_below) {
+                    return self.select_to_sql_recursively(
+                        p.input.as_ref(),
+                        query,
+                        select,
+                        relation,
+                    );
+                }
+
+                if let Some(sort) = absorbed_sort {
+                    let Some(query_ref) = query.as_mut() else {
+                        return internal_err!(
+                            "Sort operator only valid in a statement context."
+                        );
+                    };
+                    let sort_exprs: Vec<SortExpr> = if fully_absorbed {
+                        let agg =
+                            find_agg_node_within_select(plan, select.already_projected());
+                        sort.expr
+                            .iter()
+                            .map(|sort_expr| {
+                                Self::unproject_sort_expr_in_scope(
+                                    sort_expr.clone(),
+                                    agg,
+                                    None,
+                                    sort.input.as_ref(),
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?
+                    } else {
+                        sort.expr.clone()
+                    };
+                    query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                }
+                if have_combined_limit {
+                    let Some(query_ref) = query.as_mut() else {
+                        return internal_err!(
+                            "Limit operator only valid in a statement context."
+                        );
+                    };
+                    if let Some(fetch) = combined_fetch {
+                        query_ref.limit(Some(ast::Expr::value(ast::Value::Number(
+                            fetch.to_string(),
+                            false,
+                        ))));
+                    }
+                    if combined_skip > 0 {
+                        query_ref.offset(Some(ast::Offset {
+                            rows: ast::OffsetRows::None,
+                            value: ast::Expr::value(ast::Value::Number(
+                                combined_skip.to_string(),
+                                false,
+                            )),
+                        }));
+                    }
+                }
+
+                self.select_to_sql_recursively(cur, query, select, relation)
             }
             LogicalPlan::Filter(filter) => {
                 let window = find_window_nodes_within_select(
@@ -1787,13 +2168,14 @@ impl Unparser<'_> {
                     let mut unprojected =
                         unproject_window_exprs(filter.predicate.clone(), window)?;
                     if let Some(agg) = agg {
-                        unprojected = unproject_agg_exprs(unprojected, agg, None)?;
+                        unprojected =
+                            UnparserAggScope::new(agg).prepare(unprojected, None)?;
                     }
                     let filter_expr = self.expr_to_sql(&unprojected)?;
                     select.qualify(Some(filter_expr));
                 } else if let Some(agg) = agg {
-                    let unprojected =
-                        unproject_agg_exprs(filter.predicate.clone(), agg, None)?;
+                    let unprojected = UnparserAggScope::new(agg)
+                        .prepare(filter.predicate.clone(), None)?;
                     let filter_expr = self.expr_to_sql(&unprojected)?;
                     select.having(Some(filter_expr));
                 } else {
@@ -1927,7 +2309,7 @@ impl Unparser<'_> {
                     .expr
                     .iter()
                     .map(|sort_expr| {
-                        unproject_sort_expr(
+                        Self::unproject_sort_expr_in_scope(
                             sort_expr.clone(),
                             agg,
                             windows.as_deref(),
@@ -2002,20 +2384,38 @@ impl Unparser<'_> {
 
                 // Aggregation can be already handled in the projection case
                 if !select.already_projected() {
+                    let unparser_agg_scope = UnparserAggScope::new(agg);
                     // The query returns aggregate and group expressions. If that weren't the case,
                     // the aggregate would have been placed inside a projection, making the check above^ false
                     let exprs: Vec<_> = agg
                         .aggr_expr
                         .iter()
                         .chain(agg.group_expr.iter())
-                        .map(|expr| self.select_item_to_sql(expr))
+                        .cloned()
+                        .map(|expr| {
+                            self.select_item_to_sql(&unparser_agg_scope.normalize(expr)?)
+                        })
                         .collect::<Result<Vec<_>>>()?;
                     select.projection(exprs);
 
                     select.group_by(ast::GroupByExpr::Expressions(
-                        self.group_by_keys(agg)?,
+                        agg.group_expr
+                            .iter()
+                            .cloned()
+                            .map(|expr| {
+                                self.group_by_key_to_sql(&unparser_agg_scope.normalize(expr)?)
+                            })
+                            .collect::<Result<Vec<_>>>()?,
                         vec![],
                     ));
+                } else if Self::contains_aggregate_before_relation(agg.input.as_ref()) {
+                    return self.derive_with_dialect_alias(
+                        "derived_aggregate",
+                        agg.input.as_ref(),
+                        relation,
+                        false,
+                        vec![],
+                    );
                 }
 
                 self.select_to_sql_recursively(
@@ -2118,6 +2518,16 @@ impl Unparser<'_> {
                         }
                         None => Arc::clone(left_plan),
                     };
+                // A `Projection` immediately wrapping this `Join` that only
+                // passes qualified columns through unchanged carries no
+                // information a nested relation loses, so unwrap it and join
+                // against the plain `Join` instead of nesting a nearly-empty
+                // derived subquery around it.
+                let left_plan = if already_projected {
+                    Self::unwrap_qualified_passthrough_join_projection(left_plan)
+                } else {
+                    left_plan
+                };
 
                 if join.join_type == JoinType::Right {
                     let (kept, scoped) = partition_subquery_filters(std::mem::take(
@@ -2237,12 +2647,27 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
-                    self.select_to_sql_recursively(
-                        right_plan.as_ref(),
-                        query,
-                        select,
-                        &mut right_relation,
-                    )?;
+                    // A `Projection` immediately wrapping this `Join` that only
+                    // passes qualified columns through unchanged carries no
+                    // information a nested relation loses, so render it as a
+                    // nested relation directly instead of recursing into a
+                    // derived subquery around it.
+                    if already_projected
+                        && let Some(nested_relation) = self
+                            .qualified_passthrough_join_projection_to_nested_relation(
+                                right_plan.as_ref(),
+                                query,
+                            )?
+                    {
+                        right_relation = nested_relation;
+                    } else {
+                        self.select_to_sql_recursively(
+                            right_plan.as_ref(),
+                            query,
+                            select,
+                            &mut right_relation,
+                        )?;
+                    }
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full
                             && !right_scan_filters.is_empty())
@@ -3040,7 +3465,7 @@ impl Unparser<'_> {
 
         let mut flatten = FlattenRelationBuilder::default();
         flatten.input_expr(input_expr);
-        flatten.outer(unnest.options.preserve_nulls);
+        flatten.outer(unnest.options.preserve_nulls());
 
         Ok(Some(flatten))
     }
@@ -3085,6 +3510,96 @@ impl Unparser<'_> {
         }
     }
 
+    fn is_qualified_passthrough_projection(projection: &Projection) -> bool {
+        projection
+            .expr
+            .iter()
+            .all(|expr| matches!(expr, Expr::Column(column) if column.relation.is_some()))
+    }
+
+    fn unwrap_qualified_passthrough_join_projection(
+        plan: Arc<LogicalPlan>,
+    ) -> Arc<LogicalPlan> {
+        if let LogicalPlan::Projection(projection) = plan.as_ref()
+            && matches!(projection.input.as_ref(), LogicalPlan::Join(_))
+            && Self::is_qualified_passthrough_projection(projection)
+        {
+            Arc::clone(&projection.input)
+        } else {
+            plan
+        }
+    }
+
+    fn qualified_passthrough_join_projection_to_nested_relation(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+    ) -> Result<Option<RelationBuilder>> {
+        let LogicalPlan::Projection(projection) = plan else {
+            return Ok(None);
+        };
+        if !matches!(projection.input.as_ref(), LogicalPlan::Join(_))
+            || !Self::is_qualified_passthrough_projection(projection)
+        {
+            return Ok(None);
+        }
+
+        let original_query = query.clone();
+        let mut nested_select = SelectBuilder::default();
+        nested_select.push_from(TableWithJoinsBuilder::default());
+        let mut nested_relation = RelationBuilder::default();
+        self.select_to_sql_recursively(
+            projection.input.as_ref(),
+            query,
+            &mut nested_select,
+            &mut nested_relation,
+        )?;
+        if nested_select.has_selection() {
+            *query = original_query;
+            return Ok(None);
+        }
+
+        let Some(mut nested_from) = nested_select.pop_from() else {
+            return internal_err!("Failed to build nested join relation");
+        };
+        nested_from.relation(nested_relation);
+        let Some(table_with_joins) = nested_from.build()? else {
+            return internal_err!("Failed to build nested join relation");
+        };
+
+        let mut relation = RelationBuilder::default();
+        relation.nested_join(table_with_joins, None);
+        Ok(Some(relation))
+    }
+
+    /// Strip the table qualifier from every column in an expression that must
+    /// resolve against an unnamed derived table's output columns rather than a
+    /// deeper table alias that is out of scope at this nesting level.
+    fn strip_column_qualifiers(expr: Expr) -> Result<Expr> {
+        expr.transform(|e| match e {
+            Expr::Column(mut column) => {
+                column.relation = None;
+                Ok(Transformed::yes(Expr::Column(column)))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .data()
+    }
+
+    fn strip_column_qualifiers_for_schema(expr: Expr, schema: &DFSchema) -> Result<Expr> {
+        expr.transform(|e| match e {
+            Expr::Column(mut column)
+                if column.relation.is_some()
+                    && schema.index_of_column(&column).is_ok() =>
+            {
+                column.relation = None;
+                Ok(Transformed::yes(Expr::Column(column)))
+            }
+            other => Ok(Transformed::no(other)),
+        })
+        .data()
+    }
+
     /// Try to unparse a table scan with pushdown operations into a new subquery plan.
     /// If the table scan is without any pushdown operations, return None.
     fn unparse_table_scan_pushdown(
@@ -3123,10 +3638,15 @@ impl Unparser<'_> {
                     return Ok(None);
                 }
                 let table_schema = table_scan.source.schema();
+                let filter_schema = DFSchema::try_from_qualified_schema(
+                    table_scan.table_name.clone(),
+                    table_schema.as_ref(),
+                )?;
                 let mut filter_alias_rewriter =
                     alias.as_ref().map(|alias_name| TableAliasRewriter {
-                        table_schema: &table_schema,
+                        table_schema: &filter_schema,
                         alias_name: alias_name.clone(),
+                        rewrite_unqualified: true,
                     });
 
                 let mut builder = LogicalPlanBuilder::scan(
@@ -3278,11 +3798,39 @@ impl Unparser<'_> {
                     alias.clone(),
                     already_projected,
                 )? {
+                    // The pushed-down scan alias is only in scope for the
+                    // projection directly above the aliased table scan. `plan`
+                    // is the result of pushing the alias further down: if it is
+                    // itself a `Projection`, the input was another projection
+                    // (e.g. common subexpression elimination stacked one), so
+                    // this projection sits over a derived table rather than
+                    // directly over the aliased scan, and the alias is out of
+                    // scope here. Its qualified pass-through columns must then
+                    // reference the derived table's output unqualified instead
+                    // of being rebased to the alias. Build it directly so the
+                    // unqualified columns are not re-normalized back to the
+                    // alias. (Otherwise `plan` is the scan-derived plan and we
+                    // fall through to rebase to the alias, correct one level
+                    // above the scan.)
+                    if alias.is_some() && matches!(plan, LogicalPlan::Projection(_)) {
+                        let exprs = projection
+                            .expr
+                            .iter()
+                            .cloned()
+                            .map(Self::strip_column_qualifiers)
+                            .collect::<Result<Vec<_>>>()?;
+                        return Ok(Some(LogicalPlan::Projection(Projection::try_new(
+                            exprs,
+                            Arc::new(plan),
+                        )?)));
+                    }
+
                     let exprs = if alias.is_some() {
                         let mut alias_rewriter =
                             alias.as_ref().map(|alias_name| TableAliasRewriter {
-                                table_schema: plan.schema().as_arrow(),
+                                table_schema: plan.schema().as_ref(),
                                 alias_name: alias_name.clone(),
+                                rewrite_unqualified: false,
                             });
                         projection
                             .expr

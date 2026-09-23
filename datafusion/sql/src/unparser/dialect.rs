@@ -99,6 +99,11 @@ pub trait Dialect: Send + Sync {
         DateFieldExtractStyle::DatePart
     }
 
+    /// The style to use when unparsing DISTINCT FROM style expressions
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
+    }
+
     /// The character length extraction style to use: `CharacterLengthStyle`
     fn character_length_style(&self) -> CharacterLengthStyle {
         CharacterLengthStyle::CharacterLength
@@ -601,6 +606,15 @@ pub enum CharacterLengthStyle {
     CharacterLength,
 }
 
+/// `DistinctFromStyle` to use for unparsing `IsDistinctFrom` and `IsNotDistinctFrom` operators
+#[derive(Clone, Copy, PartialEq)]
+pub enum DistinctFromStyle {
+    /// DBMS supports `IS (NOT) DISTINCT FROM`
+    FullText,
+    /// DBMS supports equivalent operations via `<=>` and `NOT <=>`
+    Spaceship,
+}
+
 /// How a [`Dialect`] renders a cast that attaches a specific timezone to a
 /// timestamp. DataFusion lowers `expr AT TIME ZONE 'tz'` to
 /// `CAST(expr AS Timestamp(_, Some(tz)))`; this selects how that cast is
@@ -749,6 +763,10 @@ impl Dialect for PostgreSqlDialect {
         ast::DataType::SmallInt(None)
     }
 
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
+    }
+
     fn scalar_function_to_sql_overrides(
         &self,
         unparser: &Unparser,
@@ -780,9 +798,11 @@ impl PostgreSqlDialect {
         };
 
         Ok(Some(ast::Expr::AnyOp {
-            left: Box::new(unparser.expr_to_sql(needle)?),
+            // Recurse through the annotated entry point so the stack-growth
+            // protection engages on nested arguments; see issue #23056.
+            left: Box::new(unparser.expr_to_sql_with_nesting(needle)?),
             compare_op: BinaryOperator::Eq,
-            right: Box::new(unparser.expr_to_sql(haystack)?),
+            right: Box::new(unparser.expr_to_sql_with_nesting(haystack)?),
             is_some: false,
         }))
     }
@@ -924,6 +944,10 @@ impl Dialect for DuckDBDialect {
         }
         Some(at_time_zone_to_ast(input, tz))
     }
+
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
+    }
 }
 
 pub struct MySqlDialect {}
@@ -955,6 +979,10 @@ impl Dialect for MySqlDialect {
 
     fn date_field_extract_style(&self) -> DateFieldExtractStyle {
         DateFieldExtractStyle::Extract
+    }
+
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::Spaceship
     }
 
     fn int64_cast_dtype(&self) -> ast::DataType {
@@ -1021,6 +1049,10 @@ impl Dialect for SqliteDialect {
 
     fn character_length_style(&self) -> CharacterLengthStyle {
         CharacterLengthStyle::Length
+    }
+
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
     }
 
     fn supports_column_alias_in_table_alias(&self) -> bool {

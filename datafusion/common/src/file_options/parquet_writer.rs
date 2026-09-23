@@ -157,8 +157,8 @@ impl TryFrom<&TableParquetOptions> for WriterPropertiesBuilder {
             }
 
             if let Some(bloom_filter_ndv) = options.bloom_filter_ndv {
-                builder =
-                    builder.set_column_bloom_filter_ndv(path.clone(), bloom_filter_ndv);
+                builder = builder
+                    .set_column_bloom_filter_max_ndv(path.clone(), bloom_filter_ndv);
             }
         }
 
@@ -219,6 +219,7 @@ impl ParquetOptions {
             dictionary_page_size_limit,
             statistics_enabled,
             max_row_group_size,
+            max_row_group_bytes,
             created_by,
             column_index_truncate_length,
             statistics_truncate_length,
@@ -247,6 +248,7 @@ impl ParquetOptions {
             coerce_int96_tz: _,  // not used for writer props
             skip_arrow_metadata: _,
             max_predicate_cache_size: _,
+            max_in_list_size: _,
         } = self;
 
         let mut builder = WriterProperties::builder()
@@ -261,6 +263,7 @@ impl ParquetOptions {
                     .unwrap_or(DEFAULT_STATISTICS_ENABLED),
             )
             .set_max_row_group_row_count(Some(*max_row_group_size))
+            .set_max_row_group_bytes(max_row_group_bytes.as_ref().map(|v| v.get()))
             .set_created_by(created_by.clone())
             .set_column_index_truncate_length(*column_index_truncate_length)
             .set_statistics_truncate_length(*statistics_truncate_length)
@@ -271,7 +274,7 @@ impl ParquetOptions {
             builder = builder.set_bloom_filter_fpp(*bloom_filter_fpp);
         };
         if let Some(bloom_filter_ndv) = bloom_filter_ndv {
-            builder = builder.set_bloom_filter_ndv(*bloom_filter_ndv);
+            builder = builder.set_bloom_filter_max_ndv(*bloom_filter_ndv);
         };
         if let Some(dictionary_enabled) = dictionary_enabled {
             builder = builder.set_dictionary_enabled(*dictionary_enabled);
@@ -428,7 +431,8 @@ mod tests {
     #[cfg(feature = "parquet_encryption")]
     use crate::config::ConfigFileEncryptionProperties;
     use crate::config::{
-        ParquetCdcOptions, ParquetColumnOptions, ParquetEncryptionOptions, ParquetOptions,
+        MaxRowGroupBytes, ParquetCdcOptions, ParquetColumnOptions,
+        ParquetEncryptionOptions, ParquetOptions,
     };
     use crate::parquet_config::DFParquetWriterVersion;
     use parquet::basic::Compression;
@@ -470,9 +474,10 @@ mod tests {
             writer_version,
             compression: Some("zstd(22)".into()),
             dictionary_enabled: Some(!defaults.dictionary_enabled.unwrap_or(false)),
-            dictionary_page_size_limit: 42,
+            dictionary_page_size_limit: 43,
             statistics_enabled: Some("chunk".into()),
             max_row_group_size: 42,
+            max_row_group_bytes: Some(MaxRowGroupBytes::try_new(42).unwrap()),
             created_by: "wordy".into(),
             column_index_truncate_length: Some(42),
             statistics_truncate_length: Some(42),
@@ -485,6 +490,7 @@ mod tests {
             // not in WriterProperties, but itemizing here to not skip newly added props
             enable_page_index: defaults.enable_page_index,
             pruning: defaults.pruning,
+            max_in_list_size: defaults.max_in_list_size,
             skip_metadata: defaults.skip_metadata,
             metadata_size_hint: defaults.metadata_size_hint,
             pushdown_filters: defaults.pushdown_filters,
@@ -530,8 +536,8 @@ mod tests {
                 }
                 .into(),
             ),
-            bloom_filter_fpp: bloom_filter_default_props.map(|p| p.fpp),
-            bloom_filter_ndv: bloom_filter_default_props.map(|p| p.ndv),
+            bloom_filter_fpp: bloom_filter_default_props.map(|p| p.fpp()),
+            bloom_filter_ndv: bloom_filter_default_props.map(|p| p.ndv()),
         }
     }
 
@@ -575,13 +581,16 @@ mod tests {
         TableParquetOptions {
             global: ParquetOptions {
                 // global options
-                data_pagesize_limit: props.dictionary_page_size_limit(),
+                data_pagesize_limit: props.data_page_size_limit(),
                 write_batch_size: props.write_batch_size(),
                 writer_version: props.writer_version().into(),
                 dictionary_page_size_limit: props.dictionary_page_size_limit(),
                 max_row_group_size: props
                     .max_row_group_row_count()
                     .unwrap_or(DEFAULT_MAX_ROW_GROUP_ROW_COUNT),
+                max_row_group_bytes: props
+                    .max_row_group_bytes()
+                    .and_then(|v| MaxRowGroupBytes::try_new(v).ok()),
                 created_by: props.created_by().to_string(),
                 column_index_truncate_length: props.column_index_truncate_length(),
                 statistics_truncate_length: props.statistics_truncate_length(),
@@ -601,6 +610,7 @@ mod tests {
                 // not in WriterProperties
                 enable_page_index: global_options_defaults.enable_page_index,
                 pruning: global_options_defaults.pruning,
+                max_in_list_size: global_options_defaults.max_in_list_size,
                 skip_metadata: global_options_defaults.skip_metadata,
                 metadata_size_hint: global_options_defaults.metadata_size_hint,
                 pushdown_filters: global_options_defaults.pushdown_filters,
@@ -823,10 +833,12 @@ mod tests {
         );
         assert_eq!(
             default_writer_props.bloom_filter_properties(&"default".into()),
-            Some(&BloomFilterProperties {
-                fpp: 0.42,
-                ndv: DEFAULT_BLOOM_FILTER_NDV
-            }),
+            Some(
+                &BloomFilterProperties::builder()
+                    .with_fpp(0.42)
+                    .with_max_ndv(DEFAULT_BLOOM_FILTER_NDV)
+                    .build()
+            ),
             "should have only the fpp set, and the ndv at default",
         );
     }
@@ -896,6 +908,26 @@ mod tests {
     }
 
     #[test]
+    fn test_max_row_group_bytes_disabled_by_default() {
+        let mut opts = TableParquetOptions::default();
+        opts.arrow_schema(&Arc::new(Schema::empty()));
+
+        let props = WriterPropertiesBuilder::try_from(&opts).unwrap().build();
+        assert_eq!(props.max_row_group_bytes(), None);
+    }
+
+    #[test]
+    fn test_max_row_group_bytes_propagated_to_writer_props() {
+        let mut opts = TableParquetOptions::default();
+        opts.global.max_row_group_bytes =
+            Some(MaxRowGroupBytes::try_new(64 * 1024 * 1024).unwrap());
+        opts.arrow_schema(&Arc::new(Schema::empty()));
+
+        let props = WriterPropertiesBuilder::try_from(&opts).unwrap().build();
+        assert_eq!(props.max_row_group_bytes(), Some(64 * 1024 * 1024));
+    }
+
+    #[test]
     fn test_bloom_filter_set_ndv_only() {
         // the TableParquetOptions::default, with only ndv set
         let mut default_table_writer_opts = TableParquetOptions::default();
@@ -910,7 +942,7 @@ mod tests {
         // the WriterProperties::default, with only ndv set
         let default_writer_props = WriterProperties::builder()
             .set_bloom_filter_enabled(true)
-            .set_bloom_filter_ndv(42)
+            .set_bloom_filter_max_ndv(42)
             .build();
 
         assert_eq!(
@@ -920,10 +952,12 @@ mod tests {
         );
         assert_eq!(
             default_writer_props.bloom_filter_properties(&"default".into()),
-            Some(&BloomFilterProperties {
-                fpp: DEFAULT_BLOOM_FILTER_FPP,
-                ndv: 42
-            }),
+            Some(
+                &BloomFilterProperties::builder()
+                    .with_fpp(DEFAULT_BLOOM_FILTER_FPP)
+                    .with_max_ndv(42)
+                    .build()
+            ),
             "should have only the ndv set, and the fpp at default",
         );
     }

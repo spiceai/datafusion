@@ -887,11 +887,16 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
             }
             LogicalPlan::TableScan(table_scan) => {
                 let table_schema = table_scan.source.schema();
+                let filter_schema = DFSchema::try_from_qualified_schema(
+                    table_scan.table_name.clone(),
+                    table_schema.as_ref(),
+                )?;
                 // optional rewriter if table has an alias
                 let mut filter_alias_rewriter =
                     table_alias.as_ref().map(|alias_name| TableAliasRewriter {
-                        table_schema: &table_schema,
+                        table_schema: &filter_schema,
                         alias_name: alias_name.clone(),
+                        rewrite_unqualified: true,
                     });
 
                 // Rewrite already-collected Filter node predicates to use the
@@ -981,7 +986,7 @@ pub(crate) fn date_part_to_sql(
 ) -> Result<Option<ast::Expr>> {
     match (style, date_part_args.len()) {
         (DateFieldExtractStyle::Extract, 2) => {
-            let date_expr = unparser.expr_to_sql(&date_part_args[1])?;
+            let date_expr = unparser.expr_to_sql_with_nesting(&date_part_args[1])?;
             if let Expr::Literal(ScalarValue::Utf8(Some(field)), _) = &date_part_args[0] {
                 let field = match field.to_lowercase().as_str() {
                     "year" => ast::DateTimeField::Year,
@@ -1001,7 +1006,7 @@ pub(crate) fn date_part_to_sql(
             }
         }
         (DateFieldExtractStyle::Strftime, 2) => {
-            let column = unparser.expr_to_sql(&date_part_args[1])?;
+            let column = unparser.expr_to_sql_with_nesting(&date_part_args[1])?;
 
             if let Expr::Literal(ScalarValue::Utf8(Some(field)), _) = &date_part_args[0] {
                 let field = match field.to_lowercase().as_str() {

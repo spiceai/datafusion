@@ -30,6 +30,7 @@ mod dfschema;
 mod functional_dependencies;
 mod join_type;
 mod param_value;
+mod partitioning;
 mod schema_reference;
 mod table_reference;
 mod unnest;
@@ -92,12 +93,13 @@ pub use join_type::{JoinConstraint, JoinSide, JoinType};
 pub use nested_struct::cast_column;
 pub use null_equality::NullEquality;
 pub use param_value::ParamValues;
+pub use partitioning::{SplitPoint, validate_range_split_points};
 pub use scalar::{ScalarType, ScalarValue};
 pub use schema_reference::SchemaReference;
 pub use spans::{Location, Span, Spans};
 pub use stats::{ColumnStatistics, Statistics};
 pub use table_reference::{ResolvedTableReference, TableReference};
-pub use unnest::{RecursionUnnestOption, UnnestOptions};
+pub use unnest::{NullHandling, RecursionUnnestOption, UnnestOptions};
 pub use utils::project_schema;
 
 // These are hidden from docs purely to avoid polluting the public view of what this crate exports.

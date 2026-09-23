@@ -18,7 +18,7 @@
 //! Logical plan types
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::{self, Debug, Display, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, LazyLock};
@@ -39,10 +39,11 @@ use crate::expr_rewriter::{
 };
 use crate::logical_plan::display::{GraphvizVisitor, IndentVisitor};
 use crate::logical_plan::extension::UserDefinedLogicalNode;
-use crate::logical_plan::{DmlStatement, Statement};
+use crate::logical_plan::{DmlStatement, Statement, WriteOp};
 use crate::utils::{
-    enumerate_grouping_sets, exprlist_to_fields, find_out_reference_exprs,
-    grouping_set_expr_count, grouping_set_to_exprlist, merge_schema, split_conjunction,
+    check_aggregate_and_window_nesting, enumerate_grouping_sets, exprlist_to_fields,
+    find_out_reference_exprs, grouping_set_expr_count, grouping_set_to_exprlist,
+    merge_schema, split_conjunction,
 };
 use crate::{
     BinaryExpr, CreateMemoryTable, CreateView, Execute, Expr, ExprSchemable, GroupingSet,
@@ -50,9 +51,11 @@ use crate::{
     WindowFunctionDefinition, build_join_schema, expr_vec_fmt, requalify_sides_if_needed,
 };
 
+use crate::statistics::StatisticsRequest;
+use arrow::compute::SortOptions;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef};
 use datafusion_common::cse::{NormalizeEq, Normalizeable};
-use datafusion_common::format::ExplainFormat;
+use datafusion_common::format::{ExplainAnalyzeCategories, ExplainFormat, MetricType};
 use datafusion_common::metadata::check_metadata_with_storage_equal;
 use datafusion_common::tree_node::{
     Transformed, TreeNode, TreeNodeContainer, TreeNodeRecursion,
@@ -60,10 +63,12 @@ use datafusion_common::tree_node::{
 use datafusion_common::{
     Column, Constraints, DFSchema, DFSchemaRef, DataFusionError, Dependency,
     FunctionalDependence, FunctionalDependencies, NullEquality, ParamValues, Result,
-    ScalarValue, Spans, TableReference, UnnestOptions, aggregate_functional_dependencies,
-    assert_eq_or_internal_err, assert_or_internal_err, internal_err, plan_err,
+    ScalarValue, Spans, SplitPoint, TableReference, UnnestOptions,
+    aggregate_functional_dependencies, assert_eq_or_internal_err, assert_or_internal_err,
+    internal_err, plan_err, validate_range_split_points,
 };
 use indexmap::IndexSet;
+use itertools::Itertools as _;
 
 // backwards compatibility
 use crate::display::PgJsonVisitor;
@@ -806,12 +811,20 @@ impl LogicalPlan {
                 op,
                 ..
             }) => {
-                self.assert_no_expressions(expr)?;
                 let input = self.only_input(inputs)?;
+                let op = match op {
+                    WriteOp::MergeInto(merge_op) => {
+                        WriteOp::MergeInto(Box::new(merge_op.with_new_exprs(expr)?))
+                    }
+                    other => {
+                        self.assert_no_expressions(expr)?;
+                        other.clone()
+                    }
+                };
                 Ok(LogicalPlan::Dml(DmlStatement::new(
                     table_name.clone(),
                     Arc::clone(target),
-                    op.clone(),
+                    op,
                     Arc::new(input),
                 )))
             }
@@ -865,6 +878,32 @@ impl LogicalPlan {
                     let input = self.only_input(inputs)?;
                     Ok(LogicalPlan::Repartition(Repartition {
                         partitioning_scheme: Partitioning::Hash(expr, *n),
+                        input: Arc::new(input),
+                    }))
+                }
+                Partitioning::Range(range) => {
+                    if expr.len() != range.ordering().len() {
+                        return internal_err!(
+                            "Incorrect number of expressions for Range partitioning"
+                        );
+                    }
+                    let input = self.only_input(inputs)?;
+                    let ordering = range
+                        .ordering()
+                        .iter()
+                        .zip(expr)
+                        .map(|(sort_expr, expr)| SortExpr {
+                            expr,
+                            asc: sort_expr.asc,
+                            nulls_first: sort_expr.nulls_first,
+                        })
+                        .collect();
+                    let range = RangePartitioning::try_new(
+                        ordering,
+                        range.split_points().to_vec(),
+                    )?;
+                    Ok(LogicalPlan::Repartition(Repartition {
+                        partitioning_scheme: Partitioning::Range(range),
                         input: Arc::new(input),
                     }))
                 }
@@ -1097,8 +1136,11 @@ impl LogicalPlan {
                 let input = self.only_input(inputs)?;
                 Ok(LogicalPlan::Analyze(Analyze {
                     verbose: a.verbose,
+                    format: a.format.clone(),
                     schema: Arc::clone(&a.schema),
                     input: Arc::new(input),
+                    analyze_level: a.analyze_level,
+                    analyze_categories: a.analyze_categories.clone(),
                 }))
             }
             LogicalPlan::Explain(e) => {
@@ -1111,6 +1153,7 @@ impl LogicalPlan {
                     stringified_plans: e.stringified_plans.clone(),
                     schema: Arc::clone(&e.schema),
                     logical_optimization_succeeded: e.logical_optimization_succeeded,
+                    show_statistics: e.show_statistics,
                 }))
             }
             LogicalPlan::Statement(Statement::Prepare(Prepare {
@@ -1152,12 +1195,20 @@ impl LogicalPlan {
                 options,
                 ..
             }) => {
-                self.assert_no_expressions(expr)?;
+                let exec_columns = if expr.is_empty() {
+                    columns.clone()
+                } else {
+                    expr.into_iter()
+                        .map(|e| match e {
+                            Expr::Column(c) => Ok(c),
+                            other => internal_err!(
+                                "Expected Expr::Column for Unnest exec_columns, got {other:?}"
+                            ),
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
                 let input = self.only_input(inputs)?;
-                // Update schema with unnested column type.
-                let new_plan =
-                    unnest_with_options(input, columns.clone(), options.clone())?;
-                Ok(new_plan)
+                Ok(unnest_with_options(input, exec_columns, options.clone())?)
             }
         }
     }
@@ -1709,7 +1760,7 @@ impl LogicalPlan {
     /// ```
     pub fn display_indent(&self) -> impl Display + '_ {
         // Boilerplate structure to wrap LogicalPlan with something
-        // that that can be formatted
+        // that can be formatted
         struct Wrapper<'a>(&'a LogicalPlan);
         impl Display for Wrapper<'_> {
             fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -1755,7 +1806,7 @@ impl LogicalPlan {
     /// ```
     pub fn display_indent_schema(&self) -> impl Display + '_ {
         // Boilerplate structure to wrap LogicalPlan with something
-        // that that can be formatted
+        // that can be formatted
         struct Wrapper<'a>(&'a LogicalPlan);
         impl Display for Wrapper<'_> {
             fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -1775,7 +1826,7 @@ impl LogicalPlan {
     /// Users can use this format to visualize the plan in existing plan visualization tools, for example [dalibo](https://explain.dalibo.com/)
     pub fn display_pg_json(&self) -> impl Display + '_ {
         // Boilerplate structure to wrap LogicalPlan with something
-        // that that can be formatted
+        // that can be formatted
         struct Wrapper<'a>(&'a LogicalPlan);
         impl Display for Wrapper<'_> {
             fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -1821,7 +1872,7 @@ impl LogicalPlan {
     /// ```
     pub fn display_graphviz(&self) -> impl Display + '_ {
         // Boilerplate structure to wrap LogicalPlan with something
-        // that that can be formatted
+        // that can be formatted
         struct Wrapper<'a>(&'a LogicalPlan);
         impl Display for Wrapper<'_> {
             fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -1872,7 +1923,7 @@ impl LogicalPlan {
     /// ```
     pub fn display(&self) -> impl Display + '_ {
         // Boilerplate structure to wrap LogicalPlan with something
-        // that that can be formatted
+        // that can be formatted
         struct Wrapper<'a>(&'a LogicalPlan);
         impl Display for Wrapper<'_> {
             fn fmt(&self, f: &mut Formatter) -> fmt::Result {
@@ -2057,6 +2108,7 @@ impl LogicalPlan {
                         filter,
                         join_constraint,
                         join_type,
+                        null_aware,
                         ..
                     }) => {
                         let join_expr: Vec<String> =
@@ -2065,6 +2117,8 @@ impl LogicalPlan {
                             .as_ref()
                             .map(|expr| format!(" Filter: {expr}"))
                             .unwrap_or_else(|| "".to_string());
+                        let null_aware_expr =
+                            if *null_aware { " null_aware" } else { "" };
                         let join_type = if filter.is_none()
                             && keys.is_empty()
                             && *join_type == JoinType::Inner
@@ -2084,15 +2138,17 @@ impl LogicalPlan {
                                         filter_expr
                                     )?;
                                 }
+                                write!(f, "{null_aware_expr}")?;
                                 Ok(())
                             }
                             JoinConstraint::Using => {
                                 write!(
                                     f,
-                                    "{} Join: Using {}{}",
+                                    "{} Join: Using {}{}{}",
                                     join_type,
                                     join_expr.join(", "),
                                     filter_expr,
+                                    null_aware_expr,
                                 )
                             }
                         }
@@ -2113,6 +2169,9 @@ impl LogicalPlan {
                                 hash_expr.join(", "),
                                 n
                             )
+                        }
+                        Partitioning::Range(range) => {
+                            write!(f, "Repartition: {range}")
                         }
                         Partitioning::DistributeBy(expr) => {
                             let dist_by_expr: Vec<String> =
@@ -2190,8 +2249,7 @@ impl LogicalPlan {
                             .map(|(i, unnest_info)| {
                                 format!(
                                     "{}|depth={}",
-                                    &input_columns[*i].to_string(),
-                                    unnest_info.depth
+                                    input_columns[*i], unnest_info.depth
                                 )
                             })
                             .collect::<Vec<String>>();
@@ -2604,16 +2662,22 @@ pub struct Filter {
 impl Filter {
     /// Create a new filter operator.
     ///
+    /// Skips the type-checking and dealiasing done in [Self::try_new].
+    /// For internal use in DataFusion only.
+    ///
+    /// **Preconditions:**
+    /// - the `predicate` expression returns a boolean value
+    /// - the `predicate` expression is not aliased
+    #[doc(hidden)]
+    pub fn new(predicate: Expr, input: Arc<LogicalPlan>) -> Self {
+        Self { predicate, input }
+    }
+
+    /// Create a new filter operator.
+    ///
     /// Notes: as Aliases have no effect on the output of a filter operator,
     /// they are removed from the predicate expression.
     pub fn try_new(predicate: Expr, input: Arc<LogicalPlan>) -> Result<Self> {
-        Self::try_new_internal(predicate, input)
-    }
-
-    /// Create a new filter operator for a having clause.
-    /// This is similar to a filter, but its having flag is set to true.
-    #[deprecated(since = "48.0.0", note = "Use `try_new` instead")]
-    pub fn try_new_with_having(predicate: Expr, input: Arc<LogicalPlan>) -> Result<Self> {
         Self::try_new_internal(predicate, input)
     }
 
@@ -2742,6 +2806,11 @@ pub struct Window {
 impl Window {
     /// Create a new window operator.
     pub fn try_new(window_expr: Vec<Expr>, input: Arc<LogicalPlan>) -> Result<Self> {
+        // Reject e.g. `sum(sum(x) OVER ()) OVER ()` here rather than letting it
+        // reach physical planning, which has no equivalent for a nested window
+        // function.
+        check_aggregate_and_window_nesting(window_expr.iter())?;
+
         let fields: Vec<(Option<TableReference>, Arc<Field>)> = input
             .schema()
             .iter()
@@ -2887,6 +2956,12 @@ pub struct TableScan {
     pub filters: Vec<Expr>,
     /// Optional number of rows to read
     pub fetch: Option<usize>,
+    /// Statistics the planner would like the provider to answer for this
+    /// scan, typically attached by a custom optimizer rule from the
+    /// surrounding plan (e.g. Min/Max for sort keys).
+    ///
+    /// A [`BTreeSet`], not a `Vec` to keep the resulting plan deterministic.
+    pub statistics_requests: BTreeSet<StatisticsRequest>,
 }
 
 impl Debug for TableScan {
@@ -2961,6 +3036,7 @@ impl Hash for TableScan {
 impl TableScan {
     /// Initialize TableScan with appropriate schema from the given
     /// arguments.
+    #[deprecated(since = "54.0.0", note = "use `TableScanBuilder` instead")]
     pub fn try_new(
         table_name: impl Into<TableReference>,
         table_source: Arc<dyn TableSource>,
@@ -2968,14 +3044,92 @@ impl TableScan {
         filters: Vec<Expr>,
         fetch: Option<usize>,
     ) -> Result<Self> {
-        let table_name = table_name.into();
+        TableScanBuilder::new(table_name, table_source)
+            .with_projection(projection)
+            .with_filters(filters)
+            .with_fetch(fetch)
+            .build()
+    }
+}
+
+/// Builder for [`TableScan`].
+///
+/// Prefer this over constructing a [`TableScan`] directly: it derives the
+/// `projected_schema` from the source schema and projection, and is resilient
+/// to new fields being added to [`TableScan`]. An existing scan can be turned
+/// back into a builder with `TableScanBuilder::from(scan)`, tweaked, and
+/// rebuilt with [`TableScanBuilder::build`].
+pub struct TableScanBuilder {
+    table_name: TableReference,
+    source: Arc<dyn TableSource>,
+    projection: Option<Vec<usize>>,
+    filters: Vec<Expr>,
+    fetch: Option<usize>,
+    statistics_requests: BTreeSet<StatisticsRequest>,
+}
+
+impl TableScanBuilder {
+    /// Create a new builder for a scan of `source` named `table_name`.
+    pub fn new(
+        table_name: impl Into<TableReference>,
+        source: Arc<dyn TableSource>,
+    ) -> Self {
+        Self {
+            table_name: table_name.into(),
+            source,
+            projection: None,
+            filters: vec![],
+            fetch: None,
+            statistics_requests: BTreeSet::new(),
+        }
+    }
+
+    /// Set the column projection (indices into the source schema).
+    pub fn with_projection(mut self, projection: Option<Vec<usize>>) -> Self {
+        self.projection = projection;
+        self
+    }
+
+    /// Set the filter expressions offered to the table provider.
+    pub fn with_filters(mut self, filters: Vec<Expr>) -> Self {
+        self.filters = filters;
+        self
+    }
+
+    /// Set the maximum number of rows to read.
+    pub fn with_fetch(mut self, fetch: Option<usize>) -> Self {
+        self.fetch = fetch;
+        self
+    }
+
+    /// Set the statistics requests for the scan. See
+    /// [`TableScan::statistics_requests`].
+    pub fn with_statistics_requests(
+        mut self,
+        statistics_requests: BTreeSet<StatisticsRequest>,
+    ) -> Self {
+        self.statistics_requests = statistics_requests;
+        self
+    }
+
+    /// Build the [`TableScan`], deriving its `projected_schema` from the
+    /// source schema and projection.
+    pub fn build(self) -> Result<TableScan> {
+        let TableScanBuilder {
+            table_name,
+            source,
+            projection,
+            filters,
+            fetch,
+            statistics_requests,
+        } = self;
 
         if table_name.table().is_empty() {
             return plan_err!("table_name cannot be empty");
         }
-        let schema = table_source.schema();
+        let schema = source.schema();
         let func_dependencies = FunctionalDependencies::new_from_constraints(
-            table_source.constraints(),
+            source.constraints(),
             schema.fields.len(),
         );
         let projected_schema = projection
@@ -3001,14 +3155,28 @@ impl TableScan {
             })?;
         let projected_schema = Arc::new(projected_schema);
 
-        Ok(Self {
+        Ok(TableScan {
             table_name,
-            source: table_source,
+            source,
             projection,
             projected_schema,
             filters,
             fetch,
+            statistics_requests,
         })
+    }
+}
+
+impl From<TableScan> for TableScanBuilder {
+    fn from(scan: TableScan) -> Self {
+        Self {
+            table_name: scan.table_name,
+            source: scan.source,
+            projection: scan.projection,
+            filters: scan.filters,
+            fetch: scan.fetch,
+            statistics_requests: scan.statistics_requests,
+        }
     }
 }
 
@@ -3323,6 +3491,15 @@ pub struct ExplainOption {
     pub analyze: bool,
     /// Output syntax/format
     pub format: ExplainFormat,
+    /// Statement-level override for `datafusion.explain.show_statistics`.
+    /// `None` means "fall back to session config".
+    pub show_statistics: Option<bool>,
+    /// Statement-level override for `datafusion.explain.analyze_level`.
+    /// `None` means "fall back to session config".
+    pub analyze_level: Option<MetricType>,
+    /// Statement-level override for `datafusion.explain.analyze_categories`.
+    /// `None` means "fall back to session config".
+    pub analyze_categories: Option<ExplainAnalyzeCategories>,
 }
 
 impl Default for ExplainOption {
@@ -3331,6 +3508,9 @@ impl Default for ExplainOption {
             verbose: false,
             analyze: false,
             format: ExplainFormat::Indent,
+            show_statistics: None,
+            analyze_level: None,
+            analyze_categories: None,
         }
     }
 }
@@ -3351,6 +3531,30 @@ impl ExplainOption {
     /// Builder‐style setter for `format`
     pub fn with_format(mut self, format: ExplainFormat) -> Self {
         self.format = format;
+        self
+    }
+
+    /// Builder-style setter for a statement-level override of
+    /// `datafusion.explain.show_statistics`.
+    pub fn with_show_statistics(mut self, show_statistics: Option<bool>) -> Self {
+        self.show_statistics = show_statistics;
+        self
+    }
+
+    /// Builder-style setter for a statement-level override of
+    /// `datafusion.explain.analyze_level`.
+    pub fn with_analyze_level(mut self, analyze_level: Option<MetricType>) -> Self {
+        self.analyze_level = analyze_level;
+        self
+    }
+
+    /// Builder-style setter for a statement-level override of
+    /// `datafusion.explain.analyze_categories`.
+    pub fn with_analyze_categories(
+        mut self,
+        analyze_categories: Option<ExplainAnalyzeCategories>,
+    ) -> Self {
+        self.analyze_categories = analyze_categories;
         self
     }
 }
@@ -3376,6 +3580,9 @@ pub struct Explain {
     pub schema: DFSchemaRef,
     /// Used by physical planner to check if should proceed with planning
     pub logical_optimization_succeeded: bool,
+    /// Statement-level override for `datafusion.explain.show_statistics`.
+    /// When `None`, the session-config value is used.
+    pub show_statistics: Option<bool>,
 }
 
 // Manual implementation needed because of `schema` field. Comparison excludes this field.
@@ -3391,18 +3598,22 @@ impl PartialOrd for Explain {
             pub stringified_plans: &'a Vec<StringifiedPlan>,
             /// Used by physical planner to check if should proceed with planning
             pub logical_optimization_succeeded: &'a bool,
+            /// Statement-level override for show_statistics
+            pub show_statistics: &'a Option<bool>,
         }
         let comparable_self = ComparableExplain {
             verbose: &self.verbose,
             plan: &self.plan,
             stringified_plans: &self.stringified_plans,
             logical_optimization_succeeded: &self.logical_optimization_succeeded,
+            show_statistics: &self.show_statistics,
         };
         let comparable_other = ComparableExplain {
             verbose: &other.verbose,
             plan: &other.plan,
             stringified_plans: &other.stringified_plans,
             logical_optimization_succeeded: &other.logical_optimization_succeeded,
+            show_statistics: &other.show_statistics,
         };
         comparable_self
             .partial_cmp(&comparable_other)
@@ -3417,13 +3628,24 @@ impl PartialOrd for Explain {
 pub struct Analyze {
     /// Should extra detail be included?
     pub verbose: bool,
+    /// Output syntax/format for the rendered physical plan + metrics.
+    pub format: ExplainFormat,
     /// The logical plan that is being EXPLAIN ANALYZE'd
     pub input: Arc<LogicalPlan>,
     /// The output schema of the explain (2 columns of text)
     pub schema: DFSchemaRef,
+    /// Statement-level override for `datafusion.explain.analyze_level`.
+    /// When `None`, the session-config value is used.
+    pub analyze_level: Option<MetricType>,
+    /// Statement-level override for `datafusion.explain.analyze_categories`.
+    /// When `None`, the session-config value is used.
+    pub analyze_categories: Option<ExplainAnalyzeCategories>,
 }
 
-// Manual implementation needed because of `schema` field. Comparison excludes this field.
+// Manual implementation needed because of `schema` field and the lack of
+// `PartialOrd` on `MetricType` / `ExplainAnalyzeCategories`. Ordering is
+// defined over `(verbose, input)` and then falls back to `==` for the
+// remaining statement-level override fields.
 impl PartialOrd for Analyze {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         match self.verbose.partial_cmp(&other.verbose) {
@@ -3702,6 +3924,10 @@ impl Aggregate {
         group_expr: Vec<Expr>,
         aggr_expr: Vec<Expr>,
     ) -> Result<Self> {
+        // Reject e.g. `sum(sum(x))` here rather than letting it reach physical
+        // planning, which has no equivalent for a nested aggregate.
+        check_aggregate_and_window_nesting(group_expr.iter().chain(aggr_expr.iter()))?;
+
         let group_expr = enumerate_grouping_sets(group_expr)?;
 
         let is_grouping_set = matches!(group_expr.as_slice(), [Expr::GroupingSet(_)]);
@@ -3946,8 +4172,12 @@ fn calc_func_dependencies_for_project(
     exprs: &[Expr],
     input: &LogicalPlan,
 ) -> Result<FunctionalDependencies> {
+    // Sentinel for projection outputs that do not map back to any input field.
+    const COMPUTED_EXPR_INDEX: usize = usize::MAX;
+
     let input_fields = input.schema().field_names();
-    // Calculate expression indices (if present) in the input schema.
+    // Map each projection output position to its input column index.
+    // A projection expression can produce multiple output columns, such as `*`.
     let proj_indices = exprs
         .iter()
         .map(|expr| match expr {
@@ -3963,30 +4193,33 @@ fn calc_func_dependencies_for_project(
                 Ok::<_, DataFusionError>(
                     wildcard_fields
                         .into_iter()
-                        .filter_map(|(qualifier, f)| {
+                        .map(|(qualifier, f)| {
                             let flat_name = qualifier
                                 .map(|t| format!("{}.{}", t, f.name()))
                                 .unwrap_or_else(|| f.name().clone());
-                            input_fields.iter().position(|item| *item == flat_name)
+                            input_fields
+                                .iter()
+                                .position(|item| *item == flat_name)
+                                .unwrap_or(COMPUTED_EXPR_INDEX)
                         })
                         .collect::<Vec<_>>(),
                 )
             }
             Expr::Alias(alias) => {
                 let name = format!("{}", alias.expr);
-                Ok(input_fields
+                let input_index = input_fields
                     .iter()
                     .position(|item| *item == name)
-                    .map(|i| vec![i])
-                    .unwrap_or(vec![]))
+                    .unwrap_or(COMPUTED_EXPR_INDEX);
+                Ok(vec![input_index])
             }
             _ => {
                 let name = format!("{expr}");
-                Ok(input_fields
+                let input_index = input_fields
                     .iter()
                     .position(|item| *item == name)
-                    .map(|i| vec![i])
-                    .unwrap_or(vec![]))
+                    .unwrap_or(COMPUTED_EXPR_INDEX);
+                Ok(vec![input_index])
             }
         })
         .collect::<Result<Vec<_>>>()?
@@ -4244,11 +4477,16 @@ impl Debug for Subquery {
     }
 }
 
-/// Logical partitioning schemes supported by [`LogicalPlan::Repartition`]
+/// Logical partitioning schemes.
 ///
-/// See [`Partitioning`] for more details on partitioning
+/// A scheme can describe either requested repartitioning in
+/// [`LogicalPlan::Repartition`] or a partitioning property declared by a source.
+/// Some schemes are only valid as metadata until planner support is added.
 ///
-/// [`Partitioning`]: https://docs.rs/datafusion/latest/datafusion/physical_expr/enum.Partitioning.html#
+/// For physical execution partitioning, see
+/// [`datafusion_physical_expr::Partitioning`].
+///
+/// [`datafusion_physical_expr::Partitioning`]: https://docs.rs/datafusion/latest/datafusion/physical_expr/enum.Partitioning.html#
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
 pub enum Partitioning {
     /// Allocate batches using a round-robin algorithm and the specified number of partitions
@@ -4256,8 +4494,116 @@ pub enum Partitioning {
     /// Allocate rows based on a hash of one of more expressions and the specified number
     /// of partitions.
     Hash(Vec<Expr>, usize),
+    /// Partition rows by ranges.
+    /// See [`RangePartitioning`] for the logical contract.
+    Range(RangePartitioning),
     /// The DISTRIBUTE BY clause is used to repartition the data based on the input expressions
     DistributeBy(Vec<Expr>),
+}
+
+impl Partitioning {
+    /// Return the number of partitions, if known.
+    pub fn partition_count(&self) -> Option<usize> {
+        match self {
+            Self::RoundRobinBatch(partition_count) | Self::Hash(_, partition_count) => {
+                Some(*partition_count)
+            }
+            Self::Range(range) => Some(range.partition_count()),
+            Self::DistributeBy(_) => None,
+        }
+    }
+}
+
+/// Logical range partitioning.
+///
+/// [`RangePartitioning`] describes an ordered logical key space with split points.
+///
+/// - `ordering` defines the partitioning key and ordering using logical
+///   [`SortExpr`]s.
+/// - `split_points` define the boundaries between adjacent partitions.
+///
+/// Comparisons use the lexicographic order defined by `ordering`,
+/// including `ASC`/`DESC` and null ordering. Split points must be ordered
+/// according to that ordering, and each split point must have one value per
+/// ordering expression. See [`SplitPoint`] for the shared boundary contract.
+///
+/// The expressions are resolved against the declaring plan's schema. This
+/// constructor does not validate split point value types against the resolved
+/// expression types. Like other user-specified data properties such as
+/// sortedness, if a source declares range partitioning, it is responsible for
+/// placing each row in the partition described by the split points. DataFusion
+/// will not validate this is upheld.
+///
+/// NOTE: Range-aware optimizer and execution behavior will be introduced
+/// incrementally. See
+/// <https://github.com/apache/datafusion/issues/22395>.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Hash)]
+pub struct RangePartitioning {
+    /// Ordered logical partitioning key.
+    ordering: Vec<SortExpr>,
+    /// Boundaries between adjacent partitions.
+    split_points: Vec<SplitPoint>,
+}
+
+impl RangePartitioning {
+    /// Creates logical range partitioning metadata and validates split point
+    /// shape and ordering.
+    pub fn try_new(
+        ordering: Vec<SortExpr>,
+        split_points: Vec<SplitPoint>,
+    ) -> Result<Self> {
+        if ordering.is_empty() {
+            return plan_err!("Range partitioning requires non-empty ordering");
+        }
+
+        validate_range_split_points(&split_points, &logical_sort_options(&ordering))?;
+
+        Ok(Self {
+            ordering,
+            split_points,
+        })
+    }
+
+    /// Return the number of partitions.
+    pub fn partition_count(&self) -> usize {
+        self.split_points.len() + 1
+    }
+
+    /// Returns the ordering that defines the range key.
+    pub fn ordering(&self) -> &[SortExpr] {
+        &self.ordering
+    }
+
+    /// Returns the ordered split points between partitions.
+    pub fn split_points(&self) -> &[SplitPoint] {
+        &self.split_points
+    }
+}
+
+fn logical_sort_options(ordering: &[SortExpr]) -> Vec<SortOptions> {
+    ordering
+        .iter()
+        .map(|sort_expr| SortOptions {
+            descending: !sort_expr.asc,
+            nulls_first: sort_expr.nulls_first,
+        })
+        .collect()
+}
+
+impl Display for RangePartitioning {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let ordering = self.ordering().iter().map(ToString::to_string).join(", ");
+        let split_points = self
+            .split_points()
+            .iter()
+            .map(ToString::to_string)
+            .join(", ");
+        write!(
+            f,
+            "Range([{ordering}], [{split_points}], {})",
+            self.partition_count()
+        )
+    }
 }
 
 /// Represent the unnesting operation on a list column, such as the recursion depth and
@@ -4587,6 +4933,45 @@ mod tests {
     use insta::{assert_debug_snapshot, assert_snapshot};
     use std::hash::DefaultHasher;
 
+    /// `LogicalPlan` is moved/swapped on every step of the planning hot path
+    /// (every `mem::take` in an in-place rewriter, every `Arc<LogicalPlan>`
+    /// write, every owned `map_*` traversal). Its size is set by the largest
+    /// variant, so an oversized variant balloons cost for every other variant.
+    ///
+    /// Today the size-setter should be `Join` (~176 bytes); `DdlStatement` is
+    /// boxed precisely so it does not dominate. If you grow a variant, please
+    /// box the new large fields rather than letting this number creep up —
+    /// see the analogous `test_size_of_expr` in `expr.rs`.
+    #[test]
+    fn test_size_of_logical_plan() {
+        // `LogicalPlan` enum on aarch64 / x86_64. Today this matches
+        // `Join`'s 176 bytes (the enum discriminant fits in `Join`'s
+        // alignment padding); if `Join` grows or another variant overtakes
+        // it, this number will move with the new size-setter.
+        assert_eq!(size_of::<LogicalPlan>(), 176);
+        // `DdlStatement` is `Ddl(DdlStatement)`'s payload; keep it below the
+        // `Join` ceiling so it never re-becomes the size-setter.
+        assert!(
+            size_of::<DdlStatement>() < size_of::<Join>(),
+            "DdlStatement ({} bytes) should stay smaller than Join ({} bytes); \
+             box the new large variant rather than letting it dominate `LogicalPlan`.",
+            size_of::<DdlStatement>(),
+            size_of::<Join>(),
+        );
+        // Sanity check the two boxed variants stay boxed (so the payload
+        // sits on the heap, not in the enum).
+        assert_eq!(
+            size_of::<Box<crate::CreateExternalTable>>(),
+            8,
+            "CreateExternalTable should be Box'd inside DdlStatement"
+        );
+        assert_eq!(
+            size_of::<Box<crate::CreateFunction>>(),
+            8,
+            "CreateFunction should be Box'd inside DdlStatement"
+        );
+    }
+
     fn employee_schema() -> Schema {
         Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -4595,6 +4980,210 @@ mod tests {
             Field::new("state", DataType::Utf8, false),
             Field::new("salary", DataType::Int32, false),
         ])
+    }
+
+    #[test]
+    fn projection_with_leading_computed_column_preserves_pk() -> Result<()> {
+        let constraints =
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let source = Arc::new(
+            LogicalTableSource::new(Arc::new(employee_schema()))
+                .with_constraints(constraints),
+        );
+        let plan = LogicalPlanBuilder::scan("employee_csv", source, None)?
+            .project(vec![
+                lit(1i32).alias("__common_expr_1"),
+                col("id"),
+                col("first_name"),
+                col("salary"),
+            ])?
+            .build()?;
+
+        let deps = plan.schema().functional_dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].source_indices, vec![1]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn projection_with_leading_computed_column_and_wildcard_preserves_pk() -> Result<()> {
+        let constraints =
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let source = Arc::new(
+            LogicalTableSource::new(Arc::new(employee_schema()))
+                .with_constraints(constraints),
+        );
+        let plan = LogicalPlanBuilder::scan("employee_csv", source, None)?
+            .project(vec![
+                SelectExpr::Expression(lit(1i32).alias("__common_expr_1")),
+                SelectExpr::Wildcard(Default::default()),
+            ])?
+            .build()?;
+
+        let deps = plan.schema().functional_dependencies();
+        assert_eq!(plan.schema().fields().len(), 6);
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].source_indices, vec![1]);
+        assert_eq!(deps[0].target_indices, vec![0, 1, 2, 3, 4, 5]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn projection_with_wildcard_expr_before_pk_preserves_pk() -> Result<()> {
+        let constraints =
+            Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
+        let source = Arc::new(
+            LogicalTableSource::new(Arc::new(employee_schema()))
+                .with_constraints(constraints),
+        );
+        let input = LogicalPlanBuilder::scan("employee_csv", source, None)?.build()?;
+        #[expect(deprecated)]
+        let projection = Projection::try_new(
+            vec![
+                Expr::Wildcard {
+                    qualifier: None,
+                    options: Box::new(crate::expr::WildcardOptions::default()),
+                },
+                col("employee_csv.id"),
+            ],
+            Arc::new(input),
+        )?;
+
+        let deps = projection.schema.functional_dependencies();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].source_indices, vec![1]);
+
+        Ok(())
+    }
+
+    fn i32_split_point(value: i32) -> SplitPoint {
+        SplitPoint::new(vec![ScalarValue::Int32(Some(value))])
+    }
+
+    fn null_i32_split_point() -> SplitPoint {
+        SplitPoint::new(vec![ScalarValue::Int32(None)])
+    }
+
+    #[test]
+    fn logical_range_partitioning_validates_shape() {
+        let range = RangePartitioning::try_new(
+            vec![col("id").sort(true, true)],
+            vec![i32_split_point(10), i32_split_point(20)],
+        )
+        .unwrap();
+        assert_eq!(range.partition_count(), 3);
+
+        let range = RangePartitioning::try_new(
+            vec![col("id").sort(false, true)],
+            vec![i32_split_point(20), i32_split_point(10)],
+        )
+        .unwrap();
+        assert_eq!(range.partition_count(), 3);
+
+        let err = RangePartitioning::try_new(vec![], vec![]).unwrap_err();
+        assert!(err.to_string().contains("non-empty ordering"));
+
+        let err = RangePartitioning::try_new(
+            vec![col("id").sort(true, true), col("salary").sort(true, true)],
+            vec![i32_split_point(10)],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("split point 0 has width 1, but ordering has width 2")
+        );
+
+        let err = RangePartitioning::try_new(
+            vec![col("id").sort(true, true)],
+            vec![i32_split_point(20), i32_split_point(10)],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("split points must be strictly ordered")
+        );
+
+        let err = RangePartitioning::try_new(
+            vec![col("id").sort(true, true)],
+            vec![i32_split_point(10), i32_split_point(10)],
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("split points must be strictly ordered")
+        );
+
+        let range = RangePartitioning::try_new(
+            vec![col("id").sort(true, true)],
+            vec![null_i32_split_point(), i32_split_point(10)],
+        )
+        .unwrap();
+        assert_eq!(range.partition_count(), 3);
+    }
+
+    #[test]
+    fn logical_partitioning_reports_known_partition_count() -> Result<()> {
+        let range = RangePartitioning::try_new(
+            vec![col("id").sort(true, true)],
+            vec![i32_split_point(10)],
+        )?;
+
+        assert_eq!(Partitioning::RoundRobinBatch(4).partition_count(), Some(4));
+        assert_eq!(
+            Partitioning::Hash(vec![col("id")], 8).partition_count(),
+            Some(8)
+        );
+        assert_eq!(Partitioning::Range(range).partition_count(), Some(2));
+        assert_eq!(
+            Partitioning::DistributeBy(vec![col("id")]).partition_count(),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn logical_range_partitioning_participates_in_expression_rewrite() -> Result<()> {
+        let input =
+            table_scan(Some("employee_csv"), &employee_schema(), None)?.build()?;
+        let plan = LogicalPlan::Repartition(Repartition {
+            input: Arc::new(input),
+            partitioning_scheme: Partitioning::Range(RangePartitioning::try_new(
+                vec![col("id").sort(true, true)],
+                vec![i32_split_point(10)],
+            )?),
+        });
+
+        let mut visited_exprs = vec![];
+        plan.apply_expressions(|expr| {
+            visited_exprs.push(expr.to_string());
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        assert_eq!(visited_exprs, vec!["id"]);
+
+        let plan = plan
+            .map_expressions(|expr| {
+                if expr == col("id") {
+                    Ok(Transformed::yes(col("salary")))
+                } else {
+                    Ok(Transformed::no(expr))
+                }
+            })?
+            .data;
+
+        let LogicalPlan::Repartition(Repartition {
+            partitioning_scheme: Partitioning::Range(range),
+            ..
+        }) = plan
+        else {
+            unreachable!("expected range repartition");
+        };
+        assert_eq!(range.ordering()[0].expr, col("salary"));
+        assert_eq!(range.partition_count(), 2);
+
+        Ok(())
     }
 
     fn display_plan() -> Result<LogicalPlan> {
@@ -5314,6 +5903,7 @@ mod tests {
             projected_schema: Arc::clone(&schema),
             filters: vec![],
             fetch: None,
+            statistics_requests: BTreeSet::new(),
         }));
         let col = schema.field_names()[0].clone();
 
@@ -5344,6 +5934,7 @@ mod tests {
             projected_schema: Arc::clone(&unique_schema),
             filters: vec![],
             fetch: None,
+            statistics_requests: BTreeSet::new(),
         }));
         let col = schema.field_names()[0].clone();
 
@@ -6164,6 +6755,55 @@ mod tests {
             .expect("to get type")
             .clone();
         assert_eq!(parameter_type, Some(DataType::Int64));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unnest_with_new_exprs_accepts_expressions() -> Result<()> {
+        use crate::LogicalPlanBuilder;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Schema::new(vec![
+            Field::new("list_col", DataType::new_list(DataType::Int32, true), true),
+            Field::new("other_col", DataType::Int32, true),
+        ]);
+        let plan = table_scan(Some("t"), &schema, None)?.build()?;
+        let unnest_plan = LogicalPlanBuilder::from(plan)
+            .unnest_column("list_col")?
+            .build()?;
+
+        let exprs = unnest_plan.expressions();
+        assert!(!exprs.is_empty(), "Unnest should expose exec_columns");
+        assert_eq!(exprs.len(), 1);
+        assert!(matches!(&exprs[0], Expr::Column(c) if c.name == "list_col"));
+
+        let inputs: Vec<LogicalPlan> =
+            unnest_plan.inputs().into_iter().cloned().collect();
+        let rebuilt = unnest_plan.with_new_exprs(exprs, inputs)?;
+        assert_eq!(rebuilt.schema(), unnest_plan.schema());
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_unnest_with_new_exprs_empty_preserves_columns() -> Result<()> {
+        use crate::LogicalPlanBuilder;
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Schema::new(vec![
+            Field::new("list_col", DataType::new_list(DataType::Int32, true), true),
+            Field::new("other_col", DataType::Int32, true),
+        ]);
+        let plan = table_scan(Some("t"), &schema, None)?.build()?;
+        let unnest_plan = LogicalPlanBuilder::from(plan)
+            .unnest_column("list_col")?
+            .build()?;
+
+        let inputs: Vec<LogicalPlan> =
+            unnest_plan.inputs().into_iter().cloned().collect();
+        let rebuilt = unnest_plan.with_new_exprs(vec![], inputs)?;
+        assert_eq!(rebuilt.schema(), unnest_plan.schema());
 
         Ok(())
     }

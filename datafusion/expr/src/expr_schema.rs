@@ -31,6 +31,7 @@ use crate::{LogicalPlan, Projection, Subquery, WindowFunctionDefinition, utils};
 use arrow::compute::can_cast_types;
 use arrow::datatypes::FieldRef;
 use arrow::datatypes::{DataType, Field};
+use arrow_schema::extension::{EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY};
 use datafusion_common::datatype::FieldExt;
 use datafusion_common::{
     Column, DataFusionError, ExprSchema, Result, ScalarValue, Spans, TableReference,
@@ -69,18 +70,46 @@ pub trait ExprSchemable {
     -> Result<(DataType, bool)>;
 }
 
-/// Derives the output field for a cast expression from the source field.
+/// Derives the output field for a cast expression from the source and target fields.
+///
+/// Metadata handling:
+/// - Type-only casts (i.e., target_field == DataType::SomeDataType.into_nullable_field())
+///   propagate non extension-type metadata from the source. This is for backward compatibility
+///   (casts have propagated source metadata for many if not all previous versions), recognizing
+///   that the return type of `<some extension type>::<some non extension type>` should have the
+///   return type of `<some non extension type>` (e.g., casting arrow.json to utf8).
+/// - All other casts preserve target metadata exactly. This ensures in particular that output
+///   metadata when casting to an extension type contains the extension information in the
+///   output field. Callers that wish to have some mix of source and target metadata can use
+///   Alias or construct an output field themselves (whose metadata will be used directly).
+///
 /// For `TryCast`, `force_nullable` is `true` since a failed cast returns NULL.
 fn cast_output_field(
     source_field: &FieldRef,
-    target_type: &DataType,
+    target_field: &FieldRef,
     force_nullable: bool,
 ) -> Arc<Field> {
+    // Check if this is a "type-only" cast (target_field == DataType::X.into_nullable_field())
+    let is_type_only = target_field.name().is_empty()
+        && target_field.is_nullable()
+        && target_field.metadata().is_empty();
+
+    let metadata = if is_type_only {
+        // Type-only cast: propagate source metadata, stripping extension type keys
+        let mut meta = source_field.metadata().clone();
+        meta.remove(EXTENSION_TYPE_NAME_KEY);
+        meta.remove(EXTENSION_TYPE_METADATA_KEY);
+        meta
+    } else {
+        // Explicit target field: use target metadata exactly
+        target_field.metadata().clone()
+    };
+
     let mut f = source_field
         .as_ref()
         .clone()
-        .with_data_type(target_type.clone())
-        .with_metadata(source_field.metadata().clone());
+        .with_data_type(target_field.data_type().clone())
+        .with_metadata(metadata);
     if force_nullable {
         f = f.with_nullable(true);
     }
@@ -157,7 +186,7 @@ impl ExprSchemable for Expr {
             Expr::Cast(Cast { field, .. }) | Expr::TryCast(TryCast { field, .. }) => {
                 Ok(field.data_type().clone())
             }
-            Expr::Unnest(Unnest { expr }) => {
+            Expr::Unnest(Unnest { expr, .. }) => {
                 let arg_data_type = expr.get_type(schema)?;
                 // Unnest's output type is the inner type of the list
                 match arg_data_type {
@@ -366,7 +395,14 @@ impl ExprSchemable for Expr {
             | Expr::IsNotUnknown(_)
             | Expr::Exists { .. } => Ok(false),
             Expr::SetComparison(_) => Ok(true),
-            Expr::InSubquery(InSubquery { expr, .. }) => expr.nullable(input_schema),
+            Expr::InSubquery(InSubquery { expr, subquery, .. }) => {
+                let expr_nullable = expr.nullable(input_schema)?;
+                let subquery_nullable = subquery.subquery.schema().fields().first().ok_or_else(|| {
+                    plan_datafusion_err!("subquery must return exactly one column of data to compare against")
+                })?.is_nullable();
+
+                Ok(expr_nullable | subquery_nullable)
+            }
             Expr::ScalarSubquery(subquery) => {
                 Ok(subquery.subquery.schema().field(0).is_nullable())
             }
@@ -455,7 +491,8 @@ impl ExprSchemable for Expr {
     /// - **Aliases**: Merge underlying expr metadata with alias-specific metadata, preferring the alias metadata
     /// - **Binary expressions**: field metadata is empty
     /// - **Boolean expressions**: field metadata is empty
-    /// - **Cast expressions**: determined by the input expression's field metadata handling
+    /// - **Cast expressions**: Type-only casts pass through source metadata (stripping extension
+    ///   type keys); casts with explicit target fields use target metadata exactly
     /// - **Scalar functions**: Generate metadata via function's [`return_field_from_args`] method,
     ///   with the default implementation returning empty field metadata
     /// - **Aggregate functions**: Generate metadata via function's [`return_field`] method,
@@ -595,20 +632,16 @@ impl ExprSchemable for Expr {
                 func.return_field_from_args(args)
             }
             // _ => Ok((self.get_type(schema)?, self.nullable(schema)?)),
-            Expr::Cast(Cast { expr, field }) => {
-                expr.to_field(schema).map(|(_table_ref, src)| {
-                    cast_output_field(&src, field.data_type(), false)
-                })
-            }
+            Expr::Cast(Cast { expr, field }) => expr
+                .to_field(schema)
+                .map(|(_table_ref, src)| cast_output_field(&src, field, false)),
             Expr::Placeholder(Placeholder {
                 id: _,
                 field: Some(field),
             }) => Ok(Arc::clone(field).renamed(&schema_name)),
-            Expr::TryCast(TryCast { expr, field }) => {
-                expr.to_field(schema).map(|(_table_ref, src)| {
-                    cast_output_field(&src, field.data_type(), true)
-                })
-            }
+            Expr::TryCast(TryCast { expr, field }) => expr
+                .to_field(schema)
+                .map(|(_table_ref, src)| cast_output_field(&src, field, true)),
             Expr::LambdaVariable(LambdaVariable {
                 field: Some(field), ..
             }) => Ok(Arc::clone(field).renamed(&schema_name)),
@@ -796,8 +829,13 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::{and, col, lit, not, or, out_ref_col_with_metadata, when};
+    use crate::logical_plan::builder::LogicalTableSource;
+    use crate::{
+        LogicalPlanBuilder, and, col, in_subquery, lit, not, or,
+        out_ref_col_with_metadata, when,
+    };
 
+    use arrow::datatypes::Schema;
     use datafusion_common::{DFSchema, assert_or_internal_err};
 
     macro_rules! test_is_expr_nullable {
@@ -1192,6 +1230,76 @@ mod tests {
         }
     }
 
+    /// A scan of `t`, whose single column `a` has the given nullability.
+    fn scan_t(a_nullable: bool) -> LogicalPlanBuilder {
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, a_nullable)]);
+        let source = Arc::new(LogicalTableSource::new(Arc::new(schema)));
+        LogicalPlanBuilder::scan("t", source, None).unwrap()
+    }
+
+    #[test]
+    fn in_subquery_nullability() {
+        // `x IN (SELECT a FROM t)` evaluates to NULL when `x` is NULL, and when `x`
+        // matches no row while `a` contains a NULL. So it is nullable exactly when
+        // either the compared expression or the subquery's output column is.
+        let cases = [
+            (false, false, false),
+            (false, true, true),
+            (true, false, true),
+            (true, true, true),
+        ];
+
+        for (x_nullable, a_nullable, expected) in cases {
+            let subquery = scan_t(a_nullable)
+                .project(vec![col("a")])
+                .unwrap()
+                .build()
+                .unwrap();
+            let expr = in_subquery(col("x"), Arc::new(subquery));
+            let schema = MockExprSchema::new().with_nullable(x_nullable);
+
+            assert_eq!(expr.nullable(&schema).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn in_subquery_nullability_uses_subquery_output_schema() {
+        // `DISTINCT` carries no expressions of its own, but its output column is still
+        // nullable, so the `IN` expression must be nullable too.
+        let subquery = scan_t(true)
+            .project(vec![col("a")])
+            .unwrap()
+            .distinct()
+            .unwrap()
+            .build()
+            .unwrap();
+        let expr = in_subquery(col("x"), Arc::new(subquery));
+        assert!(expr.nullable(&MockExprSchema::new()).unwrap());
+
+        // A computed projection's expressions reference `t.a`, which does not appear in
+        // the subquery's output schema, so nullability must be read off that schema's
+        // single column rather than by resolving the projection's expressions against it.
+        let subquery = scan_t(false)
+            .project(vec![col("a") + lit(1)])
+            .unwrap()
+            .build()
+            .unwrap();
+        let expr = in_subquery(col("x"), Arc::new(subquery));
+        assert!(!expr.nullable(&MockExprSchema::new()).unwrap());
+    }
+
+    #[test]
+    fn in_subquery_nullability_errors_for_no_subquery_columns() {
+        let subquery = LogicalPlanBuilder::empty(false).build().unwrap();
+        let expr = in_subquery(col("x"), Arc::new(subquery));
+
+        let err = expr.nullable(&MockExprSchema::new()).unwrap_err();
+        assert_eq!(
+            err.strip_backtrace(),
+            "Error during planning: subquery must return exactly one column of data to compare against"
+        );
+    }
+
     #[test]
     fn test_scalar_variable() {
         let mut meta = HashMap::new();
@@ -1207,5 +1315,116 @@ mod tests {
         let schema = MockExprSchema::new();
 
         assert_eq!(meta, expr.metadata(&schema).unwrap());
+    }
+
+    #[test]
+    fn test_cast_and_try_cast_extension_type_metadata() {
+        use crate::expr::{Cast, TryCast};
+        use arrow_schema::extension::{
+            EXTENSION_TYPE_METADATA_KEY, EXTENSION_TYPE_NAME_KEY,
+        };
+
+        // Helper to build either Cast or TryCast expression
+        fn make_cast_expr(
+            expr: Expr,
+            target_field: FieldRef,
+            use_try_cast: bool,
+        ) -> Expr {
+            if use_try_cast {
+                Expr::TryCast(TryCast {
+                    expr: Box::new(expr),
+                    field: target_field,
+                })
+            } else {
+                Expr::Cast(Cast {
+                    expr: Box::new(expr),
+                    field: target_field,
+                })
+            }
+        }
+
+        // Run the same test logic for both Cast and TryCast
+        for use_try_cast in [false, true] {
+            let cast_name = if use_try_cast { "TryCast" } else { "Cast" };
+
+            // Create a schema with a field that has extension type metadata
+            let mut source_meta = HashMap::new();
+            source_meta.insert(
+                EXTENSION_TYPE_NAME_KEY.to_string(),
+                "arrow.uuid".to_string(),
+            );
+            source_meta.insert("custom_key".to_string(), "custom_value".to_string());
+
+            let source_field = Field::new("foo", DataType::FixedSizeBinary(16), false)
+                .with_metadata(source_meta);
+
+            let schema = MockExprSchema::new()
+                .with_data_type(DataType::FixedSizeBinary(16))
+                .with_metadata(FieldMetadata::from(source_field.metadata().clone()));
+
+            // Test 1: Cast to a type without extension metadata strips extension metadata
+            // but preserves non-extension metadata
+            let cast_expr = make_cast_expr(
+                col("foo"),
+                Arc::new(Field::new("", DataType::Utf8, true)),
+                use_try_cast,
+            );
+
+            let (_, result_field) = cast_expr.to_field(&schema).unwrap();
+            assert!(
+                result_field
+                    .metadata()
+                    .get(EXTENSION_TYPE_NAME_KEY)
+                    .is_none(),
+                "{cast_name}: Extension type name should be stripped when target has no extension metadata"
+            );
+            assert_eq!(
+                result_field.metadata().get("custom_key"),
+                Some(&"custom_value".to_string()),
+                "{cast_name}: Non-extension metadata should be preserved"
+            );
+            if use_try_cast {
+                assert!(
+                    result_field.is_nullable(),
+                    "TryCast result should be nullable"
+                );
+            }
+
+            // Test 2: Cast to a field with explicit metadata uses target metadata exactly
+            let mut target_meta = HashMap::new();
+            target_meta.insert(
+                EXTENSION_TYPE_NAME_KEY.to_string(),
+                "arrow.json".to_string(),
+            );
+            target_meta.insert(EXTENSION_TYPE_METADATA_KEY.to_string(), "{}".to_string());
+
+            let target_field =
+                Field::new("", DataType::Utf8, true).with_metadata(target_meta);
+
+            let cast_expr =
+                make_cast_expr(col("foo"), Arc::new(target_field), use_try_cast);
+
+            let (_, result_field) = cast_expr.to_field(&schema).unwrap();
+            assert_eq!(
+                result_field.metadata().get(EXTENSION_TYPE_NAME_KEY),
+                Some(&"arrow.json".to_string()),
+                "{cast_name}: Extension type name should come from target field"
+            );
+            assert_eq!(
+                result_field.metadata().get(EXTENSION_TYPE_METADATA_KEY),
+                Some(&"{}".to_string()),
+                "{cast_name}: Extension type metadata should come from target field"
+            );
+            assert!(
+                result_field.metadata().get("custom_key").is_none(),
+                "{cast_name}: Source metadata should NOT propagate when target has explicit metadata"
+            );
+            if use_try_cast {
+                assert!(
+                    result_field.is_nullable(),
+                    "TryCast result should be nullable"
+                );
+            }
+        }
     }
 }

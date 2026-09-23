@@ -24,13 +24,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Context;
 
-use crate::ExecutionPlan;
 use crate::common;
 use crate::execution_plan::{Boundedness, EmissionType};
 use crate::memory::MemoryStream;
 use crate::metrics::MetricsSet;
+use crate::statistics::StatisticsArgs;
 use crate::stream::RecordBatchStreamAdapter;
 use crate::streaming::PartitionStream;
+use crate::{ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions};
 use crate::{DisplayAs, DisplayFormatType, PlanProperties};
 
 use arrow::array::{Array, ArrayRef, Int32Array, RecordBatch};
@@ -137,11 +138,29 @@ impl ExecutionPlan for TestMemoryExec {
         Vec::new()
     }
 
-    fn with_new_children(
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        Ok(TreeNodeRecursion::Continue)
+    }
+
+    fn replace_children(
         self: Arc<Self>,
         _: Vec<Arc<dyn ExecutionPlan>>,
+        _: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Ok(self)
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn repartitioned(
@@ -164,8 +183,12 @@ impl ExecutionPlan for TestMemoryExec {
         unimplemented!()
     }
 
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        if partition.is_some() {
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        if args.partition().is_some() {
             Ok(Arc::new(Statistics::new_unknown(&self.schema)))
         } else {
             Ok(Arc::new(self.statistics_inner()?))
