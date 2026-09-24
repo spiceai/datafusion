@@ -39,7 +39,7 @@ use datafusion_physical_expr_common::sort_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion_physical_plan::Accumulator;
 use log::debug;
 use object_store::path::Path;
-use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore};
+use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt};
 use parquet::DecodeResult;
 use parquet::arrow::arrow_reader::statistics::StatisticsConverter;
 use parquet::arrow::async_reader::ObjectVersionType;
@@ -71,6 +71,59 @@ pub(crate) fn object_store_pin(
         },
         None => (None, None),
     }
+}
+
+/// Fetch `range` of `meta`, pinned to its listed generation when
+/// `object_versioning_type` is set.
+pub(crate) async fn get_range_pinned(
+    store: &dyn ObjectStore,
+    meta: &ObjectMeta,
+    object_versioning_type: Option<&ObjectVersionType>,
+    range: Range<u64>,
+) -> object_store::Result<bytes::Bytes> {
+    let (if_match, version) = object_store_pin(object_versioning_type, meta);
+    if if_match.is_none() && version.is_none() {
+        return store.get_range(&meta.location, range).await;
+    }
+    let opts = GetOptions {
+        range: Some(GetRange::Bounded(range)),
+        if_match,
+        version,
+        ..Default::default()
+    };
+    store.get_opts(&meta.location, opts).await?.bytes().await
+}
+
+/// Fetch `ranges` of `meta`, pinned to its listed generation when
+/// `object_versioning_type` is set.
+///
+/// The pinned path mirrors the default `ObjectStore::get_ranges` (coalesce,
+/// then one request per merged range) but issues each request through
+/// `get_opts` so it can carry `If-Match` / `version`.
+pub(crate) async fn get_ranges_pinned(
+    store: &dyn ObjectStore,
+    meta: &ObjectMeta,
+    object_versioning_type: Option<&ObjectVersionType>,
+    ranges: &[Range<u64>],
+) -> object_store::Result<Vec<bytes::Bytes>> {
+    let (if_match, version) = object_store_pin(object_versioning_type, meta);
+    if if_match.is_none() && version.is_none() {
+        return store.get_ranges(&meta.location, ranges).await;
+    }
+    object_store::coalesce_ranges(
+        ranges,
+        |range| {
+            let opts = GetOptions {
+                range: Some(GetRange::Bounded(range)),
+                if_match: if_match.clone(),
+                version: version.clone(),
+                ..Default::default()
+            };
+            async { store.get_opts(&meta.location, opts).await?.bytes().await }
+        },
+        object_store::OBJECT_STORE_COALESCE_DEFAULT,
+    )
+    .await
 }
 
 /// Promote a LIST-omitted version id from HEAD only when HEAD is still the
@@ -228,9 +281,8 @@ impl<'a> DFParquetMetadata<'a> {
     /// Pin metadata fetches to the listed object generation.
     ///
     /// Must be forwarded from the same `object_versioning_type` the file
-    /// reader uses for page reads. `ParquetFileReader::get_metadata`
-    /// calls this path instead of `ParquetObjectReader`, so omitting it
-    /// leaves the footer unpinned while the pages are pinned.
+    /// reader uses for page reads; omitting it leaves the footer unpinned
+    /// while the pages are pinned.
     pub fn with_object_versioning_type(
         mut self,
         object_versioning_type: Option<ObjectVersionType>,
@@ -243,33 +295,11 @@ impl<'a> DFParquetMetadata<'a> {
         &self,
         ranges: &[Range<u64>],
     ) -> Result<Vec<bytes::Bytes>> {
-        let (if_match, version) =
-            object_store_pin(self.object_versioning_type.as_ref(), self.object_meta);
-        if if_match.is_none() && version.is_none() {
-            return self
-                .store
-                .get_ranges(&self.object_meta.location, ranges)
-                .await
-                .map_err(DataFusionError::from);
-        }
-        object_store::coalesce_ranges(
+        get_ranges_pinned(
+            self.store,
+            self.object_meta,
+            self.object_versioning_type.as_ref(),
             ranges,
-            |range| {
-                let opts = GetOptions {
-                    range: Some(GetRange::Bounded(range)),
-                    if_match: if_match.clone(),
-                    version: version.clone(),
-                    ..Default::default()
-                };
-                async {
-                    self.store
-                        .get_opts(&self.object_meta.location, opts)
-                        .await?
-                        .bytes()
-                        .await
-                }
-            },
-            object_store::OBJECT_STORE_COALESCE_DEFAULT,
         )
         .await
         .map_err(DataFusionError::from)

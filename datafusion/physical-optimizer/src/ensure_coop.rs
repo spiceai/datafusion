@@ -27,8 +27,8 @@ use crate::PhysicalOptimizerRule;
 
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion_physical_plan::{ExecutionPlan, PhysicalExpr};
+use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::coop::CooperativeExec;
 use datafusion_physical_plan::execution_plan::{EvaluationType, SchedulingType};
 
@@ -267,10 +267,11 @@ mod tests {
         // Test that cooperative context is reset when encountering an eager evaluation boundary.
         use arrow::datatypes::Schema;
         use datafusion_common::internal_err;
+        use datafusion_common::tree_node::TreeNodeRecursion;
         use datafusion_execution::TaskContext;
         use datafusion_physical_expr::EquivalenceProperties;
         use datafusion_physical_plan::{
-            DisplayAs, DisplayFormatType, Partitioning, PlanProperties,
+            DisplayAs, DisplayFormatType, Partitioning, PhysicalExpr, PlanProperties,
             SendableRecordBatchStream,
             execution_plan::{Boundedness, EmissionType},
         };

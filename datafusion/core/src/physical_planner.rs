@@ -3187,47 +3187,6 @@ impl<'a> OptimizationInvariantChecker<'a> {
     }
 }
 
-/// Renders a schema for a schema-mismatch error.
-///
-/// [`is_allowed_schema_change`] compares metadata, which `Schema`'s `Display`
-/// does not print. Two schemas differing only in metadata would otherwise be
-/// reported as a mismatch between two identical-looking field lists, leaving
-/// nothing in the message to explain what actually differs.
-fn describe_schema_change(schema: &Schema) -> String {
-    let mut described = schema.to_string();
-
-    if !schema.metadata().is_empty() {
-        described.push_str(&format!(
-            ", schema metadata: {}",
-            format_metadata(schema.metadata())
-        ));
-    }
-
-    for field in schema.fields() {
-        if !field.metadata().is_empty() {
-            described.push_str(&format!(
-                ", metadata of field \"{}\": {}",
-                field.name(),
-                format_metadata(field.metadata())
-            ));
-        }
-    }
-
-    described
-}
-
-/// Formats a metadata map with its keys in a stable order, so that two
-/// renderings of the same metadata can be compared by eye.
-fn format_metadata(metadata: &HashMap<String, String>) -> String {
-    let mut entries: Vec<_> = metadata.iter().collect();
-    entries.sort_unstable_by_key(|(a, _)| *a);
-    let entries: Vec<_> = entries
-        .into_iter()
-        .map(|(key, value)| format!("{key}: {value:?}"))
-        .collect();
-    format!("{{ {} }}", entries.join(", "))
-}
-
 /// Checks if the change from `old` schema to `new` is allowed or not.
 ///
 /// The current implementation only allows nullability of individual fields to change

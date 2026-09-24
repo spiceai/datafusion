@@ -19,7 +19,10 @@
 //! low level control of parquet file readers
 
 use crate::ParquetFileMetrics;
-use crate::metadata::{DFParquetMetadata, version_from_head_if_same_generation};
+use crate::metadata::{
+    DFParquetMetadata, get_range_pinned, get_ranges_pinned,
+    version_from_head_if_same_generation,
+};
 use bytes::Bytes;
 use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
@@ -31,9 +34,7 @@ use futures::future::BoxFuture;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
-use parquet::arrow::async_reader::{
-    AsyncFileReader, ObjectVersionType, ParquetObjectReader,
-};
+use parquet::arrow::async_reader::{AsyncFileReader, ObjectVersionType};
 use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 use std::any::Any;
@@ -260,7 +261,6 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
 pub struct ParquetFileReader {
     file_metrics: ParquetFileMetrics,
     store: Arc<dyn ObjectStore>,
-    inner: ParquetObjectReader,
     partitioned_file: PartitionedFile,
     metadata_cache: Option<Arc<FileMetadataCache>>,
     metadata_size_hint: Option<usize>,
@@ -282,14 +282,9 @@ impl ParquetFileReader {
         store: Arc<dyn ObjectStore>,
         partitioned_file: PartitionedFile,
     ) -> Self {
-        let inner = ParquetObjectReader::new_with_meta(
-            Arc::clone(&store),
-            partitioned_file.object_meta.clone(),
-        );
         Self {
             file_metrics,
             store,
-            inner,
             partitioned_file,
             metadata_cache: None,
             metadata_size_hint: None,
@@ -327,21 +322,12 @@ impl ParquetFileReader {
 
     /// Pin footer and page reads to the listed object generation.
     ///
-    /// Applied to both this wrapper and `inner`, so
-    /// `new(...).with_object_versioning_type(...)` pins `get_bytes` /
-    /// `get_byte_ranges` as well as metadata fetches. Defaults to `None`
-    /// so existing `new` callers keep compiling.
+    /// Pins `get_bytes` / `get_byte_ranges` as well as metadata fetches.
+    /// Defaults to `None` so existing `new` callers keep compiling.
     pub fn with_object_versioning_type(
         mut self,
         object_versioning_type: Option<ObjectVersionType>,
     ) -> Self {
-        // `ParquetFileReader` implements `Drop`, so `inner` cannot be
-        // moved out. `ParquetObjectReader` is cheap to clone (store handle
-        // plus metadata).
-        self.inner = self
-            .inner
-            .clone()
-            .with_object_versioning_type(object_versioning_type.clone());
         self.object_versioning_type = object_versioning_type;
         self
     }
@@ -359,7 +345,17 @@ impl AsyncFileReader for ParquetFileReader {
     ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let bytes_scanned = range.end - range.start;
         self.file_metrics.bytes_scanned.add(bytes_scanned as usize);
-        self.inner.get_bytes(range)
+        async move {
+            get_range_pinned(
+                self.store.as_ref(),
+                &self.partitioned_file.object_meta,
+                self.object_versioning_type.as_ref(),
+                range,
+            )
+            .await
+            .map_err(|e| ParquetError::External(Box::new(e)))
+        }
+        .boxed()
     }
 
     fn get_byte_ranges(
@@ -371,7 +367,17 @@ impl AsyncFileReader for ParquetFileReader {
     {
         let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         self.file_metrics.bytes_scanned.add(total as usize);
-        self.inner.get_byte_ranges(ranges)
+        async move {
+            get_ranges_pinned(
+                self.store.as_ref(),
+                &self.partitioned_file.object_meta,
+                self.object_versioning_type.as_ref(),
+                &ranges,
+            )
+            .await
+            .map_err(|e| ParquetError::External(Box::new(e)))
+        }
+        .boxed()
     }
 
     fn get_metadata<'a>(
@@ -412,7 +418,6 @@ impl AsyncFileReader for ParquetFileReader {
                     &object_meta,
                     &version,
                 );
-                self.inner.set_object_version(version);
             }
 
             DFParquetMetadata::new(&self.store, &object_meta)

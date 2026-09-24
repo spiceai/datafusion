@@ -1082,18 +1082,11 @@ where
         }
 
         // the list element is empty; there is no value to take, so the result
-        // is NULL.
-        if start == end {
-            mutable.try_extend_nulls(1)?;
-            continue;
-        }
-
-        // the list element is empty; there is no value to take, so the result
         // is NULL. Without this guard the no-nulls branch below would read
         // `values[start]`, which is either the next element (wrong value) or
         // out of bounds when `start == values.len()` (panic).
         if start == end {
-            mutable.extend_nulls(1);
+            mutable.try_extend_nulls(1)?;
             continue;
         }
 

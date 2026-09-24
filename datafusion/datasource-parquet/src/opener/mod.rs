@@ -1722,22 +1722,6 @@ pub(crate) fn build_pruning_predicates(
         .build(Arc::clone(predicate))
 }
 
-/// Returns true if the page index must be loaded for page-level pruning.
-///
-/// The page index can only prune when at least one surviving row group is not
-/// fully matched by row-group statistics alone.
-fn should_load_page_index(
-    page_pruning_predicate: Option<&Arc<PagePruningAccessPlanFilter>>,
-    row_groups: &RowGroupAccessPlanFilter,
-) -> bool {
-    page_pruning_predicate.is_some_and(|_| {
-        let fully_matched = row_groups.is_fully_matched();
-        row_groups
-            .row_group_indexes()
-            .any(|idx| !fully_matched[idx])
-    })
-}
-
 /// Returns a `ArrowReaderMetadata` with the page index loaded, loading
 /// it from the underlying `AsyncFileReader` if necessary.
 async fn load_page_index<T: AsyncFileReader>(
