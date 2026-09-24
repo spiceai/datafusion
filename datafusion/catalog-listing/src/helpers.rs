@@ -507,7 +507,11 @@ pub async fn pruned_partition_list_with_metadata<'a>(
 /// `metadata_filters` is compiled to a physical expression and evaluated against a one-row
 /// batch. Reusing the expression evaluator gives correct `>`, `>=`, `<`, `<=`, `=`,
 /// `BETWEEN`, `IN`, `LIKE`, cast and NULL semantics identical to a row-level `WHERE`.
-fn filter_by_metadata(
+///
+/// Exposed so a caller that obtains an [`ObjectMeta`] another way — e.g. a `HEAD` on a
+/// known object key instead of a listing — can apply the identical prune before opening
+/// the file, and report the same predicates as `Exact`.
+pub fn filter_by_metadata(
     object_meta: ObjectMeta,
     metadata_filters: &[Expr],
     metadata_cols: &[MetadataColumn],
