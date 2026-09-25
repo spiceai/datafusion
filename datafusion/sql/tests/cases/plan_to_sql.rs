@@ -7135,15 +7135,271 @@ fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
     );
 
     // A FULL JOIN also null-extends its left input, but unlike a RIGHT JOIN it
-    // preserves that input. Hoisting the predicate into ON would therefore
-    // make filtered-out left rows reappear as unmatched rows. Keep the prior
-    // WHERE placement until FULL JOIN inputs can be emitted as derived tables.
+    // preserves that input. Hoisting the predicate into ON would make
+    // filtered-out left rows reappear as unmatched rows, and leaving it in
+    // WHERE would discard the unmatched right rows the FULL JOIN preserves. The
+    // predicate stays with the scan it filters, in a derived table of its own.
     assert_snapshot!(
         nested_under_outer(
             datafusion_expr::JoinType::Inner,
             datafusion_expr::JoinType::Full,
         )?,
-        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE (a.id = 'x')"
+        @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id"
+    );
+
+    Ok(())
+}
+
+/// A `FULL JOIN` input that is itself a join keeps every scan filter in that
+/// scan's own derived table, whatever the nested join's type and depth: the
+/// nested join's `ON` and `WHERE` placements both belong to the enclosing
+/// query, where `WHERE` would discard the rows the `FULL JOIN` preserves.
+#[test]
+fn full_join_input_that_is_a_join_keeps_its_scan_filters_scoped() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let filtered = |name: &str| -> Result<LogicalPlan> {
+        table_scan_with_filters(
+            Some(name),
+            &schema,
+            Some(vec![0]),
+            vec![col(format!("{name}.id")).eq(lit("x"))],
+        )?
+        .build()
+    };
+    let plain = |name: &str| -> Result<LogicalPlan> {
+        table_scan(Some(name), &schema, Some(vec![0]))?.build()
+    };
+    let join = |left: LogicalPlan,
+                right: LogicalPlan,
+                join_type: datafusion_expr::JoinType,
+                left_key: &str,
+                right_key: &str|
+     -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(left)
+            .join(right, join_type, (vec![left_key], vec![right_key]), None)?
+            .build()
+    };
+    use datafusion_expr::JoinType::{Full, Inner, Left, Right};
+
+    // Both scans of the nested inner join carry a filter; each keeps its own.
+    let plan = join(
+        join(filtered("a")?, filtered("b")?, Inner, "a.id", "b.id")?,
+        plain("c")?,
+        Full,
+        "a.id",
+        "c.id",
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a INNER JOIN (SELECT b.id FROM b WHERE (b.id = 'x')) AS b ON a.id = b.id FULL JOIN c ON a.id = c.id"
+    );
+
+    // A nested LEFT JOIN would route its non-preserved side's filter to `ON`
+    // and its preserved side's to `WHERE`; below a FULL JOIN both stay scoped.
+    let plan = join(
+        join(filtered("a")?, filtered("b")?, Left, "a.id", "b.id")?,
+        plain("c")?,
+        Full,
+        "a.id",
+        "c.id",
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a LEFT OUTER JOIN (SELECT b.id FROM b WHERE (b.id = 'x')) AS b ON a.id = b.id FULL JOIN c ON a.id = c.id"
+    );
+
+    // A nested RIGHT JOIN hoists what its left input contributes into its own
+    // `ON`; with the filter scoped at the scan there is nothing to hoist.
+    let plan = join(
+        join(filtered("a")?, plain("b")?, Right, "a.id", "b.id")?,
+        plain("c")?,
+        Full,
+        "a.id",
+        "c.id",
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a RIGHT OUTER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id"
+    );
+
+    // Two levels down.
+    let plan = join(
+        join(
+            join(filtered("a")?, plain("b")?, Inner, "a.id", "b.id")?,
+            plain("c")?,
+            Inner,
+            "b.id",
+            "c.id",
+        )?,
+        plain("d")?,
+        Full,
+        "c.id",
+        "d.id",
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id, d.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a INNER JOIN b ON a.id = b.id INNER JOIN c ON b.id = c.id FULL JOIN d ON c.id = d.id"
+    );
+
+    // A FULL JOIN nested in a FULL JOIN's input.
+    let plan = join(
+        join(filtered("a")?, plain("b")?, Full, "a.id", "b.id")?,
+        plain("c")?,
+        Full,
+        "a.id",
+        "c.id",
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a FULL JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id"
+    );
+
+    // A predicate above the FULL JOIN is the enclosing query's own and stays
+    // in its `WHERE`; only what the inputs contribute is kept out of it.
+    let plan = LogicalPlanBuilder::from(join(
+        join(filtered("a")?, plain("b")?, Inner, "a.id", "b.id")?,
+        plain("c")?,
+        Full,
+        "a.id",
+        "c.id",
+    )?)
+    .filter(col("c.id").eq(lit("y")))?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE (c.id = 'y')"
+    );
+
+    // Once the FULL JOIN's inputs are walked, a sibling join above it routes
+    // its scan filters as it always did.
+    let plan = join(
+        join(
+            join(filtered("a")?, plain("b")?, Inner, "a.id", "b.id")?,
+            plain("c")?,
+            Full,
+            "a.id",
+            "c.id",
+        )?,
+        filtered("d")?,
+        Inner,
+        "c.id",
+        "d.id",
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id, d.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id INNER JOIN d ON c.id = d.id WHERE (d.id = 'x')"
+    );
+
+    Ok(())
+}
+
+/// A nested inner join's `ON` and `WHERE` are interchangeable only within the
+/// scope holding both. Below a `FULL JOIN` the `WHERE` is the `FULL JOIN`'s, so
+/// a conjunct carrying a subquery, which an inner join would otherwise move to
+/// `WHERE` for the dialects that refuse it in `ON`, stays in `ON`.
+#[test]
+fn full_join_input_inner_join_keeps_its_subquery_conjunct_in_on() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .project(vec![col("allowed.id")])?
+        .build()?;
+    let inner = LogicalPlanBuilder::from(a)
+        .join(
+            b,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["b.id"]),
+            Some(in_subquery(col("a.id"), Arc::new(allowed.clone()))),
+        )?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(inner.clone())
+        .join(
+            c.clone(),
+            datafusion_expr::JoinType::Full,
+            (vec!["a.id"], vec!["c.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id AND a.id IN (SELECT allowed.id FROM allowed) FULL JOIN c ON a.id = c.id"
+    );
+
+    // The same inner join not under a FULL JOIN still moves the conjunct.
+    let plan = LogicalPlanBuilder::from(inner)
+        .join(
+            c,
+            datafusion_expr::JoinType::Inner,
+            (vec!["a.id"], vec!["c.id"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id INNER JOIN c ON a.id = c.id WHERE a.id IN (SELECT allowed.id FROM allowed)"
+    );
+
+    Ok(())
+}
+
+/// A predicate on a `FULL JOIN` input that no scan of the input applies has no
+/// clause: `WHERE` discards the rows the `FULL JOIN` preserves. Refused rather
+/// than emitted there.
+#[test]
+fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let x = table_scan(Some("x"), &schema, Some(vec![0]))?.build()?;
+
+    // A filter above the nested join, reading both of its sides.
+    let filtered_join = LogicalPlanBuilder::from(a.clone())
+        .join(
+            b.clone(),
+            datafusion_expr::JoinType::Left,
+            (vec!["a.id"], vec!["b.id"]),
+            None,
+        )?
+        .filter(col("a.id").not_eq(col("b.id")))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(filtered_join)
+        .join(
+            c.clone(),
+            datafusion_expr::JoinType::Full,
+            (vec!["a.id"], vec!["c.id"]),
+            None,
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err("the predicate has no clause");
+    assert_contains!(
+        error.to_string(),
+        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+    );
+
+    // A semi join's EXISTS is a predicate on the enclosing WHERE.
+    let semi = LogicalPlanBuilder::from(a)
+        .join(
+            x,
+            datafusion_expr::JoinType::LeftSemi,
+            (vec!["a.id"], vec!["x.id"]),
+            None,
+        )?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(semi)
+        .join(
+            c,
+            datafusion_expr::JoinType::Full,
+            (vec!["a.id"], vec!["c.id"]),
+            None,
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err("the EXISTS has no clause");
+    assert_contains!(
+        error.to_string(),
+        "semi or anti join as a FULL JOIN input is not supported"
     );
 
     Ok(())

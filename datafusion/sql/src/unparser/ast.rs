@@ -231,6 +231,21 @@ pub struct SelectBuilder {
     ///
     /// Set with `mark_aggregated()` and read with `already_aggregated()`.
     aggregated: bool,
+    /// Whether the join inputs being walked into this SELECT must keep their
+    /// predicates in scopes of their own instead of contributing them to this
+    /// SELECT's `WHERE`.
+    ///
+    /// Set while a `FULL JOIN`'s inputs are unparsed. `WHERE` is evaluated
+    /// after every join, so a predicate that reaches it from one input
+    /// discards the other input's unmatched rows, which the `FULL JOIN`
+    /// preserves. The scan filters of a bare input are isolated in a derived
+    /// table by the join itself; this flag carries the same rule down into an
+    /// input that is a join of its own, whose scans are reached by a nested
+    /// walk that otherwise routes their filters to the shared `WHERE`.
+    ///
+    /// Set with `set_input_predicates_stay_scoped()` and read with
+    /// `input_predicates_stay_scoped()`.
+    input_predicates_stay_scoped: bool,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -363,6 +378,19 @@ impl SelectBuilder {
     /// Returns true if an aggregate node has already been folded into this SELECT.
     pub fn already_aggregated(&self) -> bool {
         self.aggregated
+    }
+
+    /// Whether the join inputs walked into this SELECT must keep their
+    /// predicates in scopes of their own rather than in this SELECT's `WHERE`.
+    pub fn input_predicates_stay_scoped(&self) -> bool {
+        self.input_predicates_stay_scoped
+    }
+
+    /// Sets whether join inputs keep their predicates scoped, returning the
+    /// previous setting so the caller can restore it once its inputs are
+    /// walked.
+    pub fn set_input_predicates_stay_scoped(&mut self, value: bool) -> bool {
+        std::mem::replace(&mut self.input_predicates_stay_scoped, value)
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -672,6 +700,7 @@ impl SelectBuilder {
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             aggregated: false,
+            input_predicates_stay_scoped: false,
         }
     }
 }
