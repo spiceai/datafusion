@@ -2165,11 +2165,15 @@ impl Unparser<'_> {
                 // preserved. A FULL JOIN also null-extends its left input, but
                 // preserves left rows, so moving the predicate into ON would
                 // make filtered-out left rows reappear as unmatched rows.
+                // The predicate already there stays in place for the walk — a
+                // mark join in this input rewrites the mark it produces wherever
+                // that predicate reads it — and what the walk adds is `AND`ed on
+                // after it, so it is told apart by position.
                 let left_is_null_extended = matches!(join.join_type, JoinType::Right);
-                let outer_selection = if left_is_null_extended {
-                    select.take_selection()
+                let outer_conjuncts_before_left = if left_is_null_extended {
+                    select.selection_conjunct_count()
                 } else {
-                    None
+                    0
                 };
 
                 self.select_to_sql_recursively(
@@ -2204,9 +2208,7 @@ impl Unparser<'_> {
                 }
 
                 let hoisted_from_left = if left_is_null_extended {
-                    let contributed = select.take_selection();
-                    select.selection(outer_selection);
-                    contributed
+                    select.take_selection_added_after(outer_conjuncts_before_left)
                 } else {
                     None
                 };

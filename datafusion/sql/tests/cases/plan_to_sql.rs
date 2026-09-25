@@ -12949,18 +12949,57 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
     );
 
     // A predicate above the outer join that reads a mark produced inside its
-    // right input: the mark join rewrites it in place, so it has to stay in
-    // place while that input is walked, and nothing is hoisted.
+    // input: the mark join rewrites it in place, so it has to stay in place
+    // while that input is walked — whichever side, and however deep — and
+    // nothing is hoisted.
     use datafusion_expr::JoinType::LeftMark;
-    for join_type in [Left, Full] {
-        let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let marked = || -> Result<LogicalPlan> {
         let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
         let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
-        let marked = LogicalPlanBuilder::from(b)
+        LogicalPlanBuilder::from(b)
             .join(c, LeftMark, (vec!["b.id"], vec!["c.id"]), None)?
-            .build()?;
-        let plan = LogicalPlanBuilder::from(a)
-            .join(marked, join_type, (vec!["a.id"], vec!["b.id"]), None)?
+            .build()
+    };
+    let scan = |name| table_scan(Some(name), &schema, Some(vec![0]))?.build();
+    let shapes: Vec<(&str, LogicalPlan)> = vec![
+        // The mark join as the right input of a LEFT JOIN, of a FULL JOIN.
+        (
+            "a LEFT JOIN (b MARK c)",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Left, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a FULL JOIN (b MARK c)",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Full, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+        // As the left input of a RIGHT JOIN, whose left-side hoist must also
+        // leave the predicate in place.
+        (
+            "(b MARK c) RIGHT JOIN a",
+            LogicalPlanBuilder::from(marked()?)
+                .join(scan("a")?, Right, (vec!["b.id"], vec!["a.id"]), None)?
+                .build()?,
+        ),
+        // Nested: the RIGHT JOIN itself the right input of a LEFT JOIN.
+        (
+            "a LEFT JOIN ((b MARK c) RIGHT JOIN d)",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(
+                    LogicalPlanBuilder::from(marked()?)
+                        .join(scan("d")?, Right, (vec!["b.id"], vec!["d.id"]), None)?
+                        .build()?,
+                    Left,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )?
+                .build()?,
+        ),
+    ];
+    for (shape, joined) in shapes {
+        let plan = LogicalPlanBuilder::from(joined)
             .filter(col("c.mark"))?
             .project(vec![col("a.id")])?
             .build()?;
@@ -12968,7 +13007,7 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         assert!(
             sql.contains("WHERE EXISTS (SELECT 1 FROM c WHERE (b.id = c.id))")
                 && !sql.contains("mark"),
-            "the mark read above a {join_type:?} JOIN must be replaced in place: {sql}"
+            "the mark read above {shape} must be replaced in place: {sql}"
         );
     }
     Ok(())
