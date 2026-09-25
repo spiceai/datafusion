@@ -2548,6 +2548,33 @@ impl Unparser<'_> {
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 let (plan, mut columns) =
                     subquery_alias_inner_query_and_columns(plan_alias);
+
+                // An aliased join that is another join's right input is a
+                // scope of its own: walked into the shared SELECT, its scans'
+                // filters would be hoisted or placed under names the alias
+                // then hides (`b.id = 'x'` beside `(b JOIN c) AS j`). Derived,
+                // they stay inside and the alias is what the enclosing query
+                // addresses.
+                if select.in_right_join_input() && matches!(plan, LogicalPlan::Join(_)) {
+                    if !select.already_projected() {
+                        let items = plan_alias
+                            .schema
+                            .columns()
+                            .into_iter()
+                            .map(|column| self.select_item_to_sql(&Expr::Column(column)))
+                            .collect::<Result<Vec<_>>>()?;
+                        select.projection(items);
+                    }
+                    return self.derive(
+                        plan,
+                        relation,
+                        Some(self.new_table_alias(
+                            plan_alias.alias.table().to_string(),
+                            columns,
+                        )),
+                        false,
+                    );
+                }
                 let unparsed_table_scan = self.unparse_table_scan_pushdown(
                     plan,
                     Some(plan_alias.alias.clone()),
