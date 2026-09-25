@@ -1190,6 +1190,60 @@ impl Unparser<'_> {
         }
     }
 
+    /// Walks one join input into the shared `select`, counted as such for the
+    /// duration so a `Limit` reached inside it knows it is one (see
+    /// `SelectBuilder::in_join_input`); the count is left again whatever the
+    /// walk returns.
+    fn walk_join_input(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        select.enter_join_input();
+        let walked = self.select_to_sql_recursively(plan, query, select, relation);
+        select.leave_join_input();
+        walked
+    }
+
+    /// Derives a `Limit` that is a join input.
+    ///
+    /// Over one scan it takes the scan's own name, so the enclosing join's
+    /// `ON` and select list keep binding to it, with that scan's columns as
+    /// this side's select items — exactly what a row limit under a filter
+    /// needs, so the same scope is used. Over anything else there is no name
+    /// for the derived table to take: with a projection already above the
+    /// join it keeps the dialect's derived-limit alias, as before; without one
+    /// it is refused rather than bounding the join's output instead of the
+    /// input's, which is what putting its `LIMIT` on the enclosing query did.
+    fn derive_join_input_limit(
+        &self,
+        plan: &LogicalPlan,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        // A limited scan that projects no columns feeds only a count: with the
+        // projection already above the join, the dialect-alias derived table
+        // (`SELECT 1 FROM b LIMIT n`) keeps its cardinality, as before.
+        let projects_nothing = plan.schema().fields().is_empty();
+        if Self::scanned_relation_of(plan).is_some() && !projects_nothing {
+            return self.derive_row_limited_scope(plan, select, relation);
+        }
+        if select.already_projected() {
+            return self.derive_with_dialect_alias(
+                DERIVED_LIMIT_ALIAS,
+                plan,
+                relation,
+                false,
+                vec![],
+            );
+        }
+        not_impl_err!(
+            "Unparsing a row limit on a join input that is not a single table scan is not supported without a projection above the join"
+        )
+    }
+
     /// Isolates what a join input's `TableScan` did in a derived table:
     /// `(SELECT ... FROM t WHERE ... LIMIT ...) AS t`.
     ///
@@ -1822,6 +1876,15 @@ impl Unparser<'_> {
                 )
             }
             LogicalPlan::Limit(limit) => {
+                // A join input's limit has no faithful home in the enclosing
+                // query, whatever else that query carries: its `LIMIT` bounds
+                // the join's output, not one input's contribution to it. The
+                // derived table takes the scan's own name, which is what the
+                // join's `ON` and the select list already call this input
+                // (spiceai/spiceai#14375).
+                if select.in_join_input() {
+                    return self.derive_join_input_limit(plan, select, relation);
+                }
                 // Limit can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
@@ -2145,12 +2208,7 @@ impl Unparser<'_> {
                     None
                 };
 
-                self.select_to_sql_recursively(
-                    left_plan.as_ref(),
-                    query,
-                    select,
-                    relation,
-                )?;
+                self.walk_join_input(left_plan.as_ref(), query, select, relation)?;
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
@@ -2237,7 +2295,7 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
-                    self.select_to_sql_recursively(
+                    self.walk_join_input(
                         right_plan.as_ref(),
                         query,
                         select,

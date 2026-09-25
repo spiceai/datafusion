@@ -231,6 +231,15 @@ pub struct SelectBuilder {
     ///
     /// Set with `mark_aggregated()` and read with `already_aggregated()`.
     aggregated: bool,
+    /// How many join inputs the walk is currently inside. A `Limit` reached
+    /// there has no clause of this SELECT that bounds one input's
+    /// contribution to the join — `LIMIT` here bounds the join's output —
+    /// so it is derived in a scope of its own whatever else this SELECT
+    /// carries.
+    ///
+    /// Entered with `enter_join_input()`, left with `leave_join_input()`,
+    /// read with `in_join_input()`.
+    join_inputs: usize,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -363,6 +372,16 @@ impl SelectBuilder {
     /// Returns true if an aggregate node has already been folded into this SELECT.
     pub fn already_aggregated(&self) -> bool {
         self.aggregated
+    }
+    /// Whether the walk is inside some join's input (see `join_inputs`).
+    pub fn in_join_input(&self) -> bool {
+        self.join_inputs > 0
+    }
+    pub fn enter_join_input(&mut self) {
+        self.join_inputs += 1;
+    }
+    pub fn leave_join_input(&mut self) {
+        self.join_inputs = self.join_inputs.saturating_sub(1);
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -672,6 +691,7 @@ impl SelectBuilder {
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             aggregated: false,
+            join_inputs: 0,
         }
     }
 }
