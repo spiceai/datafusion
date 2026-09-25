@@ -198,6 +198,33 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     Some(schema)
 }
 
+/// Whether any of a scan's filters holds a subquery.
+///
+/// [`TableAliasRewriter`] rebases ordinary column references onto an alias but
+/// does not descend into a subquery's own plan, so a reference the subquery
+/// makes to the scan's table would outlive an alias that shadows it — `a.id`
+/// left under `FROM a AS s`, which binds to nothing. A scan filtered that way
+/// keeps the pushdown rewrite, and the refusal that comes with it.
+fn any_filter_holds_a_subquery(filters: &[Expr]) -> Result<bool> {
+    let mut found = false;
+    for filter in filters {
+        filter.apply(|expr| {
+            if matches!(
+                expr,
+                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
+            ) {
+                found = true;
+                return Ok(TreeNodeRecursion::Stop);
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        if found {
+            break;
+        }
+    }
+    Ok(found)
+}
+
 /// Whether any expression in `plan` reads a column from an enclosing query.
 ///
 /// `Expr::OuterReferenceColumn` is how a correlated reference reaches the plan,
@@ -2499,6 +2526,69 @@ impl Unparser<'_> {
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 let (plan, mut columns) =
                     subquery_alias_inner_query_and_columns(plan_alias);
+
+                // The `TableScan` arm's reasoning, reached through a plain
+                // alias: below a FULL JOIN's input, a scan that still carries
+                // its filters keeps them in a derived table of its own, since
+                // the enclosing query has no clause that would not discard the
+                // rows the join preserves. The pushdown rewrite below would
+                // materialize them as a `Filter` over the aliased scan, and the
+                // `Filter` arm refuses one here — so without this the alias
+                // turns a supported plan into `NotImplemented`.
+                //
+                // The derived table takes the alias's own name, which is what
+                // the enclosing scope already calls this input, so nothing
+                // above it rebinds. A column list means the alias renames the
+                // scan's outputs, which the derived table cannot express here;
+                // those keep the rewrite, and the refusal.
+                // Read before the guard: `?` cannot appear in a let-chain.
+                let filters_bind_under_the_alias = match plan {
+                    LogicalPlan::TableScan(scan) => {
+                        !any_filter_holds_a_subquery(&scan.filters)?
+                    }
+                    _ => false,
+                };
+
+                if columns.is_empty()
+                    && select.already_projected()
+                    && select.input_predicates_stay_scoped()
+                    && filters_bind_under_the_alias
+                    && let LogicalPlan::TableScan(scan) = plan
+                    && (!scan.filters.is_empty() || scan.fetch.is_some())
+                {
+                    let clean = LogicalPlanBuilder::scan(
+                        scan.table_name.clone(),
+                        Arc::clone(&scan.source),
+                        scan.projection.clone(),
+                    )?
+                    .alias(plan_alias.alias.clone())?
+                    .build()?;
+
+                    // The filters still name the scan's own table, which the
+                    // alias shadows inside the derived table — `FROM a AS s`
+                    // leaves `a.id` unaddressable. Rebase them onto the alias,
+                    // as the pushdown rewrite does for the same reason.
+                    let table_schema = scan.source.schema();
+                    let mut filter_alias_rewriter = TableAliasRewriter {
+                        table_schema: &table_schema,
+                        alias_name: plan_alias.alias.clone(),
+                    };
+                    let filters = scan
+                        .filters
+                        .iter()
+                        .cloned()
+                        .map(|expr| expr.rewrite(&mut filter_alias_rewriter).data())
+                        .collect::<Result<Vec<_>>>()?;
+
+                    return self.derive_join_side(
+                        &clean,
+                        filters.clone(),
+                        &filters,
+                        scan.fetch,
+                        relation,
+                    );
+                }
+
                 let unparsed_table_scan = self.unparse_table_scan_pushdown(
                     plan,
                     Some(plan_alias.alias.clone()),

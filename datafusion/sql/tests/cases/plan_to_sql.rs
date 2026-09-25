@@ -13185,3 +13185,80 @@ fn test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date() -> Re
     );
     Ok(())
 }
+
+/// A `FULL JOIN` input whose filtered scan sits under a plain alias keeps its
+/// filters in a derived table of its own, exactly as an unaliased scan does.
+/// The alias is not a reason to refuse: the pushdown rewrite would put the
+/// filters in a `Filter` over the aliased scan, where they have no clause.
+#[test]
+fn full_join_input_aliased_scan_keeps_its_filters_scoped() -> Result<()> {
+    use datafusion_expr::JoinType::Full;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let filtered_alias = || -> Result<LogicalPlanBuilder> {
+        table_scan_with_filters(
+            Some("a"),
+            &schema,
+            Some(vec![0]),
+            vec![col("a.id").eq(lit("x"))],
+        )?
+        .alias("s")
+    };
+
+    // The alias reached directly, the join's own projection folding above it.
+    let plan = LogicalPlanBuilder::from(filtered_alias()?.build()?)
+        .join(c.clone(), Full, (vec!["s.id"], vec!["c.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s.id, c.id FROM (SELECT s.id FROM a AS s WHERE (s.id = 'x')) AS s FULL JOIN c ON s.id = c.id"
+    );
+
+    // A projection between the alias and the join takes the select list first,
+    // so the scan is reached with one already taken. The filters are rebased
+    // onto the alias, which shadows the scan's own name inside the derived
+    // table: `a.id` would not bind under `FROM a AS s`.
+    let plan =
+        LogicalPlanBuilder::from(filtered_alias()?.project(vec![col("s.id")])?.build()?)
+            .join(c, Full, (vec!["s.id"], vec!["c.id"]), None)?
+            .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s.id, c.id FROM (SELECT s.id FROM a AS s WHERE (s.id = 'x')) AS s FULL JOIN c ON s.id = c.id"
+    );
+
+    Ok(())
+}
+
+/// A filter holding a subquery keeps the refusal even under an alias the
+/// scoped-derived-table path would otherwise take. The alias rewriter does not
+/// descend into the subquery's plan, so a reference it makes to the scan's own
+/// table would be left behind by `FROM a AS s` and bind to nothing.
+#[test]
+fn full_join_input_aliased_scan_with_a_subquery_filter_is_refused() -> Result<()> {
+    use datafusion_expr::JoinType::Full;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let correlated = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .filter(col("b.id").eq(col("a.id")))?
+        .build()?;
+    let aliased = table_scan_with_filters(
+        Some("a"),
+        &schema,
+        Some(vec![0]),
+        vec![exists(Arc::new(correlated))],
+    )?
+    .alias("s")?
+    .project(vec![col("s.id")])?
+    .build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(aliased)
+        .join(c, Full, (vec!["s.id"], vec!["c.id"]), None)?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("the subquery's reference would lose its binding");
+    assert_contains!(
+        error.to_string(),
+        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+    );
+    Ok(())
+}
