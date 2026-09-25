@@ -13124,5 +13124,27 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         error.to_string(),
         "outer join's subquery predicate scoped onto a joined input is not supported"
     );
+    // The same joined input under a projection that only picks its columns.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let projected = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .project(vec![col("b.id"), col("c.id")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(
+            projected,
+            Left,
+            (vec!["a.id"], vec!["b.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("a projected joined input is a joined input still");
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
     Ok(())
 }
