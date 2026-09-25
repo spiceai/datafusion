@@ -4922,10 +4922,28 @@ fn test_unparse_exists_join_refuses_build_key_bound_only_by_the_build_projection
         .project(vec![col("b.x").alias("c")])?
         .alias("s")?
         .build()?;
-    let plan = LogicalPlanBuilder::from(probe)
+    let plan = LogicalPlanBuilder::from(probe.clone())
         .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
         .build()?;
     refused(&plan, "a rename behind an alias pushed down onto the scan");
+
+    // An alias over an inline join renames its primary relation only —
+    // `FROM b AS a CROSS JOIN t` — so a column of the relation beside it,
+    // which the alias's schema requalifies as `a.c` all the same, is not one
+    // `a` answers to.
+    let over_join = table_scan(Some("b"), &int32_schema(&["k"]), Some(vec![0]))?
+        .cross_join(
+            table_scan(Some("t"), &int32_schema(&["c"]), Some(vec![0]))?.build()?,
+        )?
+        .alias("a")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(over_join, LeftSemi, (vec!["p.c"], vec!["a.c"]), None)?
+        .build()?;
+    refused(
+        &plan,
+        "a column beside the relation an inline alias renames",
+    );
 
     Ok(())
 }
@@ -4968,12 +4986,28 @@ fn test_unparse_exists_join_keeps_build_key_the_body_answers_to() -> Result<()> 
         .project(vec![col("b.x").alias("c")])?
         .alias("s")?
         .build()?;
-    let plan = LogicalPlanBuilder::from(probe)
+    let plan = LogicalPlanBuilder::from(probe.clone())
         .join(unpushed, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM (SELECT b.x AS c FROM b) AS s WHERE (p.c = s.c))"
+    );
+
+    // An alias over an inline join renames its primary relation, whose own
+    // column the key names.
+    let over_join = table_scan(Some("b"), &int32_schema(&["k"]), Some(vec![0]))?
+        .cross_join(
+            table_scan(Some("t"), &int32_schema(&["c"]), Some(vec![0]))?.build()?,
+        )?
+        .alias("a")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(over_join, LeftSemi, (vec!["p.c"], vec!["a.k"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b AS a CROSS JOIN t WHERE (p.c = a.k))"
     );
 
     Ok(())

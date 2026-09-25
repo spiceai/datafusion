@@ -4754,10 +4754,9 @@ impl Unparser<'_> {
     ///   is kept, not refused;
     /// * a qualifier that names a scan or an alias in the build plan, none of
     ///   which has the column. A scan emitted bare answers to every column its
-    ///   source has; an alias pushed down onto a scan answers to that scan's
-    ///   columns, its renames having been lifted into the select list `SELECT 1`
-    ///   replaces, and any other alias to its own schema. A name in none of
-    ///   those was the projection's.
+    ///   source has, and an alias to the columns of whichever relation the
+    ///   emitter lands it on — see [`Self::schema_an_alias_answers_to`]. A name
+    ///   in none of those was the projection's.
     ///
     /// An unqualified key is kept: the names the body answers to include the
     /// build side's own output names, which are exactly the ones `SELECT 1`
@@ -4813,9 +4812,9 @@ impl Unparser<'_> {
                         {
                             continue;
                         }
-                        match Self::scan_an_alias_is_pushed_onto(alias) {
-                            Some(scan) => scan.source.schema(),
-                            None => Arc::clone(alias.schema.inner()),
+                        match self.schema_an_alias_answers_to(alias) {
+                            Some(schema) => schema,
+                            None => continue,
                         }
                     }
                     _ => {
@@ -4833,6 +4832,63 @@ impl Unparser<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// The schema of the relation that answers to `alias` once emitted, or
+    /// `None` where the emitter's choice cannot be read from the plan.
+    ///
+    /// An alias is emitted one of three ways, and each answers to different
+    /// columns:
+    ///
+    /// * around a derived table, for an input that builds `SELECT` clauses of
+    ///   its own — the derived table keeps the input's projection, so the
+    ///   alias's schema is what it answers to;
+    /// * pushed down onto a scan the input wraps through projections and
+    ///   filters — the derived table exposes the scan's own columns, and the
+    ///   projection's renames land in the select list above it, which
+    ///   `SELECT 1` replaces;
+    /// * in place, on the primary relation of an inline join — SQL has no
+    ///   syntax for naming a join, so `relation.alias` renames the first
+    ///   relation the walk puts in the `FROM` and leaves the rest named as
+    ///   they were. The alias's schema, which [`SubqueryAlias`] requalifies
+    ///   over every output of the join, over-promises: a column of a relation
+    ///   beside the renamed one is not one the alias answers to.
+    ///
+    /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
+    fn schema_an_alias_answers_to(
+        &self,
+        alias: &datafusion_expr::SubqueryAlias,
+    ) -> Option<SchemaRef> {
+        if Self::requires_derived_subquery(&alias.input) {
+            return Some(Arc::clone(alias.schema.inner()));
+        }
+        if let Some(scan) = Self::scan_an_alias_is_pushed_onto(alias) {
+            return Some(scan.source.schema());
+        }
+        if !Self::alias_input_holds_a_join(&alias.input) {
+            return Some(Arc::clone(alias.schema.inner()));
+        }
+        // The primary relation: the join walk emits the probe side of an
+        // EXISTS-style join first, and the left input of every other join.
+        let mut node = alias.input.as_ref();
+        loop {
+            match node {
+                LogicalPlan::Join(join) => {
+                    node = if Self::swaps_join_inputs(join.join_type) {
+                        join.right.as_ref()
+                    } else {
+                        join.left.as_ref()
+                    };
+                }
+                LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
+                LogicalPlan::Projection(projection) => node = projection.input.as_ref(),
+                LogicalPlan::TableScan(scan) => return Some(scan.source.schema()),
+                LogicalPlan::SubqueryAlias(inner) => {
+                    return self.schema_an_alias_answers_to(inner);
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// The scan [`Self::unparse_table_scan_pushdown`] will push `alias` down
