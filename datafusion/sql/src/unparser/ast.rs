@@ -175,7 +175,7 @@ impl Default for QueryBuilder {
 }
 
 /// Returns true if `expr` holds a subquery anywhere within it.
-fn contains_subquery(expr: &ast::Expr) -> bool {
+pub(crate) fn contains_subquery(expr: &ast::Expr) -> bool {
     visit_expressions(expr, |expr| {
         if matches!(
             expr,
@@ -540,6 +540,29 @@ impl SelectBuilder {
         self.selection.take()
     }
 
+    /// How many conjuncts the `WHERE` predicate accumulated so far has, counting
+    /// the way `selection()` joins them: a later predicate is `AND`ed onto the
+    /// right, so the first `n` conjuncts are always the ones that were there
+    /// first, whatever a later walk rewrote inside them.
+    pub fn selection_conjunct_count(&self) -> usize {
+        self.selection.as_ref().map_or(0, |selection| {
+            split_selection_conjuncts(selection.clone()).len()
+        })
+    }
+
+    /// Splits off what was `AND`ed onto the `WHERE` predicate after its first
+    /// `kept` conjuncts, leaving those in place — rewritten or not — and returning
+    /// the rest. Unlike `take_selection()` this leaves the predicate a sub-plan
+    /// may rewrite in place (a mark join replaces the mark column it produces
+    /// wherever the predicate reads it) where that sub-plan can reach it.
+    pub fn take_selection_added_after(&mut self, kept: usize) -> Option<ast::Expr> {
+        let selection = self.selection.take()?;
+        let mut conjuncts = split_selection_conjuncts(selection);
+        let added = conjuncts.split_off(kept.min(conjuncts.len()));
+        self.selection = join_selection_conjuncts(conjuncts);
+        join_selection_conjuncts(added)
+    }
+
     /// Applies `f` to every expression this SELECT carries: the projection, `WHERE`,
     /// `GROUP BY`, `HAVING`, `QUALIFY` and the builder's own sort. `f` sees nested
     /// expressions too, so a rewrite reaches a column reference wherever it sits.
@@ -881,6 +904,34 @@ impl RelationBuilder {
         }
     }
 }
+/// The conjuncts of a `WHERE` predicate as `SelectBuilder::selection` builds
+/// it: an `AND` chain, nested to the left, in the order they were added.
+fn split_selection_conjuncts(selection: ast::Expr) -> Vec<ast::Expr> {
+    match selection {
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::And,
+            right,
+        } => {
+            let mut conjuncts = split_selection_conjuncts(*left);
+            conjuncts.extend(split_selection_conjuncts(*right));
+            conjuncts
+        }
+        other => vec![other],
+    }
+}
+
+/// The inverse of [`split_selection_conjuncts`].
+fn join_selection_conjuncts(conjuncts: Vec<ast::Expr>) -> Option<ast::Expr> {
+    conjuncts
+        .into_iter()
+        .reduce(|left, right| ast::Expr::BinaryOp {
+            left: Box::new(left),
+            op: ast::BinaryOperator::And,
+            right: Box::new(right),
+        })
+}
+
 impl Default for RelationBuilder {
     fn default() -> Self {
         Self::create_empty()

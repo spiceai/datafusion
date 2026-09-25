@@ -12918,5 +12918,58 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         error.to_string(),
         "FULL JOIN input that is a join with a predicate on its own inputs is not supported"
     );
+
+    // A nested join whose scan filter holds a subquery contributes a conjunct
+    // that some dialects refuse in `ON`, and `WHERE` is not this join's to
+    // use for its right input: refused.
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let b = table_scan_with_filters(
+        Some("b"),
+        &schema,
+        Some(vec![0]),
+        vec![exists(Arc::new(allowed))],
+    )?
+    .build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let inner = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .join(inner, Left, (vec!["a.id"], vec!["b.id"]), None)?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a subquery conjunct from a nested right input has no clause under a LEFT JOIN",
+    );
+    assert_contains!(
+        error.to_string(),
+        "LEFT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+    );
+
+    // A predicate above the outer join that reads a mark produced inside its
+    // right input: the mark join rewrites it in place, so it has to stay in
+    // place while that input is walked, and nothing is hoisted.
+    use datafusion_expr::JoinType::LeftMark;
+    for join_type in [Left, Full] {
+        let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+        let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let marked = LogicalPlanBuilder::from(b)
+            .join(c, LeftMark, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(a)
+            .join(marked, join_type, (vec!["a.id"], vec!["b.id"]), None)?
+            .filter(col("c.mark"))?
+            .project(vec![col("a.id")])?
+            .build()?;
+        let sql = plan_to_sql(&plan)?.to_string();
+        assert!(
+            sql.contains("WHERE EXISTS (SELECT 1 FROM c WHERE (b.id = c.id))")
+                && !sql.contains("mark"),
+            "the mark read above a {join_type:?} JOIN must be replaced in place: {sql}"
+        );
+    }
     Ok(())
 }

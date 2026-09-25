@@ -2275,12 +2275,18 @@ impl Unparser<'_> {
                     // discard the left rows this join preserves; it belongs in
                     // this join's `ON`. A FULL JOIN preserves both inputs, so
                     // neither clause serves — a contribution there is refused.
+                    //
+                    // The predicate already there stays in place for the walk:
+                    // a mark join in this input rewrites the mark it produces
+                    // wherever that predicate reads it, which it can only do
+                    // where the predicate is. What the walk adds is `AND`ed on
+                    // after it, so it is told apart by position.
                     let right_is_null_extended =
                         matches!(join.join_type, JoinType::Left | JoinType::Full);
-                    let outer_selection_before_right = if right_is_null_extended {
-                        select.take_selection()
+                    let outer_conjuncts_before_right = if right_is_null_extended {
+                        select.selection_conjunct_count()
                     } else {
-                        None
+                        0
                     };
                     select.enter_right_join_input();
                     let walked = self.select_to_sql_recursively(
@@ -2292,11 +2298,23 @@ impl Unparser<'_> {
                     select.leave_right_join_input();
                     walked?;
                     if right_is_null_extended {
-                        let contributed = select.take_selection();
-                        select.selection(outer_selection_before_right);
+                        let contributed = select
+                            .take_selection_added_after(outer_conjuncts_before_right);
                         if join.join_type == JoinType::Full && contributed.is_some() {
                             return not_impl_err!(
                                 "Unparsing a FULL JOIN input that is a join with a predicate on its own inputs is not supported"
+                            );
+                        }
+                        // A subquery is refused in `ON` by some dialects, which
+                        // is why an inner join moves such a conjunct to `WHERE`
+                        // — the clause this join cannot use for its right
+                        // input. Refuse rather than fold it into `ON`.
+                        if contributed
+                            .as_ref()
+                            .is_some_and(super::ast::contains_subquery)
+                        {
+                            return not_impl_err!(
+                                "Unparsing a LEFT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
                             );
                         }
                         hoisted_from_right = contributed;
