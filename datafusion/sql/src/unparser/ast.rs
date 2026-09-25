@@ -239,6 +239,16 @@ pub struct SelectBuilder {
     /// Entered with `enter_right_join_input()`, left with
     /// `leave_right_join_input()`, read with `in_right_join_input()`.
     right_join_inputs: usize,
+    /// How many null-extended join inputs the walk is currently inside — a
+    /// LEFT JOIN's right input, a RIGHT JOIN's left, either of a FULL JOIN's.
+    /// A mark join reached there is refused: the `EXISTS` that would replace
+    /// its mark is never NULL, but the mark is on a row the outer join
+    /// null-extends, so a predicate above reading it would answer differently.
+    ///
+    /// Entered with `enter_null_extended_join_input()`, left with
+    /// `leave_null_extended_join_input()`, read with
+    /// `in_null_extended_join_input()`.
+    null_extended_join_inputs: usize,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -382,6 +392,17 @@ impl SelectBuilder {
     }
     pub fn leave_right_join_input(&mut self) {
         self.right_join_inputs = self.right_join_inputs.saturating_sub(1);
+    }
+    /// Whether the walk is inside a join input the join null-extends (see
+    /// `null_extended_join_inputs`).
+    pub fn in_null_extended_join_input(&self) -> bool {
+        self.null_extended_join_inputs > 0
+    }
+    pub fn enter_null_extended_join_input(&mut self) {
+        self.null_extended_join_inputs += 1;
+    }
+    pub fn leave_null_extended_join_input(&mut self) {
+        self.null_extended_join_inputs = self.null_extended_join_inputs.saturating_sub(1);
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -715,6 +736,7 @@ impl SelectBuilder {
             flatten_table_aliases: Vec::new(),
             aggregated: false,
             right_join_inputs: 0,
+            null_extended_join_inputs: 0,
         }
     }
 }

@@ -2132,6 +2132,20 @@ impl Unparser<'_> {
                 // join's left side, so appending there would put this join's
                 // right side before the relation it joins to (#14373).
                 let is_right_join_input = select.in_right_join_input();
+                // A mark join's mark is replaced by `EXISTS` wherever the
+                // enclosing query reads it, and `EXISTS` is never NULL. On an
+                // input an outer join null-extends the mark is NULL for the
+                // rows that join adds, so `NOT x.mark` or `x.mark IS NULL`
+                // above it would keep or drop those rows differently from
+                // the plan. Refused there; computing the mark inside a derived
+                // input the outer join null-extends is the lift.
+                if select.in_null_extended_join_input()
+                    && matches!(join.join_type, JoinType::LeftMark | JoinType::RightMark)
+                {
+                    return not_impl_err!(
+                        "Unparsing a mark join as an input an outer join null-extends is not supported"
+                    );
+                }
 
                 let mut left_scan_fetch = None;
                 let mut left_scan_only_filters = vec![];
@@ -2181,12 +2195,19 @@ impl Unparser<'_> {
                     0
                 };
 
-                self.select_to_sql_recursively(
+                if left_contribution_is_watched {
+                    select.enter_null_extended_join_input();
+                }
+                let walked = self.select_to_sql_recursively(
                     left_plan.as_ref(),
                     query,
                     select,
                     relation,
-                )?;
+                );
+                if left_contribution_is_watched {
+                    select.leave_null_extended_join_input();
+                }
+                walked?;
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
@@ -2303,12 +2324,18 @@ impl Unparser<'_> {
                         0
                     };
                     select.enter_right_join_input();
+                    if right_is_null_extended {
+                        select.enter_null_extended_join_input();
+                    }
                     let walked = self.select_to_sql_recursively(
                         right_plan.as_ref(),
                         query,
                         select,
                         &mut right_relation,
                     );
+                    if right_is_null_extended {
+                        select.leave_null_extended_join_input();
+                    }
                     select.leave_right_join_input();
                     walked?;
                     if right_is_null_extended {
@@ -2332,6 +2359,18 @@ impl Unparser<'_> {
                             );
                         }
                         hoisted_from_right = contributed;
+                    }
+                    // A subquery conjunct the enclosing outer join's `ON` moves
+                    // onto this input's own scope needs a derived table that
+                    // keeps the input's names addressable; a joined input has
+                    // no single name for that, so it is refused rather than
+                    // wrapped anonymously.
+                    if !right_scoped.is_empty()
+                        && matches!(right_plan.as_ref(), LogicalPlan::Join(_))
+                    {
+                        return not_impl_err!(
+                            "Unparsing an outer join's subquery predicate scoped onto a joined input is not supported"
+                        );
                     }
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full

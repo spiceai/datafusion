@@ -12990,10 +12990,11 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         "LEFT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
     );
 
-    // A predicate above the outer join that reads a mark produced inside its
-    // input: the mark join rewrites it in place, so it has to stay in place
-    // while that input is walked — whichever side, and however deep — and
-    // nothing is hoisted.
+    // A mark join on an input an outer join null-extends is refused: the
+    // `EXISTS` that replaces its mark is never NULL, but the mark is on a row
+    // the outer join adds, so `NOT c.mark` or `c.mark IS NULL` above would
+    // answer differently from the plan. On a preserved input the mark join
+    // rewrites the mark in place, which the walk keeps possible.
     use datafusion_expr::JoinType::LeftMark;
     let marked = || -> Result<LogicalPlan> {
         let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
@@ -13003,8 +13004,7 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
             .build()
     };
     let scan = |name| table_scan(Some(name), &schema, Some(vec![0]))?.build();
-    let shapes: Vec<(&str, LogicalPlan)> = vec![
-        // The mark join as the right input of a LEFT JOIN, of a FULL JOIN.
+    let refused: Vec<(&str, LogicalPlan)> = vec![
         (
             "a LEFT JOIN (b MARK c)",
             LogicalPlanBuilder::from(scan("a")?)
@@ -13017,15 +13017,12 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
                 .join(marked()?, Full, (vec!["a.id"], vec!["b.id"]), None)?
                 .build()?,
         ),
-        // As the left input of a RIGHT JOIN, whose left-side hoist must also
-        // leave the predicate in place.
         (
             "(b MARK c) RIGHT JOIN a",
             LogicalPlanBuilder::from(marked()?)
                 .join(scan("a")?, Right, (vec!["b.id"], vec!["a.id"]), None)?
                 .build()?,
         ),
-        // Nested: the RIGHT JOIN itself the right input of a LEFT JOIN.
         (
             "a LEFT JOIN ((b MARK c) RIGHT JOIN d)",
             LogicalPlanBuilder::from(scan("a")?)
@@ -13040,7 +13037,34 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
                 .build()?,
         ),
     ];
-    for (shape, joined) in shapes {
+    for (shape, joined) in refused {
+        let plan = LogicalPlanBuilder::from(joined)
+            .filter(!col("c.mark"))?
+            .project(vec![col("a.id")])?
+            .build()?;
+        let error = plan_to_sql(&plan)
+            .expect_err("a mark join on a null-extended input must be refused");
+        assert_contains!(
+            error.to_string(),
+            "mark join as an input an outer join null-extends is not supported"
+        );
+        let _ = shape;
+    }
+    let preserved: Vec<(&str, LogicalPlan)> = vec![
+        (
+            "(b MARK c) LEFT JOIN a",
+            LogicalPlanBuilder::from(marked()?)
+                .join(scan("a")?, Left, (vec!["b.id"], vec!["a.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a RIGHT JOIN (b MARK c)",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Right, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+    ];
+    for (shape, joined) in preserved {
         let plan = LogicalPlanBuilder::from(joined)
             .filter(col("c.mark"))?
             .project(vec![col("a.id")])?
@@ -13052,5 +13076,29 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
             "the mark read above {shape} must be replaced in place: {sql}"
         );
     }
+
+    // A subquery conjunct the outer join's `ON` would scope onto a joined right
+    // input has no single name for the derived table it needs: refused.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let inner = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(
+            inner,
+            Left,
+            (vec!["a.id"], vec!["b.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a scoped subquery conjunct on a joined input has no name to bind to",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
     Ok(())
 }
