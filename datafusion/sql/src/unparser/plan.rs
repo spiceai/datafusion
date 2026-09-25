@@ -2120,14 +2120,16 @@ impl Unparser<'_> {
                 // every join nested inside such an input, since its scans are
                 // reached by this same walk and would otherwise route their
                 // filters to the shared `WHERE`.
-                let inputs_keep_predicates = select.input_predicates_stay_scoped()
-                    || join.join_type == JoinType::Full;
-                // An EXISTS-style join filters its probe side with a predicate
+                let enclosed_by_full_join = select.input_predicates_stay_scoped();
+                let inputs_keep_predicates =
+                    enclosed_by_full_join || join.join_type == JoinType::Full;
+                // A semi or anti join filters its probe side with a predicate
                 // that goes to the shared `WHERE`, which below a FULL JOIN is
                 // the clause that discards the rows the join preserves. Mark
-                // joins are excluded: their `EXISTS` lands in the select list,
-                // where it filters nothing.
-                if select.input_predicates_stay_scoped()
+                // joins are excluded: their `EXISTS` replaces the mark column
+                // where the enclosing query already reads it, and adds no
+                // predicate of its own.
+                if enclosed_by_full_join
                     && matches!(
                         join.join_type,
                         JoinType::LeftSemi

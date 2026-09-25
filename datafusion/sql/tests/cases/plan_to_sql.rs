@@ -7300,6 +7300,7 @@ fn full_join_input_that_is_a_join_keeps_its_scan_filters_scoped() -> Result<()> 
 /// mark unbound.
 #[test]
 fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, LeftMark};
     let schema = Schema::new(vec![Field::new("id", DataType::Utf8, true)]);
     let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
     let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
@@ -7312,12 +7313,7 @@ fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<
         .limit(0, Some(1))?
         .build()?;
     let plan = LogicalPlanBuilder::from(limited)
-        .join(
-            b,
-            datafusion_expr::JoinType::Full,
-            (vec!["a.id"], vec!["b.id"]),
-            None,
-        )?
+        .join(b, Full, (vec!["a.id"], vec!["b.id"]), None)?
         .filter(col("b.id").is_not_null())?
         .build()?;
     assert_snapshot!(
@@ -7327,20 +7323,10 @@ fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<
 
     // A mark join's mark, read by the predicate above the FULL JOIN.
     let marked = LogicalPlanBuilder::from(a)
-        .join(
-            x,
-            datafusion_expr::JoinType::LeftMark,
-            (vec!["a.id"], vec!["x.id"]),
-            None,
-        )?
+        .join(x, LeftMark, (vec!["a.id"], vec!["x.id"]), None)?
         .build()?;
     let plan = LogicalPlanBuilder::from(marked)
-        .join(
-            c,
-            datafusion_expr::JoinType::Full,
-            (vec!["a.id"], vec!["c.id"]),
-            None,
-        )?
+        .join(c, Full, (vec!["a.id"], vec!["c.id"]), None)?
         .filter(col("x.mark"))?
         .build()?;
     assert_snapshot!(
@@ -7357,6 +7343,7 @@ fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<
 /// `WHERE` for the dialects that refuse it in `ON`, stays in `ON`.
 #[test]
 fn full_join_input_inner_join_keeps_its_subquery_conjunct_in_on() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, Inner};
     let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
     let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
     let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
@@ -7367,18 +7354,13 @@ fn full_join_input_inner_join_keeps_its_subquery_conjunct_in_on() -> Result<()> 
     let inner = LogicalPlanBuilder::from(a)
         .join(
             b,
-            datafusion_expr::JoinType::Inner,
+            Inner,
             (vec!["a.id"], vec!["b.id"]),
-            Some(in_subquery(col("a.id"), Arc::new(allowed.clone()))),
+            Some(in_subquery(col("a.id"), Arc::new(allowed))),
         )?
         .build()?;
     let plan = LogicalPlanBuilder::from(inner.clone())
-        .join(
-            c.clone(),
-            datafusion_expr::JoinType::Full,
-            (vec!["a.id"], vec!["c.id"]),
-            None,
-        )?
+        .join(c.clone(), Full, (vec!["a.id"], vec!["c.id"]), None)?
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
@@ -7387,12 +7369,7 @@ fn full_join_input_inner_join_keeps_its_subquery_conjunct_in_on() -> Result<()> 
 
     // The same inner join not under a FULL JOIN still moves the conjunct.
     let plan = LogicalPlanBuilder::from(inner)
-        .join(
-            c,
-            datafusion_expr::JoinType::Inner,
-            (vec!["a.id"], vec!["c.id"]),
-            None,
-        )?
+        .join(c, Inner, (vec!["a.id"], vec!["c.id"]), None)?
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
@@ -7407,6 +7384,7 @@ fn full_join_input_inner_join_keeps_its_subquery_conjunct_in_on() -> Result<()> 
 /// than emitted there.
 #[test]
 fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, Left, LeftSemi};
     let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
     let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
     let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
@@ -7415,21 +7393,11 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
 
     // A filter above the nested join, reading both of its sides.
     let filtered_join = LogicalPlanBuilder::from(a.clone())
-        .join(
-            b.clone(),
-            datafusion_expr::JoinType::Left,
-            (vec!["a.id"], vec!["b.id"]),
-            None,
-        )?
+        .join(b, Left, (vec!["a.id"], vec!["b.id"]), None)?
         .filter(col("a.id").not_eq(col("b.id")))?
         .build()?;
     let plan = LogicalPlanBuilder::from(filtered_join)
-        .join(
-            c.clone(),
-            datafusion_expr::JoinType::Full,
-            (vec!["a.id"], vec!["c.id"]),
-            None,
-        )?
+        .join(c.clone(), Full, (vec!["a.id"], vec!["c.id"]), None)?
         .build()?;
     let error = plan_to_sql(&plan).expect_err("the predicate has no clause");
     assert_contains!(
@@ -7439,20 +7407,10 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
 
     // A semi join's EXISTS is a predicate on the enclosing WHERE.
     let semi = LogicalPlanBuilder::from(a)
-        .join(
-            x,
-            datafusion_expr::JoinType::LeftSemi,
-            (vec!["a.id"], vec!["x.id"]),
-            None,
-        )?
+        .join(x, LeftSemi, (vec!["a.id"], vec!["x.id"]), None)?
         .build()?;
     let plan = LogicalPlanBuilder::from(semi)
-        .join(
-            c,
-            datafusion_expr::JoinType::Full,
-            (vec!["a.id"], vec!["c.id"]),
-            None,
-        )?
+        .join(c, Full, (vec!["a.id"], vec!["c.id"]), None)?
         .build()?;
     let error = plan_to_sql(&plan).expect_err("the EXISTS has no clause");
     assert_contains!(
