@@ -4954,12 +4954,26 @@ fn test_unparse_exists_join_keeps_build_key_the_body_answers_to() -> Result<()> 
         .filter(col("b.x").gt(lit(0)))?
         .alias("s")?
         .build()?;
-    let plan = LogicalPlanBuilder::from(probe)
+    let plan = LogicalPlanBuilder::from(probe.clone())
         .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.x"]), None)?
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b AS s WHERE (s.x > 0) AND (p.c = s.x))"
+    );
+
+    // An alias over a bare scan is not pushed down: the projection becomes the
+    // derived table's own, so the rename it makes is what `s` answers to.
+    let unpushed = table_scan(Some("b"), &int32_schema(&["x"]), None)?
+        .project(vec![col("b.x").alias("c")])?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(unpushed, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM (SELECT b.x AS c FROM b) AS s WHERE (p.c = s.c))"
     );
 
     Ok(())

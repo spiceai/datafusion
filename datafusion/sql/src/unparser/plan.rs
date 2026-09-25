@@ -4817,20 +4817,9 @@ impl Unparser<'_> {
                             continue;
                         }
                         found_relation = true;
-                        let mut wrapped = alias.input.as_ref();
-                        let schema = loop {
-                            match wrapped {
-                                LogicalPlan::Projection(projection) => {
-                                    wrapped = projection.input.as_ref();
-                                }
-                                LogicalPlan::Filter(filter) => {
-                                    wrapped = filter.input.as_ref();
-                                }
-                                LogicalPlan::TableScan(scan) => {
-                                    break scan.source.schema();
-                                }
-                                _ => break Arc::clone(alias.schema.inner()),
-                            }
+                        let schema = match Self::scan_an_alias_is_pushed_onto(alias) {
+                            Some(scan) => scan.source.schema(),
+                            None => Arc::clone(alias.schema.inner()),
                         };
                         let mut columns = HashSet::new();
                         self.expose_columns(&mut columns, &schema)?;
@@ -4845,6 +4834,43 @@ impl Unparser<'_> {
             }
         }
         Ok(true)
+    }
+
+    /// The scan [`Self::unparse_table_scan_pushdown`] will push `alias` down
+    /// onto, if it will push it down at all.
+    ///
+    /// The conditions are that arm's, read the same way: the alias wraps a
+    /// scan through projections and filters only, the scan carries a pushdown
+    /// of its own (a projection, filters or a fetch) — a bare scan is left as
+    /// it is and the projection above it becomes the derived table's own — and
+    /// no filter on the way carries a subquery, which the pushdown declines to
+    /// rebase. Anything else leaves the alias emitted around its input as
+    /// written.
+    fn scan_an_alias_is_pushed_onto(
+        alias: &datafusion_expr::SubqueryAlias,
+    ) -> Option<&TableScan> {
+        let mut wrapped = alias.input.as_ref();
+        loop {
+            match wrapped {
+                LogicalPlan::Projection(projection) => {
+                    wrapped = projection.input.as_ref();
+                }
+                LogicalPlan::Filter(filter) => {
+                    if filter
+                        .predicate
+                        .exists(|expr| Ok(Self::subquery_of(expr).is_some()))
+                        .unwrap_or(true)
+                    {
+                        return None;
+                    }
+                    wrapped = filter.input.as_ref();
+                }
+                LogicalPlan::TableScan(scan) => {
+                    return Self::is_scan_with_pushdown(scan).then_some(scan);
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// The name a scope around the `EXISTS` build side has to answer to, so the
