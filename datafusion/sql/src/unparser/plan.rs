@@ -2188,7 +2188,14 @@ impl Unparser<'_> {
                 // preserved. A FULL JOIN also null-extends its left input, but
                 // preserves left rows, so moving the predicate into ON would
                 // make filtered-out left rows reappear as unmatched rows.
-                let left_is_null_extended = matches!(join.join_type, JoinType::Right);
+                // Below a FULL JOIN's input there is nothing to relocate: the
+                // marked walk keeps every predicate the left subtree carries in
+                // that subtree's own scope. Setting the accumulated predicate
+                // aside would only hide it from the walk — a row-limited input
+                // reads it to decide it needs a scope of its own, and a mark
+                // join rewrites the mark it names in place.
+                let left_is_null_extended =
+                    matches!(join.join_type, JoinType::Right) && !enclosed_by_full_join;
                 let outer_selection = if left_is_null_extended {
                     select.take_selection()
                 } else {

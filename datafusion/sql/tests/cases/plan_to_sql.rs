@@ -7300,7 +7300,7 @@ fn full_join_input_that_is_a_join_keeps_its_scan_filters_scoped() -> Result<()> 
 /// mark unbound.
 #[test]
 fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<()> {
-    use datafusion_expr::JoinType::{Full, LeftMark};
+    use datafusion_expr::JoinType::{Full, LeftMark, Right};
     let schema = Schema::new(vec![Field::new("id", DataType::Utf8, true)]);
     let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
     let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
@@ -7313,12 +7313,27 @@ fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<
         .limit(0, Some(1))?
         .build()?;
     let plan = LogicalPlanBuilder::from(limited)
-        .join(b, Full, (vec!["a.id"], vec!["b.id"]), None)?
+        .join(b.clone(), Full, (vec!["a.id"], vec!["b.id"]), None)?
         .filter(col("b.id").is_not_null())?
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @"SELECT a.id, b.id FROM (SELECT a.id FROM a LIMIT 1) AS a FULL JOIN b ON a.id = b.id WHERE b.id IS NOT NULL"
+    );
+
+    // The same limited input one level down, on the left of a nested RIGHT
+    // JOIN — whose hoist would otherwise set the predicate aside for its walk.
+    let limited = LogicalPlanBuilder::from(a.clone())
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(limited)
+        .join(b.clone(), Right, (vec!["a.id"], vec!["b.id"]), None)?
+        .join(c.clone(), Full, (vec!["a.id"], vec!["c.id"]), None)?
+        .filter(col("c.id").is_not_null())?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a LIMIT 1) AS a RIGHT OUTER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE c.id IS NOT NULL"
     );
 
     // A mark join's mark, read by the predicate above the FULL JOIN.
