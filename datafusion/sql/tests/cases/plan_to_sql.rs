@@ -13252,10 +13252,45 @@ fn full_join_input_aliased_scan_with_a_subquery_filter_is_refused() -> Result<()
     .build()?;
     let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
     let plan = LogicalPlanBuilder::from(aliased)
-        .join(c, Full, (vec!["s.id"], vec!["c.id"]), None)?
+        .join(c.clone(), Full, (vec!["s.id"], vec!["c.id"]), None)?
         .build()?;
     let error =
         plan_to_sql(&plan).expect_err("the subquery's reference would lose its binding");
+    assert_contains!(
+        error.to_string(),
+        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+    );
+
+    // Without the projection, the join arm reaches the alias directly and
+    // peels it to a scan before the `SubqueryAlias` arm could refuse it. The
+    // same refusal has to hold there, for either side of the join.
+    let bare_aliased = || -> Result<LogicalPlan> {
+        let correlated = table_scan(Some("b"), &schema, Some(vec![0]))?
+            .filter(col("b.id").eq(col("a.id")))?
+            .build()?;
+        table_scan_with_filters(
+            Some("a"),
+            &schema,
+            Some(vec![0]),
+            vec![exists(Arc::new(correlated))],
+        )?
+        .alias("s")?
+        .build()
+    };
+    let as_left = LogicalPlanBuilder::from(bare_aliased()?)
+        .join(c.clone(), Full, (vec!["s.id"], vec!["c.id"]), None)?
+        .build()?;
+    let error = plan_to_sql(&as_left)
+        .expect_err("an aliased scan reached directly as the left input is refused too");
+    assert_contains!(
+        error.to_string(),
+        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+    );
+    let as_right = LogicalPlanBuilder::from(c)
+        .join(bare_aliased()?, Full, (vec!["c.id"], vec!["s.id"]), None)?
+        .build()?;
+    let error = plan_to_sql(&as_right)
+        .expect_err("an aliased scan reached directly as the right input is refused too");
     assert_contains!(
         error.to_string(),
         "predicate on a FULL JOIN input that is not applied by one of its table scans"

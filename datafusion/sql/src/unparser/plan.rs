@@ -198,33 +198,6 @@ fn expression_schema(plan: &LogicalPlan) -> Option<DFSchema> {
     Some(schema)
 }
 
-/// Whether any of a scan's filters holds a subquery.
-///
-/// [`TableAliasRewriter`] rebases ordinary column references onto an alias but
-/// does not descend into a subquery's own plan, so a reference the subquery
-/// makes to the scan's table would outlive an alias that shadows it — `a.id`
-/// left under `FROM a AS s`, which binds to nothing. A scan filtered that way
-/// keeps the pushdown rewrite, and the refusal that comes with it.
-fn any_filter_holds_a_subquery(filters: &[Expr]) -> Result<bool> {
-    let mut found = false;
-    for filter in filters {
-        filter.apply(|expr| {
-            if matches!(
-                expr,
-                Expr::Exists(_) | Expr::InSubquery(_) | Expr::ScalarSubquery(_)
-            ) {
-                found = true;
-                return Ok(TreeNodeRecursion::Stop);
-            }
-            Ok(TreeNodeRecursion::Continue)
-        })?;
-        if found {
-            break;
-        }
-    }
-    Ok(found)
-}
-
 /// Whether any expression in `plan` reads a column from an enclosing query.
 ///
 /// `Expr::OuterReferenceColumn` is how a correlated reference reaches the plan,
@@ -305,6 +278,11 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
     })?;
     Ok(bound)
 }
+
+/// The refusal for a predicate below a FULL JOIN that no scan's own derived
+/// table applies: `WHERE`, `HAVING` and `QUALIFY` all run after the join and
+/// would discard the rows it preserves.
+const FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED: &str = "Unparsing a predicate on a FULL JOIN input that is not applied by one of its table scans is not supported";
 
 impl Unparser<'_> {
     /// Queues a recursive CTE for the statement root, keeping one definition per
@@ -1362,6 +1340,26 @@ impl Unparser<'_> {
         Ok(())
     }
 
+    /// A join side peeled to a scan under an alias, whose filters hold a
+    /// subquery, cannot be derived below a FULL JOIN: the alias rewriter does
+    /// not descend into the subquery, so a reference it makes to the scan's
+    /// own table is shadowed by `FROM a AS s` inside the derived table and
+    /// binds to nothing. When a projection routes the side through the
+    /// `SubqueryAlias` arm, that arm declines its scoped derived table and
+    /// the `Filter` arm refuses the predicate; this is the same refusal for a
+    /// side the join arm reaches directly.
+    fn refuse_aliased_scan_with_a_subquery_filter(
+        side: &LogicalPlan,
+        filters: &[Expr],
+    ) -> Result<()> {
+        if matches!(side, LogicalPlan::SubqueryAlias(_))
+            && filters.iter().any(expr_contains_subquery)
+        {
+            return not_impl_err!("{FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED}");
+        }
+        Ok(())
+    }
+
     fn derive_join_side(
         &self,
         clean_plan: &LogicalPlan,
@@ -1837,9 +1835,7 @@ impl Unparser<'_> {
                 // would discard the rows it preserves. Refuse rather than emit
                 // that, which costs the pushdown but never the rows.
                 if select.input_predicates_stay_scoped() {
-                    return not_impl_err!(
-                        "Unparsing a predicate on a FULL JOIN input that is not applied by one of its table scans is not supported"
-                    );
+                    return not_impl_err!("{FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED}");
                 }
                 let window = find_window_nodes_within_select(
                     plan,
@@ -2279,6 +2275,12 @@ impl Unparser<'_> {
                     || (inputs_keep_predicates && !left_scan_filters.is_empty())
                     || !left_scoped.is_empty()
                 {
+                    if inputs_keep_predicates {
+                        Self::refuse_aliased_scan_with_a_subquery_filter(
+                            left_plan.as_ref(),
+                            &left_scan_filters,
+                        )?;
+                    }
                     let mut side_filters = std::mem::take(&mut left_scoped);
                     if left_scan_fetch.is_some() || inputs_keep_predicates {
                         side_filters.append(&mut left_scan_filters);
@@ -2363,6 +2365,12 @@ impl Unparser<'_> {
                         || (inputs_keep_predicates && !right_scan_filters.is_empty())
                         || !right_scoped.is_empty()
                     {
+                        if inputs_keep_predicates {
+                            Self::refuse_aliased_scan_with_a_subquery_filter(
+                                right_plan.as_ref(),
+                                &right_scan_filters,
+                            )?;
+                        }
                         let mut side_filters = std::mem::take(&mut right_scoped);
                         if right_scan_fetch.is_some() || inputs_keep_predicates {
                             side_filters.append(&mut right_scan_filters);
@@ -2544,7 +2552,7 @@ impl Unparser<'_> {
                 // Read before the guard: `?` cannot appear in a let-chain.
                 let filters_bind_under_the_alias = match plan {
                     LogicalPlan::TableScan(scan) => {
-                        !any_filter_holds_a_subquery(&scan.filters)?
+                        !scan.filters.iter().any(expr_contains_subquery)
                     }
                     _ => false,
                 };
