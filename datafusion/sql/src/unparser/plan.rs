@@ -775,6 +775,18 @@ impl Unparser<'_> {
         Ok(SetExpr::Select(Box::new(select_builder.build()?)))
     }
 
+    /// Whether a join input is a joined table — a `Join`, possibly under the
+    /// projections that only pick its columns — as opposed to one scan.
+    fn is_joined_relation(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join(_) => true,
+            LogicalPlan::Projection(projection) => {
+                Self::is_joined_relation(projection.input.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     /// The names a query source can be qualified by: a table's alias or name, a
     /// derived table's alias, and every source inside a parenthesised joined
     /// table — a join that is another join's right input keeps its own sources,
@@ -2366,7 +2378,7 @@ impl Unparser<'_> {
                     // no single name for that, so it is refused rather than
                     // wrapped anonymously.
                     if !right_scoped.is_empty()
-                        && matches!(right_plan.as_ref(), LogicalPlan::Join(_))
+                        && Self::is_joined_relation(right_plan.as_ref())
                     {
                         return not_impl_err!(
                             "Unparsing an outer join's subquery predicate scoped onto a joined input is not supported"
@@ -2555,7 +2567,7 @@ impl Unparser<'_> {
                 // then hides (`b.id = 'x'` beside `(b JOIN c) AS j`). Derived,
                 // they stay inside and the alias is what the enclosing query
                 // addresses.
-                if select.in_right_join_input() && matches!(plan, LogicalPlan::Join(_)) {
+                if select.in_right_join_input() && Self::is_joined_relation(plan) {
                     if !select.already_projected() {
                         let items = plan_alias
                             .schema
