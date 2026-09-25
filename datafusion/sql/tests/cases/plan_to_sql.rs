@@ -13258,7 +13258,7 @@ fn full_join_input_aliased_scan_with_a_subquery_filter_is_refused() -> Result<()
         plan_to_sql(&plan).expect_err("the subquery's reference would lose its binding");
     assert_contains!(
         error.to_string(),
-        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+        "aliased scan filtering on a subquery is not supported: the subquery's references cannot be rebased onto the alias"
     );
 
     // Without the projection, the join arm reaches the alias directly and
@@ -13284,7 +13284,7 @@ fn full_join_input_aliased_scan_with_a_subquery_filter_is_refused() -> Result<()
         .expect_err("an aliased scan reached directly as the left input is refused too");
     assert_contains!(
         error.to_string(),
-        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+        "aliased scan filtering on a subquery is not supported: the subquery's references cannot be rebased onto the alias"
     );
     let as_right = LogicalPlanBuilder::from(c)
         .join(bare_aliased()?, Full, (vec!["c.id"], vec!["s.id"]), None)?
@@ -13293,7 +13293,7 @@ fn full_join_input_aliased_scan_with_a_subquery_filter_is_refused() -> Result<()
         .expect_err("an aliased scan reached directly as the right input is refused too");
     assert_contains!(
         error.to_string(),
-        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+        "aliased scan filtering on a subquery is not supported: the subquery's references cannot be rebased onto the alias"
     );
     Ok(())
 }

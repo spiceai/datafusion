@@ -284,6 +284,13 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
 /// would discard the rows it preserves.
 const FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED: &str = "Unparsing a predicate on a FULL JOIN input that is not applied by one of its table scans is not supported";
 
+/// The refusal for a FULL JOIN input that is an aliased scan filtering on a
+/// subquery: the scan does apply the predicate, but the derived table the
+/// input needs would rebase the filters onto the alias, and the rewriter
+/// cannot descend into the subquery's plan — a reference it makes to the
+/// scan's own table would be shadowed by `FROM a AS s` and bind to nothing.
+const ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED: &str = "Unparsing a FULL JOIN input that is an aliased scan filtering on a subquery is not supported: the subquery's references cannot be rebased onto the alias";
+
 impl Unparser<'_> {
     /// Queues a recursive CTE for the statement root, keeping one definition per
     /// name.
@@ -1344,10 +1351,9 @@ impl Unparser<'_> {
     /// subquery, cannot be derived below a FULL JOIN: the alias rewriter does
     /// not descend into the subquery, so a reference it makes to the scan's
     /// own table is shadowed by `FROM a AS s` inside the derived table and
-    /// binds to nothing. When a projection routes the side through the
-    /// `SubqueryAlias` arm, that arm declines its scoped derived table and
-    /// the `Filter` arm refuses the predicate; this is the same refusal for a
-    /// side the join arm reaches directly.
+    /// binds to nothing. The `SubqueryAlias` arm raises the same refusal when
+    /// a projection routes the side through it; this is it for a side the
+    /// join arm reaches directly.
     fn refuse_aliased_scan_with_a_subquery_filter(
         side: &LogicalPlan,
         filters: &[Expr],
@@ -1355,7 +1361,7 @@ impl Unparser<'_> {
         if matches!(side, LogicalPlan::SubqueryAlias(_))
             && filters.iter().any(expr_contains_subquery)
         {
-            return not_impl_err!("{FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED}");
+            return not_impl_err!("{ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED}");
         }
         Ok(())
     }
@@ -2549,18 +2555,23 @@ impl Unparser<'_> {
                 // above it rebinds. A column list means the alias renames the
                 // scan's outputs, which the derived table cannot express here;
                 // those keep the rewrite, and the refusal.
-                // Read before the guard: `?` cannot appear in a let-chain.
-                let filters_bind_under_the_alias = match plan {
-                    LogicalPlan::TableScan(scan) => {
-                        !scan.filters.iter().any(expr_contains_subquery)
-                    }
-                    _ => false,
-                };
-
-                if columns.is_empty()
+                //
+                // A filter holding a subquery is refused outright: the rebase
+                // below cannot descend into the subquery's plan, so a
+                // reference it makes to the scan's own table would be
+                // shadowed by the alias and bind to nothing (the join arm
+                // raises the same refusal for a side it reaches directly).
+                let scoped_alias_over_a_scan = columns.is_empty()
                     && select.already_projected()
-                    && select.input_predicates_stay_scoped()
-                    && filters_bind_under_the_alias
+                    && select.input_predicates_stay_scoped();
+                if scoped_alias_over_a_scan
+                    && let LogicalPlan::TableScan(scan) = plan
+                    && scan.filters.iter().any(expr_contains_subquery)
+                {
+                    return not_impl_err!("{ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED}");
+                }
+
+                if scoped_alias_over_a_scan
                     && let LogicalPlan::TableScan(scan) = plan
                     && (!scan.filters.is_empty() || scan.fetch.is_some())
                 {
