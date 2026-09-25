@@ -776,12 +776,16 @@ impl Unparser<'_> {
     }
 
     /// Whether a join input is a joined table — a `Join`, possibly under the
-    /// projections that only pick its columns — as opposed to one scan.
+    /// projections that only pick its columns and the filters over it — as
+    /// opposed to one scan.
     fn is_joined_relation(plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::Join(_) => true,
             LogicalPlan::Projection(projection) => {
                 Self::is_joined_relation(projection.input.as_ref())
+            }
+            LogicalPlan::Filter(filter) => {
+                Self::is_joined_relation(filter.input.as_ref())
             }
             _ => false,
         }

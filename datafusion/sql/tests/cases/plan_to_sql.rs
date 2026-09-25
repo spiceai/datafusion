@@ -13101,6 +13101,23 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         @"SELECT a.id, j.id, j.cid FROM a LEFT OUTER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid WHERE (b.id = 'x')) AS j ON a.id = j.id"
     );
 
+    // An aliased join under a filter is a joined input still: derived under
+    // the alias, with the filter inside.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?;
+    let aliased = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.cid"]), None)?
+        .filter(col("b.id").eq(lit("x")))?
+        .alias("j")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(aliased, Left, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, j.id, j.cid FROM a LEFT OUTER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid WHERE (b.id = 'x')) AS j ON a.id = j.id"
+    );
+
     // A subquery conjunct the outer join's `ON` would scope onto a joined right
     // input has no single name for the derived table it needs: refused.
     let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
