@@ -12898,5 +12898,25 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         plan_to_sql(&plan)?,
         @"SELECT a.id, b.id, c.id FROM a FULL JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id"
     );
+
+    // A nested join's scan filter must not reach the shared `WHERE` when the
+    // outer join null-extends that input: under a LEFT JOIN it folds into the
+    // outer `ON`; under a RIGHT JOIN the right input is preserved and `WHERE`
+    // is right; under a FULL JOIN neither clause serves, so it is refused.
+    use datafusion_expr::JoinType::{Left, Right};
+    assert_snapshot!(
+        plan_to_sql(&nested(Left)?)?,
+        @"SELECT a.id, b.id, c.id FROM a LEFT OUTER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id AND (b.id = 'x')"
+    );
+    assert_snapshot!(
+        plan_to_sql(&nested(Right)?)?,
+        @"SELECT a.id, b.id, c.id FROM a RIGHT OUTER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id WHERE (b.id = 'x')"
+    );
+    let error = plan_to_sql(&nested(Full)?)
+        .expect_err("a filtered nested join as a FULL JOIN input has no clause");
+    assert_contains!(
+        error.to_string(),
+        "FULL JOIN input that is a join with a predicate on its own inputs is not supported"
+    );
     Ok(())
 }

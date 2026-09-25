@@ -2235,6 +2235,12 @@ impl Unparser<'_> {
                 // clauses into the outer query. Regular joins unparse it into
                 // the shared `select` as usual.
                 let mut right_relation = RelationBuilder::default();
+                // What a null-extended right input's *nested* joins add to the
+                // shared `WHERE`, folded into this join's `ON` below — see
+                // `left_is_null_extended` for the mirror image. A scan's own
+                // filters never reach here: they are peeled above and routed by
+                // `split_join_on_and_where_filters`.
+                let mut hoisted_from_right: Option<ast::Expr> = None;
                 let right_plan: Arc<LogicalPlan> = if is_exists_join {
                     Arc::clone(right_plan)
                 } else {
@@ -2264,6 +2270,18 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
+                    // A LEFT JOIN null-extends its right input, so a predicate a
+                    // nested join there contributes to the shared `WHERE` would
+                    // discard the left rows this join preserves; it belongs in
+                    // this join's `ON`. A FULL JOIN preserves both inputs, so
+                    // neither clause serves — a contribution there is refused.
+                    let right_is_null_extended =
+                        matches!(join.join_type, JoinType::Left | JoinType::Full);
+                    let outer_selection_before_right = if right_is_null_extended {
+                        select.take_selection()
+                    } else {
+                        None
+                    };
                     select.enter_right_join_input();
                     let walked = self.select_to_sql_recursively(
                         right_plan.as_ref(),
@@ -2273,6 +2291,16 @@ impl Unparser<'_> {
                     );
                     select.leave_right_join_input();
                     walked?;
+                    if right_is_null_extended {
+                        let contributed = select.take_selection();
+                        select.selection(outer_selection_before_right);
+                        if join.join_type == JoinType::Full && contributed.is_some() {
+                            return not_impl_err!(
+                                "Unparsing a FULL JOIN input that is a join with a predicate on its own inputs is not supported"
+                            );
+                        }
+                        hoisted_from_right = contributed;
+                    }
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full
                             && !right_scan_filters.is_empty())
@@ -2326,7 +2354,7 @@ impl Unparser<'_> {
                 // else to go: returning it to the SELECT-global `WHERE` would
                 // discard unmatched rows from the preserved side. Downgrade
                 // to an equivalent `ON` constraint so it can be appended.
-                if hoisted_from_left.is_some()
+                if (hoisted_from_left.is_some() || hoisted_from_right.is_some())
                     && matches!(
                         join_constraint,
                         ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural
@@ -2337,6 +2365,9 @@ impl Unparser<'_> {
                 }
                 let (join_constraint, unhoistable) =
                     Self::and_into_join_constraint(join_constraint, hoisted_from_left);
+                select.selection(unhoistable);
+                let (join_constraint, unhoistable) =
+                    Self::and_into_join_constraint(join_constraint, hoisted_from_right);
                 select.selection(unhoistable);
 
                 let right_projection: Option<Vec<ast::SelectItem>> =
