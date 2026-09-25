@@ -231,6 +231,27 @@ pub struct SelectBuilder {
     ///
     /// Set with `mark_aggregated()` and read with `already_aggregated()`.
     aggregated: bool,
+    /// Whether the join inputs being walked into this SELECT must keep their
+    /// predicates in scopes of their own instead of contributing them to this
+    /// SELECT's `WHERE`.
+    ///
+    /// Set while a `FULL JOIN`'s inputs are unparsed. `WHERE` is evaluated
+    /// after every join, so a predicate that reaches it from one input
+    /// discards the other input's unmatched rows, which the `FULL JOIN`
+    /// preserves. The scan filters of a bare input are isolated in a derived
+    /// table by the join itself; this flag carries the same rule down into an
+    /// input that is a join of its own, whose scans are reached by a nested
+    /// walk that otherwise routes their filters to the shared `WHERE`.
+    ///
+    /// Set with `set_input_predicates_stay_scoped()` and read with
+    /// `input_predicates_stay_scoped()`.
+    input_predicates_stay_scoped: bool,
+    /// How many predicates have been added to this SELECT's `WHERE` through
+    /// `selection()`. A caller that must know whether a sub-plan contributed
+    /// a predicate compares this before and after walking it, which leaves
+    /// the predicate already there in place — taking it out would change
+    /// what the walk sees.
+    predicates_added: usize,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -365,6 +386,19 @@ impl SelectBuilder {
         self.aggregated
     }
 
+    /// Whether the join inputs walked into this SELECT must keep their
+    /// predicates in scopes of their own rather than in this SELECT's `WHERE`.
+    pub fn input_predicates_stay_scoped(&self) -> bool {
+        self.input_predicates_stay_scoped
+    }
+
+    /// Sets whether join inputs keep their predicates scoped, returning the
+    /// previous setting so the caller can restore it once its inputs are
+    /// walked.
+    pub fn set_input_predicates_stay_scoped(&mut self, value: bool) -> bool {
+        std::mem::replace(&mut self.input_predicates_stay_scoped, value)
+    }
+
     /// Returns the most recently generated flatten alias, or `None` if
     /// `next_flatten_alias` has not been called yet.
     pub fn current_flatten_alias(&self) -> Option<String> {
@@ -473,6 +507,25 @@ impl SelectBuilder {
     }
 
     pub fn selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
+        if value.is_some() {
+            self.predicates_added += 1;
+        }
+        self.and_selection(value)
+    }
+
+    /// Puts back a predicate that `take_selection()` removed. It is combined
+    /// like any other, but not counted by `predicates_added()`: it is the
+    /// predicate that was already there, not a contribution.
+    pub fn restore_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
+        self.and_selection(value)
+    }
+
+    /// How many predicates `selection()` has added to this SELECT so far.
+    pub fn predicates_added(&self) -> usize {
+        self.predicates_added
+    }
+
+    fn and_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
         // With filter pushdown optimization, the LogicalPlan can have filters defined as part of `TableScan` and `Filter` nodes.
         // To avoid overwriting one of the filters, we combine the existing filter with the additional filter.
         // Example:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -672,6 +725,8 @@ impl SelectBuilder {
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             aggregated: false,
+            input_predicates_stay_scoped: false,
+            predicates_added: 0,
         }
     }
 }

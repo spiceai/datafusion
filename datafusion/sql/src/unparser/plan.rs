@@ -279,6 +279,18 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
     Ok(bound)
 }
 
+/// The refusal for a predicate below a FULL JOIN that no scan's own derived
+/// table applies: `WHERE`, `HAVING` and `QUALIFY` all run after the join and
+/// would discard the rows it preserves.
+const FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED: &str = "Unparsing a predicate on a FULL JOIN input that is not applied by one of its table scans is not supported";
+
+/// The refusal for a FULL JOIN input that is an aliased scan filtering on a
+/// subquery: the scan does apply the predicate, but the derived table the
+/// input needs would rebase the filters onto the alias, and the rewriter
+/// cannot descend into the subquery's plan — a reference it makes to the
+/// scan's own table would be shadowed by `FROM a AS s` and bind to nothing.
+const ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED: &str = "Unparsing a FULL JOIN input that is an aliased scan filtering on a subquery is not supported: the subquery's references cannot be rebased onto the alias";
+
 impl Unparser<'_> {
     /// Queues a recursive CTE for the statement root, keeping one definition per
     /// name.
@@ -1335,6 +1347,25 @@ impl Unparser<'_> {
         Ok(())
     }
 
+    /// A join side peeled to a scan under an alias, whose filters hold a
+    /// subquery, cannot be derived below a FULL JOIN: the alias rewriter does
+    /// not descend into the subquery, so a reference it makes to the scan's
+    /// own table is shadowed by `FROM a AS s` inside the derived table and
+    /// binds to nothing. The `SubqueryAlias` arm raises the same refusal when
+    /// a projection routes the side through it; this is it for a side the
+    /// join arm reaches directly.
+    fn refuse_aliased_scan_with_a_subquery_filter(
+        side: &LogicalPlan,
+        filters: &[Expr],
+    ) -> Result<()> {
+        if matches!(side, LogicalPlan::SubqueryAlias(_))
+            && filters.iter().any(expr_contains_subquery)
+        {
+            return not_impl_err!("{ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED}");
+        }
+        Ok(())
+    }
+
     fn derive_join_side(
         &self,
         clean_plan: &LogicalPlan,
@@ -1633,6 +1664,36 @@ impl Unparser<'_> {
     ) -> Result<()> {
         match plan {
             LogicalPlan::TableScan(scan) => {
+                // Below a FULL JOIN's input, a scan reached with its filters
+                // still on it — through a projection the join walk could not
+                // see past, which is already folded into this SELECT — keeps
+                // them in a derived table of its own, as the join derives a
+                // bare filtered input. The pushdown rewrite would materialize
+                // them as a `Filter` above, and there they have no clause.
+                // The folded projection still names the scan, and the derived
+                // table takes the scan's name, so nothing above it rebinds.
+                // Only once the select list is taken: it is the folded
+                // projection that lists this scan's columns, and without one
+                // the pushdown rewrite below is what would list them — a scan
+                // reached some other way keeps the rewrite, and the refusal.
+                if select.already_projected()
+                    && select.input_predicates_stay_scoped()
+                    && (!scan.filters.is_empty() || scan.fetch.is_some())
+                {
+                    let clean = LogicalPlanBuilder::scan(
+                        scan.table_name.clone(),
+                        Arc::clone(&scan.source),
+                        scan.projection.clone(),
+                    )?
+                    .build()?;
+                    return self.derive_join_side(
+                        &clean,
+                        scan.filters.clone(),
+                        &scan.filters,
+                        scan.fetch,
+                        relation,
+                    );
+                }
                 if let Some(unparsed_table_scan) = self.unparse_table_scan_pushdown(
                     plan,
                     None,
@@ -1774,6 +1835,14 @@ impl Unparser<'_> {
                 self.select_to_sql_recursively(p.input.as_ref(), query, select, relation)
             }
             LogicalPlan::Filter(filter) => {
+                // Below a FULL JOIN, a predicate the join walk did not fold into
+                // a scan's own derived table has no clause left: `WHERE`,
+                // `HAVING` and `QUALIFY` are all evaluated after the join and
+                // would discard the rows it preserves. Refuse rather than emit
+                // that, which costs the pushdown but never the rows.
+                if select.input_predicates_stay_scoped() {
+                    return not_impl_err!("{FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED}");
+                }
                 let window = find_window_nodes_within_select(
                     plan,
                     None,
@@ -2101,6 +2170,50 @@ impl Unparser<'_> {
                     JoinType::Right => (scoped_for_input, vec![]),
                     _ => (vec![], scoped_for_input),
                 };
+                // A FULL JOIN preserves both inputs, so a predicate from either
+                // one has no clause of the enclosing query: `ON` would let the
+                // rows it rejects reappear as unmatched, and `WHERE` would
+                // discard the other input's unmatched rows. Each input's
+                // predicates stay in the scope that applies them — a derived
+                // table around the scan they filter. That rule is inherited by
+                // every join nested inside such an input, since its scans are
+                // reached by this same walk and would otherwise route their
+                // filters to the shared `WHERE`.
+                let enclosed_by_full_join = select.input_predicates_stay_scoped();
+                let inputs_keep_predicates =
+                    enclosed_by_full_join || join.join_type == JoinType::Full;
+                // A semi or anti join filters its probe side with a predicate
+                // that goes to the shared `WHERE`, which below a FULL JOIN is
+                // the clause that discards the rows the join preserves. A mark
+                // join is refused too: its `EXISTS` replaces the mark column
+                // where the enclosing query reads it, and `EXISTS` is never
+                // NULL — but the mark is, on a row the FULL JOIN null-extends,
+                // so `NOT x.mark` or `x.mark IS NULL` above the FULL JOIN would
+                // keep or drop that row differently from the plan.
+                if enclosed_by_full_join
+                    && matches!(
+                        join.join_type,
+                        JoinType::LeftSemi
+                            | JoinType::LeftAnti
+                            | JoinType::RightSemi
+                            | JoinType::RightAnti
+                            | JoinType::LeftMark
+                            | JoinType::RightMark
+                    )
+                {
+                    return not_impl_err!(
+                        "Unparsing a semi, anti or mark join as a FULL JOIN input is not supported"
+                    );
+                }
+                let inputs_kept_predicates_before =
+                    select.set_input_predicates_stay_scoped(inputs_keep_predicates);
+                // What a FULL JOIN's inputs contribute to `WHERE` is checked
+                // once both are walked; anything at all is a predicate the
+                // rules above failed to keep scoped. The predicate already
+                // there came from above this join and stays in place — a
+                // row-limited input reads it to decide whether it needs a
+                // scope of its own, and a mark join rewrites it in place.
+                let predicates_added_before = select.predicates_added();
                 // If there's an outer projection plan, it will already set up the projection.
                 // In that case, we don't need to worry about setting up the projection here.
                 // The outer projection plan will handle projecting the correct columns.
@@ -2138,7 +2251,14 @@ impl Unparser<'_> {
                 // preserved. A FULL JOIN also null-extends its left input, but
                 // preserves left rows, so moving the predicate into ON would
                 // make filtered-out left rows reappear as unmatched rows.
-                let left_is_null_extended = matches!(join.join_type, JoinType::Right);
+                // Below a FULL JOIN's input there is nothing to relocate: the
+                // marked walk keeps every predicate the left subtree carries in
+                // that subtree's own scope. Setting the accumulated predicate
+                // aside would only hide it from the walk — a row-limited input
+                // reads it to decide it needs a scope of its own, and a mark
+                // join rewrites the mark it names in place.
+                let left_is_null_extended =
+                    matches!(join.join_type, JoinType::Right) && !enclosed_by_full_join;
                 let outer_selection = if left_is_null_extended {
                     select.take_selection()
                 } else {
@@ -2158,13 +2278,21 @@ impl Unparser<'_> {
                 // and no clause of the enclosing query can express one input's
                 // `fetch`. Isolate that side in a derived table instead, and
                 // drop the filters from `left_scan_filters` so they are not
-                // also routed to `ON`/`WHERE` below.
+                // also routed to `ON`/`WHERE` below. A join nested inside a
+                // FULL JOIN's input does the same for its own scans, since the
+                // `WHERE` it would otherwise reach is the FULL JOIN's.
                 if left_scan_fetch.is_some()
-                    || (join.join_type == JoinType::Full && !left_scan_filters.is_empty())
+                    || (inputs_keep_predicates && !left_scan_filters.is_empty())
                     || !left_scoped.is_empty()
                 {
+                    if inputs_keep_predicates {
+                        Self::refuse_aliased_scan_with_a_subquery_filter(
+                            left_plan.as_ref(),
+                            &left_scan_filters,
+                        )?;
+                    }
                     let mut side_filters = std::mem::take(&mut left_scoped);
-                    if left_scan_fetch.is_some() || join.join_type == JoinType::Full {
+                    if left_scan_fetch.is_some() || inputs_keep_predicates {
                         side_filters.append(&mut left_scan_filters);
                     }
                     self.derive_join_side(
@@ -2178,7 +2306,7 @@ impl Unparser<'_> {
 
                 let hoisted_from_left = if left_is_null_extended {
                     let contributed = select.take_selection();
-                    select.selection(outer_selection);
+                    select.restore_selection(outer_selection);
                     contributed
                 } else {
                     None
@@ -2244,13 +2372,17 @@ impl Unparser<'_> {
                         &mut right_relation,
                     )?;
                     if right_scan_fetch.is_some()
-                        || (join.join_type == JoinType::Full
-                            && !right_scan_filters.is_empty())
+                        || (inputs_keep_predicates && !right_scan_filters.is_empty())
                         || !right_scoped.is_empty()
                     {
+                        if inputs_keep_predicates {
+                            Self::refuse_aliased_scan_with_a_subquery_filter(
+                                right_plan.as_ref(),
+                                &right_scan_filters,
+                            )?;
+                        }
                         let mut side_filters = std::mem::take(&mut right_scoped);
-                        if right_scan_fetch.is_some() || join.join_type == JoinType::Full
-                        {
+                        if right_scan_fetch.is_some() || inputs_keep_predicates {
                             side_filters.append(&mut right_scan_filters);
                         }
                         self.derive_join_side(
@@ -2277,8 +2409,19 @@ impl Unparser<'_> {
                         &scoped_join_filter,
                         left_scan_filters,
                         right_scan_filters,
+                        inputs_keep_predicates,
                     )
                 };
+                // Every input walked above has now had its say; the flag was
+                // this join's to set only for that walk.
+                select.set_input_predicates_stay_scoped(inputs_kept_predicates_before);
+                if join.join_type == JoinType::Full
+                    && select.predicates_added() != predicates_added_before
+                {
+                    return internal_err!(
+                        "A FULL JOIN input contributed a predicate to the enclosing WHERE, which would discard the rows the join preserves"
+                    );
+                }
                 for filter in where_filters {
                     let filter_expr = self.expr_to_sql(&filter)?;
                     select.selection(Some(filter_expr));
@@ -2401,6 +2544,74 @@ impl Unparser<'_> {
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 let (plan, mut columns) =
                     subquery_alias_inner_query_and_columns(plan_alias);
+
+                // The `TableScan` arm's reasoning, reached through a plain
+                // alias: below a FULL JOIN's input, a scan that still carries
+                // its filters keeps them in a derived table of its own, since
+                // the enclosing query has no clause that would not discard the
+                // rows the join preserves. The pushdown rewrite below would
+                // materialize them as a `Filter` over the aliased scan, and the
+                // `Filter` arm refuses one here — so without this the alias
+                // turns a supported plan into `NotImplemented`.
+                //
+                // The derived table takes the alias's own name, which is what
+                // the enclosing scope already calls this input, so nothing
+                // above it rebinds. A column list means the alias renames the
+                // scan's outputs, which the derived table cannot express here;
+                // those keep the rewrite, and the refusal.
+                //
+                // A filter holding a subquery is refused outright: the rebase
+                // below cannot descend into the subquery's plan, so a
+                // reference it makes to the scan's own table would be
+                // shadowed by the alias and bind to nothing (the join arm
+                // raises the same refusal for a side it reaches directly).
+                let scoped_alias_over_a_scan = columns.is_empty()
+                    && select.already_projected()
+                    && select.input_predicates_stay_scoped();
+                if scoped_alias_over_a_scan
+                    && let LogicalPlan::TableScan(scan) = plan
+                    && scan.filters.iter().any(expr_contains_subquery)
+                {
+                    return not_impl_err!("{ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED}");
+                }
+
+                if scoped_alias_over_a_scan
+                    && let LogicalPlan::TableScan(scan) = plan
+                    && (!scan.filters.is_empty() || scan.fetch.is_some())
+                {
+                    let clean = LogicalPlanBuilder::scan(
+                        scan.table_name.clone(),
+                        Arc::clone(&scan.source),
+                        scan.projection.clone(),
+                    )?
+                    .alias(plan_alias.alias.clone())?
+                    .build()?;
+
+                    // The filters still name the scan's own table, which the
+                    // alias shadows inside the derived table — `FROM a AS s`
+                    // leaves `a.id` unaddressable. Rebase them onto the alias,
+                    // as the pushdown rewrite does for the same reason.
+                    let table_schema = scan.source.schema();
+                    let mut filter_alias_rewriter = TableAliasRewriter {
+                        table_schema: &table_schema,
+                        alias_name: plan_alias.alias.clone(),
+                    };
+                    let filters = scan
+                        .filters
+                        .iter()
+                        .cloned()
+                        .map(|expr| expr.rewrite(&mut filter_alias_rewriter).data())
+                        .collect::<Result<Vec<_>>>()?;
+
+                    return self.derive_join_side(
+                        &clean,
+                        filters.clone(),
+                        &filters,
+                        scan.fetch,
+                        relation,
+                    );
+                }
+
                 let unparsed_table_scan = self.unparse_table_scan_pushdown(
                     plan,
                     Some(plan_alias.alias.clone()),
@@ -4860,12 +5071,16 @@ impl Unparser<'_> {
     /// than in `WHERE`. Filters routed to `ON` are AND-folded onto the join's
     /// own filter.
     ///
+    /// `enclosed_by_full_join` says the enclosing `WHERE` belongs to a
+    /// `FULL JOIN` this join is an input of, so nothing may move there.
+    ///
     /// Returns `(on_filter, where_filters)`.
     fn split_join_on_and_where_filters(
         join_type: JoinType,
         join_filter: &Option<Expr>,
         left_scan_filters: Vec<Expr>,
         right_scan_filters: Vec<Expr>,
+        enclosed_by_full_join: bool,
     ) -> (Option<Expr>, Vec<Expr>) {
         // Which clause preserves a filter's meaning depends on the side it came
         // from:
@@ -4881,12 +5096,17 @@ impl Unparser<'_> {
         //   side's filter; only a derived table does. The caller isolates a
         //   `FULL JOIN`'s filtered side in one before reaching this function,
         //   so `left_scan_filters`/`right_scan_filters` are always empty here.
+        //   The same holds for every join below a `FULL JOIN`'s input: its
+        //   `WHERE` is the `FULL JOIN`'s, so the caller has already isolated
+        //   its scans' filters too, and its own `ON` stays whole — an inner
+        //   join's `ON` and `WHERE` are equivalent only within the scope that
+        //   holds both.
         // A subquery inside `ON` is refused outright by some dialects. Where `ON`
         // and `WHERE` are equivalent the conjunct carrying it can move; where they
         // are not — an outer join preserves rows that `WHERE` would then discard —
         // it has to stay, and the dialect's own limit applies.
         let (join_filter, subquery_filters) = match join_type {
-            JoinType::Inner => {
+            JoinType::Inner if !enclosed_by_full_join => {
                 let (kept, moved) = partition_subquery_filters(
                     join_filter
                         .iter()
