@@ -7324,9 +7324,11 @@ fn full_join_input_that_is_a_join_keeps_its_scan_filters_scoped() -> Result<()> 
 
 /// The predicate above a `FULL JOIN` stays in place while the join's inputs are
 /// walked: a row-limited input reads it to decide that it needs a scope of its
-/// own, and a mark join rewrites the mark it names in place. Taking it out for
-/// the walk would let the limit escape onto the enclosing query and leave the
-/// mark unbound.
+/// own. Taking it out for the walk would let the limit escape onto the
+/// enclosing query. A mark join as the input is refused instead: the `EXISTS`
+/// that would replace its mark is never NULL, but the mark is on a row the
+/// FULL JOIN null-extends, so a null-sensitive predicate above the join would
+/// answer differently.
 #[test]
 fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<()> {
     use datafusion_expr::JoinType::{Full, LeftMark, Right};
@@ -7365,18 +7367,26 @@ fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<
         @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a LIMIT 1) AS a RIGHT OUTER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE c.id IS NOT NULL"
     );
 
-    // A mark join's mark, read by the predicate above the FULL JOIN.
-    let marked = LogicalPlanBuilder::from(a)
-        .join(x, LeftMark, (vec!["a.id"], vec!["x.id"]), None)?
-        .build()?;
-    let plan = LogicalPlanBuilder::from(marked)
-        .join(c, Full, (vec!["a.id"], vec!["c.id"]), None)?
-        .filter(col("x.mark"))?
-        .build()?;
-    assert_snapshot!(
-        plan_to_sql(&plan)?,
-        @"SELECT a.id, c.id FROM a FULL JOIN c ON a.id = c.id WHERE EXISTS (SELECT 1 FROM x WHERE (a.id = x.id))"
-    );
+    // A mark join as the FULL JOIN's input is refused, whatever reads the
+    // mark: `WHERE x.mark` happens to treat NULL and FALSE alike, but
+    // `WHERE NOT x.mark` keeps a null-extended row in the plan (NOT NULL is
+    // NULL, dropped) and would keep it in SQL (NOT FALSE is TRUE), so the
+    // shape is refused before the predicate is looked at.
+    for predicate in [col("x.mark"), !col("x.mark"), col("x.mark").is_null()] {
+        let marked = LogicalPlanBuilder::from(a.clone())
+            .join(x.clone(), LeftMark, (vec!["a.id"], vec!["x.id"]), None)?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(marked)
+            .join(c.clone(), Full, (vec!["a.id"], vec!["c.id"]), None)?
+            .filter(predicate)?
+            .build()?;
+        let error = plan_to_sql(&plan)
+            .expect_err("a mark join as a FULL JOIN input must be refused");
+        assert_contains!(
+            error.to_string(),
+            "Unparsing a semi, anti or mark join as a FULL JOIN input is not supported"
+        );
+    }
 
     Ok(())
 }
@@ -7479,7 +7489,7 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
     let error = plan_to_sql(&plan).expect_err("the EXISTS has no clause");
     assert_contains!(
         error.to_string(),
-        "semi or anti join as a FULL JOIN input is not supported"
+        "semi, anti or mark join as a FULL JOIN input is not supported"
     );
 
     Ok(())

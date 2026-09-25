@@ -2184,10 +2184,12 @@ impl Unparser<'_> {
                     enclosed_by_full_join || join.join_type == JoinType::Full;
                 // A semi or anti join filters its probe side with a predicate
                 // that goes to the shared `WHERE`, which below a FULL JOIN is
-                // the clause that discards the rows the join preserves. Mark
-                // joins are excluded: their `EXISTS` replaces the mark column
-                // where the enclosing query already reads it, and adds no
-                // predicate of its own.
+                // the clause that discards the rows the join preserves. A mark
+                // join is refused too: its `EXISTS` replaces the mark column
+                // where the enclosing query reads it, and `EXISTS` is never
+                // NULL — but the mark is, on a row the FULL JOIN null-extends,
+                // so `NOT x.mark` or `x.mark IS NULL` above the FULL JOIN would
+                // keep or drop that row differently from the plan.
                 if enclosed_by_full_join
                     && matches!(
                         join.join_type,
@@ -2195,10 +2197,12 @@ impl Unparser<'_> {
                             | JoinType::LeftAnti
                             | JoinType::RightSemi
                             | JoinType::RightAnti
+                            | JoinType::LeftMark
+                            | JoinType::RightMark
                     )
                 {
                     return not_impl_err!(
-                        "Unparsing a semi or anti join as a FULL JOIN input is not supported"
+                        "Unparsing a semi, anti or mark join as a FULL JOIN input is not supported"
                     );
                 }
                 let inputs_kept_predicates_before =
