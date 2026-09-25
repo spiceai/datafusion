@@ -1633,6 +1633,31 @@ impl Unparser<'_> {
     ) -> Result<()> {
         match plan {
             LogicalPlan::TableScan(scan) => {
+                // Below a FULL JOIN's input, a scan reached with its filters
+                // still on it — through a projection the join walk could not
+                // see past, which is already folded into this SELECT — keeps
+                // them in a derived table of its own, as the join derives a
+                // bare filtered input. The pushdown rewrite would materialize
+                // them as a `Filter` above, and there they have no clause.
+                // The folded projection still names the scan, and the derived
+                // table takes the scan's name, so nothing above it rebinds.
+                if select.input_predicates_stay_scoped()
+                    && (!scan.filters.is_empty() || scan.fetch.is_some())
+                {
+                    let clean = LogicalPlanBuilder::scan(
+                        scan.table_name.clone(),
+                        Arc::clone(&scan.source),
+                        scan.projection.clone(),
+                    )?
+                    .build()?;
+                    return self.derive_join_side(
+                        &clean,
+                        scan.filters.clone(),
+                        &scan.filters,
+                        scan.fetch,
+                        relation,
+                    );
+                }
                 if let Some(unparsed_table_scan) = self.unparse_table_scan_pushdown(
                     plan,
                     None,

@@ -7270,6 +7270,35 @@ fn full_join_input_that_is_a_join_keeps_its_scan_filters_scoped() -> Result<()> 
         @"SELECT a.id, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE (c.id = 'y')"
     );
 
+    // A projection the join walk cannot see past, over a filtered scan: the
+    // projection is folded into the query and the scan keeps its filters in a
+    // derived table of its own, directly under the FULL JOIN and inside a
+    // nested join alike.
+    let projected = |name: &str| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(filtered(name)?)
+            .project(vec![
+                col(format!("{name}.id")),
+                col(format!("{name}.id")).is_not_null().alias("present"),
+            ])?
+            .build()
+    };
+    let plan = join(projected("a")?, plain("c")?, Full, "a.id", "c.id")?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, a.id IS NOT NULL AS present, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a FULL JOIN c ON a.id = c.id"
+    );
+    let plan = join(
+        join(projected("a")?, plain("b")?, Inner, "a.id", "b.id")?,
+        plain("c")?,
+        Full,
+        "a.id",
+        "c.id",
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, a.id IS NOT NULL AS present, b.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x')) AS a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id"
+    );
+
     // Once the FULL JOIN's inputs are walked, a sibling join above it routes
     // its scan filters as it always did.
     let plan = join(
