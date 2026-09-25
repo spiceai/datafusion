@@ -4714,7 +4714,137 @@ impl Unparser<'_> {
                 "Unparsing an EXISTS-style join is not supported when a FROM the emitted SQL introduces would capture the correlation: it answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, or is a relation this unparser cannot read at all, so the reference binds there instead of in the query it was written against"
             );
         }
+
+        // The mirror image, asked of the other half of each pair: a reference
+        // meant for the inside of the body escaping outward.
+        for build_half in join
+            .on
+            .iter()
+            .map(|(left, right)| if swapped { left } else { right })
+        {
+            if !self.build_half_binds_inside(build_half, &build_scope, build_plan)? {
+                return not_impl_err!(
+                    "Unparsing an EXISTS-style join is not supported when a build-side join key names an output only the build side's projection binds: `SELECT 1` replaces that projection, so the key would bind outside the subquery instead of in the body it was written against"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Whether every column a build-half join key names still binds inside the
+    /// emitted `EXISTS` body.
+    ///
+    /// [`Self::build_exists_subquery`] replaces the build side's projection with
+    /// `SELECT 1`. A key that only that projection bound — an output qualified
+    /// with a relation the build side does not scan, or named something the
+    /// relation it is qualified with does not have — then has nothing left to
+    /// bind to inside the body. It binds outward instead, to whatever answers
+    /// to it: on the plan spiceai/spiceai#13493 reports, the outer query, so
+    /// both halves of the pair name the outer row and the comparison is a
+    /// tautology. A semi join then keeps every probe row and an anti join drops
+    /// them all, in valid SQL the engine runs without complaint.
+    ///
+    /// [`Self::ensure_exists_correlation_not_shadowed`] deliberately tests only
+    /// the correlated half of each pair — a build half naming a build relation
+    /// binds inside on purpose — so this asks the opposite question of the other
+    /// half, and only where the answer is provable from the plan:
+    ///
+    /// * a qualifier the emitted `FROM` does not introduce at all, by
+    ///   [`Self::scope_answers`], which over-collects — so a doubtful qualifier
+    ///   is kept, not refused;
+    /// * a qualifier that names a scan or an alias in the build plan, none of
+    ///   which has the column. A scan emitted bare answers to every column its
+    ///   source has; an alias pushed down onto a scan answers to that scan's
+    ///   columns, its renames having been lifted into the select list `SELECT 1`
+    ///   replaces, and any other alias to its own schema. A name in none of
+    ///   those was the projection's.
+    ///
+    /// An unqualified key is kept: the names the body answers to include the
+    /// build side's own output names, which are exactly the ones `SELECT 1`
+    /// erases, and telling those apart needs the emitted `FROM` rather than a
+    /// reading of the plan (spiceai/spiceai#13469). So is a key under an
+    /// unreadable scope, where nothing is provable.
+    fn build_half_binds_inside(
+        &self,
+        build_half: &Expr,
+        build_scope: &EmittedScope,
+        build_plan: &LogicalPlan,
+    ) -> Result<bool> {
+        let EmittedScope::Readable { exposed, .. } = build_scope else {
+            return Ok(true);
+        };
+        for column in build_half.column_refs() {
+            let Some(relation) = column.relation.as_ref() else {
+                continue;
+            };
+            if !self.scope_answers(build_scope, column)? {
+                return Ok(false);
+            }
+            // The relation is introduced; whether it has the column is only
+            // knowable where the emitted `FROM` presents the plan's own names.
+            if exposed.is_none() {
+                continue;
+            }
+            let qualifier = self.emitted_qualifier_key(relation);
+            let mut found_relation = false;
+            let mut has_column = false;
+            let mut pending = vec![build_plan];
+            while let Some(node) = pending.pop() {
+                match node {
+                    LogicalPlan::TableScan(scan) => {
+                        let emitted = self.emitted_qualifier_key(&scan.table_name);
+                        let bare = emitted.last().map(|bare| vec![bare.clone()]);
+                        if emitted == qualifier || bare.as_ref() == Some(&qualifier) {
+                            found_relation = true;
+                            let mut columns = HashSet::new();
+                            self.expose_columns(&mut columns, &scan.source.schema())?;
+                            has_column |=
+                                columns.contains(&self.emitted_column_key(&column.name)?);
+                        }
+                    }
+                    // An alias replaces the names it encloses. What its
+                    // derived table answers to depends on how the alias is
+                    // emitted: pushed down onto a scan it wraps through
+                    // projections and filters, the derived table exposes the
+                    // scan's own columns and the projection's renames land in
+                    // the select list above it — which `SELECT 1` replaces.
+                    // Anything else keeps its projection inside the derived
+                    // table, so the alias's schema is what it answers to.
+                    LogicalPlan::SubqueryAlias(alias) => {
+                        if qualifier
+                            != vec![self.identifier_comparison_key(alias.alias.table())]
+                        {
+                            continue;
+                        }
+                        found_relation = true;
+                        let mut wrapped = alias.input.as_ref();
+                        let schema = loop {
+                            match wrapped {
+                                LogicalPlan::Projection(projection) => {
+                                    wrapped = projection.input.as_ref();
+                                }
+                                LogicalPlan::Filter(filter) => {
+                                    wrapped = filter.input.as_ref();
+                                }
+                                LogicalPlan::TableScan(scan) => {
+                                    break scan.source.schema();
+                                }
+                                _ => break Arc::clone(alias.schema.inner()),
+                            }
+                        };
+                        let mut columns = HashSet::new();
+                        self.expose_columns(&mut columns, &schema)?;
+                        has_column |=
+                            columns.contains(&self.emitted_column_key(&column.name)?);
+                    }
+                    _ => pending.extend(node.inputs()),
+                }
+            }
+            if found_relation && !has_column {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// The name a scope around the `EXISTS` build side has to answer to, so the

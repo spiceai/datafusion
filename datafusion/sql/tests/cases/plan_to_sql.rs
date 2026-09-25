@@ -4855,6 +4855,116 @@ fn test_unparse_left_semi_join_keeps_build_side_key_on_shared_relation() -> Resu
     Ok(())
 }
 
+/// The mirror of the capture refusals: a build-half key that only the build
+/// side's projection bound, which `SELECT 1` erases.
+///
+/// The build side outputs `p.c` — `b.x` aliased under the probe's qualifier — so
+/// the plan is valid and the key pair is `(p.c, p.c)`. Emitted, the body would be
+/// `SELECT 1 FROM "b" WHERE ("p"."c" = "p"."c")`: neither half names `b`, both
+/// bind to the outer `p`, and a semi join keeps every probe row with a non-null
+/// `c` whenever `b` has a row at all, an anti join none. Before this was caught
+/// the plan unparsed to exactly that.
+#[test]
+fn test_unparse_exists_join_refuses_build_key_bound_only_by_the_build_projection()
+-> Result<()> {
+    use datafusion_expr::JoinType::{LeftAnti, LeftMark, LeftSemi, RightSemi};
+    let probe =
+        table_scan(Some("p"), &int32_schema(&["c", "d"]), Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x").alias_qualified(Some("p"), "c")])?
+        .build()?;
+    let refused = |plan: &LogicalPlan, what: &str| {
+        let Err(error) = plan_to_sql(plan) else {
+            panic!("{what} must be refused");
+        };
+        assert_contains!(
+            error.to_string(),
+            "names an output only the build side's projection binds"
+        );
+    };
+    for join_type in [LeftSemi, LeftAnti, LeftMark] {
+        let plan = LogicalPlanBuilder::from(probe.clone())
+            .join(build.clone(), join_type, (vec!["p.c"], vec!["p.c"]), None)?
+            .build()?;
+        refused(&plan, &format!("{join_type:?}"));
+    }
+
+    // Swapped inputs: the build side is the left input.
+    let plan = LogicalPlanBuilder::from(build.clone())
+        .join(probe.clone(), RightSemi, (vec!["p.c"], vec!["p.c"]), None)?
+        .build()?;
+    refused(&plan, "RightSemi");
+
+    // A row bound on the build side names the body's scope after the key's
+    // qualifier — `p` — which then captures the probe half as well.
+    let bounded = LogicalPlanBuilder::from(build.clone())
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(bounded, LeftSemi, (vec!["p.c"], vec!["p.c"]), None)?
+        .build()?;
+    refused(&plan, "a bounded build side");
+
+    // A renamed output qualified with the build's own relation: `b.c` names a
+    // column `b` does not have, so it binds nowhere once the projection is gone.
+    let renamed = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x").alias_qualified(Some("b"), "c")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(renamed, LeftSemi, (vec!["p.c"], vec!["b.c"]), None)?
+        .build()?;
+    refused(&plan, "a rename under the build relation's own qualifier");
+
+    // An alias pushed down onto the scan it wraps lifts the rename into the
+    // select list — `SELECT s.x AS c FROM (SELECT s.x FROM b AS s) AS s` on its
+    // own — which is the list `SELECT 1` replaces, so `s.c` binds nowhere.
+    let aliased = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x").alias("c")])?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
+        .build()?;
+    refused(&plan, "a rename behind an alias pushed down onto the scan");
+
+    Ok(())
+}
+
+/// The keys the guard above must keep: a build half naming a column its relation
+/// has binds inside whatever the projection did, and one naming a column of the
+/// scan an alias is pushed down onto binds through the alias.
+#[test]
+fn test_unparse_exists_join_keeps_build_key_the_body_answers_to() -> Result<()> {
+    use datafusion_expr::JoinType::LeftSemi;
+    let probe =
+        table_scan(Some("p"), &int32_schema(&["c", "d"]), Some(vec![0, 1]))?.build()?;
+
+    let projected = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(projected, LeftSemi, (vec!["p.c"], vec!["b.x"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b WHERE (p.c = b.x))"
+    );
+
+    let aliased = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .filter(col("b.x").gt(lit(0)))?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.x"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b AS s WHERE (s.x > 0) AND (p.c = s.x))"
+    );
+
+    Ok(())
+}
+
 /// The same capture through `join.on` rather than `join.filter`.
 ///
 /// A shared-qualifier equality cannot be attributed to two sides, so
