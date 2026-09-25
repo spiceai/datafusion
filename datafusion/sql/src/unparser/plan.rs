@@ -734,21 +734,7 @@ impl Unparser<'_> {
         let mut twj = select_builder.pop_from().unwrap();
         twj.get_joins()
             .iter()
-            .for_each(|join| match &join.relation {
-                ast::TableFactor::Table { alias, name, .. } => {
-                    if let Some(alias) = alias {
-                        all_idents.push(alias.name.to_string());
-                    } else {
-                        all_idents.push(name.to_string());
-                    }
-                }
-                ast::TableFactor::Derived {
-                    alias: Some(alias), ..
-                } => {
-                    all_idents.push(alias.name.to_string());
-                }
-                _ => {}
-            });
+            .for_each(|join| Self::push_source_idents(&join.relation, &mut all_idents));
 
         twj.relation(relation_builder);
         select_builder.push_from(twj);
@@ -787,6 +773,41 @@ impl Unparser<'_> {
         select_builder.projection(projection);
 
         Ok(SetExpr::Select(Box::new(select_builder.build()?)))
+    }
+
+    /// The names a query source can be qualified by: a table's alias or name, a
+    /// derived table's alias, and every source inside a parenthesised joined
+    /// table — a join that is another join's right input keeps its own sources,
+    /// which the enclosing query's column references still name.
+    fn push_source_idents(relation: &ast::TableFactor, all_idents: &mut Vec<String>) {
+        match relation {
+            ast::TableFactor::Table { alias, name, .. } => {
+                if let Some(alias) = alias {
+                    all_idents.push(alias.name.to_string());
+                } else {
+                    all_idents.push(name.to_string());
+                }
+            }
+            ast::TableFactor::Derived {
+                alias: Some(alias), ..
+            } => {
+                all_idents.push(alias.name.to_string());
+            }
+            ast::TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                if let Some(alias) = alias {
+                    all_idents.push(alias.name.to_string());
+                } else {
+                    Self::push_source_idents(&table_with_joins.relation, all_idents);
+                    for join in &table_with_joins.joins {
+                        Self::push_source_idents(&join.relation, all_idents);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Reconstructs a SELECT SQL statement from a logical plan by unprojecting column expressions
@@ -2105,6 +2126,12 @@ impl Unparser<'_> {
                 // In that case, we don't need to worry about setting up the projection here.
                 // The outer projection plan will handle projecting the correct columns.
                 let already_projected = select.already_projected();
+                // A join that is another join's right input is a joined table
+                // of its own on that join's right, not a further entry in
+                // the shared `FROM` — whose last entry is the enclosing
+                // join's left side, so appending there would put this join's
+                // right side before the relation it joins to (#14373).
+                let is_right_join_input = select.in_right_join_input();
 
                 let mut left_scan_fetch = None;
                 let mut left_scan_only_filters = vec![];
@@ -2237,12 +2264,15 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
-                    self.select_to_sql_recursively(
+                    select.enter_right_join_input();
+                    let walked = self.select_to_sql_recursively(
                         right_plan.as_ref(),
                         query,
                         select,
                         &mut right_relation,
-                    )?;
+                    );
+                    select.leave_right_join_input();
+                    walked?;
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full
                             && !right_scan_filters.is_empty())
@@ -2366,18 +2396,33 @@ impl Unparser<'_> {
                     | JoinType::Left
                     | JoinType::Right
                     | JoinType::Full => {
-                        let Ok(Some(relation)) = right_relation.build() else {
+                        let Ok(Some(right_factor)) = right_relation.build() else {
                             return internal_err!("Failed to build right relation");
                         };
                         let ast_join = ast::Join {
-                            relation,
+                            relation: right_factor,
                             global: false,
                             join_operator: self
                                 .join_operator_to_sql(join.join_type, join_constraint)?,
                         };
-                        let mut from = select.pop_from().unwrap();
-                        from.push_join(ast_join);
-                        select.push_from(from);
+                        if is_right_join_input {
+                            // This join's own left side was walked into the
+                            // relation the enclosing join handed down; the
+                            // joined table replaces it there, in parentheses.
+                            let Ok(Some(left_side)) = relation.build() else {
+                                return internal_err!(
+                                    "Failed to build the left relation of a nested join"
+                                );
+                            };
+                            relation.nested_join(ast::TableWithJoins {
+                                relation: left_side,
+                                joins: vec![ast_join],
+                            });
+                        } else {
+                            let mut from = select.pop_from().unwrap();
+                            from.push_join(ast_join);
+                            select.push_from(from);
+                        }
                         if !already_projected {
                             let Some(left_projection) = left_projection else {
                                 return internal_err!("Left projection is missing");

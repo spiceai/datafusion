@@ -12849,3 +12849,54 @@ fn test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date() -> Re
     );
     Ok(())
 }
+
+/// A join that is the right input of another join keeps its own shape: it is
+/// a parenthesised joined table on the right of the outer join, with its own
+/// `ON`, and `b` is in scope where the outer `ON` names it. Linearising it
+/// into the outer `FROM` put the nested join's right side before the relation
+/// it joins to (`FROM a INNER JOIN c ON b.id = c.id FULL JOIN b …`), which
+/// `PostgreSQL` and `DuckDB` reject as an unbound `b` (spiceai/spiceai#14373).
+#[test]
+fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, Inner};
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let nested = |join_type| -> Result<LogicalPlan> {
+        let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+        let b = table_scan_with_filters(
+            Some("b"),
+            &schema,
+            Some(vec![0]),
+            vec![col("b.id").eq(lit("x"))],
+        )?
+        .build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let inner = LogicalPlanBuilder::from(b)
+            .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()?;
+        LogicalPlanBuilder::from(a)
+            .join(inner, join_type, (vec!["a.id"], vec!["b.id"]), None)?
+            .build()
+    };
+
+    assert_snapshot!(
+        plan_to_sql(&nested(Inner)?)?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id WHERE (b.id = 'x')"
+    );
+
+    // The same right-nested shape under a FULL JOIN, without a scan filter (a
+    // FULL JOIN input's filters have their own scoping, out of scope here).
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let inner = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .join(inner, Full, (vec!["a.id"], vec!["b.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM a FULL JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id"
+    );
+    Ok(())
+}

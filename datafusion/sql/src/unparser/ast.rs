@@ -231,6 +231,14 @@ pub struct SelectBuilder {
     ///
     /// Set with `mark_aggregated()` and read with `already_aggregated()`.
     aggregated: bool,
+    /// How many joins' *right* inputs the walk is currently inside. A join
+    /// reached there cannot append itself to this SELECT's `FROM`, whose
+    /// last entry is the enclosing join's left side: it is a joined table of
+    /// its own, parenthesised on the enclosing join's right.
+    ///
+    /// Entered with `enter_right_join_input()`, left with
+    /// `leave_right_join_input()`, read with `in_right_join_input()`.
+    right_join_inputs: usize,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -363,6 +371,17 @@ impl SelectBuilder {
     /// Returns true if an aggregate node has already been folded into this SELECT.
     pub fn already_aggregated(&self) -> bool {
         self.aggregated
+    }
+    /// Whether the walk is inside some join's right input (see
+    /// `right_join_inputs`).
+    pub fn in_right_join_input(&self) -> bool {
+        self.right_join_inputs > 0
+    }
+    pub fn enter_right_join_input(&mut self) {
+        self.right_join_inputs += 1;
+    }
+    pub fn leave_right_join_input(&mut self) {
+        self.right_join_inputs = self.right_join_inputs.saturating_sub(1);
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -672,6 +691,7 @@ impl SelectBuilder {
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             aggregated: false,
+            right_join_inputs: 0,
         }
     }
 }
@@ -746,6 +766,9 @@ enum TableFactorBuilder {
     Derived(DerivedRelationBuilder),
     Unnest(UnnestRelationBuilder),
     Flatten(FlattenRelationBuilder),
+    /// A joined table in parentheses: a join that is another join's right
+    /// input, built in full by the arm that walked it, and its alias.
+    NestedJoin(ast::TableWithJoins, Option<ast::TableAlias>),
     Empty,
 }
 
@@ -791,6 +814,11 @@ impl RelationBuilder {
         self
     }
 
+    pub fn nested_join(&mut self, value: ast::TableWithJoins) -> &mut Self {
+        self.relation = Some(TableFactorBuilder::NestedJoin(value, None));
+        self
+    }
+
     pub fn empty(&mut self) -> &mut Self {
         self.relation = Some(TableFactorBuilder::Empty);
         self
@@ -807,6 +835,9 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Unnest(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
+            Some(TableFactorBuilder::NestedJoin(_, ref mut alias)) => {
+                *alias = value;
+            }
             Some(TableFactorBuilder::Flatten(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
@@ -821,6 +852,12 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Derived(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Unnest(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Flatten(ref value)) => Some(value.build()?),
+            Some(TableFactorBuilder::NestedJoin(ref value, ref alias)) => {
+                Some(ast::TableFactor::NestedJoin {
+                    table_with_joins: Box::new(value.clone()),
+                    alias: alias.clone(),
+                })
+            }
             Some(TableFactorBuilder::Empty) => None,
             None => return Err(Into::into(UninitializedFieldError::from("relation"))),
         })
