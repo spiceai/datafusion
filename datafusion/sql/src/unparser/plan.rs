@@ -4790,17 +4790,14 @@ impl Unparser<'_> {
             let mut has_column = false;
             let mut pending = vec![build_plan];
             while let Some(node) = pending.pop() {
-                match node {
+                let schema = match node {
                     LogicalPlan::TableScan(scan) => {
                         let emitted = self.emitted_qualifier_key(&scan.table_name);
                         let bare = emitted.last().map(|bare| vec![bare.clone()]);
-                        if emitted == qualifier || bare.as_ref() == Some(&qualifier) {
-                            found_relation = true;
-                            let mut columns = HashSet::new();
-                            self.expose_columns(&mut columns, &scan.source.schema())?;
-                            has_column |=
-                                columns.contains(&self.emitted_column_key(&column.name)?);
+                        if emitted != qualifier && bare.as_ref() != Some(&qualifier) {
+                            continue;
                         }
+                        scan.source.schema()
                     }
                     // An alias replaces the names it encloses. What its
                     // derived table answers to depends on how the alias is
@@ -4816,18 +4813,20 @@ impl Unparser<'_> {
                         {
                             continue;
                         }
-                        found_relation = true;
-                        let schema = match Self::scan_an_alias_is_pushed_onto(alias) {
+                        match Self::scan_an_alias_is_pushed_onto(alias) {
                             Some(scan) => scan.source.schema(),
                             None => Arc::clone(alias.schema.inner()),
-                        };
-                        let mut columns = HashSet::new();
-                        self.expose_columns(&mut columns, &schema)?;
-                        has_column |=
-                            columns.contains(&self.emitted_column_key(&column.name)?);
+                        }
                     }
-                    _ => pending.extend(node.inputs()),
-                }
+                    _ => {
+                        pending.extend(node.inputs());
+                        continue;
+                    }
+                };
+                found_relation = true;
+                let mut columns = HashSet::new();
+                self.expose_columns(&mut columns, &schema)?;
+                has_column |= columns.contains(&self.emitted_column_key(&column.name)?);
             }
             if found_relation && !has_column {
                 return Ok(false);
