@@ -1641,7 +1641,12 @@ impl Unparser<'_> {
                 // them as a `Filter` above, and there they have no clause.
                 // The folded projection still names the scan, and the derived
                 // table takes the scan's name, so nothing above it rebinds.
-                if select.input_predicates_stay_scoped()
+                // Only once the select list is taken: it is the folded
+                // projection that lists this scan's columns, and without one
+                // the pushdown rewrite below is what would list them — a scan
+                // reached some other way keeps the rewrite, and the refusal.
+                if select.already_projected()
+                    && select.input_predicates_stay_scoped()
                     && (!scan.filters.is_empty() || scan.fetch.is_some())
                 {
                     let clean = LogicalPlanBuilder::scan(

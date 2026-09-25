@@ -7449,6 +7449,26 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
         "predicate on a FULL JOIN input that is not applied by one of its table scans"
     );
 
+    // A filtered scan reached through a row limit rather than a projection,
+    // with no select list taken: nothing lists the scan's columns for a
+    // derived table, so the filters keep the pushdown rewrite and the refusal.
+    let limited = table_scan_with_filters(
+        Some("a"),
+        &schema,
+        Some(vec![0]),
+        vec![col("a.id").eq(lit("x"))],
+    )?
+    .limit(0, Some(1))?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(limited)
+        .join(c.clone(), Full, (vec!["a.id"], vec!["c.id"]), None)?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err("the scan's columns are unlisted");
+    assert_contains!(
+        error.to_string(),
+        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+    );
+
     // A semi join's EXISTS is a predicate on the enclosing WHERE.
     let semi = LogicalPlanBuilder::from(a)
         .join(x, LeftSemi, (vec!["a.id"], vec!["x.id"]), None)?
