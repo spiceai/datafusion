@@ -2145,12 +2145,10 @@ impl Unparser<'_> {
                 // What a FULL JOIN's inputs contribute to `WHERE` is checked
                 // once both are walked; anything at all is a predicate the
                 // rules above failed to keep scoped. The predicate already
-                // there came from above this join and stays.
-                let selection_above_full_join = if join.join_type == JoinType::Full {
-                    select.take_selection()
-                } else {
-                    None
-                };
+                // there came from above this join and stays in place — a
+                // row-limited input reads it to decide whether it needs a
+                // scope of its own, and a mark join rewrites it in place.
+                let predicates_added_before = select.predicates_added();
                 // If there's an outer projection plan, it will already set up the projection.
                 // In that case, we don't need to worry about setting up the projection here.
                 // The outer projection plan will handle projecting the correct columns.
@@ -2230,7 +2228,7 @@ impl Unparser<'_> {
 
                 let hoisted_from_left = if left_is_null_extended {
                     let contributed = select.take_selection();
-                    select.selection(outer_selection);
+                    select.restore_selection(outer_selection);
                     contributed
                 } else {
                     None
@@ -2333,13 +2331,12 @@ impl Unparser<'_> {
                 // Every input walked above has now had its say; the flag was
                 // this join's to set only for that walk.
                 select.set_input_predicates_stay_scoped(inputs_kept_predicates_before);
-                if join.join_type == JoinType::Full {
-                    if let Some(leaked) = select.take_selection() {
-                        return internal_err!(
-                            "A FULL JOIN input contributed a predicate to the enclosing WHERE, which would discard the rows the join preserves: {leaked}"
-                        );
-                    }
-                    select.selection(selection_above_full_join);
+                if join.join_type == JoinType::Full
+                    && select.predicates_added() != predicates_added_before
+                {
+                    return internal_err!(
+                        "A FULL JOIN input contributed a predicate to the enclosing WHERE, which would discard the rows the join preserves"
+                    );
                 }
                 for filter in where_filters {
                     let filter_expr = self.expr_to_sql(&filter)?;

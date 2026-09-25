@@ -246,6 +246,12 @@ pub struct SelectBuilder {
     /// Set with `set_input_predicates_stay_scoped()` and read with
     /// `input_predicates_stay_scoped()`.
     input_predicates_stay_scoped: bool,
+    /// How many predicates have been added to this SELECT's `WHERE` through
+    /// `selection()`. A caller that must know whether a sub-plan contributed
+    /// a predicate compares this before and after walking it, which leaves
+    /// the predicate already there in place — taking it out would change
+    /// what the walk sees.
+    predicates_added: usize,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -501,6 +507,25 @@ impl SelectBuilder {
     }
 
     pub fn selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
+        if value.is_some() {
+            self.predicates_added += 1;
+        }
+        self.and_selection(value)
+    }
+
+    /// Puts back a predicate that `take_selection()` removed. It is combined
+    /// like any other, but not counted by `predicates_added()`: it is the
+    /// predicate that was already there, not a contribution.
+    pub fn restore_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
+        self.and_selection(value)
+    }
+
+    /// How many predicates `selection()` has added to this SELECT so far.
+    pub fn predicates_added(&self) -> usize {
+        self.predicates_added
+    }
+
+    fn and_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
         // With filter pushdown optimization, the LogicalPlan can have filters defined as part of `TableScan` and `Filter` nodes.
         // To avoid overwriting one of the filters, we combine the existing filter with the additional filter.
         // Example:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -701,6 +726,7 @@ impl SelectBuilder {
             flatten_table_aliases: Vec::new(),
             aggregated: false,
             input_predicates_stay_scoped: false,
+            predicates_added: 0,
         }
     }
 }

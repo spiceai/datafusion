@@ -7293,6 +7293,64 @@ fn full_join_input_that_is_a_join_keeps_its_scan_filters_scoped() -> Result<()> 
     Ok(())
 }
 
+/// The predicate above a `FULL JOIN` stays in place while the join's inputs are
+/// walked: a row-limited input reads it to decide that it needs a scope of its
+/// own, and a mark join rewrites the mark it names in place. Taking it out for
+/// the walk would let the limit escape onto the enclosing query and leave the
+/// mark unbound.
+#[test]
+fn full_join_leaves_the_enclosing_predicate_in_place_for_its_inputs() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, true)]);
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let x = table_scan(Some("x"), &schema, Some(vec![0]))?.build()?;
+
+    // A limited input, and a predicate above the join, with no projection to
+    // force the limit into a scope of its own.
+    let limited = LogicalPlanBuilder::from(a.clone())
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(limited)
+        .join(
+            b,
+            datafusion_expr::JoinType::Full,
+            (vec!["a.id"], vec!["b.id"]),
+            None,
+        )?
+        .filter(col("b.id").is_not_null())?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id FROM (SELECT a.id FROM a LIMIT 1) AS a FULL JOIN b ON a.id = b.id WHERE b.id IS NOT NULL"
+    );
+
+    // A mark join's mark, read by the predicate above the FULL JOIN.
+    let marked = LogicalPlanBuilder::from(a)
+        .join(
+            x,
+            datafusion_expr::JoinType::LeftMark,
+            (vec!["a.id"], vec!["x.id"]),
+            None,
+        )?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(marked)
+        .join(
+            c,
+            datafusion_expr::JoinType::Full,
+            (vec!["a.id"], vec!["c.id"]),
+            None,
+        )?
+        .filter(col("x.mark"))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, c.id FROM a FULL JOIN c ON a.id = c.id WHERE EXISTS (SELECT 1 FROM x WHERE (a.id = x.id))"
+    );
+
+    Ok(())
+}
+
 /// A nested inner join's `ON` and `WHERE` are interchangeable only within the
 /// scope holding both. Below a `FULL JOIN` the `WHERE` is the `FULL JOIN`'s, so
 /// a conjunct carrying a subquery, which an inner join would otherwise move to
