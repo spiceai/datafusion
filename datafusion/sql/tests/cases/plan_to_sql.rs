@@ -7135,15 +7135,19 @@ fn test_join_filter_nested_under_null_extending_join() -> Result<()> {
     );
 
     // A FULL JOIN also null-extends its left input, but unlike a RIGHT JOIN it
-    // preserves that input. Hoisting the predicate into ON would therefore
-    // make filtered-out left rows reappear as unmatched rows. Keep the prior
-    // WHERE placement until FULL JOIN inputs can be emitted as derived tables.
-    assert_snapshot!(
-        nested_under_outer(
-            datafusion_expr::JoinType::Inner,
-            datafusion_expr::JoinType::Full,
-        )?,
-        @"SELECT a.id, b.id, c.id FROM a INNER JOIN b ON a.id = b.id FULL JOIN c ON a.id = c.id WHERE (a.id = 'x')"
+    // preserves that input. Hoisting the predicate into ON would make
+    // filtered-out left rows reappear as unmatched rows, and the prior WHERE
+    // placement discarded the right input's unmatched rows. Neither clause
+    // serves, so the shape is refused until FULL JOIN inputs are emitted as
+    // derived tables (spiceai/datafusion#231).
+    let error = nested_under_outer(
+        datafusion_expr::JoinType::Inner,
+        datafusion_expr::JoinType::Full,
+    )
+    .expect_err("a filtered nested join as a FULL JOIN input has no clause");
+    assert_contains!(
+        error.to_string(),
+        "FULL JOIN input that is a join with a predicate on its own inputs is not supported"
     );
 
     Ok(())
@@ -12918,6 +12922,44 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         error.to_string(),
         "FULL JOIN input that is a join with a predicate on its own inputs is not supported"
     );
+    // The same on the FULL JOIN's left, at the top and nested on a LEFT JOIN's
+    // right: neither may let the filter escape to the enclosing `WHERE` or
+    // `ON`.
+    let filtered_join_on_the_left = |outer: Option<LogicalPlan>| -> Result<LogicalPlan> {
+        let b = table_scan_with_filters(
+            Some("b"),
+            &schema,
+            Some(vec![0]),
+            vec![col("b.id").eq(lit("x"))],
+        )?
+        .build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let d = table_scan(Some("d"), &schema, Some(vec![0]))?.build()?;
+        let inner = LogicalPlanBuilder::from(b)
+            .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()?;
+        let full = LogicalPlanBuilder::from(inner)
+            .join(d, Full, (vec!["b.id"], vec!["d.id"]), None)?
+            .build()?;
+        match outer {
+            None => Ok(full),
+            Some(a) => LogicalPlanBuilder::from(a)
+                .join(full, Left, (vec!["a.id"], vec!["d.id"]), None)?
+                .build(),
+        }
+    };
+    for outer in [
+        None,
+        Some(table_scan(Some("a"), &schema, Some(vec![0]))?.build()?),
+    ] {
+        let error = plan_to_sql(&filtered_join_on_the_left(outer)?).expect_err(
+            "a filtered nested join as a FULL JOIN's left input has no clause",
+        );
+        assert_contains!(
+            error.to_string(),
+            "FULL JOIN input that is a join with a predicate on its own inputs is not supported"
+        );
+    }
 
     // A nested join whose scan filter holds a subquery contributes a conjunct
     // that some dialects refuse in `ON`, and `WHERE` is not this join's to

@@ -2169,8 +2169,13 @@ impl Unparser<'_> {
                 // mark join in this input rewrites the mark it produces wherever
                 // that predicate reads it — and what the walk adds is `AND`ed on
                 // after it, so it is told apart by position.
+                // A FULL JOIN preserves its left input as well, so a predicate a
+                // nested join there contributes has no clause either; it is
+                // watched the same way and refused.
                 let left_is_null_extended = matches!(join.join_type, JoinType::Right);
-                let outer_conjuncts_before_left = if left_is_null_extended {
+                let left_contribution_is_watched =
+                    left_is_null_extended || join.join_type == JoinType::Full;
+                let outer_conjuncts_before_left = if left_contribution_is_watched {
                     select.selection_conjunct_count()
                 } else {
                     0
@@ -2207,8 +2212,15 @@ impl Unparser<'_> {
                     )?;
                 }
 
-                let hoisted_from_left = if left_is_null_extended {
-                    select.take_selection_added_after(outer_conjuncts_before_left)
+                let hoisted_from_left = if left_contribution_is_watched {
+                    let contributed =
+                        select.take_selection_added_after(outer_conjuncts_before_left);
+                    if join.join_type == JoinType::Full && contributed.is_some() {
+                        return not_impl_err!(
+                            "Unparsing a FULL JOIN input that is a join with a predicate on its own inputs is not supported"
+                        );
+                    }
+                    contributed
                 } else {
                     None
                 };
