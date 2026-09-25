@@ -5002,12 +5002,36 @@ fn test_unparse_exists_join_keeps_build_key_the_body_answers_to() -> Result<()> 
         )?
         .alias("a")?
         .build()?;
-    let plan = LogicalPlanBuilder::from(probe)
+    let plan = LogicalPlanBuilder::from(probe.clone())
         .join(over_join, LeftSemi, (vec!["p.c"], vec!["a.k"]), None)?
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b AS a CROSS JOIN t WHERE (p.c = a.k))"
+    );
+
+    // A projection on the primary side of that join is emitted as a derived
+    // table the alias then renames, so the rename it makes is what `a` answers
+    // to.
+    let over_projected_join =
+        table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+            .project(vec![col("b.x").alias("c")])?
+            .cross_join(
+                table_scan(Some("t"), &int32_schema(&["y"]), Some(vec![0]))?.build()?,
+            )?
+            .alias("a")?
+            .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            over_projected_join,
+            LeftSemi,
+            (vec!["p.c"], vec!["a.c"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM (SELECT b.x AS c FROM b) AS a CROSS JOIN t WHERE (p.c = a.c))"
     );
 
     Ok(())

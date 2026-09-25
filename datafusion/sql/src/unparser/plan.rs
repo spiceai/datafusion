@@ -4881,7 +4881,12 @@ impl Unparser<'_> {
                     };
                 }
                 LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
-                LogicalPlan::Projection(projection) => node = projection.input.as_ref(),
+                // The alias arm takes the select list before it walks the
+                // join, so a projection met on the way is emitted as a derived
+                // table of its own, and it is that table the alias renames.
+                LogicalPlan::Projection(projection) => {
+                    return Some(Arc::clone(projection.schema.inner()));
+                }
                 LogicalPlan::TableScan(scan) => return Some(scan.source.schema()),
                 LogicalPlan::SubqueryAlias(inner) => {
                     return self.schema_an_alias_answers_to(inner);
