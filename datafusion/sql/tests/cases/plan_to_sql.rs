@@ -12904,6 +12904,26 @@ fn limit_join_input_is_derived_under_the_scans_name() -> Result<()> {
     Ok(())
 }
 
+/// A `Limit` with neither `fetch` nor `skip` bounds nothing, so as a join
+/// input it takes no scope of its own.
+#[test]
+fn no_op_limit_join_input_is_passed_through() -> Result<()> {
+    use datafusion_expr::JoinType::Inner;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?
+        .limit(0, None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT b.id, c.id FROM b INNER JOIN c ON b.id = c.id"
+    );
+    Ok(())
+}
+
 /// A limited scan that projects no columns, as a join input under a count:
 /// it keeps the dialect-alias derived table it had, `SELECT 1 FROM b LIMIT n`,
 /// which preserves the cardinality the count needs and names nothing.

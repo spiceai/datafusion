@@ -1882,7 +1882,9 @@ impl Unparser<'_> {
                 // derived table takes the scan's own name, which is what the
                 // join's `ON` and the select list already call this input
                 // (spiceai/spiceai#14375).
-                if select.in_join_input() {
+                if select.in_join_input()
+                    && (limit.fetch.is_some() || limit.skip.is_some())
+                {
                     return self.derive_join_input_limit(plan, select, relation);
                 }
                 // Limit can be top-level plan for derived table
