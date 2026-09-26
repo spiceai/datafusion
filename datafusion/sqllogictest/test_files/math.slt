@@ -896,22 +896,26 @@ physical_plan
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 
 # Non-nullable bases still use the existing simplifications
+statement ok
+CREATE TABLE non_nullable_log_power_bases (a DOUBLE NOT NULL, b DOUBLE NOT NULL) AS VALUES (2.0, 3.0);
+
 query TT
 EXPLAIN SELECT
   log(a, 1) AS l1,
   log(a, a) AS la,
   power(a, 0) AS p0,
   power(a, log(a, b)) AS pl
-FROM (VALUES (2.0::double, 3.0::double)) AS t(a, b);
+FROM non_nullable_log_power_bases;
 ----
 logical_plan
-01)Projection: Float64(0) AS l1, Float64(1) AS la, Float64(1) AS p0, t.b AS pl
-02)--SubqueryAlias: t
-03)----Projection: column2 AS b
-04)------Values: (Float64(2), Float64(3))
+01)Projection: Float64(0) AS l1, Float64(1) AS la, Float64(1) AS p0, non_nullable_log_power_bases.b AS pl
+02)--TableScan: non_nullable_log_power_bases projection=[b]
 physical_plan
-01)ProjectionExec: expr=[0 as l1, 1 as la, 1 as p0, column2@1 as pl]
+01)ProjectionExec: expr=[0 as l1, 1 as la, 1 as p0, b@0 as pl]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+statement ok
+DROP TABLE non_nullable_log_power_bases;
 
 # Float 16/32/64 for log
 query RT
