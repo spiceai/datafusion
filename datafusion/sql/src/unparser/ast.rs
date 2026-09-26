@@ -928,6 +928,7 @@ impl RelationBuilder {
 }
 /// The conjuncts of a `WHERE` predicate as `SelectBuilder::selection` builds
 /// it: an `AND` chain, nested to the left, in the order they were added.
+#[cfg_attr(feature = "recursive_protection", recursive::recursive)]
 fn split_selection_conjuncts(selection: ast::Expr) -> Vec<ast::Expr> {
     match selection {
         ast::Expr::BinaryOp {

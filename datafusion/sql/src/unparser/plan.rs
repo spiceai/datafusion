@@ -778,6 +778,7 @@ impl Unparser<'_> {
     /// Whether a join input is a joined table — a `Join`, possibly under the
     /// projections that only pick its columns and the filters over it — as
     /// opposed to one scan.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn is_joined_relation(plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::Join(_) => true,
@@ -795,6 +796,7 @@ impl Unparser<'_> {
     /// derived table's alias, and every source inside a parenthesised joined
     /// table — a join that is another join's right input keeps its own sources,
     /// which the enclosing query's column references still name.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
     fn push_source_idents(relation: &ast::TableFactor, all_idents: &mut Vec<String>) {
         match relation {
             ast::TableFactor::Table { alias, name, .. } => {
