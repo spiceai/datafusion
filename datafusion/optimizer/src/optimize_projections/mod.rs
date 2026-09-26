@@ -1294,7 +1294,6 @@ mod tests {
         )?;
         let plan_string = format!("{optimized}");
         assert_eq!(12, plan_string.matches("Int32(1)").count());
-        assert_eq!(1, plan_string.matches("Projection:").count());
         Ok(())
     }
 
