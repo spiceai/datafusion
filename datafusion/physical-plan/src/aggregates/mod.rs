@@ -2216,7 +2216,6 @@ pub fn evaluate_group_by(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::task::{Context, Poll};
 
     use super::*;
