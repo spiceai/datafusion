@@ -175,7 +175,7 @@ impl Default for QueryBuilder {
 }
 
 /// Returns true if `expr` holds a subquery anywhere within it.
-fn contains_subquery(expr: &ast::Expr) -> bool {
+pub(crate) fn contains_subquery(expr: &ast::Expr) -> bool {
     visit_expressions(expr, |expr| {
         if matches!(
             expr,
@@ -231,6 +231,24 @@ pub struct SelectBuilder {
     ///
     /// Set with `mark_aggregated()` and read with `already_aggregated()`.
     aggregated: bool,
+    /// How many joins' *right* inputs the walk is currently inside. A join
+    /// reached there cannot append itself to this SELECT's `FROM`, whose
+    /// last entry is the enclosing join's left side: it is a joined table of
+    /// its own, parenthesised on the enclosing join's right.
+    ///
+    /// Entered with `enter_right_join_input()`, left with
+    /// `leave_right_join_input()`, read with `in_right_join_input()`.
+    right_join_inputs: usize,
+    /// How many null-extended join inputs the walk is currently inside — a
+    /// LEFT JOIN's right input, a RIGHT JOIN's left, either of a FULL JOIN's.
+    /// A mark join reached there is refused: the `EXISTS` that would replace
+    /// its mark is never NULL, but the mark is on a row the outer join
+    /// null-extends, so a predicate above reading it would answer differently.
+    ///
+    /// Entered with `enter_null_extended_join_input()`, left with
+    /// `leave_null_extended_join_input()`, read with
+    /// `in_null_extended_join_input()`.
+    null_extended_join_inputs: usize,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -363,6 +381,28 @@ impl SelectBuilder {
     /// Returns true if an aggregate node has already been folded into this SELECT.
     pub fn already_aggregated(&self) -> bool {
         self.aggregated
+    }
+    /// Whether the walk is inside some join's right input (see
+    /// `right_join_inputs`).
+    pub fn in_right_join_input(&self) -> bool {
+        self.right_join_inputs > 0
+    }
+    pub fn enter_right_join_input(&mut self) {
+        self.right_join_inputs += 1;
+    }
+    pub fn leave_right_join_input(&mut self) {
+        self.right_join_inputs = self.right_join_inputs.saturating_sub(1);
+    }
+    /// Whether the walk is inside a join input the join null-extends (see
+    /// `null_extended_join_inputs`).
+    pub fn in_null_extended_join_input(&self) -> bool {
+        self.null_extended_join_inputs > 0
+    }
+    pub fn enter_null_extended_join_input(&mut self) {
+        self.null_extended_join_inputs += 1;
+    }
+    pub fn leave_null_extended_join_input(&mut self) {
+        self.null_extended_join_inputs = self.null_extended_join_inputs.saturating_sub(1);
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -521,6 +561,29 @@ impl SelectBuilder {
         self.selection.take()
     }
 
+    /// How many conjuncts the `WHERE` predicate accumulated so far has, counting
+    /// the way `selection()` joins them: a later predicate is `AND`ed onto the
+    /// right, so the first `n` conjuncts are always the ones that were there
+    /// first, whatever a later walk rewrote inside them.
+    pub fn selection_conjunct_count(&self) -> usize {
+        self.selection.as_ref().map_or(0, |selection| {
+            split_selection_conjuncts(selection.clone()).len()
+        })
+    }
+
+    /// Splits off what was `AND`ed onto the `WHERE` predicate after its first
+    /// `kept` conjuncts, leaving those in place — rewritten or not — and returning
+    /// the rest. Unlike `take_selection()` this leaves the predicate a sub-plan
+    /// may rewrite in place (a mark join replaces the mark column it produces
+    /// wherever the predicate reads it) where that sub-plan can reach it.
+    pub fn take_selection_added_after(&mut self, kept: usize) -> Option<ast::Expr> {
+        let selection = self.selection.take()?;
+        let mut conjuncts = split_selection_conjuncts(selection);
+        let added = conjuncts.split_off(kept.min(conjuncts.len()));
+        self.selection = join_selection_conjuncts(conjuncts);
+        join_selection_conjuncts(added)
+    }
+
     /// Applies `f` to every expression this SELECT carries: the projection, `WHERE`,
     /// `GROUP BY`, `HAVING`, `QUALIFY` and the builder's own sort. `f` sees nested
     /// expressions too, so a rewrite reaches a column reference wherever it sits.
@@ -672,6 +735,8 @@ impl SelectBuilder {
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             aggregated: false,
+            right_join_inputs: 0,
+            null_extended_join_inputs: 0,
         }
     }
 }
@@ -746,6 +811,9 @@ enum TableFactorBuilder {
     Derived(DerivedRelationBuilder),
     Unnest(UnnestRelationBuilder),
     Flatten(FlattenRelationBuilder),
+    /// A joined table in parentheses: a join that is another join's right
+    /// input, built in full by the arm that walked it, and its alias.
+    NestedJoin(ast::TableWithJoins, Option<ast::TableAlias>),
     Empty,
 }
 
@@ -791,6 +859,11 @@ impl RelationBuilder {
         self
     }
 
+    pub fn nested_join(&mut self, value: ast::TableWithJoins) -> &mut Self {
+        self.relation = Some(TableFactorBuilder::NestedJoin(value, None));
+        self
+    }
+
     pub fn empty(&mut self) -> &mut Self {
         self.relation = Some(TableFactorBuilder::Empty);
         self
@@ -807,6 +880,9 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Unnest(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
+            Some(TableFactorBuilder::NestedJoin(_, ref mut alias)) => {
+                *alias = value;
+            }
             Some(TableFactorBuilder::Flatten(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
@@ -821,6 +897,12 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Derived(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Unnest(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Flatten(ref value)) => Some(value.build()?),
+            Some(TableFactorBuilder::NestedJoin(ref value, ref alias)) => {
+                Some(ast::TableFactor::NestedJoin {
+                    table_with_joins: Box::new(value.clone()),
+                    alias: alias.clone(),
+                })
+            }
             Some(TableFactorBuilder::Empty) => None,
             None => return Err(Into::into(UninitializedFieldError::from("relation"))),
         })
@@ -844,6 +926,35 @@ impl RelationBuilder {
         }
     }
 }
+/// The conjuncts of a `WHERE` predicate as `SelectBuilder::selection` builds
+/// it: an `AND` chain, nested to the left, in the order they were added.
+#[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+fn split_selection_conjuncts(selection: ast::Expr) -> Vec<ast::Expr> {
+    match selection {
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::And,
+            right,
+        } => {
+            let mut conjuncts = split_selection_conjuncts(*left);
+            conjuncts.extend(split_selection_conjuncts(*right));
+            conjuncts
+        }
+        other => vec![other],
+    }
+}
+
+/// The inverse of [`split_selection_conjuncts`].
+fn join_selection_conjuncts(conjuncts: Vec<ast::Expr>) -> Option<ast::Expr> {
+    conjuncts
+        .into_iter()
+        .reduce(|left, right| ast::Expr::BinaryOp {
+            left: Box::new(left),
+            op: ast::BinaryOperator::And,
+            right: Box::new(right),
+        })
+}
+
 impl Default for RelationBuilder {
     fn default() -> Self {
         Self::create_empty()

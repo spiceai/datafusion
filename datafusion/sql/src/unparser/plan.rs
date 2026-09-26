@@ -734,21 +734,7 @@ impl Unparser<'_> {
         let mut twj = select_builder.pop_from().unwrap();
         twj.get_joins()
             .iter()
-            .for_each(|join| match &join.relation {
-                ast::TableFactor::Table { alias, name, .. } => {
-                    if let Some(alias) = alias {
-                        all_idents.push(alias.name.to_string());
-                    } else {
-                        all_idents.push(name.to_string());
-                    }
-                }
-                ast::TableFactor::Derived {
-                    alias: Some(alias), ..
-                } => {
-                    all_idents.push(alias.name.to_string());
-                }
-                _ => {}
-            });
+            .for_each(|join| Self::push_source_idents(&join.relation, &mut all_idents));
 
         twj.relation(relation_builder);
         select_builder.push_from(twj);
@@ -787,6 +773,59 @@ impl Unparser<'_> {
         select_builder.projection(projection);
 
         Ok(SetExpr::Select(Box::new(select_builder.build()?)))
+    }
+
+    /// Whether a join input is a joined table — a `Join`, possibly under the
+    /// projections that only pick its columns and the filters over it — as
+    /// opposed to one scan.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn is_joined_relation(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join(_) => true,
+            LogicalPlan::Projection(projection) => {
+                Self::is_joined_relation(projection.input.as_ref())
+            }
+            LogicalPlan::Filter(filter) => {
+                Self::is_joined_relation(filter.input.as_ref())
+            }
+            _ => false,
+        }
+    }
+
+    /// The names a query source can be qualified by: a table's alias or name, a
+    /// derived table's alias, and every source inside a parenthesised joined
+    /// table — a join that is another join's right input keeps its own sources,
+    /// which the enclosing query's column references still name.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn push_source_idents(relation: &ast::TableFactor, all_idents: &mut Vec<String>) {
+        match relation {
+            ast::TableFactor::Table { alias, name, .. } => {
+                if let Some(alias) = alias {
+                    all_idents.push(alias.name.to_string());
+                } else {
+                    all_idents.push(name.to_string());
+                }
+            }
+            ast::TableFactor::Derived {
+                alias: Some(alias), ..
+            } => {
+                all_idents.push(alias.name.to_string());
+            }
+            ast::TableFactor::NestedJoin {
+                table_with_joins,
+                alias,
+            } => {
+                if let Some(alias) = alias {
+                    all_idents.push(alias.name.to_string());
+                } else {
+                    Self::push_source_idents(&table_with_joins.relation, all_idents);
+                    for join in &table_with_joins.joins {
+                        Self::push_source_idents(&join.relation, all_idents);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Reconstructs a SELECT SQL statement from a logical plan by unprojecting column expressions
@@ -2105,6 +2144,26 @@ impl Unparser<'_> {
                 // In that case, we don't need to worry about setting up the projection here.
                 // The outer projection plan will handle projecting the correct columns.
                 let already_projected = select.already_projected();
+                // A join that is another join's right input is a joined table
+                // of its own on that join's right, not a further entry in
+                // the shared `FROM` — whose last entry is the enclosing
+                // join's left side, so appending there would put this join's
+                // right side before the relation it joins to (#14373).
+                let is_right_join_input = select.in_right_join_input();
+                // A mark join's mark is replaced by `EXISTS` wherever the
+                // enclosing query reads it, and `EXISTS` is never NULL. On an
+                // input an outer join null-extends the mark is NULL for the
+                // rows that join adds, so `NOT x.mark` or `x.mark IS NULL`
+                // above it would keep or drop those rows differently from
+                // the plan. Refused there; computing the mark inside a derived
+                // input the outer join null-extends is the lift.
+                if select.in_null_extended_join_input()
+                    && matches!(join.join_type, JoinType::LeftMark | JoinType::RightMark)
+                {
+                    return not_impl_err!(
+                        "Unparsing a mark join as an input an outer join null-extends is not supported"
+                    );
+                }
 
                 let mut left_scan_fetch = None;
                 let mut left_scan_only_filters = vec![];
@@ -2138,19 +2197,35 @@ impl Unparser<'_> {
                 // preserved. A FULL JOIN also null-extends its left input, but
                 // preserves left rows, so moving the predicate into ON would
                 // make filtered-out left rows reappear as unmatched rows.
+                // The predicate already there stays in place for the walk — a
+                // mark join in this input rewrites the mark it produces wherever
+                // that predicate reads it — and what the walk adds is `AND`ed on
+                // after it, so it is told apart by position.
+                // A FULL JOIN preserves its left input as well, so a predicate a
+                // nested join there contributes has no clause either; it is
+                // watched the same way and refused.
                 let left_is_null_extended = matches!(join.join_type, JoinType::Right);
-                let outer_selection = if left_is_null_extended {
-                    select.take_selection()
+                let left_contribution_is_watched =
+                    left_is_null_extended || join.join_type == JoinType::Full;
+                let outer_conjuncts_before_left = if left_contribution_is_watched {
+                    select.selection_conjunct_count()
                 } else {
-                    None
+                    0
                 };
 
-                self.select_to_sql_recursively(
+                if left_contribution_is_watched {
+                    select.enter_null_extended_join_input();
+                }
+                let walked = self.select_to_sql_recursively(
                     left_plan.as_ref(),
                     query,
                     select,
                     relation,
-                )?;
+                );
+                if left_contribution_is_watched {
+                    select.leave_null_extended_join_input();
+                }
+                walked?;
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
@@ -2176,9 +2251,14 @@ impl Unparser<'_> {
                     )?;
                 }
 
-                let hoisted_from_left = if left_is_null_extended {
-                    let contributed = select.take_selection();
-                    select.selection(outer_selection);
+                let hoisted_from_left = if left_contribution_is_watched {
+                    let contributed =
+                        select.take_selection_added_after(outer_conjuncts_before_left);
+                    if join.join_type == JoinType::Full && contributed.is_some() {
+                        return not_impl_err!(
+                            "Unparsing a FULL JOIN input that is a join with a predicate on its own inputs is not supported"
+                        );
+                    }
                     contributed
                 } else {
                     None
@@ -2208,6 +2288,12 @@ impl Unparser<'_> {
                 // clauses into the outer query. Regular joins unparse it into
                 // the shared `select` as usual.
                 let mut right_relation = RelationBuilder::default();
+                // What a null-extended right input's *nested* joins add to the
+                // shared `WHERE`, folded into this join's `ON` below — see
+                // `left_is_null_extended` for the mirror image. A scan's own
+                // filters never reach here: they are peeled above and routed by
+                // `split_join_on_and_where_filters`.
+                let mut hoisted_from_right: Option<ast::Expr> = None;
                 let right_plan: Arc<LogicalPlan> = if is_exists_join {
                     Arc::clone(right_plan)
                 } else {
@@ -2237,12 +2323,73 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
-                    self.select_to_sql_recursively(
+                    // A LEFT JOIN null-extends its right input, so a predicate a
+                    // nested join there contributes to the shared `WHERE` would
+                    // discard the left rows this join preserves; it belongs in
+                    // this join's `ON`. A FULL JOIN preserves both inputs, so
+                    // neither clause serves — a contribution there is refused.
+                    //
+                    // The predicate already there stays in place for the walk:
+                    // a mark join in this input rewrites the mark it produces
+                    // wherever that predicate reads it, which it can only do
+                    // where the predicate is. What the walk adds is `AND`ed on
+                    // after it, so it is told apart by position.
+                    let right_is_null_extended =
+                        matches!(join.join_type, JoinType::Left | JoinType::Full);
+                    let outer_conjuncts_before_right = if right_is_null_extended {
+                        select.selection_conjunct_count()
+                    } else {
+                        0
+                    };
+                    select.enter_right_join_input();
+                    if right_is_null_extended {
+                        select.enter_null_extended_join_input();
+                    }
+                    let walked = self.select_to_sql_recursively(
                         right_plan.as_ref(),
                         query,
                         select,
                         &mut right_relation,
-                    )?;
+                    );
+                    if right_is_null_extended {
+                        select.leave_null_extended_join_input();
+                    }
+                    select.leave_right_join_input();
+                    walked?;
+                    if right_is_null_extended {
+                        let contributed = select
+                            .take_selection_added_after(outer_conjuncts_before_right);
+                        if join.join_type == JoinType::Full && contributed.is_some() {
+                            return not_impl_err!(
+                                "Unparsing a FULL JOIN input that is a join with a predicate on its own inputs is not supported"
+                            );
+                        }
+                        // A subquery is refused in `ON` by some dialects, which
+                        // is why an inner join moves such a conjunct to `WHERE`
+                        // — the clause this join cannot use for its right
+                        // input. Refuse rather than fold it into `ON`.
+                        if contributed
+                            .as_ref()
+                            .is_some_and(super::ast::contains_subquery)
+                        {
+                            return not_impl_err!(
+                                "Unparsing a LEFT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+                            );
+                        }
+                        hoisted_from_right = contributed;
+                    }
+                    // A subquery conjunct the enclosing outer join's `ON` moves
+                    // onto this input's own scope needs a derived table that
+                    // keeps the input's names addressable; a joined input has
+                    // no single name for that, so it is refused rather than
+                    // wrapped anonymously.
+                    if !right_scoped.is_empty()
+                        && Self::is_joined_relation(right_plan.as_ref())
+                    {
+                        return not_impl_err!(
+                            "Unparsing an outer join's subquery predicate scoped onto a joined input is not supported"
+                        );
+                    }
                     if right_scan_fetch.is_some()
                         || (join.join_type == JoinType::Full
                             && !right_scan_filters.is_empty())
@@ -2296,7 +2443,7 @@ impl Unparser<'_> {
                 // else to go: returning it to the SELECT-global `WHERE` would
                 // discard unmatched rows from the preserved side. Downgrade
                 // to an equivalent `ON` constraint so it can be appended.
-                if hoisted_from_left.is_some()
+                if (hoisted_from_left.is_some() || hoisted_from_right.is_some())
                     && matches!(
                         join_constraint,
                         ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural
@@ -2307,6 +2454,9 @@ impl Unparser<'_> {
                 }
                 let (join_constraint, unhoistable) =
                     Self::and_into_join_constraint(join_constraint, hoisted_from_left);
+                select.selection(unhoistable);
+                let (join_constraint, unhoistable) =
+                    Self::and_into_join_constraint(join_constraint, hoisted_from_right);
                 select.selection(unhoistable);
 
                 let right_projection: Option<Vec<ast::SelectItem>> =
@@ -2366,18 +2516,33 @@ impl Unparser<'_> {
                     | JoinType::Left
                     | JoinType::Right
                     | JoinType::Full => {
-                        let Ok(Some(relation)) = right_relation.build() else {
+                        let Ok(Some(right_factor)) = right_relation.build() else {
                             return internal_err!("Failed to build right relation");
                         };
                         let ast_join = ast::Join {
-                            relation,
+                            relation: right_factor,
                             global: false,
                             join_operator: self
                                 .join_operator_to_sql(join.join_type, join_constraint)?,
                         };
-                        let mut from = select.pop_from().unwrap();
-                        from.push_join(ast_join);
-                        select.push_from(from);
+                        if is_right_join_input {
+                            // This join's own left side was walked into the
+                            // relation the enclosing join handed down; the
+                            // joined table replaces it there, in parentheses.
+                            let Ok(Some(left_side)) = relation.build() else {
+                                return internal_err!(
+                                    "Failed to build the left relation of a nested join"
+                                );
+                            };
+                            relation.nested_join(ast::TableWithJoins {
+                                relation: left_side,
+                                joins: vec![ast_join],
+                            });
+                        } else {
+                            let mut from = select.pop_from().unwrap();
+                            from.push_join(ast_join);
+                            select.push_from(from);
+                        }
                         if !already_projected {
                             let Some(left_projection) = left_projection else {
                                 return internal_err!("Left projection is missing");
@@ -2401,6 +2566,33 @@ impl Unparser<'_> {
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 let (plan, mut columns) =
                     subquery_alias_inner_query_and_columns(plan_alias);
+
+                // An aliased join that is another join's right input is a
+                // scope of its own: walked into the shared SELECT, its scans'
+                // filters would be hoisted or placed under names the alias
+                // then hides (`b.id = 'x'` beside `(b JOIN c) AS j`). Derived,
+                // they stay inside and the alias is what the enclosing query
+                // addresses.
+                if select.in_right_join_input() && Self::is_joined_relation(plan) {
+                    if !select.already_projected() {
+                        let items = plan_alias
+                            .schema
+                            .columns()
+                            .into_iter()
+                            .map(|column| self.select_item_to_sql(&Expr::Column(column)))
+                            .collect::<Result<Vec<_>>>()?;
+                        select.projection(items);
+                    }
+                    return self.derive(
+                        plan,
+                        relation,
+                        Some(self.new_table_alias(
+                            plan_alias.alias.table().to_string(),
+                            columns,
+                        )),
+                        false,
+                    );
+                }
                 let unparsed_table_scan = self.unparse_table_scan_pushdown(
                     plan,
                     Some(plan_alias.alias.clone()),
