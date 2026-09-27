@@ -2430,7 +2430,7 @@ logical_plan
 03)--SubqueryAlias: __correlated_sq_1
 04)----TableScan: nia_right_with_null projection=[y]
 physical_plan
-01)HashJoinExec: mode=CollectLeft, join_type=LeftAnti, on=[(x@0, y@0)]
+01)HashJoinExec: mode=CollectLeft, join_type=LeftAnti, accumulator=MinMaxLeftAccumulator, on=[(x@0, y@0)]
 02)--DataSourceExec: partitions=1, partition_sizes=[1]
 03)--DataSourceExec: partitions=1, partition_sizes=[1]
 
