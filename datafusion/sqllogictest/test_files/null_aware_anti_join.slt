@@ -652,19 +652,20 @@ ORDER BY 1;
 statement ok
 DROP TABLE naconst_clash;
 
-# A constant value expression with a non-equality correlation leaves the
-# null-aware join without any equi-join key. Only `HashJoinExec` implements
-# null-aware semantics and it needs a key, so the planner reports the gap
-# instead of falling back to a nested loop join that ignores the NULLs and
-# silently returns wrong results.
+# A constant value expression with a non-equality correlation leaves no
+# equi-join key. The correlated `NOT IN` is planned as the `NOT EXISTS` it
+# equals in a filter, so the NULL the correlation keeps for `g = 1` makes that
+# row UNKNOWN and the row with an empty subquery is kept.
 statement ok
 CREATE TABLE naconst_corr_t1(id INT, g INT) AS VALUES (1, 1), (2, 2);
 
 statement ok
 CREATE TABLE naconst_corr_t2(id INT, g INT) AS VALUES (1, 1), (NULL, 2);
 
-query error DataFusion error: Error during planning: null_aware LeftAnti join requires equi\-join keys, but the join has none
+query I
 SELECT id FROM naconst_corr_t1 WHERE 3 NOT IN (SELECT id FROM naconst_corr_t2 WHERE naconst_corr_t2.g > naconst_corr_t1.g);
+----
+2
 
 statement ok
 DROP TABLE naconst_corr_t1;
