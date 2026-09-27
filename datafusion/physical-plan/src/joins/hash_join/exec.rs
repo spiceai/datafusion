@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fmt;
 use std::marker::PhantomData;
 use std::mem::size_of;
@@ -905,6 +905,18 @@ impl<A: CollectLeftAccumulator + 'static> HashJoinExec<A> {
             return false;
         }
 
+        // A null-aware anti join emits a build-side NULL only when the probe
+        // is truly empty. The pushed filter can empty the probe by pruning
+        // every row, which would surface that NULL wrongly. A NOT NULL build
+        // key cannot produce such a NULL, so the filter stays there.
+        if self.null_aware
+            && self.on.iter().any(|(build_key, _)| {
+                build_key.nullable(&self.left.schema()).unwrap_or(true)
+            })
+        {
+            return false;
+        }
+
         // `preserve_file_partitions` can report Hash partitioning for Hive-style
         // file groups, but those partitions are not actually hash-distributed.
         // Partitioned dynamic filters rely on hash routing, so disable them in
@@ -1394,6 +1406,8 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
                             filter,
                             on_right,
                             repartition_random_state,
+                            self.null_equality,
+                            self.null_aware,
                         ))
                     })))
                 })
@@ -1611,13 +1625,14 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
         // 1. `lr_is_preserved` gates whether a side is eligible at all.
         // 2. For each filter, we check that all column references belong to the
         //    target child (using `column_indices` to map output column positions
-        //    to join sides). This is critical for correctness: name-based matching
-        //    alone (as done by `ChildFilterDescription::from_child`) can incorrectly
-        //    push filters when different join sides have columns with the same name
-        //    (e.g. nested mark joins both producing "mark" columns).
+        //    to join sides). Columns are mapped by position, never by name:
+        //    different join sides, or a nested join on one side, can produce
+        //    columns with the same name (e.g. nested mark joins both producing
+        //    "mark" columns, or several `id` columns).
         let (left_preserved, right_preserved) = lr_is_preserved(self.join_type);
 
-        // Build the set of allowed column indices for each side
+        // Map each output position to its input position, accounting for the
+        // join's projection.
         let column_indices: Vec<ColumnIndex> = match self.projection.as_ref() {
             Some(projection) => projection
                 .iter()
@@ -1626,62 +1641,56 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
             None => self.column_indices.clone(),
         };
 
-        let (mut left_allowed, mut right_allowed) = (HashSet::new(), HashSet::new());
-        column_indices
-            .iter()
-            .enumerate()
-            .for_each(|(output_idx, ci)| {
-                match ci.side {
-                    JoinSide::Left => left_allowed.insert(output_idx),
-                    JoinSide::Right => right_allowed.insert(output_idx),
-                    // Mark columns - don't allow pushdown to either side
-                    JoinSide::None => false,
-                };
-            });
+        let (mut left_mapping, mut right_mapping) = (HashMap::new(), HashMap::new());
+        for (output_idx, ci) in column_indices.iter().enumerate() {
+            match ci.side {
+                JoinSide::Left => {
+                    left_mapping.insert(output_idx, ci.index);
+                }
+                JoinSide::Right => {
+                    right_mapping.insert(output_idx, ci.index);
+                }
+                // Mark columns cannot be pushed to either side.
+                JoinSide::None => {}
+            }
+        }
 
-        // For semi/anti joins, the non-preserved side's columns are not in the
-        // output, but filters on join key columns can still be pushed there.
-        // We find output columns that are join keys on the preserved side and
-        // add their output indices to the non-preserved side's allowed set.
-        // The name-based remap in FilterRemapper will then match them to the
-        // corresponding column in the non-preserved child's schema.
-        match self.join_type {
-            JoinType::LeftSemi | JoinType::LeftAnti => {
-                let left_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(left_key, _)| {
-                        left_key.downcast_ref::<Column>().map(|c| c.index())
+        // Semi joins also allow filters on output join keys to reach the
+        // non-output side. Map to the paired key's position, which need not
+        // have the same name. Only direct column pairs can be remapped this way.
+        // Anti joins cannot do this: their emitted rows have no matching key.
+        if matches!(self.join_type, JoinType::LeftSemi | JoinType::RightSemi) {
+            let key_mapping: HashMap<usize, usize> = self
+                .on
+                .iter()
+                .filter_map(|(left_key, right_key)| {
+                    let left = left_key.downcast_ref::<Column>()?;
+                    let right = right_key.downcast_ref::<Column>()?;
+                    Some(match self.join_type {
+                        JoinType::LeftSemi => (left.index(), right.index()),
+                        _ => (right.index(), left.index()),
                     })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Left && left_key_indices.contains(&ci.index) {
-                        right_allowed.insert(output_idx);
-                    }
+                })
+                .collect();
+            let (output_side, other_mapping) = match self.join_type {
+                JoinType::LeftSemi => (JoinSide::Left, &mut right_mapping),
+                _ => (JoinSide::Right, &mut left_mapping),
+            };
+            let emitted = column_indices
+                .iter()
+                .enumerate()
+                .filter(|(_, ci)| ci.side == output_side);
+            for (output_idx, ci) in emitted {
+                if let Some(&input_idx) = key_mapping.get(&ci.index) {
+                    other_mapping.insert(output_idx, input_idx);
                 }
             }
-            JoinType::RightSemi | JoinType::RightAnti => {
-                let right_key_indices: HashSet<usize> = self
-                    .on
-                    .iter()
-                    .filter_map(|(_, right_key)| {
-                        right_key.downcast_ref::<Column>().map(|c| c.index())
-                    })
-                    .collect();
-                for (output_idx, ci) in column_indices.iter().enumerate() {
-                    if ci.side == JoinSide::Right && right_key_indices.contains(&ci.index)
-                    {
-                        left_allowed.insert(output_idx);
-                    }
-                }
-            }
-            _ => {}
         }
 
         let left_child = if left_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
+            ChildFilterDescription::from_child_with_column_mapping(
                 &parent_filters,
-                left_allowed,
+                left_mapping,
                 self.left(),
             )?
         } else {
@@ -1689,9 +1698,9 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
         };
 
         let mut right_child = if right_preserved {
-            ChildFilterDescription::from_child_with_allowed_indices(
+            ChildFilterDescription::from_child_with_column_mapping(
                 &parent_filters,
-                right_allowed,
+                right_mapping,
                 self.right(),
             )?
         } else {
@@ -1766,21 +1775,18 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
 /// Determines which sides of a join are "preserved" for filter pushdown.
 ///
 /// A preserved side means filters on that side's columns can be safely pushed
-/// below the join. This mirrors the logic in the logical optimizer's
-/// `lr_is_preserved` in `datafusion/optimizer/src/push_down_filter.rs`.
+/// below the join. This mostly mirrors the logical optimizer's `lr_is_preserved`;
+/// semi joins additionally allow join-key filters on the non-output side.
 fn lr_is_preserved(join_type: JoinType) -> (bool, bool) {
     match join_type {
         JoinType::Inner => (true, true),
         JoinType::Left => (true, false),
         JoinType::Right => (false, true),
         JoinType::Full => (false, false),
-        // Filters in semi/anti joins are either on the preserved side, or on join keys,
-        // as all output columns come from the preserved side. Join key filters can be
-        // safely pushed down into the other side.
-        JoinType::LeftSemi | JoinType::LeftAnti => (true, true),
-        JoinType::RightSemi | JoinType::RightAnti => (true, true),
-        JoinType::LeftMark => (true, false),
-        JoinType::RightMark => (false, true),
+        // Callers restrict the non-output side of semi joins to join-key columns.
+        JoinType::LeftSemi | JoinType::RightSemi => (true, true),
+        JoinType::LeftAnti | JoinType::LeftMark => (true, false),
+        JoinType::RightAnti | JoinType::RightMark => (false, true),
     }
 }
 
@@ -6406,10 +6412,10 @@ mod tests {
         assert_eq!(lr_is_preserved(JoinType::Right), (false, true));
         assert_eq!(lr_is_preserved(JoinType::Full), (false, false));
         assert_eq!(lr_is_preserved(JoinType::LeftSemi), (true, true));
-        assert_eq!(lr_is_preserved(JoinType::LeftAnti), (true, true));
+        assert_eq!(lr_is_preserved(JoinType::LeftAnti), (true, false));
         assert_eq!(lr_is_preserved(JoinType::LeftMark), (true, false));
         assert_eq!(lr_is_preserved(JoinType::RightSemi), (true, true));
-        assert_eq!(lr_is_preserved(JoinType::RightAnti), (true, true));
+        assert_eq!(lr_is_preserved(JoinType::RightAnti), (false, true));
         assert_eq!(lr_is_preserved(JoinType::RightMark), (false, true));
     }
 
@@ -6448,6 +6454,110 @@ mod tests {
             df.expression_id()
                 .expect("DynamicFilterPhysicalExpr always has an expression_id"),
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_filter_pushdown_allowed_for_null_equal_join() -> Result<()> {
+        let (_, _, on) = build_schema_and_on()?;
+        let left = build_table(("a1", &vec![1]), ("b1", &vec![1]), ("c1", &vec![1]));
+        let right = build_table(("a2", &vec![1]), ("b1", &vec![1]), ("c2", &vec![1]));
+
+        let mut session_config = SessionConfig::default();
+        session_config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::RightSemi,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNull,
+            false,
+        )?;
+
+        // Null-equal joins keep dynamic filter pushdown: the pushed predicate carries an
+        // `IS NULL` disjunct so a probe-side NULL still reaches the join.
+        assert!(join.allow_join_dynamic_filter_pushdown(session_config.options()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_filter_pushdown_rejects_null_aware_nullable_build_key() -> Result<()>
+    {
+        let left = build_table_two_cols(
+            ("a1", &vec![Some(1), None]),
+            ("b1", &vec![Some(1), Some(2)]),
+        );
+        let right = build_table_two_cols(
+            ("a2", &vec![Some(2), Some(3)]),
+            ("b2", &vec![Some(1), Some(2)]),
+        );
+        let on = vec![(
+            Arc::new(Column::new_with_schema("a1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("a2", &right.schema())?) as _,
+        )];
+
+        let mut session_config = SessionConfig::default();
+        session_config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+
+        assert!(!join.allow_join_dynamic_filter_pushdown(session_config.options()));
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_dynamic_filter_pushdown_allows_null_aware_non_null_build_key() -> Result<()> {
+        // A NOT NULL build key cannot surface a build-side NULL, so the
+        // pushdown must stay enabled.
+        let left = build_table(("a1", &vec![1]), ("b1", &vec![1]), ("c1", &vec![1]));
+        let right = build_table(("a2", &vec![2]), ("b2", &vec![2]), ("c2", &vec![2]));
+        let on = vec![(
+            Arc::new(Column::new_with_schema("a1", &left.schema())?) as _,
+            Arc::new(Column::new_with_schema("a2", &right.schema())?) as _,
+        )];
+
+        let mut session_config = SessionConfig::default();
+        session_config
+            .options_mut()
+            .optimizer
+            .enable_join_dynamic_filter_pushdown = true;
+
+        let join = HashJoinExec::try_new(
+            left,
+            right,
+            on,
+            None,
+            &JoinType::LeftAnti,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            true,
+        )?;
+
+        assert!(join.allow_join_dynamic_filter_pushdown(session_config.options()));
+
         Ok(())
     }
 

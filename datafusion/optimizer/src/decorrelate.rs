@@ -75,6 +75,10 @@ pub struct PullUpCorrelatedExpr {
     /// whether we have converted a scalar aggregation into a group aggregation. When unnesting
     /// lateral joins, we need to produce a left outer join in such cases.
     pub pulled_up_scalar_agg: bool,
+    /// whether a subquery filter equal to `in_predicate_opt` was dropped from the
+    /// join filters as its duplicate. The subquery then kept only rows whose value
+    /// equals the outer value, which a `NOT IN` decorrelation has to account for.
+    pub removed_duplicated_in_predicate: bool,
 }
 
 impl Default for PullUpCorrelatedExpr {
@@ -96,6 +100,7 @@ impl PullUpCorrelatedExpr {
             collected_count_expr_map: HashMap::new(),
             pull_up_having_expr: None,
             pulled_up_scalar_agg: false,
+            removed_duplicated_in_predicate: false,
         }
     }
 
@@ -187,7 +192,9 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     find_join_exprs(subquery_filter_exprs)?;
                 if let Some(in_predicate) = &self.in_predicate_opt {
                     // in_predicate may be already included in the join filters, remove it from the join filters first.
+                    let before = join_filters.len();
                     join_filters = remove_duplicated_filter(join_filters, in_predicate)?;
+                    self.removed_duplicated_in_predicate |= join_filters.len() < before;
                 }
                 let correlated_subquery_cols =
                     collect_subquery_cols(&join_filters, subquery_schema)?;
