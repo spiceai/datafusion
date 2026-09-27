@@ -392,6 +392,39 @@ fn build_join(
     // is a second join key, and null-aware hash joins accept only a single key.
     let mut in_value_expr = None;
 
+    // A correlated `NOT IN` in anti join position is decorrelated as the
+    // `NOT EXISTS` it equals in a filter: an outer row is kept exactly when no
+    // subquery row that satisfies the correlation has `x IS NULL OR y IS NULL
+    // OR x = y`. A null-aware hash join cannot evaluate it on this branch. It
+    // takes one key, a correlation equality can take the key its NULL rules
+    // apply to, and it checks the subquery's NULLs over every row rather than
+    // over those the correlation keeps. Upstream evaluates it in the null-aware
+    // join executor instead (apache/datafusion#25339, #25560), which needs the
+    // null-aware mark joins of #21585.
+    //
+    // A subquery filter equal to the `IN` comparison was dropped by the pull-up.
+    // It kept only subquery values equal to `x`, none of them NULL, so the
+    // comparison alone decides and the NULL terms must not be added: `x = y`
+    // and the correlation, still not null-aware. This holds whether or not a
+    // correlation is left, which the null-aware plan got wrong when none was.
+    //
+    // The form is not used for a scalar aggregate the pull-up grouped by the
+    // correlation (an outer row without a group sees no subquery row instead of
+    // the aggregate over none), nor for a volatile `x`, which the filter would
+    // evaluate more than once. Those keep the plan below.
+    let dropped_in_predicate = pull_up.removed_duplicated_in_predicate;
+    let not_exists_form = join_type == JoinType::LeftAnti
+        && (join_filter_opt.is_some() || dropped_in_predicate)
+        && !pull_up.pulled_up_scalar_agg
+        && matches!(
+            in_predicate_opt,
+            Some(Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::Eq,
+                ..
+            })) if !left.is_volatile()
+        );
+
     let mut join_filter = match (join_filter_opt, in_predicate_opt.cloned()) {
         (
             Some(join_filter),
@@ -401,8 +434,17 @@ fn build_join(
                 right,
             })),
         ) => {
-            let right_col = create_col_from_scalar_expr(right.deref(), alias)?;
-            let in_predicate = Expr::eq(left.deref().clone(), Expr::Column(right_col));
+            let right_col = Expr::Column(create_col_from_scalar_expr(right.deref(), alias)?);
+            let value = left.deref().clone();
+            let in_predicate = if not_exists_form && !dropped_in_predicate {
+                value
+                    .clone()
+                    .is_null()
+                    .or(right_col.clone().is_null())
+                    .or(Expr::eq(value, right_col))
+            } else {
+                Expr::eq(value, right_col)
+            };
             in_predicate.and(join_filter)
         }
         (Some(join_filter), _) => join_filter,
@@ -417,7 +459,9 @@ fn build_join(
             let value_name = format!("{alias}_value");
             let right_col = create_col_from_scalar_expr(right.deref(), alias)?;
             let value = left.deref().clone();
-            in_value_expr = Some((value.clone(), right_col.clone(), value_name));
+            if !not_exists_form {
+                in_value_expr = Some((value.clone(), right_col.clone(), value_name));
+            }
 
             Expr::eq(value, Expr::Column(right_col))
         }
@@ -520,6 +564,7 @@ fn build_join(
     // null-aware semantics because NULLs cannot exist in the data.
     let null_aware = join_type == JoinType::LeftAnti
         && in_predicate_opt.is_some()
+        && !not_exists_form
         && join_keys_may_be_null(&join_filter, left.schema(), sub_query_alias.schema())?;
 
     // join our sub query into the main plan
@@ -1293,7 +1338,8 @@ mod tests {
 
     /// The same rewrite must not fire for a correlated subquery: the
     /// correlation predicate is a second equi-join key, and null-aware hash
-    /// joins accept only one.
+    /// joins accept only one. The correlated `NOT IN` becomes the `NOT EXISTS`
+    /// it equals in a filter, a plain anti join that is not null-aware.
     #[test]
     fn constant_not_in_correlated_subquery_is_not_rewritten() -> Result<()> {
         let outer_scan = nullable_scalar_mark_scan("outer_t")?;
@@ -1315,7 +1361,7 @@ mod tests {
         assert_optimized_plan_equal!(
             plan,
             @r"
-        LeftAnti Join:  Filter: Int32(3) = __correlated_sq_1.id AND outer_t.grp = __correlated_sq_1.grp [id:Int32;N, grp:Int32;N]
+        LeftAnti Join:  Filter: (Int32(3) IS NULL OR __correlated_sq_1.id IS NULL OR Int32(3) = __correlated_sq_1.id) AND outer_t.grp = __correlated_sq_1.grp [id:Int32;N, grp:Int32;N]
           TableScan: outer_t [id:Int32;N, grp:Int32;N]
           SubqueryAlias: __correlated_sq_1 [id:Int32;N, grp:Int32;N]
             Projection: inner_t.id, inner_t.grp [id:Int32;N, grp:Int32;N]
