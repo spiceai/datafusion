@@ -3280,6 +3280,58 @@ fn test_unparse_right_semi_join_scopes_build_side_fetch() -> Result<()> {
     Ok(())
 }
 
+/// `RightMark` returns a record for each record from the *right* input, so like
+/// `RightSemi` and `RightAnti` its probe side is `join.right` and the `EXISTS`
+/// body is built from `join.left`. Omitting it from that swap unparsed the join
+/// against the wrong relation entirely (spiceai/spiceai#13022): the outer query
+/// read `t1`, the correlation named the rows the outer query was not selecting,
+/// and the projection asked a bounded `t1` for a column it does not carry.
+///
+/// Bounded, so the swap and the scope are asserted together: the `LIMIT` has to
+/// land inside the derived table the `EXISTS` body reads, under the name the
+/// correlation uses.
+#[test]
+fn test_unparse_right_mark_join_swaps_inputs_with_build_side_fetch() -> Result<()> {
+    let plan = LogicalPlanBuilder::from(exists_join_with_probe_side_fetch(
+        datafusion_expr::JoinType::RightMark,
+    )?)
+    .filter(col("mark").or(col("t2.d").lt(lit(0))))?
+    .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t2"."d" FROM "t2" WHERE (EXISTS (SELECT 1 FROM (SELECT "t1"."c" FROM "t1" LIMIT 5) AS "t1" WHERE ("t1"."c" = "t2"."c")) OR ("t2"."d" < 0))"#
+    );
+    Ok(())
+}
+
+/// The same swap without a bound, so the unscoped shape is pinned too: the outer
+/// `FROM` names `join.right` and the `EXISTS` body reads `join.left` directly.
+#[test]
+fn test_unparse_right_mark_join_swaps_inputs() -> Result<()> {
+    let schema = exists_fetch_schema();
+    let build = table_scan(Some("t1"), &schema, Some(vec![0]))?.build()?;
+    let probe = table_scan(Some("t2"), &schema, Some(vec![0, 1]))?.build()?;
+
+    let plan = LogicalPlanBuilder::from(build)
+        .join_on(
+            probe,
+            datafusion_expr::JoinType::RightMark,
+            vec![col("t1.c").eq(col("t2.c"))],
+        )?
+        .project(vec![col("t2.d")])?
+        .filter(col("mark").or(col("t2.d").lt(lit(0))))?
+        .build()?;
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_snapshot!(
+        unparser.plan_to_sql(&plan)?,
+        @r#"SELECT "t2"."d" FROM "t2" WHERE (EXISTS (SELECT 1 FROM "t1" WHERE ("t1"."c" = "t2"."c")) OR ("t2"."d" < 0))"#
+    );
+    Ok(())
+}
+
 /// The right anti join takes the same swap, and inherits it from the same place.
 #[test]
 fn test_unparse_right_anti_join_scopes_build_side_fetch() -> Result<()> {
@@ -4852,6 +4904,188 @@ fn test_unparse_left_semi_join_keeps_build_side_key_on_shared_relation() -> Resu
         unparser.plan_to_sql(&plan)?,
         @r#"SELECT "t1"."d", "t"."c" FROM "t1" INNER JOIN "t" ON ("t1"."d" = "t"."c") WHERE EXISTS (SELECT 1 FROM "t" WHERE ("t1"."c" = "t"."c"))"#
     );
+    Ok(())
+}
+
+/// The mirror of the capture refusals: a build-half key that only the build
+/// side's projection bound, which `SELECT 1` erases.
+///
+/// The build side outputs `p.c` — `b.x` aliased under the probe's qualifier — so
+/// the plan is valid and the key pair is `(p.c, p.c)`. Emitted, the body would be
+/// `SELECT 1 FROM "b" WHERE ("p"."c" = "p"."c")`: neither half names `b`, both
+/// bind to the outer `p`, and a semi join keeps every probe row with a non-null
+/// `c` whenever `b` has a row at all, an anti join none. Before this was caught
+/// the plan unparsed to exactly that.
+#[test]
+fn test_unparse_exists_join_refuses_build_key_bound_only_by_the_build_projection()
+-> Result<()> {
+    use datafusion_expr::JoinType::{LeftAnti, LeftMark, LeftSemi, RightSemi};
+    let probe =
+        table_scan(Some("p"), &int32_schema(&["c", "d"]), Some(vec![0, 1]))?.build()?;
+    let build = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x").alias_qualified(Some("p"), "c")])?
+        .build()?;
+    let refused = |plan: &LogicalPlan, what: &str| {
+        let Err(error) = plan_to_sql(plan) else {
+            panic!("{what} must be refused");
+        };
+        assert_contains!(
+            error.to_string(),
+            "names an output only the build side's projection binds"
+        );
+    };
+    for join_type in [LeftSemi, LeftAnti, LeftMark] {
+        let plan = LogicalPlanBuilder::from(probe.clone())
+            .join(build.clone(), join_type, (vec!["p.c"], vec!["p.c"]), None)?
+            .build()?;
+        refused(&plan, &format!("{join_type:?}"));
+    }
+
+    // Swapped inputs: the build side is the left input.
+    let plan = LogicalPlanBuilder::from(build.clone())
+        .join(probe.clone(), RightSemi, (vec!["p.c"], vec!["p.c"]), None)?
+        .build()?;
+    refused(&plan, "RightSemi");
+
+    // A row bound on the build side names the body's scope after the key's
+    // qualifier — `p` — which then captures the probe half as well.
+    let bounded = LogicalPlanBuilder::from(build.clone())
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(bounded, LeftSemi, (vec!["p.c"], vec!["p.c"]), None)?
+        .build()?;
+    refused(&plan, "a bounded build side");
+
+    // A renamed output qualified with the build's own relation: `b.c` names a
+    // column `b` does not have, so it binds nowhere once the projection is gone.
+    let renamed = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x").alias_qualified(Some("b"), "c")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(renamed, LeftSemi, (vec!["p.c"], vec!["b.c"]), None)?
+        .build()?;
+    refused(&plan, "a rename under the build relation's own qualifier");
+
+    // An alias pushed down onto the scan it wraps lifts the rename into the
+    // select list — `SELECT s.x AS c FROM (SELECT s.x FROM b AS s) AS s` on its
+    // own — which is the list `SELECT 1` replaces, so `s.c` binds nowhere.
+    let aliased = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x").alias("c")])?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
+        .build()?;
+    refused(&plan, "a rename behind an alias pushed down onto the scan");
+
+    // An alias over an inline join renames its primary relation only —
+    // `FROM b AS a CROSS JOIN t` — so a column of the relation beside it,
+    // which the alias's schema requalifies as `a.c` all the same, is not one
+    // `a` answers to.
+    let over_join = table_scan(Some("b"), &int32_schema(&["k"]), Some(vec![0]))?
+        .cross_join(
+            table_scan(Some("t"), &int32_schema(&["c"]), Some(vec![0]))?.build()?,
+        )?
+        .alias("a")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(over_join, LeftSemi, (vec!["p.c"], vec!["a.c"]), None)?
+        .build()?;
+    refused(
+        &plan,
+        "a column beside the relation an inline alias renames",
+    );
+
+    Ok(())
+}
+
+/// The keys the guard above must keep: a build half naming a column its relation
+/// has binds inside whatever the projection did, and one naming a column of the
+/// scan an alias is pushed down onto binds through the alias.
+#[test]
+fn test_unparse_exists_join_keeps_build_key_the_body_answers_to() -> Result<()> {
+    use datafusion_expr::JoinType::LeftSemi;
+    let probe =
+        table_scan(Some("p"), &int32_schema(&["c", "d"]), Some(vec![0, 1]))?.build()?;
+
+    let projected = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![col("b.x")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(projected, LeftSemi, (vec!["p.c"], vec!["b.x"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b WHERE (p.c = b.x))"
+    );
+
+    let aliased = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .filter(col("b.x").gt(lit(0)))?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.x"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b AS s WHERE (s.x > 0) AND (p.c = s.x))"
+    );
+
+    // An alias over a bare scan is not pushed down: the projection becomes the
+    // derived table's own, so the rename it makes is what `s` answers to.
+    let unpushed = table_scan(Some("b"), &int32_schema(&["x"]), None)?
+        .project(vec![col("b.x").alias("c")])?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(unpushed, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM (SELECT b.x AS c FROM b) AS s WHERE (p.c = s.c))"
+    );
+
+    // An alias over an inline join renames its primary relation, whose own
+    // column the key names.
+    let over_join = table_scan(Some("b"), &int32_schema(&["k"]), Some(vec![0]))?
+        .cross_join(
+            table_scan(Some("t"), &int32_schema(&["c"]), Some(vec![0]))?.build()?,
+        )?
+        .alias("a")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe.clone())
+        .join(over_join, LeftSemi, (vec!["p.c"], vec!["a.k"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM b AS a CROSS JOIN t WHERE (p.c = a.k))"
+    );
+
+    // A projection on the primary side of that join is emitted as a derived
+    // table the alias then renames, so the rename it makes is what `a` answers
+    // to.
+    let over_projected_join =
+        table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+            .project(vec![col("b.x").alias("c")])?
+            .cross_join(
+                table_scan(Some("t"), &int32_schema(&["y"]), Some(vec![0]))?.build()?,
+            )?
+            .alias("a")?
+            .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            over_projected_join,
+            LeftSemi,
+            (vec!["p.c"], vec!["a.c"]),
+            None,
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT p.c, p.d FROM p WHERE EXISTS (SELECT 1 FROM (SELECT b.x AS c FROM b) AS a CROSS JOIN t WHERE (p.c = a.c))"
+    );
+
     Ok(())
 }
 
@@ -7916,10 +8150,12 @@ fn test_filter_on_unnamed_projection_output_binds() -> Result<()> {
 }
 
 #[test]
-fn test_filter_on_named_projection_output_is_unchanged() -> Result<()> {
-    // An alias gives the output a name the emitted `SELECT` carries, and a bare
-    // column keeps the name it already had. Neither needs repairing, so neither
-    // is inlined.
+fn test_filter_on_aliased_projection_output_is_inlined() -> Result<()> {
+    // An alias names the output in the `SELECT` list, but a `WHERE` in the same
+    // `SELECT` binds against the relations read, not against that list —
+    // PostgreSQL and MySQL reject `WHERE (s > 1)` outright, and the engines that
+    // accept it resolve it by repeating the expression. So the expression is
+    // inlined, exactly as for an output the projection leaves unnamed.
     let schema = Schema::new(vec![
         Field::new("a", DataType::Int32, false),
         Field::new("b", DataType::Int32, false),
@@ -7931,9 +8167,30 @@ fn test_filter_on_named_projection_output_is_unchanged() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&aliased)?,
-        @r#"SELECT (t.a + t.b) AS s FROM t WHERE (s > 1)"#
+        @r#"SELECT (t.a + t.b) AS s FROM t WHERE ((t.a + t.b) > 1)"#
     );
 
+    // A renamed column is an alias too: `WHERE (s > 1)` would not bind, and the
+    // column it renames is what the relation carries.
+    let renamed = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&renamed)?,
+        @r#"SELECT t.a AS s FROM t WHERE (t.a > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_bare_column_projection_output_is_unchanged() -> Result<()> {
+    // A bare column keeps the name it already had, which the relation carries,
+    // so there is nothing to repair.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
     let bare_column = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
         .project(vec![col("t.a")])?
         .filter(col("t.a").gt(lit(1)))?
@@ -7987,20 +8244,542 @@ fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
     Ok(())
 }
 
+/// The volatile call the cases below project.
+fn random() -> Expr {
+    datafusion_functions::math::random().call(vec![])
+}
+
+/// `Projection(<table>.a, random() AS r)` over a one-column scan of `table`: the
+/// projection whose output `r` the cases below filter on.
+fn volatile_projection(table: &str) -> Result<LogicalPlanBuilder> {
+    table_scan(Some(table), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col(format!("{table}.a")), random().alias("r")])
+}
+
 #[test]
-fn test_filter_on_unnamed_volatile_projection_output_is_not_inlined() -> Result<()> {
-    // Inlining a volatile expression would evaluate it a second time, in a
-    // clause that can see a different value than the `SELECT` list did, turning
-    // an unbindable reference into silently wrong rows. The unbindable
-    // reference is the safer of the two, so it is left in place.
-    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
-    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
-        .project(vec![datafusion_functions::math::random().call(vec![])])?
+fn test_filter_on_unnamed_volatile_projection_output_is_scoped() -> Result<()> {
+    // A volatile output has no faithful form in the `SELECT` that computes it.
+    // The `WHERE` cannot read the `SELECT` list's name for it, and repeating the
+    // expression there draws a second value, so the predicate would filter on a
+    // value the `SELECT` list never showed. The projection therefore becomes a
+    // derived table, whose output the predicate reads by name from the `SELECT`
+    // above it: one evaluation, and a reference that binds.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![random()])?
         .filter(col("random()").gt(lit(0.5)))?
         .build()?;
 
-    let sql = plan_to_sql(&plan)?;
-    assert_snapshot!(sql, @r#"SELECT random() FROM t WHERE ("random()" > 0.5)"#);
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "random()" FROM (SELECT random() AS "random()" FROM t) WHERE ("random()" > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_aliased_volatile_projection_output_is_scoped() -> Result<()> {
+    // The alias is what the enclosing `SELECT` reads the output by. This is the
+    // shape `SELECT * FROM (SELECT a, random() AS r FROM t) WHERE r > 0.5` plans
+    // to, since the optimizer cannot push a filter through a volatile
+    // projection: emitted beside the projection as `WHERE (r > 0.5)`, PostgreSQL
+    // rejects the alias and SQLite and DuckDB evaluate `random()` again for it,
+    // returning rows whose `r` the predicate never saw.
+    let plan = volatile_projection("t")?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_projection_output_over_a_limit_is_scoped() -> Result<()> {
+    // The bound below the projection keeps its own scope, and the projection
+    // still gets the one the predicate needs above it.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .limit(0, Some(5))?
+        .project(vec![col("t.a"), random().alias("r")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT a, random() AS r FROM (SELECT t.a FROM t LIMIT 5)) WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_reads_its_other_references_from_the_scope() -> Result<()>
+{
+    // Every reference in the predicate now reads from the derived table, so a
+    // reference still qualified by the relation inside it — `t.a` — would bind to
+    // nothing. It is unqualified along with the volatile one. An outer reference
+    // names an enclosing query rather than this one, and keeps its qualifier.
+    let plan = volatile_projection("t")?
+        .filter(
+            col("t.a")
+                .gt(lit(1))
+                .and(col("r").gt(lit(0.5)))
+                .and(col("r").lt(out_ref_col(DataType::Float64, "o.x"))),
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (((a > 1) AND (r > 0.5)) AND (r < o.x))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_refuses_two_outputs_of_one_name() -> Result<()> {
+    // Two outputs that differ only by qualifier cannot be told apart once the
+    // derived table has replaced the qualifiers, so the shape is refused rather
+    // than emitted with an ambiguous reference.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .join_on(
+            table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.a").eq(col("t2.a"))],
+        )?
+        .project(vec![col("t1.a"), col("t2.a"), random().alias("r")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("two outputs named a must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection has two outputs named a"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_filter_on_volatile_output_derives_the_alias() -> Result<()> {
+    // `SELECT * FROM (SELECT a, random() AS r FROM t) sq WHERE sq.r > 0.5`. The
+    // alias pushdown would fold the projection into the enclosing `SELECT` and
+    // requalify the reference as `sq.r`, a column no relation exposes. A volatile
+    // output declines the pushdown, so the aliased plan is emitted as the derived
+    // table it names, with the predicate reading `r` from outside it.
+    let plan = volatile_projection("t")?
+        .filter(col("r").gt(lit(0.5)))?
+        .alias("sq")?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM (SELECT t.a, random() AS r FROM t) AS sq WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_filter_on_aliased_projection_output_is_inlined() -> Result<()> {
+    // The same pushdown, on an output that can be repeated: the expression is
+    // inlined before the alias rewriter requalifies its columns, so the predicate
+    // reads the relation the folded `SELECT` actually has.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")).alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .alias("sq")?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (sq.a + sq.b) AS s FROM (SELECT sq.a, sq.b FROM t AS sq) AS sq WHERE ((sq.a + sq.b) > 1)"#
+    );
+    Ok(())
+}
+
+/// `Projection(t.a, random() AS r)` with two filters stacked on it, `first` nearer
+/// the projection and `second` above it.
+fn stacked_filters_over_volatile_projection(
+    first: Expr,
+    second: Expr,
+) -> Result<LogicalPlan> {
+    volatile_projection("t")?
+        .filter(first)?
+        .filter(second)?
+        .build()
+}
+
+#[test]
+fn test_stacked_filters_on_a_volatile_projection_output_are_scoped_together() -> Result<()>
+{
+    // The stack is emitted as one `WHERE`, so every filter in it moves above the
+    // derived table with the one that reads the volatile output — a filter left
+    // beside the projection would put `t.a` in a `WHERE` whose `FROM` no longer
+    // exposes `t`. Whichever of the two reads the volatile output.
+    let volatile_on_top = stacked_filters_over_volatile_projection(
+        col("t.a").gt(lit(1)),
+        col("r").gt(lit(0.5)),
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&volatile_on_top)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE ((r > 0.5) AND (a > 1))"#
+    );
+
+    let volatile_below = stacked_filters_over_volatile_projection(
+        col("r").gt(lit(0.5)),
+        col("t.a").gt(lit(1)),
+    )?;
+    assert_snapshot!(
+        plan_to_sql(&volatile_below)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE ((a > 1) AND (r > 0.5))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
+    // A subquery in the predicate may correlate against the relation the derived
+    // table would hide, and its outer references cannot be told from ones that
+    // reach further out, so the shape is refused rather than rebound blindly.
+    let schema = int32_schema(&["a"]);
+    let subquery = Arc::new(table_scan(Some("u"), &schema, Some(vec![0]))?.build()?);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), random().alias("r")])?
+        .filter(col("r").gt(lit(0.5)).and(exists(subquery)))?
+        .build()?;
+
+    let err =
+        plan_to_sql(&plan).expect_err("a predicate holding a subquery must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the predicate holds a subquery"
+    );
+    Ok(())
+}
+
+/// The refusal a dialect whose derived tables do not fix a volatile value must produce
+/// for every shape that would read one through a derived table, spelled once.
+const VOLATILE_SCOPE_REFUSAL: &str = "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded";
+
+#[test]
+fn test_filter_on_volatile_output_is_refused_where_a_derived_table_does_not_fix_it()
+-> Result<()> {
+    // SQLite flattens the derived table and evaluates `random()` again for the
+    // predicate, and MySQL merges it the same way, so the scope that repairs the
+    // shape elsewhere returns wrong rows there. Every route to that scope is
+    // refused on such a dialect: the filter that would build it, the filter
+    // already above a derived projection, and the alias pushdown that would
+    // otherwise decline into one.
+    for dialect in [
+        &SqliteDialect {} as &dyn UnparserDialect,
+        &UnparserMySqlDialect {},
+    ] {
+        refuses_every_route_to_the_volatile_scope(dialect)?;
+    }
+    Ok(())
+}
+
+fn refuses_every_route_to_the_volatile_scope(
+    dialect: &dyn UnparserDialect,
+) -> Result<()> {
+    let unparser = Unparser::new(dialect);
+    let projection = || volatile_projection("t");
+
+    let scoped_here = projection()?.filter(col("r").gt(lit(0.5)))?.build()?;
+    let err = unparser
+        .plan_to_sql(&scoped_here)
+        .expect_err("a filter that would build the scope must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    let already_derived = projection()?
+        .filter(col("r").gt(lit(0.5)))?
+        .project(vec![col("t.a")])?
+        .build()?;
+    let err = unparser
+        .plan_to_sql(&already_derived)
+        .expect_err("a filter above a derived projection must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    let aliased = projection()?
+        .filter(col("r").gt(lit(0.5)))?
+        .alias("sq")?
+        .build()?;
+    let err = unparser.plan_to_sql(&aliased).expect_err(
+        "an alias pushdown that would decline into the scope must be refused",
+    );
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    // The filter above the alias, under a taken SELECT list: the shape Spice's
+    // federation path presents for `SELECT * FROM (…) sq WHERE sq.r > 0.5`.
+    let above_the_alias = projection()?
+        .alias("sq")?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .project(vec![col("sq.a"), col("sq.r")])?
+        .build()?;
+    let err = unparser
+        .plan_to_sql(&above_the_alias)
+        .expect_err("a filter above the alias reading the output must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    // The filter above the alias with the list free: scoped here, and gated.
+    let above_the_alias_free_list = projection()?
+        .alias("sq")?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .build()?;
+    let err = unparser.plan_to_sql(&above_the_alias_free_list).expect_err(
+        "a filter above the alias under a free list reading the output must be refused",
+    );
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    // The filter below an unfetched sort: lowered beneath it, and gated.
+    let below_a_sort = projection()?
+        .sort(vec![col("t.a").sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+    let err = unparser
+        .plan_to_sql(&below_a_sort)
+        .expect_err("a filter below a sort reading the output must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+
+    // The filter above a DISTINCT: read through it, and gated.
+    let above_a_distinct = projection()?
+        .distinct()?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+    let err = unparser
+        .plan_to_sql(&above_a_distinct)
+        .expect_err("a filter above a DISTINCT reading the output must be refused");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_subquery_alias_on_a_volatile_output_binds_to_the_alias()
+-> Result<()> {
+    // The same shape on a dialect whose derived tables fix the value: the alias arm
+    // derives the projection and the filter reads `sq.r` from it, evaluated once, so
+    // nothing needs rewriting — only the dialect gate above applies.
+    let plan = volatile_projection("t")?
+        .alias("sq")?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .project(vec![col("sq.a"), col("sq.r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT sq.a, sq.r FROM (SELECT sq.a, random() AS r FROM t AS sq) AS sq WHERE (sq.r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_a_scalar_subquery_output_is_scoped() -> Result<()> {
+    // `Expr::is_volatile` does not look inside a subquery, so `(SELECT random())`
+    // reads as repeatable while repeating it draws a second value. An output
+    // holding a subquery is therefore never inlined: it takes the scope a
+    // volatile output takes, and is evaluated once.
+    let schema = int32_schema(&["a"]);
+    let random_row = table_scan(Some("u"), &schema, Some(vec![0]))?
+        .project(vec![random()])?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![
+            col("t.a"),
+            scalar_subquery(Arc::new(random_row)).alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, (SELECT random() FROM u) AS r FROM t) WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_subquery_alias_filter_under_a_projection_keeps_the_output_reference() -> Result<()>
+{
+    // With the enclosing SELECT list already taken, the aliased projection becomes
+    // a derived table exposing `s`, so the predicate keeps reading `s` — inlining
+    // `sq.a + sq.b` there would name columns the derived table hides.
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b")).alias("s")])?
+        .filter(col("s").gt(lit(1)))?
+        .alias("sq")?
+        .project(vec![col("sq.s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT sq.s FROM (SELECT (sq.a + sq.b) AS s FROM t AS sq) AS sq WHERE (sq.s > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_clauses_above_a_scoped_filter_read_the_derived_outputs() -> Result<()> {
+    // A sort above the stack has already put `ORDER BY (t.a + 1)` on the query
+    // before the stack is found to need the scope; the filter above that sort
+    // joins the stack beneath it. The ORDER BY was written against `t`, which the
+    // derived table now hides, so it is re-pointed at the derived outputs along
+    // with the predicates.
+    let plan = volatile_projection("t")?
+        .filter(col("r").gt(lit(0.5)))?
+        .sort(vec![col("t.a").add(lit(1)).sort(true, false)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE ((a > 1) AND (r > 0.5)) ORDER BY (a + 1) ASC NULLS LAST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_is_refused_inside_a_join_input() -> Result<()> {
+    // A join walks both inputs into one SELECT, so the derived table the scope
+    // builds would sit beside `u`: the `ON` would still name the hidden `t`, and
+    // `a` is exposed by both sides. Refused rather than emitted ambiguous.
+    let schema = int32_schema(&["a"]);
+    let left = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), random().alias("r")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+    let joined = LogicalPlanBuilder::from(left).join_on(
+        table_scan(Some("u"), &schema, Some(vec![0]))?.build()?,
+        datafusion_expr::JoinType::Inner,
+        vec![col("t.a").eq(col("u.a"))],
+    )?;
+
+    let err = plan_to_sql(&joined.clone().build()?)
+        .expect_err("a scoped join input must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is an input of a join"
+    );
+
+    // An enclosing projection takes the SELECT list first, and the input projection
+    // becomes a derived table beside `u` all the same — the predicate would land in
+    // the shared `WHERE` as a bare `r`, so the refusal must not depend on the list
+    // being free.
+    let err = plan_to_sql(&joined.project(vec![col("t.a"), col("u.a")])?.build()?)
+        .expect_err("a scoped join input under a projection must be refused too");
+    assert!(
+        err.to_string()
+            .ends_with("when the projection is an input of a join"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_is_refused_under_a_clause_holding_a_subquery()
+-> Result<()> {
+    // A filter above the DISTINCT has already put `t.a > 1 AND EXISTS (...)` in
+    // the WHERE. The rewrite that re-points clauses at the derived table skips an
+    // expression holding a subquery, so `t.a` there would keep naming the hidden
+    // relation — refused, rather than emitted unbindable.
+    let schema = int32_schema(&["a"]);
+    let subquery = Arc::new(table_scan(Some("u"), &schema, Some(vec![0]))?.build()?);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), random().alias("r")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .distinct()?
+        .filter(col("t.a").gt(lit(1)).and(exists(subquery)))?
+        .build()?;
+
+    let err =
+        plan_to_sql(&plan).expect_err("a subquery in a clause above must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when a clause above it holds a subquery"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_holding_a_subquery_above_a_sort_joins_the_stack_and_is_refused()
+-> Result<()> {
+    // The same filter above a sort is lowered beneath it, into the stack over the
+    // projection, where the scope refuses a predicate holding a subquery itself.
+    let schema = int32_schema(&["a"]);
+    let subquery = Arc::new(table_scan(Some("u"), &schema, Some(vec![0]))?.build()?);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), random().alias("r")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .sort(vec![col("t.a").sort(true, false)])?
+        .filter(col("t.a").gt(lit(1)).and(exists(subquery)))?
+        .build()?;
+
+    let err =
+        plan_to_sql(&plan).expect_err("a subquery in the lowered stack must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the predicate holds a subquery"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_volatile_output_is_refused_on_an_exists_build_side() -> Result<()> {
+    // The EXISTS body is built with a builder of its own and the correlation
+    // `t.a = u.a` is appended after it, so a scoped build side would leave that
+    // predicate naming the `u` the derived table hides. Refused, for semi and
+    // anti joins alike.
+    let schema = int32_schema(&["a"]);
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
+    ] {
+        let build = table_scan(Some("u"), &schema, Some(vec![0]))?
+            .project(vec![col("u.a"), random().alias("r")])?
+            .filter(col("r").gt(lit(0.5)))?
+            .build()?;
+        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+            .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
+            .build()?;
+
+        let err =
+            plan_to_sql(&plan).expect_err("a scoped EXISTS build side must be refused");
+        assert_eq!(
+            err.to_string(),
+            "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is the build side of an EXISTS-style join",
+            "{join_type:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_derived_table_filter_on_a_named_output_is_inlined() -> Result<()> {
+    // Naming a derived table's unnamed outputs happens before the derived plan is
+    // unparsed, so the filter inside it meets the output as an alias. It is
+    // inlined all the same: `WHERE ("t.a + t.b" > 1)` beside the `SELECT` list
+    // that names it does not bind (spiceai/spiceai#13445).
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0, 1]))?
+        .project(vec![col("t.a").add(col("t.b"))])?
+        .filter(col("t.a + t.b").gt(lit(1)))?
+        .limit(0, Some(5))?
+        .project(vec![col("t.a + t.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.a + t.b" FROM (SELECT (t.a + t.b) AS "t.a + t.b" FROM t WHERE ((t.a + t.b) > 1) LIMIT 5)"#
+    );
     Ok(())
 }
 
@@ -8075,7 +8854,7 @@ fn test_derived_volatile_output_is_named_and_evaluated_once() -> Result<()> {
     // case that inlining cannot.
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
     let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
-        .project(vec![datafusion_functions::math::random().call(vec![])])?
+        .project(vec![random()])?
         .filter(col("random()").gt(lit(0.5)))?
         .project(vec![col("random()")])?
         .build()?;
@@ -13304,6 +14083,488 @@ fn full_join_input_aliased_scan_with_a_subquery_filter_is_refused() -> Result<()
     assert_contains!(
         error.to_string(),
         "aliased scan filtering on a subquery is not supported: the subquery's references cannot be rebased onto the alias"
+    );
+    Ok(())
+}
+
+/// `Projection(t.a, (t.a + t.b) AS s)` over a two-column scan of `t`: a computed
+/// output that can be repeated.
+fn summed_projection() -> Result<LogicalPlanBuilder> {
+    table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .project(vec![col("t.a"), col("t.a").add(col("t.b")).alias("s")])
+}
+
+#[test]
+fn test_filter_below_an_unfetched_sort_on_a_volatile_output_is_scoped() -> Result<()> {
+    // `Filter → Sort → Projection`: the sort folds into this SELECT as ORDER BY,
+    // evaluated after the WHERE either way, so the stack is lowered beneath it and
+    // meets the projection. Above the sort the predicate was emitted verbatim into
+    // the same SELECT as the volatile expression — `WHERE r > 0.5` beside
+    // `random() AS r` — the very shape the scope exists to prevent.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY a ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_below_a_sort_keyed_on_the_volatile_output_is_scoped() -> Result<()> {
+    // The sort key is the output itself: emitted above the scope, it reads the
+    // derived table's `r` — the one value the SELECT list showed.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY r ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stacked_filters_below_an_unfetched_sort_are_lowered_together() -> Result<()> {
+    // One filter reads a bare column, the other the volatile output: the whole
+    // stack moves beneath the sort and into one WHERE above the scope.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").sort(true, true)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE ((r > 0.5) AND (a > 1)) ORDER BY a ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_below_an_unfetched_sort_on_a_repeatable_output_is_inlined() -> Result<()> {
+    // The repeatable counterpart: lowered beneath the sort, the predicate meets the
+    // projection and its expression is inlined, where before it was emitted as
+    // `WHERE s > 1`, a SELECT-list name no WHERE can bind.
+    let plan = summed_projection()?
+        .sort(vec![col("t.a").sort(true, true)])?
+        .filter(col("s").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a, (t.a + t.b) AS s FROM t WHERE ((t.a + t.b) > 1) ORDER BY t.a ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_below_an_unfetched_sort_on_bare_columns_is_left_in_place() -> Result<()> {
+    // Nothing in the stack needs the projection: the sort stays where it is and the
+    // emitted SQL is what it always was.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").sort(true, true)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a, random() AS r FROM t WHERE (t.a > 1) ORDER BY t.a ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_below_an_unfetched_sort_under_a_taken_list_is_scoped_and_gated()
+-> Result<()> {
+    // With the enclosing list taken, the lowered sort becomes a derived table of
+    // its own, and the scope — and its dialect gate — is built inside it. Before,
+    // the sort alone was derived and the filter read `r` from it with the gate
+    // never consulted.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .project(vec![col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a FROM (SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY a ASC NULLS FIRST)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_subquery_alias_on_a_volatile_output_under_a_free_list_is_scoped()
+-> Result<()> {
+    // `Filter → SubqueryAlias → Projection` with no enclosing projection. The alias
+    // arm would fold the projection into this SELECT and push `sq` onto the scan,
+    // leaving `WHERE sq.r` to name a column no relation has. Taking the list here
+    // makes the alias the derived table the reference needs.
+    let plan = volatile_projection("t")?
+        .alias("sq")?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT sq.a, random() AS r FROM t AS sq) AS sq WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_subquery_alias_on_a_repeatable_output_under_a_free_list_is_scoped()
+-> Result<()> {
+    // The same fold loses a repeatable output's name just the same, and its
+    // expression cannot be inlined either: the columns it names are the scan's,
+    // which the alias rewrite is about to rename. The scope serves both.
+    let plan = summed_projection()?
+        .alias("sq")?
+        .filter(col("sq.s").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, s FROM (SELECT sq.a, (sq.a + sq.b) AS s FROM t AS sq) AS sq WHERE (s > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_subquery_alias_on_a_renamed_column_under_a_free_list_is_scoped()
+-> Result<()> {
+    // A renamed column is computed for this purpose: the scan knows it by its old
+    // name only.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").alias("x")])?
+        .alias("sq")?
+        .filter(col("sq.x").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT sq.a AS x FROM t AS sq) AS sq WHERE (x > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_subquery_alias_on_a_bare_column_under_a_free_list_is_left_alone()
+-> Result<()> {
+    // A bare column survives the fold under its own name, so the alias pushdown is
+    // left to run as before.
+    let plan = volatile_projection("t")?
+        .alias("sq")?
+        .filter(col("sq.a").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT sq.a, random() AS r FROM (SELECT sq.a FROM t AS sq) AS sq WHERE (sq.a > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_below_a_sort_above_a_subquery_alias_on_a_volatile_output_is_scoped()
+-> Result<()> {
+    // Both repairs at once: the stack is lowered beneath the sort, then scoped
+    // through the alias. The sort key keeps its `sq` qualifier, which now names the
+    // derived table.
+    let plan = volatile_projection("t")?
+        .alias("sq")?
+        .sort(vec![col("sq.a").sort(true, true)])?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT sq.a, random() AS r FROM t AS sq) AS sq WHERE (r > 0.5) ORDER BY sq.a ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_subquery_alias_inside_a_join_input_under_a_free_list_is_refused()
+-> Result<()> {
+    // A join at the root has no list of its own to take, so the alias would fold
+    // onto the scan inside the join and `sq.r` would bind to nothing; refused.
+    let right = volatile_projection("u")?
+        .alias("sq")?
+        .filter(col("sq.r").gt(lit(0.5)))?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join(
+            right,
+            datafusion_expr::JoinType::Inner,
+            (vec!["t.a"], vec!["sq.a"]),
+            None,
+        )?
+        .build()?;
+
+    let err = plan_to_sql(&plan)
+        .expect_err("an aliased volatile output inside a bare join must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection is an input of a join"
+    );
+
+    let right = summed_projection()?
+        .alias("sq")?
+        .filter(col("sq.s").gt(lit(1)))?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join(
+            right,
+            datafusion_expr::JoinType::Inner,
+            (vec!["t.a"], vec!["sq.a"]),
+            None,
+        )?
+        .build()?;
+
+    let err = plan_to_sql(&plan)
+        .expect_err("an aliased computed output inside a bare join must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a filter on a computed output of an aliased projection is not supported when the projection is an input of a join"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_distinct_on_a_volatile_output_is_scoped() -> Result<()> {
+    // `Filter → Distinct → Projection`: the DISTINCT folds into the SELECT that
+    // computes the projection and keeps its output names, so the predicate reads
+    // the projection through it. Before, it was emitted as `SELECT DISTINCT …
+    // random() AS r … WHERE r > 0.5`, the same SELECT as the volatile expression.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) WHERE (r > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_distinct_on_a_repeatable_output_is_inlined() -> Result<()> {
+    let plan = summed_projection()?
+        .distinct()?
+        .filter(col("s").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT DISTINCT t.a, (t.a + t.b) AS s FROM t WHERE ((t.a + t.b) > 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_above_a_distinct_under_a_taken_list_is_gated() -> Result<()> {
+    // The enclosing projection already makes the DISTINCT a derived table exposing
+    // `r`, so the shape binds — but only the dialect gate says whether the engine
+    // reads the value the list produced, and the walk through the DISTINCT is what
+    // lets the gate see the volatile output.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .filter(col("r").gt(lit(0.5)))?
+        .project(vec![col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a FROM (SELECT DISTINCT t.a, random() AS r FROM t) WHERE (r > 0.5)"#
+    );
+    let err = Unparser::new(&SqliteDialect {})
+        .plan_to_sql(&plan)
+        .expect_err("the gate must see the volatile output through the DISTINCT");
+    assert_eq!(err.to_string(), VOLATILE_SCOPE_REFUSAL);
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_keeps_its_alias_resolution() -> Result<()> {
+    // Lowering the stack beneath the sort leaves the sort's input a `Filter`, and a
+    // sort key that names a projection output is resolved against the projection —
+    // so the key must be unprojected before the lowering, not after it. Inside the
+    // compound key `b + 1`, `b` is the SELECT-list alias for `0 - t.b`; left
+    // unresolved it binds the scan's `b` instead, which is a different order and,
+    // under the `LIMIT`, a different row.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            (lit(0) - col("t.b")).alias("b"),
+        ])?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("a").gt(lit(0)))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a AS a, (0 - t.b) AS b FROM t WHERE (t.a > 0) ORDER BY ((0 - t.b) + 1) ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_keeps_a_bare_alias_key_as_the_alias() -> Result<()> {
+    // The companion to the case above: a key that is the alias alone stays the
+    // alias, which every dialect reads as the output column. Unprojecting it into
+    // the expression would be the same needless inlining the un-hoisted path
+    // already avoids.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .project(vec![
+            col("t.a").alias("a"),
+            (lit(0) - col("t.b")).alias("b"),
+        ])?
+        .sort(vec![col("b").sort(true, true)])?
+        .filter(col("a").gt(lit(0)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a AS a, (0 - t.b) AS b FROM t WHERE (t.a > 0) ORDER BY b ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_volatile_predicate_over_a_distinct_is_scoped_above_it() -> Result<()> {
+    // The plan applies the predicate above the `Distinct`, so its `random()` is
+    // drawn once per surviving distinct row. Folded into the same SELECT as the
+    // `DISTINCT` it would be drawn once per input row instead — a different
+    // probability, silently. The `DISTINCT` becomes a derived table so the draw
+    // stays above the dedup.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s")])?
+        .distinct()?
+        .filter(col("s").gt(lit(0)).and(random().lt(lit(0.5))))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s FROM (SELECT DISTINCT (t.a + 1) AS s FROM t) WHERE ((s > 0) AND (random() < 0.5))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_over_a_scope_keeps_its_key_on_the_output() -> Result<()> {
+    // The companion constraint to resolving a hoisted key: when the lowered stack
+    // scopes the projection, the derived table shows `r` and the ORDER BY above it
+    // must keep naming it. Resolving the key here would inline `random()` outside
+    // that scope, drawing a second value and ordering by something the SELECT list
+    // never showed — under the `LIMIT`, a different row.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_volatile_predicate_over_a_distinct_in_a_join_input_is_refused() -> Result<()> {
+    // A join input has no SELECT list of its own to take, so the DISTINCT cannot
+    // become the derived table the predicate needs to sit above. Refused by name
+    // rather than emitted into the DISTINCT's own WHERE, where the draw would move
+    // below the dedup.
+    let right = table_scan(Some("u"), &int32_schema(&["k"]), Some(vec![0]))?.build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s")])?
+        .distinct()?
+        .filter(col("s").gt(lit(0)).and(random().lt(lit(0.5))))?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            [col("s").eq(col("u.k"))],
+        )?
+        .build()?;
+
+    let err =
+        plan_to_sql(&plan).expect_err("a join input has no list to take for the scope");
+    assert_eq!(
+        err.to_string(),
+        "This feature is not implemented: Unparsing a filter that cannot be repeated over a DISTINCT is not supported when the DISTINCT is an input of a join"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_under_an_outer_projection_keeps_its_key_on_the_output()
+-> Result<()> {
+    // The enclosing projection has taken this SELECT's list, so the hoisted sort
+    // opens one of its own — and inside that SELECT the stack is free to scope the
+    // projection. The key must be read against the scope the sort ends up in, not
+    // the one it was hoisted from, or `r + 1` is inlined to `random() + 1` above a
+    // derived table that already holds the single draw.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .project(vec![col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @r#"SELECT a FROM (SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY (r + 1.0) ASC NULLS FIRST)"#);
+    Ok(())
+}
+
+#[test]
+fn test_a_hoisted_sort_reads_its_aggregate_from_the_sort_down() -> Result<()> {
+    // The aggregate lookup counts the projections it passes, so it has to start at
+    // the sort rather than at the sort's input: starting a projection lower walks
+    // past the boundary the derived table draws and unprojects the key against an
+    // aggregate that table hides. `s0` is what the derived table shows, and what
+    // both the WHERE and the ORDER BY above it read.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .project(vec![col("t.a"), col("sum(t.b)").alias("s0")])?
+        .project(vec![col("t.a"), (col("s0") + lit(1)).alias("s")])?
+        .sort(vec![(col("s") + lit(1)).sort(true, true)])?
+        .filter(col("s").gt(lit(0)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, (s0 + 1) AS s FROM (SELECT t.a, sum(t.b) AS s0 FROM t GROUP BY t.a) WHERE ((s0 + 1) > 0) ORDER BY ((s0 + 1) + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_distinct_scope_repoints_a_clause_naming_its_alias() -> Result<()> {
+    // The derived table is built around whatever the filters stand on, so the
+    // `SubqueryAlias` under the DISTINCT is enclosed with it and the name it gave
+    // the outputs goes out of scope. The ORDER BY above, emitted before the scope
+    // existed, still spelled `sq.a` — a column the enclosing SELECT has no relation
+    // for. It reads the derived table's `a` now, like the predicates the scope
+    // rewrites itself.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a")])?
+        .alias("sq")?
+        .distinct()?
+        .filter(random().lt(lit(0.5)))?
+        .sort(vec![(col("sq.a") + lit(1)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a FROM (SELECT DISTINCT sq.a FROM (SELECT sq.a FROM t AS sq) AS sq) WHERE (random() < 0.5) ORDER BY (a + 1) ASC NULLS FIRST"#
     );
     Ok(())
 }
