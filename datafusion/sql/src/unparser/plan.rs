@@ -31,13 +31,17 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        expr_contains_subquery, find_agg_node_within_select,
-        find_projection_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, name_derived_scope_outputs, name_scope_outputs,
-        partition_subquery_filters, select_list_wraps_a_grouping_expr,
-        try_transform_to_simple_table_scan_with_filters, unproject_sort_expr,
-        unproject_unnamed_projection_exprs, unproject_unnest_expr,
+        enclosed_qualifiers, expr_contains_subquery, filters_scope_their_projection,
+        find_agg_node_within_select, find_unnest_node_within_select,
+        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
+        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
+        predicate_reads_unrepeatable_output, projection_below_filters,
+        scope_filters_over_projection, select_list_wraps_a_grouping_expr,
+        stacked_filters_read_unrepeatable_output,
+        try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
+        unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
+        unrepeatable_output_refusal,
     },
 };
 use crate::unparser::extension_unparser::{
@@ -57,8 +61,8 @@ use datafusion_common::{
 use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, Join, JoinConstraint, JoinType, LogicalPlan,
-    LogicalPlanBuilder, Operator, Projection, SortExpr, Subquery, TableScan, Unnest,
-    UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
+    LogicalPlanBuilder, Operator, Projection, Sort, SortExpr, Subquery, TableScan,
+    Unnest, UserDefinedLogicalNode, Window, expr::Alias, utils::split_conjunction,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
@@ -278,6 +282,18 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
     })?;
     Ok(bound)
 }
+
+/// The refusal for a predicate below a FULL JOIN that no scan's own derived
+/// table applies: `WHERE`, `HAVING` and `QUALIFY` all run after the join and
+/// would discard the rows it preserves.
+const FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED: &str = "Unparsing a predicate on a FULL JOIN input that is not applied by one of its table scans is not supported";
+
+/// The refusal for a FULL JOIN input that is an aliased scan filtering on a
+/// subquery: the scan does apply the predicate, but the derived table the
+/// input needs would rebase the filters onto the alias, and the rewriter
+/// cannot descend into the subquery's plan — a reference it makes to the
+/// scan's own table would be shadowed by `FROM a AS s` and bind to nothing.
+const ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED: &str = "Unparsing a FULL JOIN input that is an aliased scan filtering on a subquery is not supported: the subquery's references cannot be rebased onto the alias";
 
 impl Unparser<'_> {
     /// Queues a recursive CTE for the statement root, keeping one definition per
@@ -958,16 +974,14 @@ impl Unparser<'_> {
         // reference still qualified by a relation the derived table encloses binds
         // to nothing. DataFusion re-plans such SQL, but a stricter remote binder
         // rejects it, which is what breaks a federated pushdown.
-        let derived_qualifiers: HashSet<String> = p
-            .input
-            .schema()
-            .iter()
-            .filter_map(|(qualifier, _)| qualifier)
-            .flat_map(|qualifier| [qualifier.to_string(), qualifier.table().to_string()])
-            .collect();
+        let derived_qualifiers = enclosed_qualifiers(p.input.schema());
         select.visit_expressions_in_clauses_mut(|expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
-                requalify_column_onto_derived_table(idents, &derived_qualifiers, &alias);
+                requalify_column_onto_derived_table(
+                    idents,
+                    &derived_qualifiers,
+                    Some(&alias),
+                );
             }
         });
 
@@ -1038,6 +1052,37 @@ impl Unparser<'_> {
         relation.derived(derived_builder);
 
         Ok(())
+    }
+
+    /// Refuses to read a projection output that cannot be repeated — a volatile
+    /// expression, or a subquery — through a derived table on a dialect whose engine
+    /// does not fix the value there.
+    ///
+    /// Emitting the scope anyway would answer with rows the `SELECT` list never
+    /// showed — see [`Dialect::derived_table_evaluates_volatile_outputs_once`] —
+    /// so the pushdown is refused instead, which costs the pushdown and never a row.
+    fn ensure_derived_table_fixes_volatile_outputs(&self) -> Result<()> {
+        if self.dialect.derived_table_evaluates_volatile_outputs_once() {
+            return Ok(());
+        }
+        unrepeatable_output_refusal(
+            "for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded",
+        )
+    }
+
+    /// Unparses one input of a join into the shared `select`, marked as such for
+    /// the duration — see [`SelectBuilder::within_join_input`].
+    fn walk_join_input(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        select.enter_join_input();
+        let walked = self.select_to_sql_recursively(plan, query, select, relation);
+        select.exit_join_input();
+        walked
     }
 
     fn derive_with_dialect_alias(
@@ -1332,6 +1377,25 @@ impl Unparser<'_> {
                 })
             })
         })?;
+        Ok(())
+    }
+
+    /// A join side peeled to a scan under an alias, whose filters hold a
+    /// subquery, cannot be derived below a FULL JOIN: the alias rewriter does
+    /// not descend into the subquery, so a reference it makes to the scan's
+    /// own table is shadowed by `FROM a AS s` inside the derived table and
+    /// binds to nothing. The `SubqueryAlias` arm raises the same refusal when
+    /// a projection routes the side through it; this is it for a side the
+    /// join arm reaches directly.
+    fn refuse_aliased_scan_with_a_subquery_filter(
+        side: &LogicalPlan,
+        filters: &[Expr],
+    ) -> Result<()> {
+        if matches!(side, LogicalPlan::SubqueryAlias(_))
+            && filters.iter().any(expr_contains_subquery)
+        {
+            return not_impl_err!("{ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED}");
+        }
         Ok(())
     }
 
@@ -1633,6 +1697,36 @@ impl Unparser<'_> {
     ) -> Result<()> {
         match plan {
             LogicalPlan::TableScan(scan) => {
+                // Below a FULL JOIN's input, a scan reached with its filters
+                // still on it — through a projection the join walk could not
+                // see past, which is already folded into this SELECT — keeps
+                // them in a derived table of its own, as the join derives a
+                // bare filtered input. The pushdown rewrite would materialize
+                // them as a `Filter` above, and there they have no clause.
+                // The folded projection still names the scan, and the derived
+                // table takes the scan's name, so nothing above it rebinds.
+                // Only once the select list is taken: it is the folded
+                // projection that lists this scan's columns, and without one
+                // the pushdown rewrite below is what would list them — a scan
+                // reached some other way keeps the rewrite, and the refusal.
+                if select.already_projected()
+                    && select.input_predicates_stay_scoped()
+                    && (!scan.filters.is_empty() || scan.fetch.is_some())
+                {
+                    let clean = LogicalPlanBuilder::scan(
+                        scan.table_name.clone(),
+                        Arc::clone(&scan.source),
+                        scan.projection.clone(),
+                    )?
+                    .build()?;
+                    return self.derive_join_side(
+                        &clean,
+                        scan.filters.clone(),
+                        &scan.filters,
+                        scan.fetch,
+                        relation,
+                    );
+                }
                 if let Some(unparsed_table_scan) = self.unparse_table_scan_pushdown(
                     plan,
                     None,
@@ -1774,6 +1868,14 @@ impl Unparser<'_> {
                 self.select_to_sql_recursively(p.input.as_ref(), query, select, relation)
             }
             LogicalPlan::Filter(filter) => {
+                // Below a FULL JOIN, a predicate the join walk did not fold into
+                // a scan's own derived table has no clause left: `WHERE`,
+                // `HAVING` and `QUALIFY` are all evaluated after the join and
+                // would discard the rows it preserves. Refuse rather than emit
+                // that, which costs the pushdown but never the rows.
+                if select.input_predicates_stay_scoped() {
+                    return not_impl_err!("{FULL_JOIN_INPUT_PREDICATE_UNSUPPORTED}");
+                }
                 let window = find_window_nodes_within_select(
                     plan,
                     None,
@@ -1797,16 +1899,185 @@ impl Unparser<'_> {
                     let filter_expr = self.expr_to_sql(&unprojected)?;
                     select.having(Some(filter_expr));
                 } else {
-                    // A predicate can reference a projection output that the
-                    // projection does not name, whose logical name is not an
-                    // identifier the emitted statement carries.
-                    let predicate = match find_projection_node_within_select(
-                        plan,
-                        select.already_projected(),
-                    ) {
-                        Some(projection) => unproject_unnamed_projection_exprs(
+                    // A sort without a fetch beneath the stack folds into this
+                    // SELECT as its ORDER BY, evaluated after the WHERE either way,
+                    // so the filters select the same rows on either side of it —
+                    // but only beneath it do they meet the projection whose
+                    // outputs they read, where the repairs below apply.
+                    if let Some((sort_plan, lowered)) =
+                        hoist_unfetched_sort_above_filters(plan)?
+                    {
+                        let LogicalPlan::Sort(sort) = sort_plan else {
+                            return internal_err!(
+                                "hoist_unfetched_sort_above_filters returned a plan that is not a Sort"
+                            );
+                        };
+                        // Where the lowered stack folds the projection into this
+                        // SELECT, the keys are resolved here, before the lowering
+                        // puts a `Filter` where the projection was: a key naming a
+                        // projection output is looked up in the sort's input, so
+                        // afterwards `b + 1` would keep a `b` that binds to the
+                        // relation rather than to the output the SELECT list shows.
+                        //
+                        // Where the stack scopes the projection instead, the keys
+                        // must stay as they are: the derived table shows the outputs
+                        // under their own names, and the ORDER BY above it reads
+                        // them there. Resolving them would inline the expression
+                        // outside that scope — for a volatile output, a second draw
+                        // ordering by a value the SELECT list never showed.
+                        //
+                        // The scope to read the keys against is the one the
+                        // hoisted sort lands in, not the one it was hoisted from:
+                        // with this SELECT's list already taken the `Sort` arm
+                        // derives a table of its own, so either way the stack below
+                        // it meets a SELECT whose list is free.
+                        let sorted = sort.input.as_ref();
+                        let expr = if filters_scope_their_projection(&lowered, false) {
+                            sort.expr.clone()
+                        } else {
+                            let agg =
+                                if self.projection_scopes_its_aggregate(sorted, select) {
+                                    None
+                                } else {
+                                    find_agg_node_within_select(sort_plan, false)
+                                };
+                            let window_nodes =
+                                find_window_nodes_within_select(sort_plan, None, false);
+                            let windows: Option<Vec<&Window>> =
+                                window_nodes.as_deref().map(|ws| ws.to_vec());
+                            sort.expr
+                                .iter()
+                                .map(|sort_expr| {
+                                    unproject_sort_expr(
+                                        sort_expr.clone(),
+                                        agg,
+                                        windows.as_deref(),
+                                        sorted,
+                                    )
+                                })
+                                .collect::<Result<Vec<_>>>()?
+                        };
+                        let hoisted = LogicalPlan::Sort(Sort {
+                            expr,
+                            input: lowered,
+                            fetch: None,
+                        });
+                        return self.select_to_sql_recursively(
+                            &hoisted, query, select, relation,
+                        );
+                    }
+                    // A predicate can reference an output of the projection this
+                    // SELECT folds in, which a `WHERE` cannot read by name: it
+                    // binds against the relations read, not the SELECT list. The
+                    // expression producing the output is inlined instead — unless
+                    // it is volatile, when repeating it draws a second value. That
+                    // output is only readable from a SELECT above the one
+                    // computing it, so the projection becomes a derived table.
+                    let below = projection_below_filters(plan);
+                    if let Some(filtered) = &below {
+                        let unrepeatable =
+                            stacked_filters_read_unrepeatable_output(plan, filtered);
+                        // Whether the scope is built here. Read from the same
+                        // helper the sort hoist above consults, so the ORDER BY it
+                        // emits cannot disagree with the repair chosen here.
+                        let scoped_here = filters_scope_their_projection(
+                            plan,
+                            select.already_projected(),
+                        );
+                        if unrepeatable {
+                            // Whether the scope is built here, the projection is
+                            // already a derived table from an enclosing projection,
+                            // or the filters read it through a `SubqueryAlias` the
+                            // alias arm derives, the predicate reads the output
+                            // through a derived table, on the same guarantee.
+                            self.ensure_derived_table_fixes_volatile_outputs()?;
+                        }
+                        // The predicate ends up in this SELECT's `WHERE` addressing the
+                        // derived table's output by bare name — whether the scope is
+                        // built below or an enclosing projection has already made the
+                        // projection a derived table — which is right only while that
+                        // derived table is the SELECT's sole relation. A join input sits
+                        // beside another relation: its `ON` still names the hidden one,
+                        // and a bare name can be ambiguous. Through an alias under a
+                        // taken list the reference binds to the alias instead, so that
+                        // shape is kept; with the list free the alias folds onto the
+                        // scan, and a join input has no list of its own to take.
+                        if (unrepeatable || scoped_here)
+                            && select.within_join_input()
+                            && (filtered.alias.is_none() || !select.already_projected())
+                        {
+                            return if unrepeatable {
+                                unrepeatable_output_refusal(
+                                    "when the projection is an input of a join",
+                                )
+                            } else if filtered.alias.is_some() {
+                                not_impl_err!(
+                                    "Unparsing a filter on a computed output of an aliased projection is not supported when the projection is an input of a join"
+                                )
+                            } else {
+                                not_impl_err!(
+                                    "Unparsing a filter that cannot be repeated over a DISTINCT is not supported when the DISTINCT is an input of a join"
+                                )
+                            };
+                        }
+                        if scoped_here {
+                            // The clauses this SELECT already carries — an ORDER BY from
+                            // a sort above the stack, a WHERE from a filter above that
+                            // sort — were emitted against the projection's relations,
+                            // which the derived table is about to hide. They read its
+                            // outputs by name now, like the predicates the scope rewrites
+                            // itself. A clause holding a subquery is left alone by the
+                            // visitors, and would keep naming the hidden relation: refused.
+                            // The derived table is built around whatever the
+                            // filters stand on. That is the `SubqueryAlias` itself
+                            // when one is directly below them, and the derived table
+                            // then carries its name, so `alias.output` still binds —
+                            // to the derived table now. Read through a `DISTINCT`
+                            // the alias is a level further down, enclosed by an
+                            // unnamed derived table, and the name it gave those
+                            // outputs is hidden like the relation's own.
+                            let mut hidden_qualifiers =
+                                enclosed_qualifiers(&filtered.projection.schema);
+                            if let Some(alias) = filtered.alias
+                                && filtered.through_distinct
+                            {
+                                hidden_qualifiers
+                                    .extend(enclosed_qualifiers(&alias.schema));
+                            }
+                            let mut repoint = |expr: &mut ast::Expr| {
+                                if let ast::Expr::CompoundIdentifier(idents) = expr {
+                                    requalify_column_onto_derived_table(
+                                        idents,
+                                        &hidden_qualifiers,
+                                        None,
+                                    );
+                                }
+                            };
+                            let mut skipped =
+                                select.visit_expressions_in_clauses_mut(&mut repoint);
+                            if let Some(query) = query.as_mut() {
+                                skipped |= query.visit_order_by_mut(&mut repoint);
+                            }
+                            if skipped {
+                                return unrepeatable_output_refusal(
+                                    "when a clause above it holds a subquery",
+                                );
+                            }
+                            let scoped = scope_filters_over_projection(plan)?;
+                            return self.select_to_sql_recursively(
+                                &scoped, query, select, relation,
+                            );
+                        }
+                    }
+                    // Inlined only where the projection folds into this SELECT: not
+                    // under a taken list, and not through an alias, whose arm derives
+                    // the projection and lets the reference bind to the alias.
+                    let predicate = match below.as_ref().filter(|filtered| {
+                        !select.already_projected() && filtered.alias.is_none()
+                    }) {
+                        Some(filtered) => unproject_projection_exprs(
                             filter.predicate.clone(),
-                            projection,
+                            filtered.projection,
                         )?,
                         None => filter.predicate.clone(),
                     };
@@ -1978,20 +2249,13 @@ impl Unparser<'_> {
                     // reference still qualified by a relation the derived table encloses
                     // binds to nothing. DataFusion re-plans such SQL, but a stricter remote
                     // binder rejects it, which is what breaks a federated pushdown.
-                    let derived_qualifiers: HashSet<String> = plan
-                        .schema()
-                        .iter()
-                        .filter_map(|(qualifier, _)| qualifier)
-                        .flat_map(|qualifier| {
-                            [qualifier.to_string(), qualifier.table().to_string()]
-                        })
-                        .collect();
+                    let derived_qualifiers = enclosed_qualifiers(plan.schema());
                     select.visit_expressions_in_clauses_mut(|expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
                             requalify_column_onto_derived_table(
                                 idents,
                                 &derived_qualifiers,
-                                &alias,
+                                Some(&alias),
                             );
                         }
                     });
@@ -2101,6 +2365,50 @@ impl Unparser<'_> {
                     JoinType::Right => (scoped_for_input, vec![]),
                     _ => (vec![], scoped_for_input),
                 };
+                // A FULL JOIN preserves both inputs, so a predicate from either
+                // one has no clause of the enclosing query: `ON` would let the
+                // rows it rejects reappear as unmatched, and `WHERE` would
+                // discard the other input's unmatched rows. Each input's
+                // predicates stay in the scope that applies them — a derived
+                // table around the scan they filter. That rule is inherited by
+                // every join nested inside such an input, since its scans are
+                // reached by this same walk and would otherwise route their
+                // filters to the shared `WHERE`.
+                let enclosed_by_full_join = select.input_predicates_stay_scoped();
+                let inputs_keep_predicates =
+                    enclosed_by_full_join || join.join_type == JoinType::Full;
+                // A semi or anti join filters its probe side with a predicate
+                // that goes to the shared `WHERE`, which below a FULL JOIN is
+                // the clause that discards the rows the join preserves. A mark
+                // join is refused too: its `EXISTS` replaces the mark column
+                // where the enclosing query reads it, and `EXISTS` is never
+                // NULL — but the mark is, on a row the FULL JOIN null-extends,
+                // so `NOT x.mark` or `x.mark IS NULL` above the FULL JOIN would
+                // keep or drop that row differently from the plan.
+                if enclosed_by_full_join
+                    && matches!(
+                        join.join_type,
+                        JoinType::LeftSemi
+                            | JoinType::LeftAnti
+                            | JoinType::RightSemi
+                            | JoinType::RightAnti
+                            | JoinType::LeftMark
+                            | JoinType::RightMark
+                    )
+                {
+                    return not_impl_err!(
+                        "Unparsing a semi, anti or mark join as a FULL JOIN input is not supported"
+                    );
+                }
+                let inputs_kept_predicates_before =
+                    select.set_input_predicates_stay_scoped(inputs_keep_predicates);
+                // What a FULL JOIN's inputs contribute to `WHERE` is checked
+                // once both are walked; anything at all is a predicate the
+                // rules above failed to keep scoped. The predicate already
+                // there came from above this join and stays in place — a
+                // row-limited input reads it to decide whether it needs a
+                // scope of its own, and a mark join rewrites it in place.
+                let predicates_added_before = select.predicates_added();
                 // If there's an outer projection plan, it will already set up the projection.
                 // In that case, we don't need to worry about setting up the projection here.
                 // The outer projection plan will handle projecting the correct columns.
@@ -2138,19 +2446,21 @@ impl Unparser<'_> {
                 // preserved. A FULL JOIN also null-extends its left input, but
                 // preserves left rows, so moving the predicate into ON would
                 // make filtered-out left rows reappear as unmatched rows.
-                let left_is_null_extended = matches!(join.join_type, JoinType::Right);
+                // Below a FULL JOIN's input there is nothing to relocate: the
+                // marked walk keeps every predicate the left subtree carries in
+                // that subtree's own scope. Setting the accumulated predicate
+                // aside would only hide it from the walk — a row-limited input
+                // reads it to decide it needs a scope of its own, and a mark
+                // join rewrites the mark it names in place.
+                let left_is_null_extended =
+                    matches!(join.join_type, JoinType::Right) && !enclosed_by_full_join;
                 let outer_selection = if left_is_null_extended {
                     select.take_selection()
                 } else {
                     None
                 };
 
-                self.select_to_sql_recursively(
-                    left_plan.as_ref(),
-                    query,
-                    select,
-                    relation,
-                )?;
+                self.walk_join_input(left_plan.as_ref(), query, select, relation)?;
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
@@ -2158,13 +2468,21 @@ impl Unparser<'_> {
                 // and no clause of the enclosing query can express one input's
                 // `fetch`. Isolate that side in a derived table instead, and
                 // drop the filters from `left_scan_filters` so they are not
-                // also routed to `ON`/`WHERE` below.
+                // also routed to `ON`/`WHERE` below. A join nested inside a
+                // FULL JOIN's input does the same for its own scans, since the
+                // `WHERE` it would otherwise reach is the FULL JOIN's.
                 if left_scan_fetch.is_some()
-                    || (join.join_type == JoinType::Full && !left_scan_filters.is_empty())
+                    || (inputs_keep_predicates && !left_scan_filters.is_empty())
                     || !left_scoped.is_empty()
                 {
+                    if inputs_keep_predicates {
+                        Self::refuse_aliased_scan_with_a_subquery_filter(
+                            left_plan.as_ref(),
+                            &left_scan_filters,
+                        )?;
+                    }
                     let mut side_filters = std::mem::take(&mut left_scoped);
-                    if left_scan_fetch.is_some() || join.join_type == JoinType::Full {
+                    if left_scan_fetch.is_some() || inputs_keep_predicates {
                         side_filters.append(&mut left_scan_filters);
                     }
                     self.derive_join_side(
@@ -2178,7 +2496,7 @@ impl Unparser<'_> {
 
                 let hoisted_from_left = if left_is_null_extended {
                     let contributed = select.take_selection();
-                    select.selection(outer_selection);
+                    select.restore_selection(outer_selection);
                     contributed
                 } else {
                     None
@@ -2237,20 +2555,24 @@ impl Unparser<'_> {
                         right_scoped.extend(scoped);
                     }
 
-                    self.select_to_sql_recursively(
+                    self.walk_join_input(
                         right_plan.as_ref(),
                         query,
                         select,
                         &mut right_relation,
                     )?;
                     if right_scan_fetch.is_some()
-                        || (join.join_type == JoinType::Full
-                            && !right_scan_filters.is_empty())
+                        || (inputs_keep_predicates && !right_scan_filters.is_empty())
                         || !right_scoped.is_empty()
                     {
+                        if inputs_keep_predicates {
+                            Self::refuse_aliased_scan_with_a_subquery_filter(
+                                right_plan.as_ref(),
+                                &right_scan_filters,
+                            )?;
+                        }
                         let mut side_filters = std::mem::take(&mut right_scoped);
-                        if right_scan_fetch.is_some() || join.join_type == JoinType::Full
-                        {
+                        if right_scan_fetch.is_some() || inputs_keep_predicates {
                             side_filters.append(&mut right_scan_filters);
                         }
                         self.derive_join_side(
@@ -2277,8 +2599,19 @@ impl Unparser<'_> {
                         &scoped_join_filter,
                         left_scan_filters,
                         right_scan_filters,
+                        inputs_keep_predicates,
                     )
                 };
+                // Every input walked above has now had its say; the flag was
+                // this join's to set only for that walk.
+                select.set_input_predicates_stay_scoped(inputs_kept_predicates_before);
+                if join.join_type == JoinType::Full
+                    && select.predicates_added() != predicates_added_before
+                {
+                    return internal_err!(
+                        "A FULL JOIN input contributed a predicate to the enclosing WHERE, which would discard the rows the join preserves"
+                    );
+                }
                 for filter in where_filters {
                     let filter_expr = self.expr_to_sql(&filter)?;
                     select.selection(Some(filter_expr));
@@ -2341,12 +2674,14 @@ impl Unparser<'_> {
 
                         match join.join_type {
                             JoinType::LeftMark | JoinType::RightMark => {
-                                let source_schema =
-                                    if join.join_type == JoinType::LeftMark {
-                                        right_plan.schema()
-                                    } else {
-                                        left_plan.schema()
-                                    };
+                                // The mark is qualified by the build side, which
+                                // is `right_plan` for both mark joins once the
+                                // swap above has been applied — the same plan
+                                // `build_exists_subquery` was just given. Reading
+                                // `join.right`/`join.left` directly here instead
+                                // is what lets the qualifier disagree with the
+                                // body it marks.
+                                let source_schema = right_plan.schema();
                                 let (table_ref, _) = source_schema.qualified_field(0);
                                 let column = self.col_to_sql(&Column::new(
                                     table_ref.cloned(),
@@ -2401,6 +2736,74 @@ impl Unparser<'_> {
             LogicalPlan::SubqueryAlias(plan_alias) => {
                 let (plan, mut columns) =
                     subquery_alias_inner_query_and_columns(plan_alias);
+
+                // The `TableScan` arm's reasoning, reached through a plain
+                // alias: below a FULL JOIN's input, a scan that still carries
+                // its filters keeps them in a derived table of its own, since
+                // the enclosing query has no clause that would not discard the
+                // rows the join preserves. The pushdown rewrite below would
+                // materialize them as a `Filter` over the aliased scan, and the
+                // `Filter` arm refuses one here — so without this the alias
+                // turns a supported plan into `NotImplemented`.
+                //
+                // The derived table takes the alias's own name, which is what
+                // the enclosing scope already calls this input, so nothing
+                // above it rebinds. A column list means the alias renames the
+                // scan's outputs, which the derived table cannot express here;
+                // those keep the rewrite, and the refusal.
+                //
+                // A filter holding a subquery is refused outright: the rebase
+                // below cannot descend into the subquery's plan, so a
+                // reference it makes to the scan's own table would be
+                // shadowed by the alias and bind to nothing (the join arm
+                // raises the same refusal for a side it reaches directly).
+                let scoped_alias_over_a_scan = columns.is_empty()
+                    && select.already_projected()
+                    && select.input_predicates_stay_scoped();
+                if scoped_alias_over_a_scan
+                    && let LogicalPlan::TableScan(scan) = plan
+                    && scan.filters.iter().any(expr_contains_subquery)
+                {
+                    return not_impl_err!("{ALIASED_SCAN_SUBQUERY_FILTER_UNSUPPORTED}");
+                }
+
+                if scoped_alias_over_a_scan
+                    && let LogicalPlan::TableScan(scan) = plan
+                    && (!scan.filters.is_empty() || scan.fetch.is_some())
+                {
+                    let clean = LogicalPlanBuilder::scan(
+                        scan.table_name.clone(),
+                        Arc::clone(&scan.source),
+                        scan.projection.clone(),
+                    )?
+                    .alias(plan_alias.alias.clone())?
+                    .build()?;
+
+                    // The filters still name the scan's own table, which the
+                    // alias shadows inside the derived table — `FROM a AS s`
+                    // leaves `a.id` unaddressable. Rebase them onto the alias,
+                    // as the pushdown rewrite does for the same reason.
+                    let table_schema = scan.source.schema();
+                    let mut filter_alias_rewriter = TableAliasRewriter {
+                        table_schema: &table_schema,
+                        alias_name: plan_alias.alias.clone(),
+                    };
+                    let filters = scan
+                        .filters
+                        .iter()
+                        .cloned()
+                        .map(|expr| expr.rewrite(&mut filter_alias_rewriter).data())
+                        .collect::<Result<Vec<_>>>()?;
+
+                    return self.derive_join_side(
+                        &clean,
+                        filters.clone(),
+                        &filters,
+                        scan.fetch,
+                        relation,
+                    );
+                }
+
                 let unparsed_table_scan = self.unparse_table_scan_pushdown(
                     plan,
                     Some(plan_alias.alias.clone()),
@@ -3246,14 +3649,48 @@ impl Unparser<'_> {
                     alias.clone(),
                     already_projected,
                 )? {
+                    // The rewritten plan folds into one SELECT, so a predicate
+                    // reading a computed output of the projection below has to be
+                    // repaired the way the Filter arm repairs it: the alias
+                    // rewriter would otherwise requalify the output's name onto
+                    // the alias as though the relation exposed such a column, and
+                    // `sq."random()"` binds to nothing. The expression is inlined
+                    // where repeating it is faithful; a volatile output cannot be,
+                    // and declining the pushdown lets the caller wrap the plan as
+                    // a derived table, where the predicate reads the output by
+                    // name from the SELECT above it.
+                    let predicate = match projection_below_filters(&plan) {
+                        Some(filtered)
+                            if predicate_reads_unrepeatable_output(
+                                &filter.predicate,
+                                &filtered,
+                            ) =>
+                        {
+                            // Declined, and the derived path the caller takes re-enters
+                            // the Filter arm, which applies the dialect gate.
+                            return Ok(None);
+                        }
+                        // Inlined only where the projection folds into this SELECT.
+                        // With the list already taken it becomes a derived table
+                        // exposing the output under its own name, which the
+                        // requalified reference binds to; the inlined expression's
+                        // columns would be hidden inside it.
+                        Some(filtered) if !already_projected => {
+                            unproject_projection_exprs(
+                                filter.predicate.clone(),
+                                filtered.projection,
+                            )?
+                        }
+                        _ => filter.predicate.clone(),
+                    };
                     let predicate = if let Some(ref alias_name) = alias {
                         let mut rewriter = TableAliasRewriter {
                             table_schema: plan.schema().as_arrow(),
                             alias_name: alias_name.clone(),
                         };
-                        filter.predicate.clone().rewrite(&mut rewriter).data()?
+                        predicate.rewrite(&mut rewriter).data()?
                     } else {
-                        filter.predicate.clone()
+                        predicate
                     };
                     Ok(Some(
                         LogicalPlanBuilder::from(plan).filter(predicate)?.build()?,
@@ -3601,6 +4038,20 @@ impl Unparser<'_> {
         // found below.
         self.ensure_exists_correlation_not_shadowed(join)?;
 
+        // The body is built with a builder of its own, so the join-input mark
+        // the shared builder carries does not reach it, and the correlated
+        // predicates are appended after the body is unparsed. A build side
+        // whose filter reads an output that cannot be repeated would move its
+        // projection into a derived table, and the predicates appended below
+        // would then name the relation that table hides.
+        if let Some(filtered) = projection_below_filters(right_plan)
+            && stacked_filters_read_unrepeatable_output(right_plan, &filtered)
+        {
+            return unrepeatable_output_refusal(
+                "when the projection is the build side of an EXISTS-style join",
+            );
+        }
+
         let mut query_builder = Some(QueryBuilder::default());
         let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
         let mut query_builder = query_builder.unwrap();
@@ -3712,15 +4163,24 @@ impl Unparser<'_> {
     }
 
     /// Whether a join presents its inputs to the unparser the other way round
-    /// from the way the plan holds them: `RightSemi` and `RightAnti` correlate
-    /// `join.right` and build the `EXISTS` body from `join.left`.
+    /// from the way the plan holds them: the `Right*` half of the `EXISTS`
+    /// family correlates `join.right` and builds the `EXISTS` body from
+    /// `join.left`.
+    ///
+    /// The membership is what `JoinType`'s own documentation says about which
+    /// input the rows come from: `RightSemi`, `RightAnti` and `RightMark` each
+    /// "return a record for each record from the right input", so `join.right`
+    /// is the probe side for all three.
     ///
     /// Read from here rather than restated, so that everything deciding which
     /// side is which agrees — the join arm swaps the plans, and anything
     /// reading `join.on` has to take the key from the matching side of each
     /// pair or it will name the relation the correlation does not.
     const fn swaps_join_inputs(join_type: JoinType) -> bool {
-        matches!(join_type, JoinType::RightSemi | JoinType::RightAnti)
+        matches!(
+            join_type,
+            JoinType::RightSemi | JoinType::RightAnti | JoinType::RightMark
+        )
     }
 
     /// Whether `qualifier`, as the emitted SQL spells it, is a name the unparser
@@ -4714,7 +5174,223 @@ impl Unparser<'_> {
                 "Unparsing an EXISTS-style join is not supported when a FROM the emitted SQL introduces would capture the correlation: it answers to the correlated reference's relation qualifier, or exposes its column name when the reference carries none, or is a relation this unparser cannot read at all, so the reference binds there instead of in the query it was written against"
             );
         }
+
+        // The mirror image, asked of the other half of each pair: a reference
+        // meant for the inside of the body escaping outward.
+        for build_half in join
+            .on
+            .iter()
+            .map(|(left, right)| if swapped { left } else { right })
+        {
+            if !self.build_half_binds_inside(build_half, &build_scope, build_plan)? {
+                return not_impl_err!(
+                    "Unparsing an EXISTS-style join is not supported when a build-side join key names an output only the build side's projection binds: `SELECT 1` replaces that projection, so the key would bind outside the subquery instead of in the body it was written against"
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Whether every column a build-half join key names still binds inside the
+    /// emitted `EXISTS` body.
+    ///
+    /// [`Self::build_exists_subquery`] replaces the build side's projection with
+    /// `SELECT 1`. A key that only that projection bound — an output qualified
+    /// with a relation the build side does not scan, or named something the
+    /// relation it is qualified with does not have — then has nothing left to
+    /// bind to inside the body. It binds outward instead, to whatever answers
+    /// to it: on the plan spiceai/spiceai#13493 reports, the outer query, so
+    /// both halves of the pair name the outer row and the comparison is a
+    /// tautology. A semi join then keeps every probe row and an anti join drops
+    /// them all, in valid SQL the engine runs without complaint.
+    ///
+    /// [`Self::ensure_exists_correlation_not_shadowed`] deliberately tests only
+    /// the correlated half of each pair — a build half naming a build relation
+    /// binds inside on purpose — so this asks the opposite question of the other
+    /// half, and only where the answer is provable from the plan:
+    ///
+    /// * a qualifier the emitted `FROM` does not introduce at all, by
+    ///   [`Self::scope_answers`], which over-collects — so a doubtful qualifier
+    ///   is kept, not refused;
+    /// * a qualifier that names a scan or an alias in the build plan, none of
+    ///   which has the column. A scan emitted bare answers to every column its
+    ///   source has, and an alias to the columns of whichever relation the
+    ///   emitter lands it on — see [`Self::schema_an_alias_answers_to`]. A name
+    ///   in none of those was the projection's.
+    ///
+    /// An unqualified key is kept: the names the body answers to include the
+    /// build side's own output names, which are exactly the ones `SELECT 1`
+    /// erases, and telling those apart needs the emitted `FROM` rather than a
+    /// reading of the plan (spiceai/spiceai#13469). So is a key under an
+    /// unreadable scope, where nothing is provable.
+    fn build_half_binds_inside(
+        &self,
+        build_half: &Expr,
+        build_scope: &EmittedScope,
+        build_plan: &LogicalPlan,
+    ) -> Result<bool> {
+        let EmittedScope::Readable { exposed, .. } = build_scope else {
+            return Ok(true);
+        };
+        for column in build_half.column_refs() {
+            let Some(relation) = column.relation.as_ref() else {
+                continue;
+            };
+            if !self.scope_answers(build_scope, column)? {
+                return Ok(false);
+            }
+            // The relation is introduced; whether it has the column is only
+            // knowable where the emitted `FROM` presents the plan's own names.
+            if exposed.is_none() {
+                continue;
+            }
+            let qualifier = self.emitted_qualifier_key(relation);
+            let mut found_relation = false;
+            let mut has_column = false;
+            let mut pending = vec![build_plan];
+            while let Some(node) = pending.pop() {
+                let schema = match node {
+                    LogicalPlan::TableScan(scan) => {
+                        let emitted = self.emitted_qualifier_key(&scan.table_name);
+                        let bare = emitted.last().map(|bare| vec![bare.clone()]);
+                        if emitted != qualifier && bare.as_ref() != Some(&qualifier) {
+                            continue;
+                        }
+                        scan.source.schema()
+                    }
+                    // An alias replaces the names it encloses. What its
+                    // derived table answers to depends on how the alias is
+                    // emitted: pushed down onto a scan it wraps through
+                    // projections and filters, the derived table exposes the
+                    // scan's own columns and the projection's renames land in
+                    // the select list above it — which `SELECT 1` replaces.
+                    // Anything else keeps its projection inside the derived
+                    // table, so the alias's schema is what it answers to.
+                    LogicalPlan::SubqueryAlias(alias) => {
+                        if qualifier
+                            != vec![self.identifier_comparison_key(alias.alias.table())]
+                        {
+                            continue;
+                        }
+                        match self.schema_an_alias_answers_to(alias) {
+                            Some(schema) => schema,
+                            None => continue,
+                        }
+                    }
+                    _ => {
+                        pending.extend(node.inputs());
+                        continue;
+                    }
+                };
+                found_relation = true;
+                let mut columns = HashSet::new();
+                self.expose_columns(&mut columns, &schema)?;
+                has_column |= columns.contains(&self.emitted_column_key(&column.name)?);
+            }
+            if found_relation && !has_column {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// The schema of the relation that answers to `alias` once emitted, or
+    /// `None` where the emitter's choice cannot be read from the plan.
+    ///
+    /// An alias is emitted one of three ways, and each answers to different
+    /// columns:
+    ///
+    /// * around a derived table, for an input that builds `SELECT` clauses of
+    ///   its own — the derived table keeps the input's projection, so the
+    ///   alias's schema is what it answers to;
+    /// * pushed down onto a scan the input wraps through projections and
+    ///   filters — the derived table exposes the scan's own columns, and the
+    ///   projection's renames land in the select list above it, which
+    ///   `SELECT 1` replaces;
+    /// * in place, on the primary relation of an inline join — SQL has no
+    ///   syntax for naming a join, so `relation.alias` renames the first
+    ///   relation the walk puts in the `FROM` and leaves the rest named as
+    ///   they were. The alias's schema, which [`SubqueryAlias`] requalifies
+    ///   over every output of the join, over-promises: a column of a relation
+    ///   beside the renamed one is not one the alias answers to.
+    ///
+    /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
+    fn schema_an_alias_answers_to(
+        &self,
+        alias: &datafusion_expr::SubqueryAlias,
+    ) -> Option<SchemaRef> {
+        if Self::requires_derived_subquery(&alias.input) {
+            return Some(Arc::clone(alias.schema.inner()));
+        }
+        if let Some(scan) = Self::scan_an_alias_is_pushed_onto(alias) {
+            return Some(scan.source.schema());
+        }
+        if !Self::alias_input_holds_a_join(&alias.input) {
+            return Some(Arc::clone(alias.schema.inner()));
+        }
+        // The primary relation: the join walk emits the probe side of an
+        // EXISTS-style join first, and the left input of every other join.
+        let mut node = alias.input.as_ref();
+        loop {
+            match node {
+                LogicalPlan::Join(join) => {
+                    node = if Self::swaps_join_inputs(join.join_type) {
+                        join.right.as_ref()
+                    } else {
+                        join.left.as_ref()
+                    };
+                }
+                LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
+                // The alias arm takes the select list before it walks the
+                // join, so a projection met on the way is emitted as a derived
+                // table of its own, and it is that table the alias renames.
+                LogicalPlan::Projection(projection) => {
+                    return Some(Arc::clone(projection.schema.inner()));
+                }
+                LogicalPlan::TableScan(scan) => return Some(scan.source.schema()),
+                LogicalPlan::SubqueryAlias(inner) => {
+                    return self.schema_an_alias_answers_to(inner);
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The scan [`Self::unparse_table_scan_pushdown`] will push `alias` down
+    /// onto, if it will push it down at all.
+    ///
+    /// The conditions are that arm's, read the same way: the alias wraps a
+    /// scan through projections and filters only, the scan carries a pushdown
+    /// of its own (a projection, filters or a fetch) — a bare scan is left as
+    /// it is and the projection above it becomes the derived table's own — and
+    /// no filter on the way carries a subquery, which the pushdown declines to
+    /// rebase. Anything else leaves the alias emitted around its input as
+    /// written.
+    fn scan_an_alias_is_pushed_onto(
+        alias: &datafusion_expr::SubqueryAlias,
+    ) -> Option<&TableScan> {
+        let mut wrapped = alias.input.as_ref();
+        loop {
+            match wrapped {
+                LogicalPlan::Projection(projection) => {
+                    wrapped = projection.input.as_ref();
+                }
+                LogicalPlan::Filter(filter) => {
+                    if filter
+                        .predicate
+                        .exists(|expr| Ok(Self::subquery_of(expr).is_some()))
+                        .unwrap_or(true)
+                    {
+                        return None;
+                    }
+                    wrapped = filter.input.as_ref();
+                }
+                LogicalPlan::TableScan(scan) => {
+                    return Self::is_scan_with_pushdown(scan).then_some(scan);
+                }
+                _ => return None,
+            }
+        }
     }
 
     /// The name a scope around the `EXISTS` build side has to answer to, so the
@@ -4860,12 +5536,16 @@ impl Unparser<'_> {
     /// than in `WHERE`. Filters routed to `ON` are AND-folded onto the join's
     /// own filter.
     ///
+    /// `enclosed_by_full_join` says the enclosing `WHERE` belongs to a
+    /// `FULL JOIN` this join is an input of, so nothing may move there.
+    ///
     /// Returns `(on_filter, where_filters)`.
     fn split_join_on_and_where_filters(
         join_type: JoinType,
         join_filter: &Option<Expr>,
         left_scan_filters: Vec<Expr>,
         right_scan_filters: Vec<Expr>,
+        enclosed_by_full_join: bool,
     ) -> (Option<Expr>, Vec<Expr>) {
         // Which clause preserves a filter's meaning depends on the side it came
         // from:
@@ -4881,12 +5561,17 @@ impl Unparser<'_> {
         //   side's filter; only a derived table does. The caller isolates a
         //   `FULL JOIN`'s filtered side in one before reaching this function,
         //   so `left_scan_filters`/`right_scan_filters` are always empty here.
+        //   The same holds for every join below a `FULL JOIN`'s input: its
+        //   `WHERE` is the `FULL JOIN`'s, so the caller has already isolated
+        //   its scans' filters too, and its own `ON` stays whole — an inner
+        //   join's `ON` and `WHERE` are equivalent only within the scope that
+        //   holds both.
         // A subquery inside `ON` is refused outright by some dialects. Where `ON`
         // and `WHERE` are equivalent the conjunct carrying it can move; where they
         // are not — an outer join preserves rows that `WHERE` would then discard —
         // it has to stay, and the dialect's own limit applies.
         let (join_filter, subquery_filters) = match join_type {
-            JoinType::Inner => {
+            JoinType::Inner if !enclosed_by_full_join => {
                 let (kept, moved) = partition_subquery_filters(
                     join_filter
                         .iter()

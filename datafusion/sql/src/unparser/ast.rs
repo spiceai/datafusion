@@ -80,6 +80,26 @@ impl QueryBuilder {
     pub fn get_order_by(&self) -> Option<OrderByKind> {
         self.order_by_kind.clone()
     }
+    /// Applies `f` to every expression in this query's `ORDER BY`, nested ones
+    /// included, so a caller that replaces the relation the `SELECT` reads — unparsing
+    /// a sub-plan as a derived table — can re-point the references that addressed the
+    /// old one. The `SELECT`-level counterpart is
+    /// [`SelectBuilder::visit_expressions_in_clauses_mut`]; an expression holding a
+    /// subquery is skipped whole for the reason given there, and the return says
+    /// whether any was.
+    pub fn visit_order_by_mut<F>(&mut self, mut f: F) -> bool
+    where
+        F: FnMut(&mut ast::Expr),
+    {
+        let Some(OrderByKind::Expressions(sorts)) = self.order_by_kind.as_mut() else {
+            return false;
+        };
+        let mut skipped = false;
+        for sort in sorts {
+            skipped |= visit_unless_subquery(&mut sort.expr, &mut f);
+        }
+        skipped
+    }
     pub fn limit(&mut self, value: Option<ast::Expr>) -> &mut Self {
         self.limit = value;
         self
@@ -174,6 +194,22 @@ impl Default for QueryBuilder {
     }
 }
 
+/// Applies `f` to `expr` and every expression nested in it, unless `expr` holds a
+/// subquery — then leaves it untouched and returns `true`.
+fn visit_unless_subquery(
+    expr: &mut ast::Expr,
+    f: &mut impl FnMut(&mut ast::Expr),
+) -> bool {
+    if contains_subquery(expr) {
+        return true;
+    }
+    let _ = visit_expressions_mut(expr, |expr| {
+        f(expr);
+        ControlFlow::<()>::Continue(())
+    });
+    false
+}
+
 /// Returns true if `expr` holds a subquery anywhere within it.
 fn contains_subquery(expr: &ast::Expr) -> bool {
     visit_expressions(expr, |expr| {
@@ -225,12 +261,37 @@ pub struct SelectBuilder {
     /// Table aliases that correspond to LATERAL FLATTEN relations.
     /// Column references into these aliases must use `VALUE` as the column name.
     flatten_table_aliases: Vec<String>,
+    /// How many join inputs the walk is currently inside. A join walks both of its
+    /// inputs with this one builder, so while this is non-zero the relation being
+    /// unparsed is not the SELECT's only one — see [`Self::within_join_input`].
+    join_inputs_in_progress: usize,
     /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
     /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so
     /// a second aggregate below it belongs in a derived table.
     ///
     /// Set with `mark_aggregated()` and read with `already_aggregated()`.
     aggregated: bool,
+    /// Whether the join inputs being walked into this SELECT must keep their
+    /// predicates in scopes of their own instead of contributing them to this
+    /// SELECT's `WHERE`.
+    ///
+    /// Set while a `FULL JOIN`'s inputs are unparsed. `WHERE` is evaluated
+    /// after every join, so a predicate that reaches it from one input
+    /// discards the other input's unmatched rows, which the `FULL JOIN`
+    /// preserves. The scan filters of a bare input are isolated in a derived
+    /// table by the join itself; this flag carries the same rule down into an
+    /// input that is a join of its own, whose scans are reached by a nested
+    /// walk that otherwise routes their filters to the shared `WHERE`.
+    ///
+    /// Set with `set_input_predicates_stay_scoped()` and read with
+    /// `input_predicates_stay_scoped()`.
+    input_predicates_stay_scoped: bool,
+    /// How many predicates have been added to this SELECT's `WHERE` through
+    /// `selection()`. A caller that must know whether a sub-plan contributed
+    /// a predicate compares this before and after walking it, which leaves
+    /// the predicate already there in place — taking it out would change
+    /// what the walk sees.
+    predicates_added: usize,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -340,6 +401,24 @@ impl SelectBuilder {
         )
     }
 
+    /// Marks the start of walking one input of a join into this SELECT; paired with
+    /// [`Self::exit_join_input`].
+    pub fn enter_join_input(&mut self) {
+        self.join_inputs_in_progress += 1;
+    }
+
+    pub fn exit_join_input(&mut self) {
+        self.join_inputs_in_progress = self.join_inputs_in_progress.saturating_sub(1);
+    }
+
+    /// Whether the node being unparsed is an input of a join this SELECT reads, so
+    /// the relation it produces will sit beside at least one other. A rewrite that
+    /// assumes its derived table is the SELECT's only relation — addressing the
+    /// outputs by bare name, taking the SELECT list for itself — is wrong here.
+    pub fn within_join_input(&self) -> bool {
+        self.join_inputs_in_progress > 0
+    }
+
     /// Register a table alias as pointing to a LATERAL FLATTEN relation.
     pub fn add_flatten_table_alias(&mut self, alias: String) {
         self.flatten_table_aliases.push(alias);
@@ -363,6 +442,19 @@ impl SelectBuilder {
     /// Returns true if an aggregate node has already been folded into this SELECT.
     pub fn already_aggregated(&self) -> bool {
         self.aggregated
+    }
+
+    /// Whether the join inputs walked into this SELECT must keep their
+    /// predicates in scopes of their own rather than in this SELECT's `WHERE`.
+    pub fn input_predicates_stay_scoped(&self) -> bool {
+        self.input_predicates_stay_scoped
+    }
+
+    /// Sets whether join inputs keep their predicates scoped, returning the
+    /// previous setting so the caller can restore it once its inputs are
+    /// walked.
+    pub fn set_input_predicates_stay_scoped(&mut self, value: bool) -> bool {
+        std::mem::replace(&mut self.input_predicates_stay_scoped, value)
     }
 
     /// Returns the most recently generated flatten alias, or `None` if
@@ -473,6 +565,25 @@ impl SelectBuilder {
     }
 
     pub fn selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
+        if value.is_some() {
+            self.predicates_added += 1;
+        }
+        self.and_selection(value)
+    }
+
+    /// Puts back a predicate that `take_selection()` removed. It is combined
+    /// like any other, but not counted by `predicates_added()`: it is the
+    /// predicate that was already there, not a contribution.
+    pub fn restore_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
+        self.and_selection(value)
+    }
+
+    /// How many predicates `selection()` has added to this SELECT so far.
+    pub fn predicates_added(&self) -> usize {
+        self.predicates_added
+    }
+
+    fn and_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
         // With filter pushdown optimization, the LogicalPlan can have filters defined as part of `TableScan` and `Filter` nodes.
         // To avoid overwriting one of the filters, we combine the existing filter with the additional filter.
         // Example:                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
@@ -533,20 +644,16 @@ impl SelectBuilder {
     /// references an enclosing query's relation, which stays in scope and is
     /// indistinguishable by name from a reference to this SELECT's own relation, so
     /// rewriting inside one would silently change which column the subquery reads. That
-    /// leaves such an expression untouched rather than risk rewriting it wrongly.
-    pub fn visit_expressions_in_clauses_mut<F>(&mut self, mut f: F)
+    /// leaves such an expression untouched rather than risk rewriting it wrongly — and is
+    /// reported: the return is `true` when at least one expression was skipped, for a
+    /// caller whose rewrite has to reach every reference to be sound.
+    pub fn visit_expressions_in_clauses_mut<F>(&mut self, mut f: F) -> bool
     where
         F: FnMut(&mut ast::Expr),
     {
-        let mut visit = |expr: &mut ast::Expr| {
-            if contains_subquery(expr) {
-                return;
-            }
-            let _ = visit_expressions_mut(expr, |expr| {
-                f(expr);
-                ControlFlow::<()>::Continue(())
-            });
-        };
+        let mut skipped = false;
+        let mut visit =
+            |expr: &mut ast::Expr| skipped |= visit_unless_subquery(expr, &mut f);
 
         for item in self.projection.iter_mut().flatten() {
             match item {
@@ -573,6 +680,7 @@ impl SelectBuilder {
         for sort in &mut self.sort_by {
             visit(&mut sort.expr);
         }
+        skipped
     }
 
     pub fn group_by(&mut self, value: ast::GroupByExpr) -> &mut Self {
@@ -671,7 +779,10 @@ impl SelectBuilder {
             flatten_alias_counter: 0,
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
+            join_inputs_in_progress: 0,
             aggregated: false,
+            input_predicates_stay_scoped: false,
+            predicates_added: 0,
         }
     }
 }

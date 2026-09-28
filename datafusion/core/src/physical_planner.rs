@@ -1607,6 +1607,17 @@ impl DefaultPhysicalPlanner {
                 let prefer_hash_join =
                     session_state.config_options().optimizer.prefer_hash_join;
 
+                // Only `HashJoinExec` implements null-aware semantics, and it
+                // needs equi-join keys to do so. Without them the join would be
+                // planned as a nested loop (or piecewise merge) join, which
+                // silently ignores the flag and returns wrong results for
+                // `NOT IN` over a nullable subquery. Fail loudly instead.
+                if *null_aware && join_on.is_empty() {
+                    return plan_err!(
+                        "null_aware {join_type} join requires equi-join keys, but the join has none"
+                    );
+                }
+
                 // TODO: Allow PWMJ to deal with residual equijoin conditions
                 let join: Arc<dyn ExecutionPlan> = if join_on.is_empty() {
                     if join_filter.is_none() && *join_type == JoinType::Inner {
@@ -1737,6 +1748,11 @@ impl DefaultPhysicalPlanner {
                 } else if session_state.config().target_partitions() > 1
                     && session_state.config().repartition_joins()
                     && !prefer_hash_join
+                    && !*null_aware
+                // Null-aware joins (e.g. `NOT IN` with a nullable subquery) must
+                // use the CollectLeft HashJoin below: SortMergeJoinExec does not
+                // implement null-aware anti-join semantics and would return wrong
+                // results when the right side contains a null join key.
                 {
                     // Use SortMergeJoin if hash join is not preferred
                     let join_on_len = join_on.len();
