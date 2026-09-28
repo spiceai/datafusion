@@ -31,7 +31,7 @@ use datafusion_expr::{BinaryExpr, Operator, lit, utils};
 
 use arrow::{
     array::{Array, AsArray},
-    datatypes::{DataType, Field},
+    datatypes::{DataType, Field, SchemaRef},
     record_batch::RecordBatch,
 };
 use datafusion_expr::execution_props::ExecutionProps;
@@ -43,6 +43,7 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema};
 use datafusion_expr::{Expr, Volatility};
 use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
 
@@ -446,16 +447,23 @@ pub async fn pruned_partition_list_with_metadata<'a>(
         None
     };
 
+    let metadata_predicate = MetadataPredicate::try_new(
+        metadata_filters,
+        metadata_cols,
+        ctx.execution_props(),
+    )?;
+
     let objects = table_path
         .list_prefixed_files(ctx, store, prefix, file_extension)
         .await?
         .try_filter(|object_meta| futures::future::ready(object_meta.size > 0))
         .try_filter_map(move |object_meta| {
-            futures::future::ready(filter_by_metadata(
-                object_meta,
-                metadata_filters,
-                metadata_cols,
-            ))
+            futures::future::ready(match &metadata_predicate {
+                Some(predicate) => predicate
+                    .matches(&object_meta)
+                    .map(|keep| keep.then_some(object_meta)),
+                None => Ok(Some(object_meta)),
+            })
         });
 
     if partition_cols.is_empty() {
@@ -498,52 +506,92 @@ pub async fn pruned_partition_list_with_metadata<'a>(
     }
 }
 
-/// Evaluate metadata-column predicates against a single file's [`ObjectMeta`], without
-/// opening the file. Returns `Some(object_meta)` when the object satisfies every predicate,
-/// or `None` when it should be pruned from the listing.
+/// A metadata-column predicate compiled once per listing and evaluated against every
+/// [`ObjectMeta`] the listing returns, without opening any file.
 ///
 /// The metadata columns (`_last_modified`, `_size`, `_location`) are materialized from
-/// `object_meta` via [`MetadataColumn::to_scalar_value`], then the conjunction of
-/// `metadata_filters` is compiled to a physical expression and evaluated against a one-row
-/// batch. Reusing the expression evaluator gives correct `>`, `>=`, `<`, `<=`, `=`,
-/// `BETWEEN`, `IN`, `LIKE`, cast and NULL semantics identical to a row-level `WHERE`.
+/// each `ObjectMeta` via [`MetadataColumn::to_scalar_value`], and the conjunction of the
+/// filters is evaluated as a one-row batch. Reusing the same compiled expression across
+/// every object (rather than recompiling per file) gives correct `>`, `>=`, `<`, `<=`,
+/// `=`, `BETWEEN`, `IN`, `LIKE`, cast and NULL semantics identical to a row-level `WHERE`,
+/// at the cost of one expression compilation per listing instead of one per file.
+pub struct MetadataPredicate<'a> {
+    cols: &'a [MetadataColumn],
+    schema: SchemaRef,
+    expr: Arc<dyn PhysicalExpr>,
+}
+
+impl<'a> MetadataPredicate<'a> {
+    /// Compiles `filters` against `cols`, or returns `Ok(None)` when there is nothing to
+    /// prune on (no metadata columns configured, or no filters to evaluate).
+    ///
+    /// `props` must be the caller's session-scoped [`ExecutionProps`] — a filter such as
+    /// `_size > @threshold` uses a `ScalarVariable`, which only resolves through the
+    /// session's variable providers, not a fresh, empty `ExecutionProps`.
+    pub fn try_new(
+        filters: &[Expr],
+        cols: &'a [MetadataColumn],
+        props: &ExecutionProps,
+    ) -> Result<Option<Self>> {
+        if cols.is_empty() {
+            return Ok(None);
+        }
+        let Some(filter) = utils::conjunction(filters.iter().cloned()) else {
+            return Ok(None);
+        };
+
+        let df_schema = DFSchema::from_unqualified_fields(
+            cols.iter().map(MetadataColumn::field).collect(),
+            Default::default(),
+        )?;
+        let expr = create_physical_expr(&filter, &df_schema, props)?;
+
+        Ok(Some(Self {
+            cols,
+            schema: Arc::clone(df_schema.inner()),
+            expr,
+        }))
+    }
+
+    /// Whether `object_meta` satisfies every predicate.
+    ///
+    /// A single object produces a single-row result. It is kept only on an explicit
+    /// `TRUE`; a `NULL` (unknown) result prunes it, matching SQL `WHERE` semantics.
+    pub fn matches(&self, object_meta: &ObjectMeta) -> Result<bool> {
+        let arrays = self
+            .cols
+            .iter()
+            .map(|col| col.to_scalar_value(object_meta).to_array())
+            .collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)?;
+
+        let matches = self.expr.evaluate(&batch)?.into_array(1)?;
+        let matches = matches.as_boolean();
+        Ok(matches.is_valid(0) && matches.value(0))
+    }
+}
+
+/// Evaluate metadata-column predicates against a single file's [`ObjectMeta`], without
+/// opening the file. Returns `Some(object_meta)` when the object satisfies every
+/// predicate, or `None` when it should be pruned.
 ///
-/// Exposed so a caller that obtains an [`ObjectMeta`] another way — e.g. a `HEAD` on a
-/// known object key instead of a listing — can apply the identical prune before opening
-/// the file, and report the same predicates as `Exact`.
+/// A thin wrapper over [`MetadataPredicate`] for a caller that obtains an `ObjectMeta`
+/// another way — e.g. a `HEAD` on a known object key instead of a listing — so it can
+/// apply the identical prune before opening the file, and report the same predicates as
+/// `Exact`. A listing that checks many objects should build a [`MetadataPredicate`]
+/// directly instead, to compile the filter expression once rather than per object.
 pub fn filter_by_metadata(
     object_meta: ObjectMeta,
     metadata_filters: &[Expr],
     metadata_cols: &[MetadataColumn],
 ) -> Result<Option<ObjectMeta>> {
-    if metadata_filters.is_empty() || metadata_cols.is_empty() {
-        return Ok(Some(object_meta));
-    }
-
-    let df_schema = DFSchema::from_unqualified_fields(
-        metadata_cols.iter().map(MetadataColumn::field).collect(),
-        Default::default(),
-    )?;
-
-    let arrays = metadata_cols
-        .iter()
-        .map(|col| col.to_scalar_value(&object_meta).to_array())
-        .collect::<Result<Vec<_>>>()?;
-    let batch = RecordBatch::try_new(Arc::clone(df_schema.inner()), arrays)?;
-
-    let filter =
-        utils::conjunction(metadata_filters.iter().cloned()).unwrap_or_else(|| lit(true));
-    let props = ExecutionProps::new();
-    let expr = create_physical_expr(&filter, &df_schema, &props)?;
-
-    // A single object => a single-row result. Keep the file only on an explicit TRUE;
-    // a NULL (unknown) result must prune it, matching SQL `WHERE` semantics.
-    let matches = expr.evaluate(&batch)?.into_array(1)?;
-    let matches = matches.as_boolean();
-    if matches.is_valid(0) && matches.value(0) {
-        Ok(Some(object_meta))
-    } else {
-        Ok(None)
+    match MetadataPredicate::try_new(
+        metadata_filters,
+        metadata_cols,
+        &ExecutionProps::new(),
+    )? {
+        Some(predicate) => Ok(predicate.matches(&object_meta)?.then_some(object_meta)),
+        None => Ok(Some(object_meta)),
     }
 }
 
@@ -629,6 +677,17 @@ mod tests {
         ))
     }
 
+    /// Compiles `filters` against `cols` and evaluates them against `meta`, matching
+    /// `pruned_partition_list_with_metadata`'s per-object check.
+    fn keeps(meta: &ObjectMeta, filters: &[Expr], cols: &[MetadataColumn]) -> bool {
+        match MetadataPredicate::try_new(filters, cols, &ExecutionProps::new())
+            .expect("compile predicate")
+        {
+            Some(predicate) => predicate.matches(meta).expect("eval"),
+            None => true,
+        }
+    }
+
     #[test]
     fn filter_by_metadata_prunes_stale_last_modified() {
         // Reproduces github.com/spiceai/spiceai#14264: a file whose mtime is below the
@@ -636,47 +695,30 @@ mod tests {
         let cols = [MetadataColumn::LastModified];
         let filters = [col("_last_modified").gt(ts_lit(2023))];
 
-        let stale =
-            filter_by_metadata(meta_at("old.jsonl.gz", 10, 2020), &filters, &cols)
-                .expect("eval");
-        assert!(stale.is_none(), "2020 file must be pruned by > 2023");
-
-        let fresh =
-            filter_by_metadata(meta_at("new.jsonl.gz", 10, 2024), &filters, &cols)
-                .expect("eval");
-        assert!(fresh.is_some(), "2024 file must survive > 2023");
+        assert!(
+            !keeps(&meta_at("old.jsonl.gz", 10, 2020), &filters, &cols),
+            "2020 file must be pruned by > 2023"
+        );
+        assert!(
+            keeps(&meta_at("new.jsonl.gz", 10, 2024), &filters, &cols),
+            "2024 file must survive > 2023"
+        );
     }
 
     #[test]
     fn filter_by_metadata_prunes_by_size() {
         let cols = [MetadataColumn::Size];
         let filters = [col("_size").lt(lit(100u64))];
-        assert!(
-            filter_by_metadata(meta_at("big", 500, 2024), &filters, &cols)
-                .expect("eval")
-                .is_none()
-        );
-        assert!(
-            filter_by_metadata(meta_at("small", 50, 2024), &filters, &cols)
-                .expect("eval")
-                .is_some()
-        );
+        assert!(!keeps(&meta_at("big", 500, 2024), &filters, &cols));
+        assert!(keeps(&meta_at("small", 50, 2024), &filters, &cols));
     }
 
     #[test]
     fn filter_by_metadata_between_bounds() {
         let cols = [MetadataColumn::LastModified];
         let filters = [col("_last_modified").between(ts_lit(2022), ts_lit(2025))];
-        assert!(
-            filter_by_metadata(meta_at("in", 10, 2023), &filters, &cols)
-                .expect("eval")
-                .is_some()
-        );
-        assert!(
-            filter_by_metadata(meta_at("out", 10, 2019), &filters, &cols)
-                .expect("eval")
-                .is_none()
-        );
+        assert!(keeps(&meta_at("in", 10, 2023), &filters, &cols));
+        assert!(!keeps(&meta_at("out", 10, 2019), &filters, &cols));
     }
 
     #[test]
@@ -685,32 +727,20 @@ mod tests {
         let cols = [MetadataColumn::LastModified];
         let null_ts = lit(ScalarValue::TimestampMicrosecond(None, Some("UTC".into())));
         let filters = [col("_last_modified").gt(null_ts)];
-        assert!(
-            filter_by_metadata(meta_at("f", 10, 2024), &filters, &cols)
-                .expect("eval")
-                .is_none()
-        );
+        assert!(!keeps(&meta_at("f", 10, 2024), &filters, &cols));
     }
 
     #[test]
     fn filter_by_metadata_noop_without_filters_or_cols() {
         let cols = [MetadataColumn::LastModified];
         // No filters → file kept.
-        assert!(
-            filter_by_metadata(meta_at("f", 10, 2020), &[], &cols)
-                .expect("eval")
-                .is_some()
-        );
+        assert!(keeps(&meta_at("f", 10, 2020), &[], &cols));
         // No metadata columns configured → nothing to prune on, file kept.
-        assert!(
-            filter_by_metadata(
-                meta_at("f", 10, 2020),
-                &[col("_last_modified").gt(ts_lit(2099))],
-                &[]
-            )
-            .expect("eval")
-            .is_some()
-        );
+        assert!(keeps(
+            &meta_at("f", 10, 2020),
+            &[col("_last_modified").gt(ts_lit(2099))],
+            &[]
+        ));
     }
 
     #[test]

@@ -538,12 +538,7 @@ impl TableProvider for ListingTable {
             .map(|field| field.name().as_str())
             .collect::<Vec<_>>();
 
-        let metadata_col_names = self
-            .options
-            .metadata_cols
-            .iter()
-            .map(MetadataColumn::name)
-            .collect::<Vec<_>>();
+        let metadata_col_names = self.metadata_column_names();
 
         // If the filters can be resolved using only partition cols, there is no need to
         // pushdown it to TableScan, otherwise, `unhandled` pruning predicates will be generated
@@ -651,6 +646,20 @@ impl TableProvider for ListingTable {
         Ok(ScanResult::new(plan))
     }
 
+    /// Report which filters `scan`/`scan_with_args` can enforce exactly.
+    ///
+    /// As of this change, a filter that is fully evaluable against metadata columns
+    /// (`_last_modified`, `_size`, `_location`) is reported as `Exact`, not just a filter
+    /// on partition columns. `ListingTable` honors this by applying the metadata filter
+    /// during listing (see [`Self::list_files_for_scan_with_metadata`]), so no residual
+    /// `FilterExec` is needed above the scan.
+    ///
+    /// Any other `TableProvider` that forwards this method to a `ListingTable`, but does
+    /// not forward the scan itself, must apply the same metadata-column filters in its
+    /// own scan path. If it does not, it inherits the `Exact` claim without enforcing it,
+    /// and the optimizer will skip the residual filter — the wrapper then returns wrong
+    /// rows. This is a real class of bug: a wrapper with a custom fast-path scan has hit
+    /// it in practice.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -661,12 +670,7 @@ impl TableProvider for ListingTable {
             .iter()
             .map(|col| col.0.as_str())
             .collect::<Vec<_>>();
-        let metadata_column_names = self
-            .options
-            .metadata_cols
-            .iter()
-            .map(MetadataColumn::name)
-            .collect::<Vec<_>>();
+        let metadata_column_names = self.metadata_column_names();
         filters
             .iter()
             .map(|filter| {
@@ -766,6 +770,20 @@ impl TableProvider for ListingTable {
 }
 
 impl ListingTable {
+    /// The names of this table's configured metadata columns (`_last_modified`, `_size`,
+    /// `_location`).
+    ///
+    /// Shared by [`Self::scan_with_args`] and `supports_filters_pushdown`, which must
+    /// agree on this set: `supports_filters_pushdown` reports a filter `Exact` only when
+    /// `scan_with_args` actually applies it during listing.
+    fn metadata_column_names(&self) -> Vec<&str> {
+        self.options
+            .metadata_cols
+            .iter()
+            .map(MetadataColumn::name)
+            .collect()
+    }
+
     /// Get the list of files for a scan as well as the file level statistics.
     /// The list is grouped to let the execution plan know how the files should
     /// be distributed to different threads / executors.
@@ -773,6 +791,12 @@ impl ListingTable {
     /// `filters` must reference only partition columns (see
     /// [`list_files_for_scan_with_metadata`](Self::list_files_for_scan_with_metadata)
     /// to additionally prune by metadata columns).
+    ///
+    /// This is one of the two methods (the other being
+    /// [`list_files_for_scan_with_metadata`](Self::list_files_for_scan_with_metadata))
+    /// that actually enforce the metadata-column filtering that
+    /// `supports_filters_pushdown` promises via `Exact`. A caller or wrapper that needs
+    /// exact semantics must call through here, not just check pushdown support.
     pub async fn list_files_for_scan<'a>(
         &'a self,
         ctx: &'a dyn Session,
@@ -786,6 +810,10 @@ impl ListingTable {
     /// Like [`list_files_for_scan`](Self::list_files_for_scan), but additionally prunes
     /// the listing by `metadata_filters` — predicates resolvable purely from each file's
     /// `ObjectMeta` (`_last_modified`, `_size`, `_location`) — before any file is opened.
+    ///
+    /// This is the method that actually enforces the metadata-column filtering that
+    /// `supports_filters_pushdown` promises via `Exact`. A caller or wrapper that needs
+    /// exact semantics must call through here, not just check pushdown support.
     pub async fn list_files_for_scan_with_metadata<'a>(
         &'a self,
         ctx: &'a dyn Session,
