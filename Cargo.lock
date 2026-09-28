@@ -185,22 +185,22 @@ dependencies = [
 
 [[package]]
 name = "arrow"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-arith 59.2.0",
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-cast 59.2.0",
- "arrow-csv 59.2.0",
- "arrow-data 59.2.0",
- "arrow-ipc 59.2.0",
- "arrow-json 59.2.0",
- "arrow-ord 59.2.0",
- "arrow-row 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
- "arrow-string 59.2.0",
+ "arrow-arith 59.3.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-cast 59.3.0",
+ "arrow-csv 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-ipc 59.3.0",
+ "arrow-json 59.3.0",
+ "arrow-ord 59.3.0",
+ "arrow-row 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
+ "arrow-string 59.3.0",
  "half",
  "rand 0.9.5",
 ]
@@ -221,13 +221,13 @@ dependencies = [
 
 [[package]]
 name = "arrow-arith"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
  "chrono",
  "num-traits",
 ]
@@ -253,13 +253,13 @@ dependencies = [
 
 [[package]]
 name = "arrow-array"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
  "ahash",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
  "chrono",
  "chrono-tz",
  "half",
@@ -272,12 +272,12 @@ dependencies = [
 
 [[package]]
 name = "arrow-avro"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-schema 59.3.0",
  "bytes",
  "bzip2",
  "crc",
@@ -307,8 +307,8 @@ dependencies = [
 
 [[package]]
 name = "arrow-buffer"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
  "bytes",
  "half",
@@ -340,15 +340,15 @@ dependencies = [
 
 [[package]]
 name = "arrow-cast"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-ord 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-ord 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
  "atoi",
  "base64 0.23.1",
  "chrono",
@@ -376,12 +376,12 @@ dependencies = [
 
 [[package]]
 name = "arrow-csv"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-cast 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-cast 59.3.0",
+ "arrow-schema 59.3.0",
  "chrono",
  "csv",
  "csv-core",
@@ -403,11 +403,11 @@ dependencies = [
 
 [[package]]
 name = "arrow-data"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-buffer 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow-buffer 59.3.0",
+ "arrow-schema 59.3.0",
  "half",
  "num-integer",
  "num-traits",
@@ -415,20 +415,20 @@ dependencies = [
 
 [[package]]
 name = "arrow-flight"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-arith 59.2.0",
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-cast 59.2.0",
- "arrow-data 59.2.0",
- "arrow-ipc 59.2.0",
- "arrow-ord 59.2.0",
- "arrow-row 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
- "arrow-string 59.2.0",
+ "arrow-arith 59.3.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-cast 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-ipc 59.3.0",
+ "arrow-ord 59.3.0",
+ "arrow-row 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
+ "arrow-string 59.3.0",
  "base64 0.23.1",
  "bytes",
  "futures",
@@ -456,14 +456,14 @@ dependencies = [
 
 [[package]]
 name = "arrow-ipc"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
  "flatbuffers",
  "lz4_flex 0.14.0",
  "zstd 0.13.3",
@@ -496,15 +496,15 @@ dependencies = [
 
 [[package]]
 name = "arrow-json"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-cast 59.2.0",
- "arrow-ord 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-cast 59.3.0",
+ "arrow-ord 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
  "chrono",
  "half",
  "indexmap 2.14.2",
@@ -533,14 +533,14 @@ dependencies = [
 
 [[package]]
 name = "arrow-ord"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
 ]
 
 [[package]]
@@ -558,13 +558,13 @@ dependencies = [
 
 [[package]]
 name = "arrow-row"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
  "half",
 ]
 
@@ -581,8 +581,8 @@ dependencies = [
 
 [[package]]
 name = "arrow-schema"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
  "bitflags 2.13.2",
  "serde",
@@ -606,14 +606,14 @@ dependencies = [
 
 [[package]]
 name = "arrow-select"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
  "ahash",
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
  "num-traits",
 ]
 
@@ -636,14 +636,14 @@ dependencies = [
 
 [[package]]
 name = "arrow-string"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
  "memchr",
  "num-traits",
  "regex",
@@ -2153,8 +2153,8 @@ dependencies = [
 name = "datafusion"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow 59.3.0",
+ "arrow-schema 59.3.0",
  "async-trait",
  "bytes",
  "bzip2",
@@ -2227,7 +2227,7 @@ dependencies = [
 name = "datafusion-benchmarks"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "bytes",
  "clap",
@@ -2283,7 +2283,7 @@ dependencies = [
 name = "datafusion-catalog"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "dashmap",
  "datafusion-common 55.1.0",
@@ -2306,7 +2306,7 @@ dependencies = [
 name = "datafusion-catalog-listing"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "chrono",
  "datafusion-catalog 55.1.0",
@@ -2332,7 +2332,7 @@ dependencies = [
 name = "datafusion-cli"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "aws-config",
  "aws-credential-types",
@@ -2386,9 +2386,9 @@ dependencies = [
 name = "datafusion-common"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-ipc 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow 59.3.0",
+ "arrow-ipc 59.3.0",
+ "arrow-schema 59.3.0",
  "chrono",
  "criterion",
  "foldhash 0.2.0",
@@ -2464,7 +2464,7 @@ dependencies = [
 name = "datafusion-datasource"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-compression",
  "async-trait",
  "bytes",
@@ -2504,8 +2504,8 @@ dependencies = [
 name = "datafusion-datasource-arrow"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-ipc 59.2.0",
+ "arrow 59.3.0",
+ "arrow-ipc 59.3.0",
  "async-trait",
  "bytes",
  "chrono",
@@ -2528,7 +2528,7 @@ dependencies = [
 name = "datafusion-datasource-avro"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "arrow-avro",
  "async-trait",
  "bytes",
@@ -2546,7 +2546,7 @@ dependencies = [
 name = "datafusion-datasource-csv"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "bytes",
  "datafusion-common 55.1.0",
@@ -2568,7 +2568,7 @@ dependencies = [
 name = "datafusion-datasource-json"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "bytes",
  "datafusion-common 55.1.0",
@@ -2591,8 +2591,8 @@ dependencies = [
 name = "datafusion-datasource-parquet"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow 59.3.0",
+ "arrow-schema 59.3.0",
  "async-trait",
  "bytes",
  "chrono",
@@ -2636,9 +2636,9 @@ version = "55.1.0"
 name = "datafusion-examples"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "arrow-flight",
- "arrow-schema 59.2.0",
+ "arrow-schema 59.3.0",
  "async-trait",
  "base64 0.23.1",
  "bytes",
@@ -2700,8 +2700,8 @@ dependencies = [
 name = "datafusion-execution"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-buffer 59.2.0",
+ "arrow 59.3.0",
+ "arrow-buffer 59.3.0",
  "async-trait",
  "bytes",
  "chrono",
@@ -2749,8 +2749,8 @@ dependencies = [
 name = "datafusion-expr"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow 59.3.0",
+ "arrow-schema 59.3.0",
  "async-trait",
  "chrono",
  "ctor",
@@ -2788,7 +2788,7 @@ dependencies = [
 name = "datafusion-expr-common"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "datafusion-common 55.1.0",
  "indexmap 2.14.2",
  "insta",
@@ -2799,8 +2799,8 @@ dependencies = [
 name = "datafusion-ffi"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow 59.3.0",
+ "arrow-schema 59.3.0",
  "async-ffi",
  "async-trait",
  "chrono",
@@ -2864,8 +2864,8 @@ dependencies = [
 name = "datafusion-functions"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-buffer 59.2.0",
+ "arrow 59.3.0",
+ "arrow-buffer 59.3.0",
  "base64 0.23.1",
  "blake2",
  "blake3",
@@ -2898,7 +2898,7 @@ dependencies = [
 name = "datafusion-functions-aggregate"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "criterion",
  "datafusion-common 55.1.0",
  "datafusion-doc 55.1.0",
@@ -2932,7 +2932,7 @@ dependencies = [
 name = "datafusion-functions-aggregate-common"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "criterion",
  "datafusion-common 55.1.0",
  "datafusion-expr-common 55.1.0",
@@ -2944,8 +2944,8 @@ dependencies = [
 name = "datafusion-functions-nested"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-ord 59.2.0",
+ "arrow 59.3.0",
+ "arrow-ord 59.3.0",
  "criterion",
  "datafusion-common 55.1.0",
  "datafusion-doc 55.1.0",
@@ -2970,7 +2970,7 @@ dependencies = [
 name = "datafusion-functions-table"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "datafusion-catalog 55.1.0",
  "datafusion-common 55.1.0",
@@ -2984,7 +2984,7 @@ dependencies = [
 name = "datafusion-functions-window"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "criterion",
  "datafusion-common 55.1.0",
  "datafusion-doc 55.1.0",
@@ -3038,7 +3038,7 @@ dependencies = [
 name = "datafusion-optimizer"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "chrono",
  "criterion",
@@ -3088,8 +3088,8 @@ dependencies = [
 name = "datafusion-physical-expr"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow 59.3.0",
+ "arrow-schema 59.3.0",
  "criterion",
  "datafusion-common 55.1.0",
  "datafusion-expr 55.1.0",
@@ -3130,7 +3130,7 @@ dependencies = [
 name = "datafusion-physical-expr-adapter"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "datafusion-common 55.1.0",
  "datafusion-expr 55.1.0",
  "datafusion-functions 55.1.0",
@@ -3160,7 +3160,7 @@ dependencies = [
 name = "datafusion-physical-expr-common"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "chrono",
  "criterion",
  "datafusion-common 55.1.0",
@@ -3178,7 +3178,7 @@ dependencies = [
 name = "datafusion-physical-optimizer"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "datafusion-common 55.1.0",
  "datafusion-execution 55.1.0",
  "datafusion-expr 55.1.0",
@@ -3234,11 +3234,11 @@ dependencies = [
 name = "datafusion-physical-plan"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
- "arrow-data 59.2.0",
- "arrow-ipc 59.2.0",
- "arrow-ord 59.2.0",
- "arrow-schema 59.2.0",
+ "arrow 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-ipc 59.3.0",
+ "arrow-ord 59.3.0",
+ "arrow-schema 59.3.0",
  "async-trait",
  "bytes",
  "criterion",
@@ -3276,7 +3276,7 @@ dependencies = [
 name = "datafusion-proto"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "datafusion",
  "datafusion-catalog 55.1.0",
@@ -3314,7 +3314,7 @@ dependencies = [
 name = "datafusion-proto-common"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "datafusion-common 55.1.0",
  "doc-comment",
  "pbjson 0.9.0",
@@ -3354,7 +3354,7 @@ dependencies = [
 name = "datafusion-pruning"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "datafusion-common 55.1.0",
  "datafusion-datasource 55.1.0",
  "datafusion-expr 55.1.0",
@@ -3386,7 +3386,7 @@ dependencies = [
 name = "datafusion-session"
 version = "55.1.0"
 dependencies = [
- "arrow-schema 59.2.0",
+ "arrow-schema 59.3.0",
  "async-trait",
  "datafusion-common 55.1.0",
  "datafusion-execution 55.1.0",
@@ -3399,7 +3399,7 @@ dependencies = [
 name = "datafusion-spark"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "bigdecimal",
  "chrono",
  "crc32fast",
@@ -3429,7 +3429,7 @@ dependencies = [
 name = "datafusion-sql"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "bigdecimal",
  "chrono",
  "ctor",
@@ -3455,7 +3455,7 @@ dependencies = [
 name = "datafusion-sqllogictest"
 version = "55.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "async-trait",
  "bigdecimal",
  "bytes",
@@ -3893,7 +3893,7 @@ dependencies = [
 name = "ffi_example_table_provider"
 version = "0.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "datafusion",
  "datafusion-ffi",
  "ffi_module_interface",
@@ -5624,16 +5624,16 @@ dependencies = [
 
 [[package]]
 name = "parquet"
-version = "59.2.0"
-source = "git+https://github.com/spiceai/arrow-rs.git?rev=eed0d7b890d56e292afd401c8f1f3f8d62b2da0a#eed0d7b890d56e292afd401c8f1f3f8d62b2da0a"
+version = "59.3.0"
+source = "git+https://github.com/spiceai/arrow-rs.git?rev=16974504b7f1776971f4fb20bbe355b09d090a0d#16974504b7f1776971f4fb20bbe355b09d090a0d"
 dependencies = [
  "ahash",
- "arrow-array 59.2.0",
- "arrow-buffer 59.2.0",
- "arrow-data 59.2.0",
- "arrow-ipc 59.2.0",
- "arrow-schema 59.2.0",
- "arrow-select 59.2.0",
+ "arrow-array 59.3.0",
+ "arrow-buffer 59.3.0",
+ "arrow-data 59.3.0",
+ "arrow-ipc 59.3.0",
+ "arrow-schema 59.3.0",
+ "arrow-select 59.3.0",
  "base64 0.23.1",
  "brotli",
  "bytes",
@@ -7408,7 +7408,7 @@ checksum = "d4d1330fe7f7f872cd05165130b10602d667b205fd85be09be2814b115d4ced9"
 name = "test-utils"
 version = "0.1.0"
 dependencies = [
- "arrow 59.2.0",
+ "arrow 59.3.0",
  "chrono-tz",
  "datafusion-common 55.1.0",
  "env_logger",
