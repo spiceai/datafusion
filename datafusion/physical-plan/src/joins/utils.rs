@@ -3362,6 +3362,7 @@ mod tests {
             create_stats(Some(62), nation, false),
             create_stats(Some(3_000_000), customer_expr_key, false),
             &on,
+            NullEquality::NullEqualsNothing,
         )
         .expect("cardinality should be estimable via the borrowed key stats");
 
@@ -3404,6 +3405,7 @@ mod tests {
             create_stats(Some(1000), utf8_fk, false),
             create_stats(Some(50), dim_pk, false),
             &on,
+            NullEquality::NullEqualsNothing,
         )
         .expect("cardinality should be estimable via the borrowed partner NDV");
 
@@ -3436,6 +3438,7 @@ mod tests {
             create_stats(Some(1000), outer, false),
             create_stats(Some(50), inner_expr_key, false),
             &on,
+            NullEquality::NullEqualsNothing,
         )
         .expect("semi cardinality should be estimable via the borrowed key stats");
 
@@ -3725,6 +3728,7 @@ mod tests {
             create_stats(Some(1000), left_col_stats.clone(), false),
             create_stats(Some(2000), right_col_stats.clone(), false),
             &left_column_on,
+            NullEquality::NullEqualsNothing,
         )
         .expect("column NDV should drive a finite estimate");
         assert_eq!(stats.num_rows, 20_000);
@@ -3738,6 +3742,7 @@ mod tests {
             create_stats(Some(1000), left_col_stats.clone(), false),
             create_stats(Some(2000), right_col_stats.clone(), false),
             &right_column_on,
+            NullEquality::NullEqualsNothing,
         )
         .expect("column NDV should drive a finite estimate");
         assert_eq!(stats.num_rows, 40_000);
@@ -3755,6 +3760,7 @@ mod tests {
             create_stats(Some(1000), left_col_stats.clone(), false),
             create_stats(Some(2000), right_col_stats.clone(), false),
             &both_expr_on,
+            NullEquality::NullEqualsNothing,
         )
         .expect("num_rows fallback still yields an estimate");
         assert_eq!(stats.num_rows, 1000);

@@ -1025,10 +1025,10 @@ mod tests {
     }
 
     fn bounds(min: i32, max: i32) -> PartitionBounds {
-        PartitionBounds::new(vec![ColumnBounds::new(
+        PartitionBounds::new(vec![Arc::new(MinMaxColumnBounds::new(
             ScalarValue::Int32(Some(min)),
             ScalarValue::Int32(Some(max)),
-        )])
+        ))])
     }
 
     fn no_bounds() -> PartitionBounds {

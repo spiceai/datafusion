@@ -7123,7 +7123,8 @@ mod tests {
             Arc::new(Column::new_with_schema("r_key", &right.schema())?) as _,
         )];
 
-        let dynamic_filter = HashJoinExec::create_dynamic_filter(&on);
+        let dynamic_filter =
+            HashJoinExec::<MinMaxLeftAccumulator>::create_dynamic_filter(&on);
         let join = HashJoinExec::try_new(
             left,
             right,

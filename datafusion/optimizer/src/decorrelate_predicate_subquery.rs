@@ -1295,6 +1295,14 @@ mod tests {
         )
     }
 
+    fn nullable_scalar_mark_scan(name: &str) -> Result<LogicalPlan> {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32, true),
+            Field::new("grp", DataType::Int32, true),
+        ]);
+        table_scan(Some(name), &schema, None)?.build()
+    }
+
     /// A constant value expression has no column, so `Int32(3) = inner_t.id`
     /// cannot be an equi-join key on its own. The rule projects the constant as
     /// a column of the outer side; `ExtractEquijoinPredicate` (not run here)
