@@ -3209,9 +3209,14 @@ impl Unparser<'_> {
                     // leaves `a.id` unaddressable. Rebase them onto the alias,
                     // as the pushdown rewrite does for the same reason.
                     let table_schema = scan.source.schema();
+                    let filter_schema = DFSchema::try_from_qualified_schema(
+                        scan.table_name.clone(),
+                        table_schema.as_ref(),
+                    )?;
                     let mut filter_alias_rewriter = TableAliasRewriter {
-                        table_schema: &table_schema,
+                        table_schema: &filter_schema,
                         alias_name: plan_alias.alias.clone(),
+                        rewrite_unqualified: true,
                     };
                     let filters = scan
                         .filters
