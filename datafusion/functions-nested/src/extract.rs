@@ -1088,15 +1088,6 @@ where
             continue;
         }
 
-        // the list element is empty; there is no value to take, so the result
-        // is NULL. Without this guard the no-nulls branch below would read
-        // `values[start]`, which is either the next element (wrong value) or
-        // out of bounds when `start == values.len()` (panic).
-        if start == end {
-            mutable.extend_nulls(1);
-            continue;
-        }
-
         let row_value = array.value(row_index);
         match row_value.nulls() {
             Some(row_nulls_buffer) => {
