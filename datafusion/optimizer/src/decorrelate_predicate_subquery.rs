@@ -434,7 +434,8 @@ fn build_join(
                 right,
             })),
         ) => {
-            let right_col = Expr::Column(create_col_from_scalar_expr(right.deref(), alias)?);
+            let right_col =
+                Expr::Column(create_col_from_scalar_expr(right.deref(), alias)?);
             let value = left.deref().clone();
             let in_predicate = if not_exists_form && !dropped_in_predicate {
                 value

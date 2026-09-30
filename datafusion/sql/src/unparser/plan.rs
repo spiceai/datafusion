@@ -1233,7 +1233,7 @@ impl Unparser<'_> {
     /// does not fix the value there.
     ///
     /// Emitting the scope anyway would answer with rows the `SELECT` list never
-    /// showed — see [`Dialect::derived_table_evaluates_volatile_outputs_once`] —
+    /// showed — see [`Dialect::derived_table_evaluates_volatile_outputs_once`](crate::unparser::dialect::Dialect::derived_table_evaluates_volatile_outputs_once) —
     /// so the pushdown is refused instead, which costs the pushdown and never a row.
     fn ensure_derived_table_fixes_volatile_outputs(&self) -> Result<()> {
         if self.dialect.derived_table_evaluates_volatile_outputs_once() {

@@ -451,9 +451,13 @@ impl ExecutionPlan for ProjectionExec {
             child_with_fetch.schema().as_ref(),
         )
         .ok()?;
-        ProjectionExec::try_from_projector(projector, child_with_fetch, overrides_metadata)
-            .ok()
-            .map(|projection| Arc::new(projection) as Arc<dyn ExecutionPlan>)
+        ProjectionExec::try_from_projector(
+            projector,
+            child_with_fetch,
+            overrides_metadata,
+        )
+        .ok()
+        .map(|projection| Arc::new(projection) as Arc<dyn ExecutionPlan>)
     }
 
     fn fetch(&self) -> Option<usize> {

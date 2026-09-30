@@ -1650,9 +1650,9 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::metadata::MetadataColumn;
     use crate::source::DataSourceExec;
     use crate::test_util::col;
-    use crate::metadata::MetadataColumn;
     use crate::{TableSchema, TableSchemaBuilder};
     use crate::{
         generate_test_files, test_util::MockSource, tests::aggr_test_schema,
@@ -3056,6 +3056,8 @@ mod tests {
 
     #[test]
     fn test_partition_statistics_with_metadata_columns() {
+        use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
+
         use crate::source::DataSourceExec;
         use datafusion_physical_plan::ExecutionPlan;
 
@@ -3118,9 +3120,12 @@ mod tests {
         // partition_statistics must return 3 column_statistics entries —
         // one for each column in the projected schema — so that
         // ProjectionExec doesn't panic on index access.
-        let stats = exec
-            .partition_statistics(Some(0))
-            .expect("partition_statistics should succeed");
+        let stats = StatisticsContext::new()
+            .compute(
+                exec.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(0)),
+            )
+            .expect("partition statistics should succeed");
         assert_eq!(
             stats.column_statistics.len(),
             3,
@@ -3129,9 +3134,9 @@ mod tests {
         );
 
         // Also verify aggregate statistics (partition = None)
-        let agg_stats = exec
-            .partition_statistics(None)
-            .expect("aggregate partition_statistics should succeed");
+        let agg_stats = StatisticsContext::new()
+            .compute(exec.as_ref(), &StatisticsArgs::new())
+            .expect("aggregate statistics should succeed");
         assert_eq!(
             agg_stats.column_statistics.len(),
             3,

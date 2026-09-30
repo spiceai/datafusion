@@ -764,7 +764,7 @@ impl BoolVecBuilder {
     }
 
     /// Combines the results in the [`ColumnarValue`] to the currently in
-    /// progress array, following the same rules as [`Self::combine_array`].
+    /// progress array, following the same rules as `Self::combine_array`.
     ///
     /// # Panics
     /// If `value` is not boolean
@@ -6136,7 +6136,9 @@ mod tests {
 
         // Create the pruning predicate
         let physical_expr = logical2physical(&expr, &schema);
-        let pruning_predicate = PruningPredicate::try_new(physical_expr, schema)?;
+        let pruning_predicate = PruningPredicateBuilder::new()
+            .with_file_schema(schema)
+            .try_build(physical_expr)?;
 
         // Test pruning results
         let result1 = pruning_predicate.prune(&statistics1)?;

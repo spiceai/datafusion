@@ -45,7 +45,7 @@
 //! saves. `retained_groups_bound` is the cap (when derivable) on how many
 //! pre-aggregated groups the join can keep — the over-production guard against a
 //! `join_out` over-estimate that would otherwise wave a wasteful push through;
-//! see [`cost_gate`].
+//! see `cost_gate`.
 //!
 //! # Scope (first milestone)
 //!
@@ -130,8 +130,8 @@ use crate::PhysicalOptimizerRule;
 use arrow::datatypes::{DataType, FieldRef};
 use datafusion_common::JoinSide;
 use datafusion_common::Result;
-use datafusion_common::config::ConfigOptions;
 use datafusion_common::Statistics;
+use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_expr::{AggregateUDF, JoinType, Operator};
@@ -2396,7 +2396,8 @@ mod tests {
             &self,
             _f: &mut dyn FnMut(
                 &Arc<dyn PhysicalExpr>,
-            ) -> Result<datafusion_common::tree_node::TreeNodeRecursion>,
+            )
+                -> Result<datafusion_common::tree_node::TreeNodeRecursion>,
         ) -> Result<datafusion_common::tree_node::TreeNodeRecursion> {
             Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
         }

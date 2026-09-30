@@ -228,7 +228,7 @@ impl<'a> DFParquetMetadata<'a> {
     /// Pin metadata fetches to the listed object generation.
     ///
     /// Must be forwarded from the same `object_versioning_type` the file
-    /// reader uses for page reads. [`crate::ParquetFileReader::get_metadata`]
+    /// reader uses for page reads. `get_metadata` on [`crate::ParquetFileReader`]
     /// fetches the footer through this path, so omitting it leaves the footer
     /// unpinned while the pages are pinned.
     pub fn with_object_versioning_type(

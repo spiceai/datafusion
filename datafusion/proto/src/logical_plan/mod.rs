@@ -619,7 +619,7 @@ impl AsLogicalPlan for LogicalPlanNode {
                             }
                             Arc::new(csv)
                         },
-                        #[cfg_attr(not(feature = "vortex"), allow(unused_variables))]
+                        #[cfg_attr(not(feature = "vortex"), expect(unused_variables))]
                         FileFormatType::Vortex(protobuf::VortexFormat {
                             options
                         }) => {

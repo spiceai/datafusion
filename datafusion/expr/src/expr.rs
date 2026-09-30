@@ -3137,10 +3137,7 @@ macro_rules! expr_vec_fmt {
 /// A subquery that does not project exactly one column leaves the placeholder
 /// untouched rather than failing inference; the subquery invariant checks
 /// report that shape as a planning error.
-fn rewrite_placeholder_from_subquery(
-    expr: &mut Expr,
-    subquery: &Subquery,
-) -> Result<()> {
+fn rewrite_placeholder_from_subquery(expr: &mut Expr, subquery: &Subquery) -> Result<()> {
     let subquery_schema = subquery.subquery.schema();
     if let [subquery_field] = &subquery_schema.fields()[..] {
         rewrite_placeholder_field(expr, subquery_field)?;

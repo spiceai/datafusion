@@ -1556,7 +1556,7 @@ config_namespace! {
         /// while the optimization matures.
         pub enable_eager_aggregation: bool, default = false
 
-        /// Cost-gate threshold for [`enable_eager_aggregation`]: the
+        /// Cost-gate threshold for `enable_eager_aggregation`: the
         /// pushed-down pre-aggregation must reduce its input by at least this
         /// factor (estimated input rows >= estimated group count * factor) to be
         /// applied. This guards against pushing an aggregation that barely
@@ -1565,7 +1565,7 @@ config_namespace! {
         /// accepts any reduction.
         pub eager_aggregation_min_reduction_factor: usize, default = 4
 
-        /// Cost-gate cap for [`enable_eager_aggregation`]: if non-zero,
+        /// Cost-gate cap for `enable_eager_aggregation`: if non-zero,
         /// decline the push-down when the estimated pushed-down group count
         /// exceeds this value (an absolute guard on the pre-aggregation's memory
         /// footprint). 0 disables the cap.
