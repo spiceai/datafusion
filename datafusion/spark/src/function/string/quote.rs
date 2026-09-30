@@ -22,8 +22,8 @@ use datafusion_common::types::{NativeType, logical_string};
 use datafusion_common::utils::take_function_args;
 use datafusion_common::{Result, exec_err};
 use datafusion_expr::{
-    Coercion, ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature, TypeSignatureClass,
-    Volatility,
+    Coercion, ColumnarValue, ScalarFunctionArgs, ScalarUDFImpl, Signature,
+    TypeSignatureClass, Volatility,
 };
 use datafusion_functions::utils::make_scalar_function;
 
