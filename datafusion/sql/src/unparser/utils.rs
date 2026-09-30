@@ -1108,18 +1108,17 @@ pub(crate) fn unproject_sort_expr(
                 Expr::Column(Column {
                     relation: Some(_), ..
                 }) => Ok(Transformed::no(sub_expr)),
-                // In case of aggregation there could be columns containing aggregation functions we need to unproject
-                Expr::Column(col)
-                    if let Some(agg) = agg
-                        && agg.schema.is_column_from_schema(&col) =>
-                {
-                    Ok(Transformed::yes(unproject_agg_exprs(
-                        Expr::Column(col),
-                        agg,
-                        None,
-                    )?))
-                }
                 Expr::Column(col) => {
+                    // In case of aggregation there could be columns containing aggregation functions we need to unproject
+                    if let Some(agg) = agg
+                        && agg.schema.is_column_from_schema(&col)
+                    {
+                        return Ok(Transformed::yes(unproject_agg_exprs(
+                            Expr::Column(col),
+                            agg,
+                            None,
+                        )?));
+                    }
                     // When an expression in the `ORDER BY` contains an alias from the `SELECT`
                     // we need to transform it back to the actual expression so that it is
                     // valid SQL in all positions inside ORDER BY (PostgreSQL only allows bare
