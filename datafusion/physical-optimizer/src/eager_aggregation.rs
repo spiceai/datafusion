@@ -131,6 +131,7 @@ use arrow::datatypes::{DataType, FieldRef};
 use datafusion_common::JoinSide;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
+use datafusion_common::Statistics;
 use datafusion_common::stats::Precision;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_expr::{AggregateUDF, JoinType, Operator};
@@ -149,6 +150,7 @@ use datafusion_physical_plan::joins::utils::{
     ColumnIndex, JoinFilter, build_join_schema,
 };
 use datafusion_physical_plan::projection::ProjectionExec;
+use datafusion_physical_plan::statistics::{StatisticsArgs, StatisticsContext};
 
 /// Cost-based physical eager-aggregation rule. See the [module docs](self).
 #[derive(Debug, Default)]
@@ -591,7 +593,7 @@ fn try_push_aggregate(
             Side::Left => right,
             Side::Right => left,
         };
-        match other_plan.partition_statistics(None)?.num_rows {
+        match plan_statistics(other_plan.as_ref())?.num_rows {
             Precision::Exact(n) | Precision::Inexact(n) => Some(n),
             Precision::Absent => None,
         }
@@ -1004,6 +1006,15 @@ fn collect_columns(expr: &Arc<dyn PhysicalExpr>, out: &mut Vec<Column>) {
     }
 }
 
+/// Whole-plan statistics through DataFusion 55's `StatisticsContext`.
+///
+/// `ExecutionPlan::partition_statistics` is deprecated in 55 and several operators
+/// (e.g. `FilterExec`) no longer derive statistics through it, so reading it would
+/// leave the cost gate without row counts and the rule would never fire.
+fn plan_statistics(plan: &dyn ExecutionPlan) -> Result<Arc<Statistics>> {
+    StatisticsContext::new().compute(plan, &StatisticsArgs::new())
+}
+
 /// Cost gate: push only when the join's estimated output exceeds the estimated
 /// pre-aggregated row count (and pre-aggregation actually reduces rows). Declines
 /// (with a reason) when the required statistics are absent (conservative).
@@ -1024,14 +1035,14 @@ fn cost_gate(
         .eager_aggregation_min_reduction_factor
         .max(1);
     let max_groups = config.optimizer.eager_aggregation_max_pushed_groups;
-    let push_stats = push_plan.partition_statistics(None)?;
+    let push_stats = plan_statistics(push_plan.as_ref())?;
     let push_rows = match push_stats.num_rows {
         Precision::Exact(n) | Precision::Inexact(n) => n,
         Precision::Absent => {
             return Ok(CostGate::Decline("push side num_rows absent".into()));
         }
     };
-    let join_out = match join.partition_statistics(None)?.num_rows {
+    let join_out = match plan_statistics(join)?.num_rows {
         Precision::Exact(n) | Precision::Inexact(n) => n,
         Precision::Absent => {
             return Ok(CostGate::Decline("join output num_rows absent".into()));
@@ -1121,7 +1132,7 @@ mod tests {
     use super::*;
     use crate::PhysicalOptimizerRule;
 
-    use crate::enforce_distribution::EnforceDistribution;
+    use crate::ensure_requirements::EnsureRequirements;
     use arrow::array::{Decimal128Array, Float64Array, Int32Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
@@ -2381,6 +2392,14 @@ mod tests {
         ) -> Result<Arc<dyn ExecutionPlan>> {
             Ok(self)
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            ) -> Result<datafusion_common::tree_node::TreeNodeRecursion>,
+        ) -> Result<datafusion_common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion_common::tree_node::TreeNodeRecursion::Continue)
+        }
         fn execute(
             &self,
             _partition: usize,
@@ -2433,9 +2452,10 @@ mod tests {
     }
 
     fn enforce_distribution(plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-        // EnforceDistribution inserts the repartitioning the pushed/top
-        // FinalPartitioned aggregates require to execute correctly.
-        EnforceDistribution::new()
+        // EnsureRequirements (which subsumes EnforceDistribution in 55) inserts
+        // the repartitioning the pushed/top FinalPartitioned aggregates require
+        // to execute correctly.
+        EnsureRequirements::new()
             .optimize(plan, &ConfigOptions::default())
             .unwrap()
     }
