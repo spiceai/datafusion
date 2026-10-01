@@ -1166,7 +1166,7 @@ impl Unparser<'_> {
     ) -> Result<()> {
         let Some(table_ref) = Self::scanned_relation_of(plan) else {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is only supported when the limited input is a single table scan"
+                "Unparsing a row limit in a scope of its own is only supported when the limited input is a single table scan"
             );
         };
 
@@ -1174,7 +1174,7 @@ impl Unparser<'_> {
         // with the full path would be left pointing at a name that is gone.
         if self.dialect.full_qualified_col() && table_ref.to_vec().len() > 1 {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is not supported for a qualified table name on a dialect that spells columns in full"
+                "Unparsing a row limit in a scope of its own is not supported for a qualified table name on a dialect that spells columns in full"
             );
         }
 
@@ -1186,7 +1186,7 @@ impl Unparser<'_> {
         let fields = plan.schema().fields();
         if fields.is_empty() {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is not supported for an input projecting no columns"
+                "Unparsing a row limit in a scope of its own is not supported for an input projecting no columns"
             );
         }
 

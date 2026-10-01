@@ -14026,6 +14026,25 @@ fn limit_join_input_is_derived_under_the_scans_name() -> Result<()> {
         @"SELECT b.id, c.id FROM (SELECT b.id FROM b LIMIT 1) AS b INNER JOIN c ON b.id = c.id"
     );
 
+    // A qualified scan on a dialect that spells columns in full is refused,
+    // and the refusal names the row limit, not a filter the plan does not have.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("s.c"), &schema, Some(vec![0]))?
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let error = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("the alias cannot carry the full path");
+    assert_contains!(
+        error.to_string(),
+        "Unparsing a row limit in a scope of its own is not supported for a qualified table name on a dialect that spells columns in full"
+    );
     Ok(())
 }
 
