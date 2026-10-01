@@ -14875,5 +14875,30 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         error.to_string(),
         "outer join's subquery predicate scoped onto a joined input is not supported"
     );
+
+    // An aliased joined input that renames its columns takes the dialect's
+    // column-alias fallback: a dialect that refuses `AS j (x, y)` gets the
+    // names inside the derived table instead.
+    let renamed = || -> Result<LogicalPlan> {
+        let joined = LogicalPlanBuilder::from(scan("b")?)
+            .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .project(vec![col("b.id"), col("c.id")])?
+            .build()?;
+        let renamed = LogicalPlanBuilder::from(joined)
+            .project(vec![col("b.id").alias("x"), col("c.id").alias("y")])?
+            .alias("j")?
+            .build()?;
+        LogicalPlanBuilder::from(scan("a")?)
+            .join(renamed, Left, (vec!["a.id"], vec!["j.x"]), None)?
+            .build()
+    };
+    assert_snapshot!(
+        plan_to_sql(&renamed()?)?,
+        @"SELECT a.id, j.x, j.y FROM a LEFT OUTER JOIN (SELECT b.id, c.id FROM b INNER JOIN c ON b.id = c.id) AS j (x, y) ON a.id = j.x"
+    );
+    assert_snapshot!(
+        Unparser::new(&SqliteDialect {}).plan_to_sql(&renamed()?)?,
+        @"SELECT `a`.`id`, `j`.`x`, `j`.`y` FROM `a` LEFT OUTER JOIN (SELECT `b`.`id` AS `x`, `c`.`id` AS `y` FROM `b` INNER JOIN `c` ON `b`.`id` = `c`.`id`) AS `j` ON `a`.`id` = `j`.`x`"
+    );
     Ok(())
 }

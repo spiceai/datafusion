@@ -2906,6 +2906,29 @@ impl Unparser<'_> {
                             .collect::<Result<Vec<_>>>()?;
                         select.projection(items);
                     }
+                    // A dialect that refuses a column list on a table alias
+                    // gets the names inside the derived table instead, as the
+                    // derived paths below do.
+                    if !columns.is_empty()
+                        && !self.dialect.supports_column_alias_in_table_alias()
+                    {
+                        let Ok(rewritten_plan) =
+                            inject_column_aliases_into_subquery(plan.clone(), columns)
+                        else {
+                            return internal_err!(
+                                "Failed to transform SubqueryAlias plan"
+                            );
+                        };
+                        return self.derive(
+                            &rewritten_plan,
+                            relation,
+                            Some(self.new_table_alias(
+                                plan_alias.alias.table().to_string(),
+                                vec![],
+                            )),
+                            false,
+                        );
+                    }
                     return self.derive(
                         plan,
                         relation,
