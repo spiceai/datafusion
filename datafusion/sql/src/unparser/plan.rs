@@ -804,6 +804,9 @@ impl Unparser<'_> {
             LogicalPlan::Filter(filter) => {
                 Self::is_joined_relation(filter.input.as_ref())
             }
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::is_joined_relation(alias.input.as_ref())
+            }
             _ => false,
         }
     }
@@ -2533,6 +2536,15 @@ impl Unparser<'_> {
                     select.leave_null_extended_join_input();
                 }
                 walked?;
+                // The mirror of the right input's refusal below: a subquery
+                // conjunct this join's `ON` scopes onto a joined left input
+                // has no single name for the derived table it would need.
+                if !left_scoped.is_empty() && Self::is_joined_relation(left_plan.as_ref())
+                {
+                    return not_impl_err!(
+                        "Unparsing an outer join's subquery predicate scoped onto a joined input is not supported"
+                    );
+                }
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one

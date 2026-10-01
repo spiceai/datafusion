@@ -14902,6 +14902,45 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         error.to_string(),
         "outer join's subquery predicate scoped onto a joined input is not supported"
     );
+    // The mirror image: a RIGHT JOIN scopes the conjunct onto its left input.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let inner = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(inner)
+        .join(
+            scan("a")?,
+            Right,
+            (vec!["b.id"], vec!["a.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a scoped subquery conjunct on a joined left input has no name to bind to",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
+
+    // An aliased join behind a filter and a second alias is a joined input
+    // still: the outer alias derives all of it, so the inner alias's filter
+    // stays inside rather than naming `i` where only `o` is in scope.
+    let nested_aliases = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .alias("i")?
+        .filter(col("i.id").eq(lit("x")))?
+        .alias("o")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(nested_aliases, Left, (vec!["a.id"], vec!["o.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a.id, o.id, o."id:1" FROM a LEFT OUTER JOIN (SELECT * FROM (SELECT b.id, c.id AS "id:1" FROM b INNER JOIN c ON b.id = c.id) AS i WHERE (i.id = 'x')) AS o ON a.id = o.id"#
+    );
 
     // An aliased joined input that renames its columns takes the dialect's
     // column-alias fallback: a dialect that refuses `AS j (x, y)` gets the
