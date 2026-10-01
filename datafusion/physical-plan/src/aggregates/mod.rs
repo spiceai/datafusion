@@ -28,7 +28,7 @@ use crate::aggregates::{
 use crate::execution_plan::{CardinalityEffect, EmissionType};
 use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
-    FilterPushdownPropagation, PushedDownPredicate,
+    FilterPushdownPropagation,
 };
 use crate::metrics::{ExecutionPlanMetricsSet, MetricsSet};
 use crate::{
@@ -36,9 +36,8 @@ use crate::{
     SendableRecordBatchStream, Statistics, check_if_same_properties,
 };
 use datafusion_common::config::ConfigOptions;
-use datafusion_physical_expr::utils::collect_columns;
 use parking_lot::Mutex;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use arrow::array::{ArrayRef, UInt8Array, UInt16Array, UInt32Array, UInt64Array};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -541,10 +540,11 @@ impl From<StreamType> for SendableRecordBatchStream {
 ///
 /// ## Enable Condition
 /// - No grouping (no `GROUP BY` clause in the sql, only a single global group to aggregate)
-/// - The aggregate expression must be `min`/`max`, and evaluate directly on columns.
-///   Note multiple aggregate expressions that satisfy this requirement are allowed,
-///   and a dynamic filter will be constructed combining all applicable expr's
-///   states. See more in the following example with dynamic filter on multiple columns.
+/// - Every aggregate expression must be `min`/`max`, and evaluate directly on a
+///   column. If any aggregate expression is unsupported, dynamic filtering is
+///   disabled for the entire [`AggregateExec`]. Multiple supported aggregate
+///   expressions are combined into one dynamic filter. See the following example
+///   with a dynamic filter on multiple columns.
 ///
 /// ## Filter Construction
 /// The filter is kept in the `DataSourceExec`, and it will gets update during execution,
@@ -564,11 +564,11 @@ struct AggrDynFilter {
     /// The current bounds for the dynamic filter, updates during the execution to
     /// tighten the bound for more effective pruning.
     ///
-    /// Each vector element is for the accumulators that support dynamic filter.
-    /// e.g. This `AggregateExec` has accumulator:
-    /// min(a), avg(a), max(b)
-    /// And this field stores [PerAccumulatorDynFilter(min(a)), PerAccumulatorDynFilter(min(b))]
-    supported_accumulators_info: Vec<PerAccumulatorDynFilter>,
+    /// Each vector element corresponds to one aggregate expression. Dynamic filtering
+    /// is enabled only when every aggregate expression is supported, so this vector
+    /// contains an entry for every accumulator. For example, `min(a), max(b)` produces
+    /// entries for `min(a)` and `max(b)`.
+    accumulator_dyn_filter_info: Vec<PerAccumulatorDynFilter>,
 }
 
 // ---- Aggregate Dynamic Filter Utility Structs ----
@@ -912,7 +912,7 @@ impl AggregateExec {
         };
 
         // Validate that the filter is compatible with the aggregation columns.
-        let cols = self.cols_for_dynamic_filter(&dyn_filter.supported_accumulators_info);
+        let cols = self.cols_for_dynamic_filter(&dyn_filter.accumulator_dyn_filter_info);
         if cols.len() != filter.children().len() {
             return internal_err!(
                 "Dynamic filter expression is incompatible with aggregate due to mismatched number of columns"
@@ -929,7 +929,7 @@ impl AggregateExec {
         // Overwrite our filter
         self.dynamic_filter = Some(Arc::new(AggrDynFilter {
             filter,
-            supported_accumulators_info: dyn_filter.supported_accumulators_info.clone(),
+            accumulator_dyn_filter_info: dyn_filter.accumulator_dyn_filter_info.clone(),
         }));
         Ok(self)
     }
@@ -1290,7 +1290,7 @@ impl AggregateExec {
             return;
         }
 
-        // Collect supported accumulators
+        // Collect dynamic filter metadata for every accumulator
         // It is assumed the order of aggregate expressions are not changed from `AggregateExec`
         // to `AggregateStream`
         let mut aggr_dyn_filters = Vec::new();
@@ -1321,23 +1321,28 @@ impl AggregateExec {
                     aggr_index: i,
                     shared_bound: Arc::new(Mutex::new(ScalarValue::Null)),
                 });
+            } else {
+                // An incomplete filter could prune rows that still improve an
+                // unsupported aggregate, so every aggregate must be represented.
+                // TODO: Derive safe predicates for expressions such as `min(col + literal)`.
+                return;
             }
         }
 
         if !aggr_dyn_filters.is_empty() {
             self.dynamic_filter = Some(Arc::new(AggrDynFilter {
                 filter: Arc::new(DynamicFilterPhysicalExpr::new(all_cols, lit(true))),
-                supported_accumulators_info: aggr_dyn_filters,
+                accumulator_dyn_filter_info: aggr_dyn_filters,
             }))
         }
     }
 
-    // Collect column references for the dynamic filter expression from the supported accumulators.
+    // Collect column references for the dynamic filter expression from the accumulators.
     fn cols_for_dynamic_filter(
         &self,
-        supported_accumulators_info: &[PerAccumulatorDynFilter],
+        accumulator_dyn_filter_info: &[PerAccumulatorDynFilter],
     ) -> Vec<Arc<dyn PhysicalExpr>> {
-        let all_cols: Vec<Arc<dyn PhysicalExpr>> = supported_accumulators_info
+        let all_cols: Vec<Arc<dyn PhysicalExpr>> = accumulator_dyn_filter_info
             .iter()
             .filter_map(|info| {
                 // This should always be true due to how the supported accumulators
@@ -1350,7 +1355,7 @@ impl AggregateExec {
                 None
             })
             .collect();
-        debug_assert!(all_cols.len() == supported_accumulators_info.len());
+        debug_assert!(all_cols.len() == accumulator_dyn_filter_info.len());
         all_cols
     }
 
@@ -1643,70 +1648,49 @@ impl ExecutionPlan for AggregateExec {
         // This optimization is NOT safe for filters on aggregated columns (like filtering on
         // the result of SUM or COUNT), as those require computing all groups first.
 
-        // Build grouping columns using output indices because parent filters reference the
-        // AggregateExec's output schema where grouping columns in the output schema. The
-        // grouping expressions reference input columns which may not match the output schema.
-        //
-        // It is safe to assume that the output_schema contains group by columns in the same order
-        // as the group by expression. See [`create_schema`] and [`AggregateExec`].
-        let output_schema = self.schema();
-        let grouping_columns: HashSet<_> = (0..self.group_by.expr().len())
-            .map(|i| Column::new(output_schema.field(i).name(), i))
+        // Grouping columns are output before aggregate columns, in the same order
+        // as the grouping expressions. Map each grouping output position to the
+        // input column it reads, by position rather than by name, so that
+        // same-named grouping columns stay distinct. Only grouping expressions
+        // that are plain input columns can be mapped; a grouping-set null mask
+        // marks grouping columns that are not available in that set.
+        let column_mapping: HashMap<usize, usize> = self
+            .group_by
+            .expr()
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| {
+                self.group_by
+                    .groups()
+                    .iter()
+                    .all(|null_mask| null_mask.get(*idx) != Some(&true))
+            })
+            .filter_map(|(idx, (expr, _))| {
+                expr.downcast_ref::<Column>()
+                    .map(|column| (idx, column.index()))
+            })
             .collect();
 
-        // Analyze each filter separately to determine if it can be pushed down
-        let mut safe_filters = Vec::new();
-        let mut unsafe_filters = Vec::new();
-
-        for filter in parent_filters {
-            let filter_columns: HashSet<_> =
-                collect_columns(&filter).into_iter().collect();
-
-            // Check if this filter references non-grouping columns
-            let references_non_grouping = !grouping_columns.is_empty()
-                && !filter_columns.is_subset(&grouping_columns);
-
-            if references_non_grouping {
-                unsafe_filters.push(filter);
-                continue;
-            }
-
-            // For GROUPING SETS, verify this filter's columns appear in all grouping sets
-            if self.group_by.groups().len() > 1 {
-                let filter_column_indices: Vec<usize> = filter_columns
-                    .iter()
-                    .filter_map(|filter_col| {
-                        grouping_columns.get(filter_col).map(|col| col.index())
-                    })
-                    .collect();
-
-                // Check if any of this filter's columns are missing from any grouping set
-                let has_missing_column = self.group_by.groups().iter().any(|null_mask| {
-                    filter_column_indices
-                        .iter()
-                        .any(|&idx| null_mask.get(idx) == Some(&true))
-                });
-
-                if has_missing_column {
-                    unsafe_filters.push(filter);
-                    continue;
-                }
-            }
-
-            // This filter is safe to push down
-            safe_filters.push(filter);
-        }
-
-        // Build child filter description with both safe and unsafe filters
         let child = self.children()[0];
-        let mut child_desc = ChildFilterDescription::from_child(&safe_filters, child)?;
-
-        // Add unsafe filters as unsupported
-        child_desc.parent_filters.extend(
-            unsafe_filters
-                .into_iter()
-                .map(PushedDownPredicate::unsupported),
-        );
+        // Global aggregates and grouping sets containing an empty grouping set
+        // emit a row even when their input is empty. Parent filters therefore
+        // cannot be pushed below them, including filters without column
+        // references.
+        let may_emit_on_empty_input = self.group_by.is_true_no_grouping()
+            || self
+                .group_by
+                .groups()
+                .iter()
+                .any(|null_mask| null_mask.iter().all(|is_null| *is_null));
+        let mut child_desc = if may_emit_on_empty_input {
+            ChildFilterDescription::all_unsupported(&parent_filters)
+        } else {
+            ChildFilterDescription::from_child_with_column_mapping(
+                &parent_filters,
+                column_mapping,
+                child,
+            )?
+        };
 
         // Include self dynamic filter when it's possible
         if phase == FilterPushdownPhase::Post

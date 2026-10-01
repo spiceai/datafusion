@@ -573,6 +573,7 @@ impl ScalarUDFImpl for PowerFunc {
         let [base, exponent] = take_function_args("power", args)?;
         let base_type = info.get_data_type(&base)?;
         let exponent_type = info.get_data_type(&exponent)?;
+        let base_nullable = info.nullable(&base)?;
 
         // Null propagation
         if base_type.is_null() || exponent_type.is_null() {
@@ -584,7 +585,7 @@ impl ScalarUDFImpl for PowerFunc {
 
         match exponent {
             Expr::Literal(value, _)
-                if value == ScalarValue::new_zero(&exponent_type)? =>
+                if value == ScalarValue::new_zero(&exponent_type)? && !base_nullable =>
             {
                 Ok(ExprSimplifyResult::Simplified(lit(ScalarValue::new_one(
                     &base_type,
@@ -594,7 +595,10 @@ impl ScalarUDFImpl for PowerFunc {
                 Ok(ExprSimplifyResult::Simplified(base))
             }
             Expr::ScalarFunction(ScalarFunction { func, mut args })
-                if is_log(&func) && args.len() == 2 && base == args[0] =>
+                if is_log(&func)
+                    && args.len() == 2
+                    && base == args[0]
+                    && !base_nullable =>
             {
                 let b = args.pop().unwrap(); // length checked above
                 Ok(ExprSimplifyResult::Simplified(b))

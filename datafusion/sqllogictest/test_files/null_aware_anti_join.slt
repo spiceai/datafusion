@@ -451,3 +451,171 @@ DROP TABLE customers_test;
 
 statement ok
 DROP TABLE all_null_banned;
+
+#############
+## Test: dynamic filter pushdown must not drop inner (probe-side) NULLs.
+## With join dynamic filter pushdown on, the build-side filter pushed to the probe scan would drop
+## inner NULLs, but NOT IN three-valued logic needs them to collapse the result to zero rows. The
+## in-memory VALUES scans above never apply the pushed filter, so this case needs a parquet scan.
+#############
+
+statement ok
+set datafusion.optimizer.enable_join_dynamic_filter_pushdown = true;
+
+# Row-level parquet filtering, so the pushed filter actually drops matching rows instead of only
+# pruning row groups. Without this the single row group is read whole and the NULL never gets dropped.
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+statement ok
+CREATE TABLE asa_outer(id INT) AS VALUES (1), (2), (3);
+
+statement ok
+CREATE TABLE asa_inner(eid INT) AS VALUES (2), (NULL);
+
+query I
+COPY asa_outer TO 'test_files/scratch/null_aware_anti_join/asa_outer.parquet' STORED AS PARQUET;
+----
+3
+
+query I
+COPY asa_inner TO 'test_files/scratch/null_aware_anti_join/asa_inner.parquet' STORED AS PARQUET;
+----
+2
+
+statement ok
+CREATE EXTERNAL TABLE asa_outer_parquet(id INT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/null_aware_anti_join/asa_outer.parquet';
+
+statement ok
+CREATE EXTERNAL TABLE asa_inner_parquet(eid INT)
+STORED AS PARQUET
+LOCATION 'test_files/scratch/null_aware_anti_join/asa_inner.parquet';
+
+# Expected: zero rows. Before the fix the pushed dynamic filter dropped inner NULLs, so the join
+# wrongly returned id = 1 and id = 3.
+query I
+SELECT id FROM asa_outer_parquet WHERE id NOT IN (SELECT eid FROM asa_inner_parquet) ORDER BY id;
+----
+
+statement ok
+DROP TABLE asa_outer;
+
+statement ok
+DROP TABLE asa_inner;
+
+statement ok
+DROP TABLE asa_outer_parquet;
+
+statement ok
+DROP TABLE asa_inner_parquet;
+
+statement ok
+RESET datafusion.execution.parquet.pushdown_filters;
+
+statement ok
+RESET datafusion.optimizer.enable_join_dynamic_filter_pushdown;
+
+#############
+## Regression: constant (non-column) value expression in `NOT IN (subquery)`
+##
+## `3 NOT IN (1, NULL)` is UNKNOWN, so a `WHERE` clause must remove every row.
+## The value expression `3` contains no column, so on its own it cannot be an
+## equi-join key; decorrelation projects it as a column of the outer side so
+## the null-aware hash join gets a real key. Otherwise the predicate stays in
+## the join filter, where it is pushed into the subquery (dropping the NULL
+## rows before the join can observe them) and leaves a keyless join that no
+## null-aware operator can execute.
+#############
+
+statement ok
+CREATE TABLE naconst_t1(id INT) AS VALUES (1), (2);
+
+statement ok
+CREATE TABLE naconst_t2(id INT) AS VALUES (1), (NULL);
+
+# Q1: expected no rows (subquery yields {1, NULL} => `3 NOT IN {1, NULL}` is UNKNOWN)
+query I
+SELECT id FROM naconst_t1 WHERE 3 NOT IN (SELECT id FROM naconst_t2) ORDER BY id;
+----
+
+# Q2: `NOT (x IN (...))` is the same predicate spelled differently
+query I
+SELECT id FROM naconst_t1 WHERE NOT (3 IN (SELECT id FROM naconst_t2)) ORDER BY id;
+----
+
+# C1: the constant is present in the subquery => FALSE, no rows (already correct)
+query I
+SELECT id FROM naconst_t1 WHERE 1 NOT IN (SELECT id FROM naconst_t2) ORDER BY id;
+----
+
+# C2: no NULL in the subquery => plain TRUE, all rows survive
+query I
+SELECT id FROM naconst_t1 WHERE 3 NOT IN (SELECT id FROM naconst_t2 WHERE id IS NOT NULL) ORDER BY id;
+----
+1
+2
+
+# C3: column value expression (an equi-join key exists) => already correct
+query I
+SELECT id FROM naconst_t1 WHERE id + 2 NOT IN (SELECT id FROM naconst_t2) ORDER BY id;
+----
+
+# A constant that is absent from a NULL-free subquery still yields TRUE even
+# when other outer predicates are present.
+query I
+SELECT id FROM naconst_t1
+WHERE id > 1 AND 3 NOT IN (SELECT id FROM naconst_t2 WHERE id IS NOT NULL)
+ORDER BY id;
+----
+2
+
+# The projected value column is named after the subquery alias. A user column
+# that happens to share that name must not make the reference ambiguous.
+statement ok
+CREATE TABLE naconst_clash("__correlated_sq_1_value" INT) AS VALUES (1), (2);
+
+query I
+SELECT "__correlated_sq_1_value" FROM naconst_clash
+WHERE 3 NOT IN (SELECT id FROM naconst_t2)
+ORDER BY 1;
+----
+
+query I
+SELECT "__correlated_sq_1_value" FROM naconst_clash
+WHERE 3 NOT IN (SELECT id FROM naconst_t2 WHERE id IS NOT NULL)
+ORDER BY 1;
+----
+1
+2
+
+statement ok
+DROP TABLE naconst_clash;
+
+# A constant value expression with a non-equality correlation leaves no
+# equi-join key. The correlated `NOT IN` is planned as the `NOT EXISTS` it
+# equals in a filter, so the NULL the correlation keeps for `g = 1` makes that
+# row UNKNOWN and the row with an empty subquery is kept.
+statement ok
+CREATE TABLE naconst_corr_t1(id INT, g INT) AS VALUES (1, 1), (2, 2);
+
+statement ok
+CREATE TABLE naconst_corr_t2(id INT, g INT) AS VALUES (1, 1), (NULL, 2);
+
+query I
+SELECT id FROM naconst_corr_t1 WHERE 3 NOT IN (SELECT id FROM naconst_corr_t2 WHERE naconst_corr_t2.g > naconst_corr_t1.g);
+----
+2
+
+statement ok
+DROP TABLE naconst_corr_t1;
+
+statement ok
+DROP TABLE naconst_corr_t2;
+
+statement ok
+DROP TABLE naconst_t1;
+
+statement ok
+DROP TABLE naconst_t2;

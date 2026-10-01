@@ -165,8 +165,12 @@ impl CastExpr {
         }
     }
 
-    /// Check if casting from the specified source type to the target type is a
-    /// widening cast (e.g. from `Int8` to `Int16`).
+    /// Check if casting from the source type to the target type is known to be
+    /// lossless and strictly order-preserving for all source values, preserving nulls.
+    /// This includes widening casts (e.g. `Int8` to `Int16`) and representation
+    /// conversions such as `Int32` to `Date32`, which interprets the same integer
+    /// as days since the epoch, or `Int64` to `Date64`, which interprets the same
+    /// integer as milliseconds since the epoch.
     pub fn check_bigger_cast(cast_type: &DataType, src: &DataType) -> bool {
         if cast_type.eq(src) {
             return true;
@@ -176,6 +180,10 @@ impl CastExpr {
             (Int8, Int16 | Int32 | Int64)
                 | (Int16, Int32 | Int64)
                 | (Int32, Int64)
+                | (Int32, Date32)
+                | (Date32, Int32)
+                | (Int64, Date64)
+                | (Date64, Int64)
                 | (UInt8, UInt16 | UInt32 | UInt64)
                 | (UInt16, UInt32 | UInt64)
                 | (UInt32, UInt64)
@@ -188,7 +196,8 @@ impl CastExpr {
         )
     }
 
-    /// Check if the cast is a widening cast (e.g. from `Int8` to `Int16`).
+    /// Check if the cast is lossless and strictly order-preserving for all source
+    /// values, preserving nulls. See [`Self::check_bigger_cast`].
     pub fn is_bigger_cast(&self, src: &DataType) -> bool {
         Self::check_bigger_cast(self.cast_type(), src)
     }
