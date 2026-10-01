@@ -2567,7 +2567,20 @@ impl Unparser<'_> {
                 }
 
                 let hoisted_from_left = if left_is_null_extended {
-                    select.take_selection_added_after(outer_conjuncts_before_left)
+                    let contributed =
+                        select.take_selection_added_after(outer_conjuncts_before_left);
+                    // A subquery is refused in `ON` by some dialects, and `WHERE`
+                    // is not this join's to use for its left input — the same
+                    // refusal as for a LEFT JOIN's right input below.
+                    if contributed
+                        .as_ref()
+                        .is_some_and(super::ast::contains_subquery)
+                    {
+                        return not_impl_err!(
+                            "Unparsing a RIGHT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+                        );
+                    }
+                    contributed
                 } else {
                     None
                 };

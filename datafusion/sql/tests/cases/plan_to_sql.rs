@@ -14700,6 +14700,33 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         error.to_string(),
         "LEFT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
     );
+    // The mirror image: a semi join on a RIGHT JOIN's null-extended left
+    // contributes its `EXISTS`, which the left hoist would fold into `ON`.
+    use datafusion_expr::JoinType::LeftSemi;
+    let semi =
+        LogicalPlanBuilder::from(table_scan(Some("b"), &schema, Some(vec![0]))?.build()?)
+            .join(
+                table_scan(Some("c"), &schema, Some(vec![0]))?.build()?,
+                LeftSemi,
+                (vec!["b.id"], vec!["c.id"]),
+                None,
+            )?
+            .build()?;
+    let plan = LogicalPlanBuilder::from(semi)
+        .join(
+            table_scan(Some("a"), &schema, Some(vec![0]))?.build()?,
+            Right,
+            (vec!["b.id"], vec!["a.id"]),
+            None,
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a subquery conjunct from a nested left input has no clause under a RIGHT JOIN",
+    );
+    assert_contains!(
+        error.to_string(),
+        "RIGHT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+    );
 
     // A mark join on an input an outer join null-extends is refused: the
     // `EXISTS` that replaces its mark is never NULL, but the mark is on a row
