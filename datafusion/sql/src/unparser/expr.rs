@@ -1884,12 +1884,19 @@ impl Unparser<'_> {
                         "Unable to convert Date32 to NaiveDate"
                     ))?;
 
+                // The literal is spelled as a cast, so its target type has to be
+                // the one the dialect gives an `Expr::Cast` to `Date32`: an engine
+                // that reads `DATE` as a number (SQLite gives the type name
+                // numeric affinity, so `CAST('1994-01-01' AS DATE)` is `1994`)
+                // compares it against a text column wrongly, while the same
+                // date written as a `Cast` expression renders `TEXT` and
+                // compares right.
                 Ok(ast::Expr::Cast {
                     kind: ast::CastKind::Cast,
                     expr: Box::new(ast::Expr::value(SingleQuotedString(
                         date.to_string(),
                     ))),
-                    data_type: ast::DataType::Date,
+                    data_type: self.dialect.date32_cast_dtype(),
                     array: false,
                     format: None,
                 })
@@ -3748,6 +3755,47 @@ mod tests {
             let expected = format!(r#"CAST(a AS {identifier})"#);
 
             assert_eq!(actual, expected);
+        }
+        Ok(())
+    }
+
+    /// A `Date32` literal is spelled as a cast, so it must take the same
+    /// target type the dialect gives an `Expr::Cast` to `Date32`. SQLite gives
+    /// the type name `DATE` numeric affinity: `CAST('1994-01-01' AS DATE)` is
+    /// the integer `1994`, which a `YYYY-MM-DD` text column never matches, so a
+    /// literal that ignores the dialect silently filters every row out.
+    #[test]
+    fn date32_literal_takes_the_dialects_cast_type() -> Result<()> {
+        let default_dialect = CustomDialectBuilder::default().build();
+        let text_custom_dialect = CustomDialectBuilder::new()
+            .with_date32_cast_dtype(ast::DataType::Text)
+            .build();
+        let sqlite_dialect = SqliteDialect {};
+
+        for (dialect, identifier) in [
+            (&default_dialect as &dyn Dialect, "DATE"),
+            (&text_custom_dialect, "TEXT"),
+            (&sqlite_dialect, "TEXT"),
+        ] {
+            let unparser = Unparser::new(dialect);
+
+            // 8766 days after the epoch is 1994-01-01.
+            let literal = Expr::Literal(ScalarValue::Date32(Some(8766)), None);
+            let ast = unparser.expr_to_sql(&literal)?;
+            assert_eq!(
+                format!("{ast}"),
+                format!(r#"CAST('1994-01-01' AS {identifier})"#)
+            );
+
+            // The literal and an explicit cast to the same type must agree,
+            // whichever of the two the planner leaves in the filter.
+            let cast =
+                Expr::Cast(Cast::new(Box::new(lit("1994-01-01")), DataType::Date32));
+            let ast = unparser.expr_to_sql(&cast)?;
+            assert_eq!(
+                format!("{ast}"),
+                format!(r#"CAST('1994-01-01' AS {identifier})"#)
+            );
         }
         Ok(())
     }
