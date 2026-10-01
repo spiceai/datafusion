@@ -608,10 +608,20 @@ fn estimate_join_cardinality(
                 // statistics which might yield subpar results (although it is
                 // true, esp regarding min/max). For a better estimation, we need
                 // filter selectivity analysis first.
+                //
+                // `sum_value` is the exception: a join repeats a row once per
+                // match and drops the rows that match nothing, so an input's sum
+                // says nothing about the output's. Kept, an exact input sum lets
+                // `AggregateStatistics` answer `SUM` over the join with the input's
+                // total.
                 column_statistics: left_stats
                     .column_statistics
                     .into_iter()
                     .chain(right_stats.column_statistics)
+                    .map(|mut stats| {
+                        stats.sum_value = Precision::Absent;
+                        stats
+                    })
                     .collect(),
             })
         }
@@ -4277,6 +4287,48 @@ mod tests {
         )
         .map(|c| c.num_rows);
         assert_eq!(left_anti, Some(0));
+    }
+
+    #[test]
+    fn test_inner_and_outer_joins_drop_input_sums() {
+        let join_on = vec![(
+            Arc::new(Column::new("l_key", 0)) as _,
+            Arc::new(Column::new("r_key", 0)) as _,
+        )];
+        let side = |sum: i64| Statistics {
+            num_rows: Exact(2_048),
+            total_byte_size: Absent,
+            column_statistics: vec![ColumnStatistics {
+                null_count: Exact(0),
+                min_value: Exact(ScalarValue::from(0_i64)),
+                max_value: Exact(ScalarValue::from(2_047_i64)),
+                sum_value: Exact(ScalarValue::from(sum)),
+                distinct_count: Exact(2_048),
+                byte_size: Absent,
+            }],
+        };
+
+        for join_type in [
+            JoinType::Inner,
+            JoinType::Left,
+            JoinType::Right,
+            JoinType::Full,
+        ] {
+            let result = estimate_join_cardinality(
+                &join_type,
+                side(2_096_128),
+                side(2_096_128),
+                &join_on,
+                NullEquality::NullEqualsNothing,
+            )
+            .expect("join cardinality should be estimated");
+            for (index, stats) in result.column_statistics.iter().enumerate() {
+                assert_eq!(
+                    stats.sum_value, Absent,
+                    "{join_type}: column {index} kept an input sum the join output does not have"
+                );
+            }
+        }
     }
 
     #[test]
