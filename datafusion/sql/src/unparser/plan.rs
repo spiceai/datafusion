@@ -1242,9 +1242,10 @@ impl Unparser<'_> {
     /// this side's select items — exactly what a row limit under a filter
     /// needs, so the same scope is used. Over anything else there is no name
     /// for the derived table to take: with a projection already above the
-    /// join it keeps the dialect's derived-limit alias, as before; without one
-    /// it is refused rather than bounding the join's output instead of the
-    /// input's, which is what putting its `LIMIT` on the enclosing query did.
+    /// join it keeps the dialect's derived-limit alias, as before, while the
+    /// input's columns are unqualified; without one, or over qualified
+    /// columns the derived table would hide, it is refused rather than
+    /// emitting SQL that bounds the join's output or names an unbound relation.
     fn derive_join_input_limit(
         &self,
         plan: &LogicalPlan,
@@ -1259,6 +1260,18 @@ impl Unparser<'_> {
             return self.derive_row_limited_scope(plan, select, relation);
         }
         if select.already_projected() {
+            // The derived table hides every relation inside it, so an output
+            // column still qualified by one of them (a grouping's key, a join's
+            // columns) is one the enclosing `ON` and select list cannot reach.
+            if plan
+                .schema()
+                .iter()
+                .any(|(qualifier, _)| qualifier.is_some())
+            {
+                return not_impl_err!(
+                    "Unparsing a row limit on a join input whose columns are qualified is not supported unless the input is a single table scan"
+                );
+            }
             return self.derive_with_dialect_alias(
                 DERIVED_LIMIT_ALIAS,
                 plan,

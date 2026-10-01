@@ -14048,6 +14048,51 @@ fn limit_join_input_is_derived_under_the_scans_name() -> Result<()> {
     Ok(())
 }
 
+/// A `Limit` over something other than one scan, as a join input with a
+/// projection above, keeps the dialect-alias derived table only while its
+/// output columns are unqualified: a qualified one names a relation inside the
+/// derived table, which the enclosing `ON` and select list cannot reach.
+#[test]
+fn limit_join_input_over_qualified_outputs_is_refused() -> Result<()> {
+    use datafusion_expr::JoinType::Inner;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let scan = |name| table_scan(Some(name), &schema, Some(vec![0]))?.build();
+    let joined_on = |input: LogicalPlan, key: Expr| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(scan("a")?)
+            .join_on(input, Inner, vec![col("a.id").eq(key.clone())])?
+            .project(vec![col("a.id"), key])?
+            .build()
+    };
+
+    // Renamed outputs carry no qualifier, so the enclosing query binds them.
+    let renamed = LogicalPlanBuilder::from(scan("b")?)
+        .project(vec![col("b.id").alias("x")])?
+        .limit(0, Some(1))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&joined_on(renamed, col("x"))?)?,
+        @"SELECT a.id, x FROM a INNER JOIN (SELECT b.id AS x FROM b LIMIT 1) ON (a.id = x)"
+    );
+
+    let grouped = LogicalPlanBuilder::from(scan("b")?)
+        .aggregate(vec![col("b.id")], Vec::<Expr>::new())?
+        .limit(0, Some(1))?
+        .build()?;
+    let joined = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .limit(0, Some(1))?
+        .build()?;
+    for input in [grouped, joined] {
+        let error = plan_to_sql(&joined_on(input, col("b.id"))?)
+            .expect_err("`b` is not addressable outside the derived table");
+        assert_contains!(
+            error.to_string(),
+            "Unparsing a row limit on a join input whose columns are qualified is not supported unless the input is a single table scan"
+        );
+    }
+    Ok(())
+}
+
 /// A `Limit` with neither `fetch` nor `skip` bounds nothing, so as a join
 /// input it takes no scope of its own.
 #[test]
