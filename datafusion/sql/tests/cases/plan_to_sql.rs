@@ -14942,6 +14942,42 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         @r#"SELECT a.id, o.id, o."id:1" FROM a LEFT OUTER JOIN (SELECT * FROM (SELECT b.id, c.id AS "id:1" FROM b INNER JOIN c ON b.id = c.id) AS i WHERE (i.id = 'x')) AS o ON a.id = o.id"#
     );
 
+    // An aliased join on the right of a join inside an EXISTS build side is
+    // derived there too, so the correlation on its primary output binds
+    // inside the subquery. A key on another of its outputs is still refused by
+    // the correlation check, which models the alias as renaming only its
+    // primary relation.
+    use datafusion_expr::JoinType::LeftSemi as Semi;
+    let build_side = || -> Result<LogicalPlan> {
+        let j = LogicalPlanBuilder::from(scan("b")?)
+            .join(
+                table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?,
+                Inner,
+                (vec!["b.id"], vec!["c.cid"]),
+                None,
+            )?
+            .alias("j")?
+            .build()?;
+        LogicalPlanBuilder::from(scan("d")?)
+            .join(j, Inner, (vec!["d.id"], vec!["j.id"]), None)?
+            .build()
+    };
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(build_side()?, Semi, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM d INNER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid) AS j ON d.id = j.id WHERE (a.id = j.id))"
+    );
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(build_side()?, Semi, (vec!["a.id"], vec!["j.cid"]), None)?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err("the correlation check refuses it");
+    assert_contains!(
+        error.to_string(),
+        "a build-side join key names an output only the build side's projection binds"
+    );
+
     // An aliased joined input that renames its columns takes the dialect's
     // column-alias fallback: a dialect that refuses `AS j (x, y)` gets the
     // names inside the derived table instead.
