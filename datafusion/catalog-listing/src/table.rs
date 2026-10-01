@@ -788,15 +788,14 @@ impl ListingTable {
     /// The list is grouped to let the execution plan know how the files should
     /// be distributed to different threads / executors.
     ///
-    /// `filters` must reference only partition columns (see
-    /// [`list_files_for_scan_with_metadata`](Self::list_files_for_scan_with_metadata)
-    /// to additionally prune by metadata columns).
+    /// `filters` must reference only partition columns; this method applies no
+    /// metadata-column filtering.
     ///
-    /// This is one of the two methods (the other being
-    /// [`list_files_for_scan_with_metadata`](Self::list_files_for_scan_with_metadata))
-    /// that actually enforce the metadata-column filtering that
-    /// `supports_filters_pushdown` promises via `Exact`. A caller or wrapper that needs
-    /// exact semantics must call through here, not just check pushdown support.
+    /// It therefore does not on its own honor the `Exact` pushdown that
+    /// `supports_filters_pushdown` reports for metadata predicates. A caller or wrapper
+    /// that needs exact semantics must call
+    /// [`list_files_for_scan_with_metadata`](Self::list_files_for_scan_with_metadata)
+    /// and pass the metadata filters, not just check pushdown support.
     pub async fn list_files_for_scan<'a>(
         &'a self,
         ctx: &'a dyn Session,

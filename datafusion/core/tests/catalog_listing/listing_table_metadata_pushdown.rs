@@ -25,15 +25,19 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::DataType;
+use datafusion::assert_batches_eq;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig};
 use datafusion::prelude::SessionContext;
+use datafusion_common::{Result, ScalarValue};
 use datafusion_datasource::ListingTableUrl;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_datasource_json::JsonFormat;
 use datafusion_execution::object_store::ObjectStoreUrl;
+use datafusion_expr::var_provider::{VarProvider, VarType};
 use datafusion_expr::{Expr, TableProviderFilterPushDown, col, lit};
 use datafusion_physical_plan::{ExecutionPlan, displayable};
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
@@ -168,5 +172,52 @@ async fn mixed_predicate_stays_inexact_with_residual_filter() {
     assert!(
         plan_str.contains("FilterExec"),
         "an Inexact predicate must keep a residual FilterExec:\n{plan_str}"
+    );
+}
+
+/// Resolves `@threshold` to a byte size, so a metadata filter can only be evaluated
+/// with the session's variable providers in scope.
+#[derive(Debug)]
+struct SizeThreshold;
+
+impl VarProvider for SizeThreshold {
+    fn get_value(&self, _var_names: Vec<String>) -> Result<ScalarValue> {
+        Ok(ScalarValue::UInt64(Some(100)))
+    }
+
+    fn get_type(&self, _var_names: &[String]) -> Option<DataType> {
+        Some(DataType::UInt64)
+    }
+}
+
+#[tokio::test]
+async fn metadata_filter_resolves_session_variables() {
+    let ctx = SessionContext::new();
+    ctx.register_variable(VarType::UserDefined, Arc::new(SizeThreshold));
+    // One file well under 100 bytes, one well over.
+    let table = build_table(&ctx, &[1, 50], vec![MetadataColumn::Size]).await;
+    ctx.register_table("t", table).unwrap();
+
+    // `@threshold` resolves only through the session's variable providers. Compiling the
+    // listing predicate against a fresh `ExecutionProps` instead of the session's fails
+    // here with "No user defined variable provider found", while the equivalent
+    // row-level filter would succeed.
+    let batches = ctx
+        .sql("SELECT count(*) FROM t WHERE _size < @threshold")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_batches_eq!(
+        [
+            "+----------+",
+            "| count(*) |",
+            "+----------+",
+            "| 1        |",
+            "+----------+",
+        ],
+        &batches
     );
 }

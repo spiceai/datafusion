@@ -580,16 +580,18 @@ impl<'a> MetadataPredicate<'a> {
 /// apply the identical prune before opening the file, and report the same predicates as
 /// `Exact`. A listing that checks many objects should build a [`MetadataPredicate`]
 /// directly instead, to compile the filter expression once rather than per object.
+///
+/// `props` must be the caller's session-scoped [`ExecutionProps`], for the reason given
+/// on [`MetadataPredicate::try_new`]: a filter such as `_size > @threshold` resolves only
+/// through the session's variable providers. Passing a fresh `ExecutionProps` makes such
+/// a filter fail here while the equivalent row-level filter succeeds.
 pub fn filter_by_metadata(
     object_meta: ObjectMeta,
     metadata_filters: &[Expr],
     metadata_cols: &[MetadataColumn],
+    props: &ExecutionProps,
 ) -> Result<Option<ObjectMeta>> {
-    match MetadataPredicate::try_new(
-        metadata_filters,
-        metadata_cols,
-        &ExecutionProps::new(),
-    )? {
+    match MetadataPredicate::try_new(metadata_filters, metadata_cols, props)? {
         Some(predicate) => Ok(predicate.matches(&object_meta)?.then_some(object_meta)),
         None => Ok(Some(object_meta)),
     }
