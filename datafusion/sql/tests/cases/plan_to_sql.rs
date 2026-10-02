@@ -223,6 +223,9 @@ fn roundtrip_statement() -> Result<()> {
             "SELECT left[1] FROM array",
             "SELECT {a:1, b:2}",
             "SELECT s.a FROM (SELECT {a:1, b:2} AS s)",
+            // A qualified struct field path, fed back to the planner as the AST it
+            // was emitted as, not as re-parsed text.
+            "SELECT u.struct_col.field1 FROM unnest_table u",
             "SELECT MAP {'a': 1, 'b': 2}"
     ];
 
@@ -14641,6 +14644,20 @@ fn test_dangling_qualifier_leaves_a_field_path_in_place() -> Result<()> {
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT "metadata".product FROM (SELECT t."metadata" FROM t)"#
+    );
+    Ok(())
+}
+
+/// A correlated reference in an aliased projection item binds in the enclosing
+/// query, so its qualifier is not dangling in the subquery's own `FROM`.
+#[test]
+fn test_correlated_reference_keeps_its_qualifier_under_an_alias()
+-> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT j1.j1_id AS x FROM j2 LIMIT 1) FROM j1",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT j1.j1_id AS x FROM j2 LIMIT 1) FROM j1",
     );
     Ok(())
 }

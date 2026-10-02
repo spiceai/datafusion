@@ -640,6 +640,8 @@ pub fn requalify_column_onto_derived_table(
 /// reference uses for it: an aliased relation is visible only as its alias; a bare
 /// table as its last name part, the form [`super::Unparser::emitted_qualifier`]
 /// writes by default, and as its full name for a dialect that writes every part.
+/// A correlated reference binds in an enclosing query rather than in this `FROM`, so
+/// the qualifiers the plan's outer references carry count as visible too.
 #[derive(Debug, Default)]
 pub(super) struct VisibleScope {
     relations: Vec<Vec<String>>,
@@ -677,6 +679,14 @@ impl VisibleScope {
         self.relations.push(vec![alias.name.value.clone()]);
     }
 
+    /// A qualifier that binds outside this `SELECT`: the relation an outer reference
+    /// reads from, spelled as the unparser emits it.
+    pub(super) fn add_outer_qualifier(&mut self, parts: Vec<String>) {
+        if !parts.is_empty() {
+            self.relations.push(parts);
+        }
+    }
+
     /// A bare table is visible as its last name part and, for a dialect that writes
     /// every part of a qualifier, as its full name.
     pub(super) fn add_table_name(&mut self, name: &ast::ObjectName) {
@@ -693,11 +703,12 @@ impl VisibleScope {
         }
     }
 
-    /// Whether `idents` starts with a qualifier this scope makes visible, with at
-    /// least one part left over for the column itself.
+    /// Whether `idents` is a qualifier this scope makes visible followed by exactly
+    /// one column name. A shorter visible name that merely prefixes the qualifier does
+    /// not count: an alias `d` does not make `d.t.id` bind when `d.t` is enclosed.
     fn names_visible_relation(&self, idents: &[Ident]) -> bool {
         self.relations.iter().any(|relation| {
-            relation.len() < idents.len()
+            relation.len() + 1 == idents.len()
                 && relation
                     .iter()
                     .zip(idents)
@@ -728,7 +739,12 @@ pub(super) fn strip_dangling_qualifier(expr: &mut ast::Expr, scope: &VisibleScop
             strip_dangling_qualifier(root, scope);
         }
         ast::Expr::CompoundIdentifier(idents) => {
-            if idents.len() < 2 || scope.names_visible_relation(idents) {
+            // `@root.name` is a scalar variable, not a qualified column (the planner
+            // draws the same line on an unquoted leading `@`).
+            let is_variable = idents.first().is_some_and(|root| {
+                root.value.starts_with('@') && root.quote_style.is_none()
+            });
+            if idents.len() < 2 || is_variable || scope.names_visible_relation(idents) {
                 return;
             }
             if let Some(column) = idents.pop() {
@@ -867,6 +883,41 @@ mod tests {
         assert_eq!(
             stripped(compound(&["t", "id"]), &scope),
             ast::Expr::Identifier(Ident::new("id"))
+        );
+    }
+
+    #[test]
+    fn a_visible_name_that_only_prefixes_the_qualifier_does_not_bind_it() {
+        let mut scope = VisibleScope::default();
+        scope.add_alias(&alias("derived_projection"));
+        // `derived_projection.t` is the enclosed table; the alias alone is visible.
+        assert_eq!(
+            stripped(compound(&["derived_projection", "t", "id"]), &scope),
+            ast::Expr::Identifier(Ident::new("id"))
+        );
+    }
+
+    #[test]
+    fn a_scalar_variable_is_not_a_qualified_column() {
+        let scope = VisibleScope::default();
+        let variable = compound(&["@root", "foo"]);
+        assert_eq!(stripped(variable.clone(), &scope), variable);
+        // Quoted, it is an ordinary (dangling) qualifier.
+        let mut quoted = idents(&["@root", "foo"]);
+        quoted[0].quote_style = Some('"');
+        assert_eq!(
+            stripped(ast::Expr::CompoundIdentifier(quoted), &scope),
+            ast::Expr::Identifier(Ident::new("foo"))
+        );
+    }
+
+    #[test]
+    fn an_outer_references_qualifier_is_visible() {
+        let mut scope = VisibleScope::default();
+        scope.add_outer_qualifier(vec!["o".to_string()]);
+        assert_eq!(
+            stripped(compound(&["o", "id"]), &scope),
+            compound(&["o", "id"])
         );
     }
 
