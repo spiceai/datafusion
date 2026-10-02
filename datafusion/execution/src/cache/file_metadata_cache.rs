@@ -87,11 +87,8 @@ impl DefaultFilesMetadataCacheState {
 
     /// Evicts entries from the LRU cache until `memory_used` is lower than `memory_limit`.
     ///
-    /// An evicted entry leaves `cache_hits` together with `lru_queue`: the hit counter
-    /// belongs to the cached entry, so the two maps hold the same keys at all times.
-    /// Without this, a process that caches a file footer once per unique path (every
-    /// refresh and compaction writes new files) keeps one `(Path, usize)` pair per file
-    /// it has ever cached, outside the `memory_used` accounting, for its whole lifetime.
+    /// `cache_hits` holds exactly the keys of `lru_queue`, so an evicted key leaves both;
+    /// a stale counter would otherwise outlive its entry, outside the `memory_used` accounting.
     fn evict_entries(&mut self) {
         while self.memory_used > self.memory_limit {
             if let Some((evicted_key, evicted)) = self.lru_queue.pop() {
@@ -770,13 +767,16 @@ mod tests {
     }
 
     /// The hit counter is part of the cached entry, so every eviction path leaves the hit map
-    /// holding exactly the keys the queue holds. Only `remove` and `clear` pruned it before;
-    /// `evict_entries` (reached from `put` and `update_cache_limit`) left one `(Path, usize)`
-    /// pair behind per evicted key, unbounded over the life of the process.
+    /// holding exactly the keys the queue holds. `evict_entries` (reached from `put` and
+    /// `update_cache_limit`) must drop the evicted key from `cache_hits`, otherwise the map
+    /// gains one `(Path, usize)` pair per evicted key for the life of the process.
+    /// Regression test for spiceai/spiceai#12952.
     #[test]
     fn evicting_an_entry_also_drops_its_hit_counter() {
+        /// The hit map's keys, sorted, after checking it holds exactly as many as the queue.
         fn hit_keys(cache: &DefaultFilesMetadataCache) -> Vec<String> {
             let state = cache.state.lock().unwrap();
+            assert_eq!(state.cache_hits.len(), state.lru_queue.len());
             let mut keys: Vec<String> =
                 state.cache_hits.keys().map(ToString::to_string).collect();
             keys.sort();
@@ -790,27 +790,27 @@ mod tests {
         // directory: 50 puts of distinct keys evict 47 entries through `put`.
         for i in 0..50 {
             let (meta, metadata) = generate_test_metadata_with_size(&i.to_string(), 100);
-            let location = meta.location.clone();
-            cache.put(&location, CachedFileMetadataEntry::new(meta, metadata));
+            cache.put(&meta.location, CachedFileMetadataEntry::new(meta.clone(), metadata));
         }
         assert_eq!(cache.len(), 3);
-        assert_eq!(hit_keys(&cache), vec!["47", "48", "49"]);
+        assert_eq!(cache.memory_used(), 300);
+        assert_eq!(hit_keys(&cache), ["47", "48", "49"]);
         assert!(!cache.contains_key(&Path::from("0")));
 
         // A recorded hit on a live entry survives; the evicted entry's counter does not come
         // back with it.
         assert!(cache.get(&Path::from("49")).is_some());
         assert!(cache.get(&Path::from("0")).is_none());
-        assert_eq!(hit_keys(&cache), vec!["47", "48", "49"]);
+        assert_eq!(hit_keys(&cache), ["47", "48", "49"]);
         assert_eq!(cache.list_entries()[&Path::from("49")].hits, 1);
 
         // Eviction through a lowered limit prunes the same way.
         cache.update_cache_limit(100);
         assert_eq!(cache.len(), 1);
-        assert_eq!(hit_keys(&cache), vec!["49"]);
+        assert_eq!(cache.memory_used(), 100);
+        assert_eq!(hit_keys(&cache), ["49"]);
 
-        // `list_entries` reports a hit count for every live entry (it unwraps the map), and
-        // only for live entries.
+        // `list_entries` still resolves a hit count for the surviving entry.
         let entries = cache.list_entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[&Path::from("49")].hits, 1);
