@@ -752,13 +752,13 @@ impl Unparser<'_> {
         twj.relation(relation_builder);
         select_builder.push_from(twj);
 
-        let full_qualified = self.dialect.full_qualified_col();
-
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
         for select_item in &mut projection {
-            if let ast::SelectItem::UnnamedExpr(expr) = select_item {
-                strip_dangling_qualifier(expr, &scope, full_qualified);
+            if let ast::SelectItem::UnnamedExpr(expr)
+            | ast::SelectItem::ExprWithAlias { expr, .. } = select_item
+            {
+                strip_dangling_qualifier(expr, &scope);
             }
         }
 
@@ -767,7 +767,7 @@ impl Unparser<'_> {
             && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
         {
             for sort_item in &mut order_by {
-                strip_dangling_qualifier(&mut sort_item.expr, &scope, full_qualified);
+                strip_dangling_qualifier(&mut sort_item.expr, &scope);
             }
 
             query.order_by(OrderByKind::Expressions(order_by));
@@ -776,7 +776,7 @@ impl Unparser<'_> {
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
         for sort_item in &mut sort {
-            strip_dangling_qualifier(&mut sort_item.expr, &scope, full_qualified);
+            strip_dangling_qualifier(&mut sort_item.expr, &scope);
         }
         select_builder.sort_by(sort);
 

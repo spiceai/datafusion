@@ -893,14 +893,11 @@ impl RelationBuilder {
                 (None, Some(name)) => scope.add_table_name(name),
                 (None, None) => {}
             },
-            Some(TableFactorBuilder::Derived(derived)) => match &derived.subquery {
-                Some(subquery) => scope.add_derived(subquery, derived.alias.as_ref()),
-                None => {
-                    if let Some(alias) = &derived.alias {
-                        scope.add_alias(alias);
-                    }
+            Some(TableFactorBuilder::Derived(derived)) => {
+                if let Some(alias) = &derived.alias {
+                    scope.add_alias(alias);
                 }
-            },
+            }
             Some(TableFactorBuilder::Unnest(unnest)) => {
                 if let Some(alias) = &unnest.alias {
                     scope.add_alias(alias);

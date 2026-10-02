@@ -2950,9 +2950,11 @@ fn test_unparse_extension_to_sql() -> Result<()> {
         Arc::new(UnusedUnparser {}),
     ]);
     let sql = unparser.plan_to_sql(&plan)?;
+    // `j1` is enclosed by the un-aliased derived table, so the aliased item is left
+    // unqualified like an unnamed one.
     assert_snapshot!(
         sql,
-        @"SELECT j1.j1_id AS user_id FROM (SELECT j1.j1_id, j1.j1_string FROM j1)"
+        @"SELECT j1_id AS user_id FROM (SELECT j1.j1_id, j1.j1_string FROM j1)"
     );
 
     if let Some(err) = plan_to_sql(&plan).err() {
@@ -14569,6 +14571,76 @@ fn test_a_distinct_scope_repoints_a_clause_naming_its_alias() -> Result<()> {
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT a FROM (SELECT DISTINCT sq.a FROM (SELECT sq.a FROM t AS sq) AS sq) WHERE (random() < 0.5) ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+/// A column named like its own table is no reason to keep a dangling qualifier: the
+/// derived table encloses `t`, whatever its columns are called.
+#[test]
+fn test_dangling_qualifier_is_stripped_when_a_column_shares_the_table_name() -> Result<()>
+{
+    let schema = Schema::new(vec![
+        Field::new("t", DataType::Int32, false),
+        Field::new("id", DataType::Int32, false),
+    ]);
+    let plan = LogicalPlanBuilder::from(
+        table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?,
+    )
+    .project(vec![col("t"), col("id")])?
+    .project(vec![col("id")])?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT id FROM (SELECT t.t, t.id FROM t)"
+    );
+    Ok(())
+}
+
+/// An aliased projection item is swept like an unnamed one.
+#[test]
+fn test_dangling_qualifier_is_stripped_under_a_column_alias() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+    let plan = LogicalPlanBuilder::from(
+        table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?,
+    )
+    .project(vec![col("id"), col("age")])?
+    .project(vec![col("id").alias("x")])?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT id AS x FROM (SELECT t1.id, t1.age FROM t1)"
+    );
+    Ok(())
+}
+
+/// A struct field path over an un-aliased derived table keeps its path and loses only
+/// the qualifier the derived table encloses.
+#[test]
+fn test_dangling_qualifier_leaves_a_field_path_in_place() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "metadata",
+        DataType::Struct(arrow::datatypes::Fields::from(vec![Field::new(
+            "product",
+            DataType::Utf8,
+            true,
+        )])),
+        true,
+    )]);
+    let plan =
+        LogicalPlanBuilder::from(table_scan(Some("t"), &schema, Some(vec![0]))?.build()?)
+            .project(vec![col("metadata")])?
+            .project(vec![datafusion_functions::core::expr_fn::get_field(
+                col("metadata"),
+                "product",
+            )])?
+            .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "metadata".product FROM (SELECT t."metadata" FROM t)"#
     );
     Ok(())
 }
