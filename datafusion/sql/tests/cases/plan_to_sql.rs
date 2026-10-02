@@ -394,7 +394,8 @@ fn roundtrip_statement_with_dialect_5() -> Result<(), DataFusionError> {
         sql: "select j1_id from (select j1_id from j1 limit 10);",
         parser_dialect: MySqlDialect {},
         unparser_dialect: UnparserMySqlDialect {},
-        expected: @"SELECT `j1`.`j1_id` FROM (SELECT `j1`.`j1_id` FROM `j1` LIMIT 10) AS `derived_limit`",
+        // `j1` is enclosed by `derived_limit`, so the outer reference is left unqualified.
+        expected: @"SELECT `j1_id` FROM (SELECT `j1`.`j1_id` FROM `j1` LIMIT 10) AS `derived_limit`",
     );
     Ok(())
 }
@@ -1785,7 +1786,9 @@ fn test_table_scan_pushdown() -> Result<()> {
         plan_to_sql(&query_from_table_scan_with_two_projections)?;
     assert_snapshot!(
         query_from_table_scan_with_two_projections,
-        @"SELECT t1.id, t1.age FROM (SELECT t1.id, t1.age FROM t1)"
+        // `t1` is enclosed by the un-aliased derived table, so the outer references are
+        // left unqualified.
+        @"SELECT id, age FROM (SELECT t1.id, t1.age FROM t1)"
     );
 
     let table_scan_with_filter = table_scan_with_filters(
@@ -1943,8 +1946,9 @@ fn test_sort_with_scalar_fn_and_push_down_fetch() -> Result<()> {
     // Build a plan that mimics the DF52 optimizer output:
     // Projection(search_phrase) → Sort(substr(event_time), fetch=10)
     //   → Projection(search_phrase, event_time) → Filter → TableScan
-    // This triggers a subquery because the outer projection differs from the inner one.
-    // The ORDER BY scalar function must not reference the inner table qualifier.
+    // The sort is hoisted onto the statement itself: an ORDER BY inside a derived table
+    // is one the remote engine is free to ignore, so the inner projection that only
+    // exposed the sort key's column is folded away.
     let plan = table_scan(Some("t1"), &schema, None)?
         .filter(col("search_phrase").not_eq(lit("")))?
         .project(vec![col("search_phrase"), col("event_time")])?
@@ -1962,7 +1966,7 @@ fn test_sort_with_scalar_fn_and_push_down_fetch() -> Result<()> {
     let sql = plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @"SELECT t1.search_phrase FROM (SELECT t1.search_phrase, t1.event_time FROM t1 WHERE (t1.search_phrase <> '') ORDER BY substr(t1.event_time, 1, 5) ASC NULLS FIRST LIMIT 10)"
+        @"SELECT t1.search_phrase FROM t1 WHERE (t1.search_phrase <> '') ORDER BY substr(t1.event_time, 1, 5) ASC NULLS FIRST LIMIT 10"
     );
     Ok(())
 }

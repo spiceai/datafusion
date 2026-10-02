@@ -25,9 +25,9 @@ use super::{
         TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
-        TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_identifiers, requalify_column_onto_derived_table,
-        rewrite_plan_for_sort_on_non_projected_fields,
+        TableAliasRewriter, VisibleScope, inject_column_aliases_into_subquery,
+        normalize_union_schema, requalify_column_onto_derived_table,
+        rewrite_plan_for_sort_on_non_projected_fields, strip_dangling_qualifier,
         subquery_alias_inner_query_and_columns,
     },
     utils::{
@@ -739,66 +739,46 @@ impl Unparser<'_> {
             )]);
         }
 
-        // Construct a list of all the identifiers present in query sources
-        let mut all_idents = Vec::new();
-        if let Some(source_alias) = relation_builder.get_alias() {
-            all_idents.push(source_alias);
-        } else if let Some(source_name) = relation_builder.get_name() {
-            all_idents.push(source_name);
-        }
+        // The relations the FROM makes visible, so a qualifier none of them answers
+        // to can be stripped from the projection and the ORDER BY below.
+        let mut scope = VisibleScope::default();
+        relation_builder.add_visible_to(&mut scope);
 
         let mut twj = select_builder.pop_from().unwrap();
-        twj.get_joins()
-            .iter()
-            .for_each(|join| match &join.relation {
-                ast::TableFactor::Table { alias, name, .. } => {
-                    if let Some(alias) = alias {
-                        all_idents.push(alias.name.to_string());
-                    } else {
-                        all_idents.push(name.to_string());
-                    }
-                }
-                ast::TableFactor::Derived {
-                    alias: Some(alias), ..
-                } => {
-                    all_idents.push(alias.name.to_string());
-                }
-                _ => {}
-            });
+        for join in twj.get_joins() {
+            scope.add_relation(&join.relation);
+        }
 
         twj.relation(relation_builder);
         select_builder.push_from(twj);
 
+        let full_qualified = self.dialect.full_qualified_col();
+
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
-        projection.iter_mut().for_each(|select_item| {
-            if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) =
-                select_item
-            {
-                remove_dangling_identifiers(idents, &all_idents);
+        for select_item in &mut projection {
+            if let ast::SelectItem::UnnamedExpr(expr) = select_item {
+                strip_dangling_qualifier(expr, &scope, full_qualified);
             }
-        });
+        }
 
         // Check the order by as well
         if let Some(query) = query.as_mut()
             && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
         {
-            order_by.iter_mut().for_each(|sort_item| {
-                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                    remove_dangling_identifiers(idents, &all_idents);
-                }
-            });
+            for sort_item in &mut order_by {
+                strip_dangling_qualifier(&mut sort_item.expr, &scope, full_qualified);
+            }
 
             query.order_by(OrderByKind::Expressions(order_by));
         }
 
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
-        sort.iter_mut().for_each(|sort_item| {
-            if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                remove_dangling_identifiers(idents, &all_idents);
-            }
-        });
+        for sort_item in &mut sort {
+            strip_dangling_qualifier(&mut sort_item.expr, &scope, full_qualified);
+        }
+        select_builder.sort_by(sort);
 
         select_builder.projection(projection);
 
