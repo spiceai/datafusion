@@ -711,28 +711,6 @@ impl Unparser<'_> {
         )))
     }
 
-    /// The qualifiers of the columns `plan` reads from an enclosing query, as the
-    /// unparser emits them. Such a reference binds outside this `SELECT`, so the
-    /// dangling-qualifier sweep has to leave it alone. Nested subqueries are not
-    /// descended: their outer references are not compound identifiers of this
-    /// `SELECT`, and they are judged where they are emitted.
-    fn outer_reference_qualifiers(&self, plan: &LogicalPlan) -> Result<Vec<Vec<String>>> {
-        let mut qualifiers = Vec::new();
-        plan.apply(|node| {
-            node.apply_expressions(|expr| {
-                expr.apply(|expr| {
-                    if let Expr::OuterReferenceColumn(_, column) = expr
-                        && let Some(relation) = &column.relation
-                    {
-                        qualifiers.push(self.emitted_qualifier(relation));
-                    }
-                    Ok(TreeNodeRecursion::Continue)
-                })
-            })
-        })?;
-        Ok(qualifiers)
-    }
-
     fn select_to_sql_expr(
         &self,
         plan: &LogicalPlan,
@@ -765,9 +743,6 @@ impl Unparser<'_> {
         // to can be stripped from the projection and the ORDER BY below.
         let mut scope = VisibleScope::default();
         relation_builder.add_visible_to(&mut scope);
-        for qualifier in self.outer_reference_qualifiers(plan)? {
-            scope.add_outer_qualifier(qualifier);
-        }
 
         let mut twj = select_builder.pop_from().unwrap();
         for join in twj.get_joins() {

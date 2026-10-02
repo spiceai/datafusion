@@ -26,6 +26,7 @@ use datafusion_common::{
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::{self, Ident};
+use sqlparser::tokenizer::{Location, Span};
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -640,8 +641,9 @@ pub fn requalify_column_onto_derived_table(
 /// reference uses for it: an aliased relation is visible only as its alias; a bare
 /// table as its last name part, the form [`super::Unparser::emitted_qualifier`]
 /// writes by default, and as its full name for a dialect that writes every part.
-/// A correlated reference binds in an enclosing query rather than in this `FROM`, so
-/// the qualifiers the plan's outer references carry count as visible too.
+///
+/// A correlated reference binds in an enclosing query, not in this `FROM`, and is not
+/// judged against it at all: see [`mark_outer_reference`].
 #[derive(Debug, Default)]
 pub(super) struct VisibleScope {
     relations: Vec<Vec<String>>,
@@ -679,14 +681,6 @@ impl VisibleScope {
         self.relations.push(vec![alias.name.value.clone()]);
     }
 
-    /// A qualifier that binds outside this `SELECT`: the relation an outer reference
-    /// reads from, spelled as the unparser emits it.
-    pub(super) fn add_outer_qualifier(&mut self, parts: Vec<String>) {
-        if !parts.is_empty() {
-            self.relations.push(parts);
-        }
-    }
-
     /// A bare table is visible as its last name part and, for a dialect that writes
     /// every part of a qualifier, as its full name.
     pub(super) fn add_table_name(&mut self, name: &ast::ObjectName) {
@@ -717,6 +711,39 @@ impl VisibleScope {
     }
 }
 
+/// The span the unparser gives every identifier of a correlated reference.
+///
+/// An [`Expr::OuterReferenceColumn`] prints exactly like a local column, but it binds
+/// in an enclosing query, so [`strip_dangling_qualifier`] must leave it alone even
+/// when its qualifier spells the same as a relation this `FROM` encloses. The span
+/// is the one field of an [`Ident`] that neither prints nor takes part in equality,
+/// so it carries that provenance without changing the statement. A synthesized
+/// identifier otherwise has an empty span, so a non-empty one at line 0 cannot come
+/// from parsed text.
+const OUTER_REFERENCE_SPAN: Span = Span {
+    start: Location { line: 0, column: 1 },
+    end: Location { line: 0, column: 1 },
+};
+
+/// Marks the identifiers of `expr`, an emitted correlated column reference, as
+/// binding outside the `SELECT` that contains them.
+pub(super) fn mark_outer_reference(mut expr: ast::Expr) -> ast::Expr {
+    match &mut expr {
+        ast::Expr::Identifier(ident) => ident.span = OUTER_REFERENCE_SPAN,
+        ast::Expr::CompoundIdentifier(idents) => {
+            for ident in idents {
+                ident.span = OUTER_REFERENCE_SPAN;
+            }
+        }
+        _ => {}
+    }
+    expr
+}
+
+fn is_outer_reference(ident: &Ident) -> bool {
+    ident.span == OUTER_REFERENCE_SPAN
+}
+
 /// Strips a relation qualifier the enclosing `FROM` does not make visible from a
 /// column reference, so the statement binds in an engine that resolves qualifiers
 /// against the `FROM` alone.
@@ -740,11 +767,13 @@ pub(super) fn strip_dangling_qualifier(expr: &mut ast::Expr, scope: &VisibleScop
         }
         ast::Expr::CompoundIdentifier(idents) => {
             // `@root.name` is a scalar variable, not a qualified column (the planner
-            // draws the same line on an unquoted leading `@`).
-            let is_variable = idents.first().is_some_and(|root| {
-                root.value.starts_with('@') && root.quote_style.is_none()
+            // draws the same line on an unquoted leading `@`); a correlated reference
+            // binds outside this SELECT and is not judged against its FROM.
+            let exempt = idents.first().is_some_and(|root| {
+                (root.value.starts_with('@') && root.quote_style.is_none())
+                    || is_outer_reference(root)
             });
-            if idents.len() < 2 || is_variable || scope.names_visible_relation(idents) {
+            if idents.len() < 2 || exempt || scope.names_visible_relation(idents) {
                 return;
             }
             if let Some(column) = idents.pop() {
@@ -912,12 +941,18 @@ mod tests {
     }
 
     #[test]
-    fn an_outer_references_qualifier_is_visible() {
-        let mut scope = VisibleScope::default();
-        scope.add_outer_qualifier(vec!["o".to_string()]);
+    fn a_correlated_reference_is_kept_whatever_the_from_encloses() {
+        let scope = VisibleScope::default();
+        let outer = mark_outer_reference(compound(&["t", "x"]));
+        assert_eq!(stripped(outer.clone(), &scope), outer);
+        // The marker is invisible to text and to equality, so the same spelling as a
+        // local reference still compares equal and prints the same.
+        assert_eq!(outer, compound(&["t", "x"]));
+        assert_eq!(outer.to_string(), "t.x");
+        // The local spelling, unmarked, is still judged against the FROM.
         assert_eq!(
-            stripped(compound(&["o", "id"]), &scope),
-            compound(&["o", "id"])
+            stripped(compound(&["t", "x"]), &scope),
+            ast::Expr::Identifier(Ident::new("x"))
         );
     }
 

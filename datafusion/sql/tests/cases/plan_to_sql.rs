@@ -14661,3 +14661,19 @@ fn test_correlated_reference_keeps_its_qualifier_under_an_alias()
     );
     Ok(())
 }
+
+/// A local column read through an un-aliased derived table loses the qualifier the
+/// derived table encloses, even when a correlated reference in the same `SELECT`
+/// spells its qualifier the same way: `t.j2_id` is the derived table's, `t.j1_string`
+/// is the enclosing query's, and only the latter keeps `t`.
+#[test]
+fn test_local_and_correlated_references_sharing_a_qualifier_are_told_apart()
+-> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT t.j2_id FROM (SELECT t.j2_id FROM j2 AS t) WHERE t.j1_string = 'x') FROM j1 AS t",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT j2_id FROM (SELECT t.j2_id FROM j2 AS t) WHERE (t.j1_string = 'x')) FROM j1 AS t",
+    );
+    Ok(())
+}

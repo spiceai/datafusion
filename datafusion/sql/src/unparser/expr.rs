@@ -57,6 +57,8 @@ use datafusion_expr::{
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::tokenizer::Span;
 
+use super::rewrite::mark_outer_reference;
+
 /// Convert a DataFusion [`Expr`] to [`ast::Expr`]
 ///
 /// This function is the opposite of [`SqlToRel::sql_to_expr`] and can be used
@@ -695,7 +697,9 @@ impl Unparser<'_> {
             Expr::Placeholder(p) => {
                 Ok(ast::Expr::value(ast::Value::Placeholder(p.id.to_string())))
             }
-            Expr::OuterReferenceColumn(_, col) => self.col_to_sql(col),
+            Expr::OuterReferenceColumn(_, col) => {
+                Ok(mark_outer_reference(self.col_to_sql(col)?))
+            }
             Expr::Unnest(unnest) => self.unnest_to_sql(unnest),
             Expr::HigherOrderFunction(HigherOrderFunction { func, args }) => {
                 let func_name = func.name();
