@@ -1108,18 +1108,17 @@ pub(crate) fn unproject_sort_expr(
                 Expr::Column(Column {
                     relation: Some(_), ..
                 }) => Ok(Transformed::no(sub_expr)),
-                // In case of aggregation there could be columns containing aggregation functions we need to unproject
-                Expr::Column(col)
-                    if let Some(agg) = agg
-                        && agg.schema.is_column_from_schema(&col) =>
-                {
-                    Ok(Transformed::yes(unproject_agg_exprs(
-                        Expr::Column(col),
-                        agg,
-                        None,
-                    )?))
-                }
                 Expr::Column(col) => {
+                    // In case of aggregation there could be columns containing aggregation functions we need to unproject
+                    if let Some(agg) = agg
+                        && agg.schema.is_column_from_schema(&col)
+                    {
+                        return Ok(Transformed::yes(unproject_agg_exprs(
+                            Expr::Column(col),
+                            agg,
+                            None,
+                        )?));
+                    }
                     // When an expression in the `ORDER BY` contains an alias from the `SELECT`
                     // we need to transform it back to the actual expression so that it is
                     // valid SQL in all positions inside ORDER BY (PostgreSQL only allows bare
@@ -1235,11 +1234,16 @@ pub(crate) fn try_transform_to_simple_table_scan_with_filters(
             }
             LogicalPlan::TableScan(table_scan) => {
                 let table_schema = table_scan.source.schema();
+                let filter_schema = DFSchema::try_from_qualified_schema(
+                    table_scan.table_name.clone(),
+                    table_schema.as_ref(),
+                )?;
                 // optional rewriter if table has an alias
                 let mut filter_alias_rewriter =
                     table_alias.as_ref().map(|alias_name| TableAliasRewriter {
-                        table_schema: &table_schema,
+                        table_schema: &filter_schema,
                         alias_name: alias_name.clone(),
+                        rewrite_unqualified: true,
                     });
 
                 // Rewrite already-collected Filter node predicates to use the
@@ -1329,7 +1333,7 @@ pub(crate) fn date_part_to_sql(
 ) -> Result<Option<ast::Expr>> {
     match (style, date_part_args.len()) {
         (DateFieldExtractStyle::Extract, 2) => {
-            let date_expr = unparser.expr_to_sql(&date_part_args[1])?;
+            let date_expr = unparser.expr_to_sql_with_nesting(&date_part_args[1])?;
             if let Expr::Literal(ScalarValue::Utf8(Some(field)), _) = &date_part_args[0] {
                 let field = match field.to_lowercase().as_str() {
                     "year" => ast::DateTimeField::Year,
@@ -1349,7 +1353,7 @@ pub(crate) fn date_part_to_sql(
             }
         }
         (DateFieldExtractStyle::Strftime, 2) => {
-            let column = unparser.expr_to_sql(&date_part_args[1])?;
+            let column = unparser.expr_to_sql_with_nesting(&date_part_args[1])?;
 
             if let Expr::Literal(ScalarValue::Utf8(Some(field)), _) = &date_part_args[0] {
                 let field = match field.to_lowercase().as_str() {

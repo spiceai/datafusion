@@ -45,7 +45,9 @@ pub use case::{CaseExpr, case};
 pub use cast::{CastExpr, cast};
 pub use column::{Column, col, with_new_schema};
 pub use datafusion_expr::utils::format_state_name;
-pub use dynamic_filters::{DynamicFilterPhysicalExpr, Inner as DynamicFilterInner};
+pub use dynamic_filters::{
+    DynamicFilterPhysicalExpr, DynamicFilterTracker, DynamicFilterTracking,
+};
 pub use in_list::{InListExpr, in_list};
 pub use is_not_null::{IsNotNullExpr, is_not_null};
 pub use is_null::{IsNullExpr, is_null};
@@ -56,7 +58,7 @@ pub use literal::{Literal, lit};
 pub use negative::{NegativeExpr, negative};
 pub use no_op::NoOp;
 pub use not::{NotExpr, not};
-pub use try_cast::{TryCastExpr, try_cast};
+pub use try_cast::{TryCastExpr, try_cast, try_cast_with_target_field};
 pub use unknown_column::UnKnownColumn;
 
 pub(crate) use cast::cast_with_target_field;

@@ -199,7 +199,7 @@ impl<'a> Unparser<'a> {
 
     /// The field `expr` resolves to, when a schema was supplied.
     ///
-    /// [`Self::resolved_data_type`] answers with a `DataType`, which is not
+    /// `Self::resolved_data_type` answers with a `DataType`, which is not
     /// enough for an operand carried by an Arrow **extension type**: the storage
     /// type of `arrow.json` is `Utf8`, and what distinguishes it from an
     /// ordinary string lives in the field's metadata. A dialect that renders a

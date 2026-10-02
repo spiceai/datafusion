@@ -434,7 +434,8 @@ fn build_join(
                 right,
             })),
         ) => {
-            let right_col = Expr::Column(create_col_from_scalar_expr(right.deref(), alias)?);
+            let right_col =
+                Expr::Column(create_col_from_scalar_expr(right.deref(), alias)?);
             let value = left.deref().clone();
             let in_predicate = if not_exists_form && !dropped_in_predicate {
                 value
@@ -1326,7 +1327,7 @@ mod tests {
             plan,
             @r"
         Projection: outer_t.id, outer_t.grp [id:Int32;N, grp:Int32;N]
-          LeftAnti Join:  Filter: __correlated_sq_1_value = __correlated_sq_1.id [id:Int32;N, grp:Int32;N, __correlated_sq_1_value:Int32]
+          LeftAnti Join:  Filter: __correlated_sq_1_value = __correlated_sq_1.id null_aware [id:Int32;N, grp:Int32;N, __correlated_sq_1_value:Int32]
             Projection: outer_t.id, outer_t.grp, Int32(3) AS __correlated_sq_1_value [id:Int32;N, grp:Int32;N, __correlated_sq_1_value:Int32]
               TableScan: outer_t [id:Int32;N, grp:Int32;N]
             SubqueryAlias: __correlated_sq_1 [id:Int32;N]
