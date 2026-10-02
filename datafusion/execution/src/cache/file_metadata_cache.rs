@@ -790,7 +790,10 @@ mod tests {
         // directory: 50 puts of distinct keys evict 47 entries through `put`.
         for i in 0..50 {
             let (meta, metadata) = generate_test_metadata_with_size(&i.to_string(), 100);
-            cache.put(&meta.location, CachedFileMetadataEntry::new(meta.clone(), metadata));
+            cache.put(
+                &meta.location,
+                CachedFileMetadataEntry::new(meta.clone(), metadata),
+            );
         }
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.memory_used(), 300);
