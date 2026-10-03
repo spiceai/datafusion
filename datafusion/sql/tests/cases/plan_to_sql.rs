@@ -14199,6 +14199,617 @@ fn test_filter_below_an_unfetched_sort_under_a_taken_list_is_scoped_and_gated()
     Ok(())
 }
 
+/// The refusal a dialect whose derived tables do not fix a volatile value must produce
+/// for a sort key that would read one through a derived table, spelled once.
+const VOLATILE_SORT_SCOPE_REFUSAL: &str = "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported for this dialect: its engine evaluates the expression again for the key instead of reading the value the SELECT list produced, and would order the rows by a value that list never showed";
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_inside_an_expression_is_scoped() -> Result<()>
+{
+    // A key that is not the bare output name has the output's expression inlined,
+    // so `ORDER BY (r + 1.0)` would read `ORDER BY (random() + 1.0)`: a second
+    // draw, ordering the rows by a value the SELECT list never showed. The
+    // projection becomes a derived table instead, and the key reads its `r` from
+    // the SELECT above it, the one value that list holds.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_naming_an_unnamed_volatile_output_is_scoped() -> Result<()> {
+    // Only an aliased output is emitted by name as a bare key; an unnamed one is
+    // inlined like any other reference, so `ORDER BY random()` would draw again.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![random()])?
+        .sort(vec![col("random()").sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "random()" FROM (SELECT random() AS "random()" FROM t) ORDER BY "random()" ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_keeps_its_fetch_above_the_scope() -> Result<()>
+{
+    // The fetch bounds the ordered rows, so it stays the LIMIT of the query above
+    // the derived table rather than moving inside it.
+    let plan = volatile_projection("t")?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_is_unqualified_with_its_neighbours()
+-> Result<()> {
+    // Every reference in the key reads from the derived table, so one still
+    // qualified by the relation inside it would bind to nothing: unqualified along
+    // with the volatile one, as a scoped predicate's references are.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").add(col("r")).sort(false, false)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (a + r) DESC NULLS LAST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_repeatable_output_is_still_inlined() -> Result<()> {
+    // The repeatable counterpart keeps the inlining: the expression draws the same
+    // value at either point of use, and PostgreSQL rejects a bare alias inside a
+    // compound key.
+    let plan = summed_projection()?
+        .sort(vec![col("s").add(lit(1)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a, (t.a + t.b) AS s FROM t ORDER BY ((t.a + t.b) + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_below_a_sort_keyed_on_an_expression_of_the_volatile_output_is_scoped()
+-> Result<()> {
+    // `Filter → Sort → Projection`, the stack reading a renamed column: lowered
+    // beneath the sort, it meets the projection and would fold it in, since nothing
+    // it reads needs a scope — and the sort's key, resolved against that fold, would
+    // be inlined into a second draw. The key alone puts the projection in a scope,
+    // built around the lowered stack, and the ORDER BY above reads its `r`.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").alias("a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("a").gt(lit(0)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a AS a, random() AS r FROM t) WHERE (a > 0) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_limit_above_a_filter_below_a_sort_keyed_on_the_volatile_output_bounds_the_scope()
+-> Result<()> {
+    // The shape that selects a different row: under a LIMIT, a second draw would
+    // keep whichever row *it* ordered first and return the first draw's `r` beside it.
+    // The stack reads a repeatable output, so the projection would have folded in.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("s").gt(lit(0)))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s, r FROM (SELECT (t.a + 1) AS s, random() AS r FROM t) WHERE (s > 0) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_bare_columns_above_a_sort_keyed_on_the_volatile_output_reads_the_scope()
+-> Result<()> {
+    // A stack reading only bare columns is left above the sort, and its WHERE was
+    // emitted against `t` before the sort built the scope that hides it. The clause
+    // is re-pointed onto the derived table's output, as a scoped filter re-points
+    // the clauses above it.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (a > 1) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_the_list_above_keeps_is_scoped() -> Result<()>
+{
+    // `Projection → Sort → Projection` with the outer list reading every inner
+    // output folds into one SELECT (`rewrite_plan_for_sort_on_non_projected_fields`),
+    // and the sort then stands over the projection: the scope is built as for a
+    // free list.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("t.a"), col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_the_list_above_drops_is_inlined_once()
+-> Result<()> {
+    // The same fold with the outer list dropping `r`: the rewrite inlines the
+    // dropped output's expression into the key, and that is the one draw — no
+    // SELECT list shows the value, so there is nothing for the key to disagree
+    // with, and no scope is needed.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t ORDER BY (random() + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_under_a_reordering_list_keeps_that_order()
+-> Result<()> {
+    // `Projection[r, a] → Sort → Projection[a, random() AS r]`: the fold puts the
+    // outer list's expressions into the inner projection but leaves its schema in
+    // the old order, so the scope is built on the projection rebuilt from those
+    // expressions, and the derived table's outputs come out in the order asked for.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("r"), col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r, a FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_repeatable_output_under_a_reordering_list_is_still_inlined()
+-> Result<()> {
+    // The same fold with the key reading the repeatable output: looked up through
+    // the stale schema, `a` would land on `random()` and the sort would be scoped
+    // — and reordered — for nothing. Rebuilt, the key reads `t.a` and stays inlined.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("r"), col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT random() AS r, t.a FROM t ORDER BY (t.a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_repeatable_output_the_list_above_drops_is_still_inlined()
+-> Result<()> {
+    // The outer list keeps only `r`; the key reads `t.a`, which the fold inlines
+    // and no longer projects. Through the stale schema `a` would resolve to
+    // `random()` and the scope would emit a derived table exposing no `a`.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT random() AS r FROM t ORDER BY (t.a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_and_a_dropped_column_carries_the_column()
+-> Result<()> {
+    // `Projection[r] → Sort[(r + t.a)] → Projection[t.a, random() AS r]`: the fold
+    // drops `t.a` from the projection, and the key still reads it. The derived
+    // table carries `t.a` as a further output the ORDER BY reads, while the SELECT
+    // list above shows only `r`.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(col("t.a")).sort(true, true)])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + a) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_keys_reading_a_volatile_output_and_a_dropped_column_apart_carry_the_column()
+-> Result<()> {
+    // The same dependency as its own key, beside the one reading `r`.
+    let plan = volatile_projection("t")?
+        .sort(vec![
+            col("r").add(lit(1.0)).sort(true, true),
+            col("t.a").sort(true, true),
+        ])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST, a ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_and_a_dropped_expression_carries_its_columns()
+-> Result<()> {
+    // The dropped output is an expression, `(t.a + 1) AS s`: the fold inlines it
+    // into the key, and the column it reads is what the derived table carries.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s"), random().alias("r")])?
+        .sort(vec![col("r").add(col("s")).sort(true, true)])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + (a + 1)) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_dropped_column_from_another_relation_carries_it_qualified()
+-> Result<()> {
+    // Over a join, the dropped column comes from the other relation: it is carried
+    // under its own qualifier, so the key reads `b` of `t2`, not a column of `t1`.
+    let schema = int32_schema(&["a", "b"]);
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .cross_join(table_scan(Some("t2"), &schema, Some(vec![1]))?.build()?)?
+        .project(vec![col("t1.a"), col("t2.b"), random().alias("r")])?
+        .sort(vec![col("r").add(col("t2.b")).sort(true, true)])?
+        .project(vec![col("t1.a"), col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t1.a, random() AS r, t2.b FROM t1 CROSS JOIN t2) ORDER BY (r + b) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_dropped_column_named_like_an_output_is_refused() -> Result<()>
+{
+    // `t2.a` dropped by the outer list is not the output `t1.a` the derived table
+    // shows under the name `a`: looked up by name alone it would pass for it, and
+    // the unqualified key would order by `t1.a`. Carried, the derived table has two
+    // outputs named `a`, and that is refused.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .cross_join(table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?)?
+        .project(vec![col("t1.a"), col("t2.a"), random().alias("r")])?
+        .sort(vec![col("r").add(col("t2.a")).sort(true, true)])?
+        .project(vec![col("t1.a"), col("r")])?
+        .build()?;
+
+    let err = plan_to_sql(&plan)
+        .expect_err("a dropped column named like an output must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection has two outputs named a"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_is_refused_on_an_exists_build_side()
+-> Result<()> {
+    // The EXISTS body is built with a builder of its own and the correlation
+    // `t.a = u.a` is appended after it, so a scoped build side would leave that
+    // predicate naming the `u` the derived table hides — whether the sort is the
+    // build side's top or sits below a filter. Refused, for semi and anti joins.
+    let schema = int32_schema(&["a"]);
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
+    ] {
+        let sorted = table_scan(Some("u"), &schema, Some(vec![0]))?
+            .project(vec![col("u.a"), random().alias("r")])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+        let filtered_above = table_scan(Some("u"), &schema, Some(vec![0]))?
+            .project(vec![col("u.a").alias("a"), random().alias("r")])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .filter(col("a").gt(lit(0)))?
+            .build()?;
+        for build in [sorted, filtered_above] {
+            let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+                .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
+                .build()?;
+
+            let err = plan_to_sql(&plan)
+                .expect_err("a sort-scoped EXISTS build side must be refused");
+            assert_eq!(
+                err.to_string(),
+                "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection is the build side of an EXISTS-style join",
+                "{join_type:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_scoped()
+-> Result<()> {
+    // A bounded build side is emitted as a derived table under the build side's
+    // own name, and the correlation binds to that alias, so the scope inside it
+    // is sound and is built.
+    let schema = int32_schema(&["a"]);
+    let build = table_scan(Some("u"), &schema, Some(vec![0]))?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .limit(0, Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_struct_field_filter_above_a_sort_keyed_on_the_volatile_output_reads_the_scope()
+-> Result<()> {
+    // The WHERE above the sort reads a field of a struct column, `t.payload.x`: the
+    // relation is the leading part only, and re-pointing it onto the derived table
+    // keeps the column and its field path.
+    use datafusion_functions::core::expr_ext::FieldAccessor;
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new(
+            "payload",
+            DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into()),
+            false,
+        ),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.a"), col("t.payload"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("t.payload").field("x").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, payload, r FROM (SELECT t.a, t.payload, random() AS r FROM t) WHERE (payload.x > 1) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_re_pointed_onto_a_sort_scope_is_a_plain_identifier() -> Result<()> {
+    // The re-pointed reference is the node a one-part name is planned as, not a
+    // compound identifier of one part, which prints the same and plans differently.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+
+    let ast = format!("{:?}", plan_to_sql(&plan)?);
+    assert!(
+        ast.contains(r#"Identifier(Ident { value: "a""#),
+        "the re-pointed `a` must be an Identifier: {ast}"
+    );
+    assert!(
+        !ast.contains(r#"CompoundIdentifier([Ident { value: "a""#),
+        "the re-pointed `a` must not be a one-part CompoundIdentifier: {ast}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
+    // A subquery in the key may correlate against the relation the derived table
+    // would hide, and its outer references cannot be told from ones that reach
+    // further out, so the shape is refused rather than rebound blindly.
+    let schema = int32_schema(&["a"]);
+    let subquery = Arc::new(
+        table_scan(Some("u"), &schema, Some(vec![0]))?
+            .aggregate(Vec::<Expr>::new(), vec![count(col("u.a"))])?
+            .build()?,
+    );
+    let plan = volatile_projection("t")?
+        .sort(vec![
+            col("r").add(scalar_subquery(subquery)).sort(true, true),
+        ])?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a key holding a subquery must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the key holds a subquery"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_refuses_two_outputs_of_one_name() -> Result<()>
+{
+    // Two outputs that differ only by qualifier cannot be told apart once the
+    // derived table has replaced the qualifiers.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .join_on(
+            table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.a").eq(col("t2.a"))],
+        )?
+        .project(vec![col("t1.a"), col("t2.a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("two outputs named a must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection has two outputs named a"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_is_refused_where_a_derived_table_does_not_fix_it()
+-> Result<()> {
+    // The same engines that evaluate a derived table's volatile output again for a
+    // predicate do so for a key: every route to the sort's scope is refused there.
+    for dialect in [
+        &SqliteDialect {} as &dyn UnparserDialect,
+        &UnparserMySqlDialect {},
+    ] {
+        let unparser = Unparser::new(dialect);
+
+        let sort_arm = volatile_projection("t")?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+        let err = unparser
+            .plan_to_sql(&sort_arm)
+            .expect_err("a key that would build the scope must be refused");
+        assert_eq!(err.to_string(), VOLATILE_SORT_SCOPE_REFUSAL);
+
+        // The stack lowered beneath the sort folds the projection in on its own; the
+        // key builds the scope around it, and is gated there too.
+        let below_a_filter = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+            .project(vec![col("t.a").alias("a"), random().alias("r")])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .filter(col("a").gt(lit(0)))?
+            .build()?;
+        let err = unparser
+            .plan_to_sql(&below_a_filter)
+            .expect_err("a key below a lowered stack must be refused");
+        assert_eq!(err.to_string(), VOLATILE_SORT_SCOPE_REFUSAL);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_having_below_a_sort_keyed_on_the_volatile_output_stays_inside_the_scope()
+-> Result<()> {
+    // `Sort → Projection → Filter → Aggregate`: the HAVING belongs to the aggregate
+    // the derived table encloses, so it is emitted inside it, under the SELECT
+    // that computes the aggregate, and the ORDER BY above reads `r` by name.
+    let schema = int32_schema(&["a", "b"]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .filter(col("sum(t.b)").gt(lit(0)))?
+        .project(vec![
+            col("t.a"),
+            col("sum(t.b)").alias("s"),
+            random().alias("r"),
+        ])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, s, r FROM (SELECT t.a, sum(t.b) AS s, random() AS r FROM t GROUP BY t.a HAVING (sum(t.b) > 0)) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_having_above_a_sort_keyed_on_the_volatile_output_is_refused() -> Result<()> {
+    // `Filter → Sort → Projection → Aggregate`, the filter reading the aggregate:
+    // it is emitted as a HAVING before the sort is reached, against the aggregate
+    // the scope would enclose. A HAVING cannot be lifted over a derived table —
+    // the aggregate it reads is nameable only in the SELECT computing it — and
+    // re-pointing it would leave `HAVING (sum(b) > 0)` outside a derived table
+    // that exposes no `b`. Refused rather than emitted unbindable.
+    let schema = int32_schema(&["a", "b"]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .project(vec![col("t.a"), col("sum(t.b)"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("sum(t.b)").gt(lit(0)))?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a HAVING above the scope must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when a HAVING or QUALIFY above it reads an aggregate or window the derived table would hide"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_qualify_above_a_sort_keyed_on_the_volatile_output_is_refused() -> Result<()> {
+    // The window counterpart: a filter on a window output above the sort is
+    // emitted as a QUALIFY, which reads the window the derived table would hide.
+    let schema = int32_schema(&["a"]);
+    let row_number = Expr::from(WindowFunction::new(
+        WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        vec![],
+    ));
+    let plan = table_scan(Some("t"), &schema, None)?
+        .window(vec![row_number.alias("rn")])?
+        .project(vec![col("t.a"), col("rn"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("rn").gt(lit(1)))?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a QUALIFY above the scope must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when a HAVING or QUALIFY above it reads an aggregate or window the derived table would hide"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_filter_above_a_subquery_alias_on_a_volatile_output_under_a_free_list_is_scoped()
 -> Result<()> {

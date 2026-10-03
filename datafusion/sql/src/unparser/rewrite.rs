@@ -602,6 +602,10 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// table is not the SELECT's only relation. `None` is for a derived table that *is* the
 /// SELECT's only relation and carries no alias: its outputs are addressed by name alone.
 ///
+/// The qualifier is the longest leading run of identifiers naming an enclosed relation,
+/// so a multi-part one (`db.schema.t`) is recognised whole, and a reference that goes on
+/// past the column — a field path, `t.payload.x` — keeps the column and its path.
+///
 /// Both tests are on names alone, so neither distinguishes a correlated reference to an
 /// enclosing query — that qualifier can name the very same relation. A caller must not
 /// offer one, which is why [`SelectBuilder::visit_expressions_in_clauses_mut`] skips any
@@ -613,24 +617,21 @@ pub fn requalify_column_onto_derived_table(
     derived_qualifiers: &HashSet<String>,
     alias: Option<&Ident>,
 ) {
-    let Some((last, qualifier)) = idents.split_last() else {
+    let qualifier_len = (1..idents.len()).rev().find(|&len| {
+        let qualifier = idents[..len]
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect::<Vec<String>>()
+            .join(".");
+        derived_qualifiers.contains(&qualifier)
+    });
+    let Some(qualifier_len) = qualifier_len else {
         return;
     };
-    if qualifier.is_empty() {
-        return;
-    }
-    let qualifier = qualifier
-        .iter()
-        .map(|ident| ident.value.clone())
-        .collect::<Vec<String>>()
-        .join(".");
-    if !derived_qualifiers.contains(&qualifier) {
-        return;
-    }
-    let last = last.clone();
+    let rest = idents.split_off(qualifier_len);
     *idents = match alias {
-        Some(alias) => vec![alias.clone(), last],
-        None => vec![last],
+        Some(alias) => std::iter::once(alias.clone()).chain(rest).collect(),
+        None => rest,
     };
 }
 
