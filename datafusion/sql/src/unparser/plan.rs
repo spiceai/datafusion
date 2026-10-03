@@ -1178,7 +1178,7 @@ impl Unparser<'_> {
                 "when the sort's fetch bounds an input of a join",
             );
         }
-        Self::repoint_clauses_onto_derived_table(
+        self.repoint_clauses_onto_derived_table(
             &enclosed_qualifiers(hidden),
             query,
             select,
@@ -1192,7 +1192,15 @@ impl Unparser<'_> {
     /// emitted against, so they read its outputs by name like the references the
     /// scope rewrites itself. A clause holding a subquery is left alone by the
     /// visitors and would keep naming a hidden relation: refused, with `refuse`.
+    ///
+    /// A reference left qualified reads a relation of an enclosing query, and on a
+    /// dialect that names every derived table one spelled with an alias the
+    /// unparser invents (`derived_projection`) would bind to the scope's own table
+    /// instead: refused the same way, as
+    /// [`Self::ensure_scope_alias_captures_no_outer_reference`] refuses one in the
+    /// expressions the scope places.
     fn repoint_clauses_onto_derived_table(
+        &self,
         hidden_qualifiers: &EnclosedRelations,
         query: &mut Option<QueryBuilder>,
         select: &mut SelectBuilder,
@@ -1208,9 +1216,31 @@ impl Unparser<'_> {
                 "when a HAVING or QUALIFY above it reads an aggregate or window the derived table would hide",
             );
         }
+        let names_derived_table = self.dialect.requires_derived_table_alias();
+        let mut captured = None;
         let mut repoint = |expr: &mut ast::Expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
                 requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+                if names_derived_table
+                    && captured.is_none()
+                    && let Some((_, qualifier)) = idents.split_last()
+                    && Self::is_unparser_derived_alias(
+                        &self.qualifier_key(
+                            &qualifier
+                                .iter()
+                                .map(|ident| ident.value.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                {
+                    captured = Some(
+                        idents
+                            .iter()
+                            .map(|ident| ident.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
                 // A reference reduced to its bare column is a plain identifier,
                 // the node the planner reads a one-part name as.
                 if idents.len() == 1 {
@@ -1225,6 +1255,11 @@ impl Unparser<'_> {
         }
         if skipped {
             return refuse("when a clause above it holds a subquery");
+        }
+        if let Some(reference) = captured {
+            return refuse(&format!(
+                "when the outer reference {reference} carries a name the unparser gives a derived table"
+            ));
         }
         Ok(())
     }
@@ -2255,7 +2290,7 @@ impl Unparser<'_> {
                                     .map(|filter| &filter.predicate),
                                 unrepeatable_output_refusal,
                             )?;
-                            Self::repoint_clauses_onto_derived_table(
+                            self.repoint_clauses_onto_derived_table(
                                 &hidden_qualifiers,
                                 query,
                                 select,

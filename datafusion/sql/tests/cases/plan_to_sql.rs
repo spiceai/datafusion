@@ -15531,6 +15531,29 @@ fn test_scope_refuses_an_outer_reference_its_alias_would_capture() -> Result<()>
         plan_to_sql(&filtered)?,
         @r#"SELECT derived_projection.r, (SELECT r FROM (SELECT random() AS r FROM t) WHERE (r > derived_projection.r) LIMIT 1) AS pick FROM derived_projection"#
     );
+
+    // The same reference in a clause above the scope, an ORDER BY the filter scope
+    // re-points, is refused the same way.
+    let reordered = pick(
+        table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .project(vec![random().alias("r"), col("t.a")])?
+            .filter(col("r").gt(lit(0.5)))?
+            .sort(vec![(col("a") * outer_r()).sort(false, false)])?
+            .project(vec![col("r")])?
+            .limit(0, Some(1))?
+            .build()?,
+    )?;
+    assert_eq!(
+        postgres
+            .plan_to_sql(&reordered)
+            .expect_err("the re-pointed ORDER BY must be refused")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the outer reference derived_projection.r carries a name the unparser gives a derived table"
+    );
+    assert_snapshot!(
+        plan_to_sql(&reordered)?,
+        @r#"SELECT derived_projection.r, (SELECT r FROM (SELECT r, a FROM (SELECT random() AS r, t.a FROM t) WHERE (r > 0.5) ORDER BY (a * derived_projection.r) DESC NULLS LAST) LIMIT 1) AS pick FROM derived_projection"#
+    );
     Ok(())
 }
 
