@@ -25,7 +25,7 @@ use super::{
 };
 use arrow::datatypes::DataType;
 use datafusion_common::{
-    Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
+    Column, DFSchema, DataFusionError, HashMap, Result, ScalarValue, TableReference,
     assert_eq_or_internal_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
@@ -820,15 +820,26 @@ pub(crate) fn unrepeatable_sort_key_refusal<T>(detail: &str) -> Result<T> {
     )
 }
 
-/// The qualifiers a derived table built from a plan with `schema` hides from the
-/// `SELECT` reading it, in both the full and the bare-table spelling a reference may
-/// carry.
-pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> HashSet<String> {
-    schema
-        .iter()
-        .filter_map(|(qualifier, _)| qualifier)
-        .flat_map(|qualifier| [qualifier.to_string(), qualifier.table().to_string()])
-        .collect()
+/// The relations a derived table hides from the `SELECT` reading it, each in both
+/// the full and the bare-table spelling a reference may carry, with the columns it
+/// provides.
+pub(crate) type EnclosedRelations = HashMap<String, HashSet<String>>;
+
+/// The [`EnclosedRelations`] of a derived table built from a plan with `schema`.
+pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> EnclosedRelations {
+    let mut relations = EnclosedRelations::new();
+    for (qualifier, field) in schema.iter() {
+        let Some(qualifier) = qualifier else {
+            continue;
+        };
+        for spelling in [qualifier.to_string(), qualifier.table().to_string()] {
+            relations
+                .entry(spelling)
+                .or_default()
+                .insert(field.name().clone());
+        }
+    }
+    relations
 }
 
 /// Whether `predicate` reads a [Projection] output that cannot be repeated at the

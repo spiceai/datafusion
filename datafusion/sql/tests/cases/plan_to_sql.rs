@@ -15407,6 +15407,50 @@ fn test_scope_over_two_declared_outputs_of_one_name_is_refused() -> Result<()> {
 }
 
 #[test]
+fn test_derived_aggregate_keeps_a_sibling_relation_whose_name_extends_an_enclosed_one()
+-> Result<()> {
+    // A derived aggregate over `t` re-points the clauses its SELECT already carries.
+    // With fully qualified columns the GROUP BY of the aggregate above the join reads
+    // `t.s.a`: column `a` of the relation `t.s` the join reads beside the derived
+    // table. `s` is not a column of the enclosed `t`, so the reference is not a field
+    // path of it, and it keeps its qualifier.
+    let ts = || TableReference::partial("t", "s");
+    let inner = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .aggregate(
+            vec![col("t.a")],
+            vec![datafusion_functions_aggregate::count::count(col("t.b")).alias("n")],
+        )?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(inner)
+        .join(
+            table_scan(Some(ts()), &int32_schema(&["a", "c"]), None)?.build()?,
+            datafusion_common::JoinType::Inner,
+            (
+                vec![Column::from_qualified_name("t.a")],
+                vec![Column::new(Some(ts()), "a")],
+            ),
+            None,
+        )?
+        .aggregate(
+            vec![Expr::Column(Column::new(Some(ts()), "a"))],
+            vec![datafusion_functions_aggregate::count::count(lit(1)).alias("m")],
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let sql = Unparser::new(&dialect).plan_to_sql(&plan)?.to_string();
+    assert!(
+        sql.starts_with("SELECT count(1) AS m, t.s.a FROM "),
+        "{sql}"
+    );
+    assert!(sql.ends_with(" GROUP BY t.s.a"), "{sql}");
+    assert!(!sql.contains("derived_aggregate_1.s"), "{sql}");
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach

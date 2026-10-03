@@ -31,10 +31,11 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        enclosed_qualifiers, expr_contains_subquery, filters_scope_their_projection,
-        find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
-        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
+        EnclosedRelations, enclosed_qualifiers, expr_contains_subquery,
+        filters_scope_their_projection, find_agg_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
+        name_scope_outputs, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, scope_sort_keys, scope_sort_over_projection,
         select_list_wraps_a_grouping_expr, sort_keys_scope_their_projection,
@@ -1155,7 +1156,7 @@ impl Unparser<'_> {
     /// scope rewrites itself. A clause holding a subquery is left alone by the
     /// visitors and would keep naming a hidden relation: refused, with `refuse`.
     fn repoint_clauses_onto_derived_table(
-        hidden_qualifiers: &HashSet<String>,
+        hidden_qualifiers: &EnclosedRelations,
         query: &mut Option<QueryBuilder>,
         select: &mut SelectBuilder,
         refuse: fn(&str) -> Result<()>,
@@ -2192,8 +2193,14 @@ impl Unparser<'_> {
                             if let Some(alias) = filtered.alias
                                 && filtered.through_distinct
                             {
-                                hidden_qualifiers
-                                    .extend(enclosed_qualifiers(&alias.schema));
+                                for (spelling, columns) in
+                                    enclosed_qualifiers(&alias.schema)
+                                {
+                                    hidden_qualifiers
+                                        .entry(spelling)
+                                        .or_default()
+                                        .extend(columns);
+                                }
                             }
                             Self::repoint_clauses_onto_derived_table(
                                 &hidden_qualifiers,

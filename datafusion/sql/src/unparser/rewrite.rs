@@ -636,16 +636,20 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// rejects the query even though DataFusion re-plans it.
 ///
 /// A reference is rewritten only when its qualifier names one of the relations the derived
-/// table encloses (`derived_qualifiers`), so a reference to a relation the SELECT still
+/// table encloses (`derived_relations`), so a reference to a relation the SELECT still
 /// reads directly — the other side of a join, say — keeps the qualifier it needs. With
 /// `Some(alias)` the column is then addressed through `alias`, which the derived table
 /// carries, rather than reduced to a bare name: bare would be ambiguous wherever the derived
 /// table is not the SELECT's only relation. `None` is for a derived table that *is* the
 /// SELECT's only relation and carries no alias: its outputs are addressed by name alone.
 ///
-/// The qualifier is the longest leading run of identifiers naming an enclosed relation,
-/// so a multi-part one (`db.schema.t`) is recognised whole, and a reference that goes on
-/// past the column — a field path, `t.payload.x` — keeps the column and its path.
+/// The qualifier is everything before the last identifier when that names an enclosed
+/// relation, so a multi-part one (`db.schema.t`) is recognised whole. A reference that
+/// goes on past the column — a field path, `t.payload.x` — has a shorter qualifier, and
+/// keeps the column and its path: the longest leading run naming an enclosed relation
+/// whose next identifier is one of that relation's columns. The column has to be checked,
+/// because on names alone `t.s.a` is as much column `a` of a relation `t.s` the SELECT
+/// reads beside the derived table, which keeps its qualifier.
 ///
 /// Both tests are on names alone, so neither distinguishes a correlated reference to an
 /// enclosing query — that qualifier can name the very same relation. A caller must not
@@ -655,7 +659,7 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
 pub fn requalify_column_onto_derived_table(
     idents: &mut Vec<Ident>,
-    derived_qualifiers: &HashSet<String>,
+    derived_relations: &HashMap<String, HashSet<String>>,
     alias: Option<&Ident>,
 ) {
     let qualifier_len = (1..idents.len()).rev().find(|&len| {
@@ -664,7 +668,9 @@ pub fn requalify_column_onto_derived_table(
             .map(|ident| ident.value.clone())
             .collect::<Vec<String>>()
             .join(".");
-        derived_qualifiers.contains(&qualifier)
+        derived_relations.get(&qualifier).is_some_and(|columns| {
+            len + 1 == idents.len() || columns.contains(&idents[len].value)
+        })
     });
     let Some(qualifier_len) = qualifier_len else {
         return;
