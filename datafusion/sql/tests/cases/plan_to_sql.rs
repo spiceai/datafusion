@@ -15272,6 +15272,141 @@ fn test_filter_reading_a_declared_output_its_alias_does_not_name_reads_the_scope
 }
 
 #[test]
+fn test_scope_names_a_declared_column_output_as_declared() -> Result<()> {
+    // A declared schema can rename a column output too: `t.a` declared as `b`. The
+    // scope a filter builds, alone or around a sort key lowered beneath it, shows
+    // the column as `b`, the name the `SELECT` above reads.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "c"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("r", DataType::Float64, false),
+            Field::new("b", DataType::Int32, false),
+        ]
+        .into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![random().alias("r"), col("t.a")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?);
+
+    let filtered = LogicalPlanBuilder::from(projection.clone())
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&filtered)?,
+        @r#"SELECT r, b FROM (SELECT random() AS r, t.a AS b FROM t) WHERE (r > 0.5)"#
+    );
+
+    let sorted = LogicalPlanBuilder::from(projection)
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&sorted)?,
+        @r#"SELECT r, b FROM (SELECT random() AS r, t.a AS b FROM t) WHERE (b > 0) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_scope_names_a_declared_output_through_a_distinct_or_an_alias() -> Result<()>
+{
+    // The filter scope reaches its projection through a `DISTINCT` or a
+    // `SubqueryAlias`, and shows each output there under its declared name too.
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "x"]), None);
+    let declared = || {
+        DFSchema::from_unqualified_fields(
+            vec![Field::new("x", DataType::Float64, false)].into(),
+            std::collections::HashMap::new(),
+        )
+    };
+    let projection = |expr: Expr| -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+            vec![expr],
+            Arc::new(scan()?.build()?),
+            Arc::new(declared()?),
+        )?))
+    };
+
+    let distinct = LogicalPlanBuilder::from(projection(random().alias("z"))?)
+        .distinct()?
+        .filter(col("x").gt(lit(0.5)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&distinct)?,
+        @r#"SELECT x FROM (SELECT DISTINCT random() AS x FROM t) WHERE (x > 0.5)"#
+    );
+
+    let aliased = LogicalPlanBuilder::from(projection(random().alias("z"))?)
+        .alias("sq")?
+        .filter(col("sq.x").gt(lit(0.5)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&aliased)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) AS sq WHERE (x > 0.5)"#
+    );
+
+    let repeatable = LogicalPlanBuilder::from(projection(
+        cast(col("t.a"), DataType::Float64).alias("z"),
+    )?)
+    .alias("sq")?
+    .filter(col("sq.x").gt(lit(0.5)))?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&repeatable)?,
+        @r#"SELECT x FROM (SELECT CAST(t.a AS DOUBLE) AS x FROM t) AS sq WHERE (x > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_scope_over_two_declared_outputs_of_one_name_is_refused() -> Result<()> {
+    // Two declared outputs of one name cannot be told apart once the scope's
+    // references are unqualified, so either scope refuses the projection before
+    // renaming its outputs, rather than failing to build the renamed one.
+    let scan = table_scan(Some("t"), &int32_schema(&["a"]), None)?.build()?;
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("q1")),
+                Arc::new(Field::new("x", DataType::Float64, false)),
+            ),
+            (
+                Some(TableReference::bare("q2")),
+                Arc::new(Field::new("x", DataType::Int32, false)),
+            ),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![random().alias("z"), col("t.a")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?);
+
+    let filtered = LogicalPlanBuilder::from(projection.clone())
+        .filter(col("q1.x").gt(lit(0.5)))?
+        .build()?;
+    let err = plan_to_sql(&filtered).expect_err("the filter scope must refuse");
+    assert_eq!(
+        err.to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection has two outputs named x"
+    );
+
+    let sorted = LogicalPlanBuilder::from(projection)
+        .sort(vec![col("q1.x").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+    let err = plan_to_sql(&sorted).expect_err("the sort scope must refuse");
+    assert_eq!(
+        err.to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection has two outputs named x"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach

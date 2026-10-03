@@ -1013,17 +1013,12 @@ pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<Logica
         return internal_err!("a filter stack has at least one predicate");
     };
     // The identity projection above reads each output by the name the projection's
-    // schema reports. An alias a declared schema names apart from, `random() AS z`
-    // declared as `x`, would show the output as `z` and leave `x` bound to nothing,
-    // so the projection is rebuilt with its outputs named as declared.
-    let input = match bottom.input.as_ref() {
-        LogicalPlan::Projection(projection) if aliases_an_output_apart(projection) => {
-            Arc::new(LogicalPlan::Projection(Projection::try_new(
-                exprs_named_as_declared(projection),
-                Arc::clone(&projection.input),
-            )?))
-        }
-        _ => Arc::clone(&bottom.input),
+    // schema reports. An output a declared schema names apart from its own name,
+    // `random() AS z` declared as `x`, would show as `z` and leave `x` bound to
+    // nothing, so the projection is rebuilt with its outputs named as declared.
+    let input = match name_scoped_outputs_as_declared(&bottom.input)? {
+        Some(named) => Arc::new(named),
+        None => Arc::clone(&bottom.input),
     };
     // `Filter::try_new` rather than the builder, whose `filter` normalizes every
     // column back to its qualified form and would undo the rewrite above.
@@ -1031,25 +1026,57 @@ pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<Logica
     identity_projection_over(Arc::new(filtered), unrepeatable_output_refusal)
 }
 
-/// Whether a schema declared apart from `projection`'s expressions
-/// (`Projection::try_new_with_schema`) names an aliased output apart from its
-/// alias: `random() AS z` declared as `x`. Beside a wildcard the expressions do not
-/// line up with the fields by position, and no output is taken to be.
-fn aliases_an_output_apart(projection: &Projection) -> bool {
-    !projection_holds_wildcard(projection)
-        && projection
+/// The node a filter scope's derived table is built from — a [Projection], reached
+/// through any `DISTINCT` and a `SubqueryAlias` the way [`projection_below_filters`]
+/// walks to it — with the projection rebuilt to show each output under the name its
+/// schema declares ([`exprs_named_as_declared`]). `None` where every output already
+/// shows it, or beside a wildcard, whose expressions do not line up with the fields
+/// by position.
+fn name_scoped_outputs_as_declared(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    match plan {
+        LogicalPlan::Distinct(Distinct::All(input)) => {
+            Ok(name_scoped_outputs_as_declared(input)?
+                .map(|named| LogicalPlan::Distinct(Distinct::All(Arc::new(named)))))
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            let LogicalPlan::Projection(projection) = alias.input.as_ref() else {
+                return Ok(None);
+            };
+            let Some(named) = projection_named_as_declared(projection)? else {
+                return Ok(None);
+            };
+            SubqueryAlias::try_new(Arc::new(named), alias.alias.clone())
+                .map(|alias| Some(LogicalPlan::SubqueryAlias(alias)))
+        }
+        LogicalPlan::Projection(projection) => projection_named_as_declared(projection),
+        _ => Ok(None),
+    }
+}
+
+/// `projection` rebuilt with each output shown under the name its schema declares,
+/// or `None` where every output already shows it or the projection holds a wildcard.
+fn projection_named_as_declared(projection: &Projection) -> Result<Option<LogicalPlan>> {
+    if projection_holds_wildcard(projection)
+        || projection
             .expr
             .iter()
             .zip(projection.schema.fields())
-            .any(|(expr, field)| {
-                matches!(expr, Expr::Alias(alias) if alias.name != *field.name())
-            })
+            .all(|(expr, field)| expr.qualified_name().1 == *field.name())
+    {
+        return Ok(None);
+    }
+    ensure_one_output_per_name(&projection.schema, unrepeatable_output_refusal)?;
+    Projection::try_new(
+        exprs_named_as_declared(projection),
+        Arc::clone(&projection.input),
+    )
+    .map(|projection| Some(LogicalPlan::Projection(projection)))
 }
 
 /// `projection`'s expressions, each aliased to the name its schema declares for it
-/// where the expression's own name differs: an unnamed expression, or an alias a
-/// declared schema names apart from. A derived table built from them shows every
-/// output under the name the `SELECT` reading it binds.
+/// where the expression's own name differs: an unnamed expression, a column, or an
+/// alias a declared schema names apart from. A derived table built from them shows
+/// every output under the name the `SELECT` reading it binds.
 fn exprs_named_as_declared(projection: &Projection) -> Vec<Expr> {
     projection
         .expr
@@ -1063,6 +1090,26 @@ fn exprs_named_as_declared(projection: &Projection) -> Vec<Expr> {
             }
         })
         .collect()
+}
+
+/// Refuses, with `refuse`, a schema carrying two fields of one name, which a derived
+/// table's unqualified references cannot tell apart. Checked before the outputs are
+/// renamed, so the refusal is what the caller sees rather than the schema error
+/// building the renamed projection would raise.
+fn ensure_one_output_per_name(
+    schema: &DFSchema,
+    refuse: fn(&str) -> Result<LogicalPlan>,
+) -> Result<()> {
+    let mut names = HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if !names.insert(field.name()) {
+            refuse(&format!(
+                "when the projection has two outputs named {}",
+                field.name()
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 /// Whether `projection` lists a wildcard, which stands for a run of its input's
@@ -1102,16 +1149,7 @@ fn projection_of_outputs(
     outputs: &[String],
     refuse: fn(&str) -> Result<LogicalPlan>,
 ) -> Result<LogicalPlan> {
-    let schema = input.schema();
-    let mut names = HashSet::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        if !names.insert(field.name()) {
-            return refuse(&format!(
-                "when the projection has two outputs named {}",
-                field.name()
-            ));
-        }
-    }
+    ensure_one_output_per_name(input.schema(), refuse)?;
     let outputs = outputs
         .iter()
         .map(|name| Expr::Column(Column::new_unqualified(name)))
@@ -1273,6 +1311,7 @@ pub(crate) fn scope_sort_over_projection(
     // Each output keeps the name the projection's schema gives it, the name the
     // identity projection above reads it by: an expression whose own name differs,
     // in a projection built with a declared schema, is aliased to it.
+    ensure_one_output_per_name(&projection.schema, unrepeatable_sort_key_refusal)?;
     let mut exprs = exprs_named_as_declared(projection);
     // A key may read a column the projection does not output: folding an outer
     // list that drops an output inlines that output's expression into the key, and
