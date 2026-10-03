@@ -27,10 +27,10 @@ use datafusion_expr::test::function_stub::{
 };
 use datafusion_expr::{
     ColumnarValue, EmptyRelation, Expr, ExprFunctionExt, Extension, LogicalPlan,
-    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
-    UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
-    WindowFunctionDefinition, cast, col, exists, in_subquery, lit, out_ref_col,
-    scalar_subquery, table_scan, wildcard,
+    LogicalPlanBuilder, Projection, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Union, UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility,
+    WindowFrame, WindowFunctionDefinition, cast, col, exists, in_subquery, lit,
+    out_ref_col, scalar_subquery, table_scan, wildcard,
 };
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
@@ -14629,8 +14629,12 @@ fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_sid
 
         let sql = plan_to_sql(&plan)?.to_string();
         let expected = match join_type {
-            datafusion_expr::JoinType::LeftAnti => "SELECT t.a FROM t WHERE NOT EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))",
-            _ => "SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))",
+            datafusion_expr::JoinType::LeftAnti => {
+                "SELECT t.a FROM t WHERE NOT EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
+            }
+            _ => {
+                "SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
+            }
         };
         assert_eq!(sql, expected, "{join_type:?}");
     }
@@ -15237,6 +15241,37 @@ fn test_a_distinct_scope_repoints_a_clause_naming_its_alias() -> Result<()> {
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT a FROM (SELECT DISTINCT sq.a FROM (SELECT sq.a FROM t AS sq) AS sq) WHERE (random() < 0.5) ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_named_only_by_a_preserved_schema_is_scoped()
+-> Result<()> {
+    // An optimizer that rewrites a projection's expressions through
+    // `Projection::try_new_with_schema` keeps the outputs' declared names while the
+    // expression under one of them loses the alias that produced its name. The
+    // declared name is still the one a sort key reads, so the output has to be found
+    // under it: resolving the key against the expressions alone would miss `r`,
+    // leaving `ORDER BY (random() + 1.0)` to draw a second time. The expression is
+    // aliased back to its declared name, and the key reads that one value.
+    let scan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?.build()?;
+    let named = Projection::try_new(
+        vec![col("t.a"), random().alias("r")],
+        Arc::new(scan.clone()),
+    )?;
+    let rewritten = Projection::try_new_with_schema(
+        vec![col("t.a"), random()],
+        Arc::new(scan),
+        Arc::clone(&named.schema),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(rewritten))
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
     );
     Ok(())
 }

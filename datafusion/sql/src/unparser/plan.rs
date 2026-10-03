@@ -1837,7 +1837,8 @@ impl Unparser<'_> {
                 Ok(())
             }
             LogicalPlan::Projection(p) => {
-                if let Some(new_plan) = rewrite_plan_for_sort_on_non_projected_fields(p) {
+                if let Some(new_plan) = rewrite_plan_for_sort_on_non_projected_fields(p)?
+                {
                     return self
                         .select_to_sql_recursively(&new_plan, query, select, relation);
                 }

@@ -1101,13 +1101,24 @@ fn sort_keys_read_unrepeatable_output(
 /// [Projection] and [`sort_keys_read_unrepeatable_output`] holds for it. `None`
 /// when the sort leaves its input as it is.
 ///
-/// The projection is returned rebuilt from its expressions, and the caller scopes
-/// that one. Folding an outer projection into the one below a sort
-/// (`rewrite_plan_for_sort_on_non_projected_fields`) replaces the projection's
-/// expressions and keeps its schema, so an output looked up by name through that
-/// schema lands on the position another expression may now occupy, and an identity
-/// projection read off it would list the outputs in the outer list's old order.
-/// Rebuilt, the projection carries the schema its expressions produce.
+/// The projection is returned with its expressions aligned to the names its schema
+/// declares: an output whose expression does not already produce its declared name
+/// is aliased to it, and the projection is rebuilt from that list. A schema
+/// preserved through [`Projection::try_new_with_schema`] keeps an output's name
+/// while the rewritten expression under it loses the alias that produced the name,
+/// and that declared name is the one a sort key reads. Rebuilding from the
+/// expressions alone would drop it, so the key would resolve to nothing and the
+/// normal path would inline the expression again; keeping the declared schema
+/// alone would name an output the emitted `SELECT` never produces. Aligning gives
+/// a projection that declares what it computes and still answers to the name the
+/// key uses. A projection whose expressions already produce its schema — every one
+/// that has not been rewritten — is unchanged by this.
+///
+/// Folding an outer projection into the one below a sort
+/// (`rewrite_plan_for_sort_on_non_projected_fields`) used to leave behind a schema
+/// describing the expressions it had just replaced. That is repaired where the
+/// replacement happens, so a schema reaching here that disagrees with its
+/// expressions is a preserved one, not a stale one.
 pub(crate) fn sort_keys_scope_their_projection(
     keys: &[SortExpr],
     input: &LogicalPlan,
@@ -1115,8 +1126,31 @@ pub(crate) fn sort_keys_scope_their_projection(
     let LogicalPlan::Projection(projection) = input else {
         return Ok(None);
     };
-    let projection =
-        Projection::try_new(projection.expr.clone(), Arc::clone(&projection.input))?;
+    let aligned = projection
+        .expr
+        .iter()
+        .zip(projection.schema.fields())
+        .map(|(expr, field)| {
+            // The name the emitted `SELECT` gives this output. An alias and a bare
+            // column each carry one of their own; a wildcard stands for a list of
+            // columns that each keep their own name and cannot take an alias at
+            // all. Only the rest have to render the expression to find it out.
+            #[expect(deprecated)]
+            let produces_declared_name = match expr {
+                Expr::Alias(alias) => alias.name == *field.name(),
+                Expr::Column(column) => column.name == *field.name(),
+                Expr::Wildcard { .. } => true,
+                other => other.schema_name().to_string() == *field.name(),
+            };
+            if produces_declared_name {
+                expr.clone()
+            } else {
+                // `alias` overwrites an existing alias rather than nesting under it.
+                expr.clone().alias(field.name())
+            }
+        })
+        .collect::<Vec<_>>();
+    let projection = Projection::try_new(aligned, Arc::clone(&projection.input))?;
     Ok(sort_keys_read_unrepeatable_output(keys, &projection).then_some(projection))
 }
 

@@ -207,13 +207,13 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// `age`.
 pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     p: &Projection,
-) -> Option<LogicalPlan> {
+) -> Result<Option<LogicalPlan>> {
     let LogicalPlan::Sort(sort) = p.input.as_ref() else {
-        return None;
+        return Ok(None);
     };
 
     let LogicalPlan::Projection(inner_p) = sort.input.as_ref() else {
-        return None;
+        return Ok(None);
     };
 
     let mut map = HashMap::new();
@@ -279,7 +279,6 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
 
     if outer_collects == inner_collects {
         let mut sort = sort.clone();
-        let mut inner_p = inner_p.clone();
 
         let new_exprs = p
             .expr
@@ -346,12 +345,19 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         }
 
-        inner_p.expr.clone_from(&new_exprs);
-        sort.input = Arc::new(LogicalPlan::Projection(inner_p));
+        // Rebuild the inner Projection rather than replacing its expressions in
+        // place: its declared schema describes the expressions being replaced, so
+        // keeping it would leave every later lookup by name landing on the position
+        // another expression now occupies. The rebuilt one carries the schema
+        // `new_exprs` produces.
+        sort.input = Arc::new(LogicalPlan::Projection(Projection::try_new(
+            new_exprs,
+            Arc::clone(&inner_p.input),
+        )?));
 
-        Some(LogicalPlan::Sort(sort))
+        Ok(Some(LogicalPlan::Sort(sort)))
     } else {
-        None
+        Ok(None)
     }
 }
 
