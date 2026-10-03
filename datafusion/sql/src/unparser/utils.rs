@@ -1067,12 +1067,15 @@ fn projection_of_outputs(
 /// applies to a key that is not a bare output name — would inline an output that
 /// cannot be repeated ([`output_is_repeatable`]).
 ///
-/// A bare unqualified key naming an aliased output is emitted as that name, which
-/// every dialect accepts as a top-level sort key, so it is never inlined. Any other
-/// key reading such an output would have the expression inlined — `ORDER BY (r + 1)`
-/// as `ORDER BY (random() + 1)` — ordering the rows by a second draw the `SELECT`
-/// list never showed. Such a key has to read the output by name from a `SELECT`
-/// above the one computing it, which is what [`scope_sort_over_projection`] builds.
+/// A bare unqualified key naming an output whose alias is that same name is emitted
+/// as that name, which every dialect accepts as a top-level sort key, so it is never
+/// inlined. A declared schema can name an output apart from its alias, `random() AS
+/// z` declared as `x`, and then the key's name is not in the `SELECT` list and would
+/// bind a column of the input instead. Any other key reading such an output would
+/// have the expression inlined — `ORDER BY (r + 1)` as `ORDER BY (random() + 1)` —
+/// ordering the rows by a second draw the `SELECT` list never showed. Such a key has
+/// to read the output by name from a `SELECT` above the one computing it, which is
+/// what [`scope_sort_over_projection`] builds.
 fn sort_keys_read_unrepeatable_output(
     keys: &[SortExpr],
     projection: &Projection,
@@ -1089,7 +1092,7 @@ fn sort_keys_read_unrepeatable_output(
             ..
         }) = &key.expr
             && let Some(index) = projection.schema.index_of_column_by_name(None, name)
-            && matches!(projection.expr.get(index), Some(Expr::Alias(_)))
+            && matches!(projection.expr.get(index), Some(Expr::Alias(alias)) if alias.name == *name)
         {
             return false;
         }

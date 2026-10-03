@@ -15135,6 +15135,35 @@ fn test_sort_key_reading_a_volatile_output_beside_a_wildcard_is_refused() -> Res
 }
 
 #[test]
+fn test_bare_sort_key_naming_a_declared_output_its_alias_does_not_name_is_scoped()
+-> Result<()> {
+    // A declared schema can name an output `x` while its expression keeps an alias
+    // of its own, `random() AS z`. The bare key `x` is not emitted as an output's
+    // name, since the SELECT list shows `z`, so `ORDER BY x` would bind the table's
+    // own column `x`. It is scoped instead, and the derived table names the output
+    // `x`.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![Field::new("x", DataType::Float64, false)].into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = Projection::try_new_with_schema(
+        vec![random().alias("z")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .sort(vec![col("x").sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) ORDER BY x ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach
