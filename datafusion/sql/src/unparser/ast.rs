@@ -264,6 +264,10 @@ pub struct SelectBuilder {
     /// How many join inputs the walk is currently inside. A join walks both of its
     /// inputs with this one builder, so while this is non-zero the relation being
     /// unparsed is not the SELECT's only one — see [`Self::within_join_input`].
+    /// A `Limit` reached there has no clause of this SELECT that bounds one
+    /// input's contribution to the join — `LIMIT` here bounds the join's
+    /// output — so it is derived in a scope of its own whatever else this
+    /// SELECT carries.
     join_inputs_in_progress: usize,
     /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
     /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so

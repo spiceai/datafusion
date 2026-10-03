@@ -1166,7 +1166,7 @@ impl Unparser<'_> {
     ) -> Result<()> {
         let Some(table_ref) = Self::scanned_relation_of(plan) else {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is only supported when the limited input is a single table scan"
+                "Unparsing a row limit in a scope of its own is only supported when the limited input is a single table scan"
             );
         };
 
@@ -1174,7 +1174,7 @@ impl Unparser<'_> {
         // with the full path would be left pointing at a name that is gone.
         if self.dialect.full_qualified_col() && table_ref.to_vec().len() > 1 {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is not supported for a qualified table name on a dialect that spells columns in full"
+                "Unparsing a row limit in a scope of its own is not supported for a qualified table name on a dialect that spells columns in full"
             );
         }
 
@@ -1186,7 +1186,7 @@ impl Unparser<'_> {
         let fields = plan.schema().fields();
         if fields.is_empty() {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is not supported for an input projecting no columns"
+                "Unparsing a row limit in a scope of its own is not supported for an input projecting no columns"
             );
         }
 
@@ -1233,6 +1233,56 @@ impl Unparser<'_> {
             }
             _ => None,
         }
+    }
+
+    /// Derives a `Limit` that is a join input.
+    ///
+    /// Over one scan it takes the scan's own name, so the enclosing join's
+    /// `ON` and select list keep binding to it, with that scan's columns as
+    /// this side's select items — exactly what a row limit under a filter
+    /// needs, so the same scope is used. Over anything else there is no name
+    /// for the derived table to take: with a projection already above the
+    /// join it keeps the dialect's derived-limit alias, as before, while the
+    /// input's columns are unqualified; without one, or over qualified
+    /// columns the derived table would hide, it is refused rather than
+    /// emitting SQL that bounds the join's output or names an unbound relation.
+    fn derive_join_input_limit(
+        &self,
+        plan: &LogicalPlan,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        // A limited scan that projects no columns feeds only a count: with the
+        // projection already above the join, the dialect-alias derived table
+        // (`SELECT 1 FROM b LIMIT n`) keeps its cardinality, as before.
+        let projects_nothing = plan.schema().fields().is_empty();
+        if Self::scanned_relation_of(plan).is_some() && !projects_nothing {
+            return self.derive_row_limited_scope(plan, select, relation);
+        }
+        if select.already_projected() {
+            // The derived table hides every relation inside it, so an output
+            // column still qualified by one of them (a grouping's key, a join's
+            // columns) is one the enclosing `ON` and select list cannot reach.
+            if plan
+                .schema()
+                .iter()
+                .any(|(qualifier, _)| qualifier.is_some())
+            {
+                return not_impl_err!(
+                    "Unparsing a row limit on a join input whose columns are qualified is not supported unless the input is a single table scan"
+                );
+            }
+            return self.derive_with_dialect_alias(
+                DERIVED_LIMIT_ALIAS,
+                plan,
+                relation,
+                false,
+                vec![],
+            );
+        }
+        not_impl_err!(
+            "Unparsing a row limit on a join input that is not a single table scan is not supported without a projection above the join"
+        )
     }
 
     /// Isolates what a join input's `TableScan` did in a derived table:
@@ -2093,6 +2143,17 @@ impl Unparser<'_> {
                 )
             }
             LogicalPlan::Limit(limit) => {
+                // A join input's limit has no faithful home in the enclosing
+                // query, whatever else that query carries: its `LIMIT` bounds
+                // the join's output, not one input's contribution to it. The
+                // derived table takes the scan's own name, which is what the
+                // join's `ON` and the select list already call this input
+                // (spiceai/spiceai#14375).
+                if select.within_join_input()
+                    && (limit.fetch.is_some() || limit.skip.is_some())
+                {
+                    return self.derive_join_input_limit(plan, select, relation);
+                }
                 // Limit can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
