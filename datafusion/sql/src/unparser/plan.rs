@@ -38,7 +38,7 @@ use super::{
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, scope_sort_keys, scope_sort_over_projection,
         select_list_wraps_a_grouping_expr, sort_keys_scope_their_projection,
-        sort_scope_within_select, stacked_filters_read_unrepeatable_output,
+        stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -717,7 +717,17 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         query: &mut Option<QueryBuilder>,
     ) -> Result<SetExpr> {
-        let mut select_builder = SelectBuilder::default();
+        self.select_to_sql_expr_with(plan, query, SelectBuilder::default())
+    }
+
+    /// [`Self::select_to_sql_expr`] into a `SELECT` the caller has already set up,
+    /// such as one marked as an EXISTS body.
+    fn select_to_sql_expr_with(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        mut select_builder: SelectBuilder,
+    ) -> Result<SetExpr> {
         select_builder.push_from(TableWithJoinsBuilder::default());
         let mut relation_builder = RelationBuilder::default();
         self.select_to_sql_recursively(
@@ -1082,10 +1092,41 @@ impl Unparser<'_> {
         )
     }
 
+    /// Whether the order a sort with `fetch` produces can be observed from where it
+    /// is being unparsed, which is what makes a key ordering by a second draw of an
+    /// output that cannot be repeated a wrong answer rather than one of the orders
+    /// the plan allows.
+    ///
+    /// A join leaves its output order unspecified, so the order of one of its
+    /// inputs reaches nothing, and an EXISTS body's rows are only tested for
+    /// existence. There an unbounded sort keeps the form it has without a scope,
+    /// which is correct, and which a scope would break: the join's `ON` clause and
+    /// the EXISTS correlation both name the relation the derived table hides. A row
+    /// bound makes the order decide which rows survive: the sort's own fetch, or a
+    /// `LIMIT` already on an EXISTS body, which [`Self::build_exists_subquery`]
+    /// then moves into a scope of its own under the build side's name.
+    fn sort_order_is_observable(
+        fetch: Option<usize>,
+        query: &Option<QueryBuilder>,
+        select: &SelectBuilder,
+    ) -> bool {
+        if fetch.is_some() {
+            return true;
+        }
+        if select.within_join_input() {
+            return false;
+        }
+        if select.within_exists_body() {
+            return query.as_ref().is_some_and(QueryBuilder::bounds_rows);
+        }
+        true
+    }
+
     /// Readies this `SELECT` for the derived table a sort key reading an output that
     /// cannot be repeated builds around the plan whose schema is `hidden`: the
-    /// dialect gate, the refusal inside a join input, and the re-pointing of the
-    /// clauses already emitted against the relations that table hides.
+    /// dialect gate, the refusal inside a join input — which a sort reaches only
+    /// with a fetch, see [`Self::sort_order_is_observable`] — and the re-pointing of
+    /// the clauses already emitted against the relations that table hides.
     fn prepare_sort_key_scope(
         &self,
         hidden: &DFSchema,
@@ -1095,7 +1136,7 @@ impl Unparser<'_> {
         self.ensure_derived_table_fixes_volatile_sort_keys()?;
         if select.within_join_input() {
             return unrepeatable_sort_key_refusal(
-                "when the projection is an input of a join",
+                "when the sort's fetch bounds an input of a join",
             );
         }
         Self::repoint_clauses_onto_derived_table(
@@ -2015,12 +2056,14 @@ impl Unparser<'_> {
                             filters_scope_their_projection(&lowered, false);
                         // With the stack folding the projection in, a key reading
                         // an output that cannot be repeated would be resolved into
-                        // a second draw — see the `Sort` arm. The key alone then
-                        // puts the projection in a scope, built here around the
+                        // a second draw — see the `Sort` arm. Where the sort's
+                        // order can be observed, the key alone then puts the
+                        // projection in a scope, built here around the
                         // lowered stack so the ORDER BY the sort emits above it
                         // reads the outputs by name, on the same guarantee and
                         // with the same refusals.
                         let keys_scope = !filters_scope
+                            && Self::sort_order_is_observable(sort.fetch, query, select)
                             && sort_keys_scope_their_projection(&sort.expr, sorted)?
                                 .is_some();
                         let expr = if keys_scope {
@@ -2252,12 +2295,14 @@ impl Unparser<'_> {
                 // inlined below (`unproject_sort_expr`), and for an output that
                 // cannot be repeated that is a second draw: `ORDER BY (r + 1)`
                 // inlined as `ORDER BY (random() + 1)` would order the rows by a
-                // value the SELECT list never showed. Such a key reads the output by name
-                // from a SELECT above the one computing it, so the projection
+                // value the SELECT list never showed. Where that order can be
+                // observed (`sort_order_is_observable`), such a key reads the output
+                // by name from a SELECT above the one computing it, so the projection
                 // becomes a derived table — the repair a predicate on such an
                 // output gets, on the same guarantee, gated and refused the same way.
-                if let Some(projection) =
-                    sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
+                if Self::sort_order_is_observable(sort.fetch, query, select)
+                    && let Some(projection) =
+                        sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
                 {
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;
                     let scoped = scope_sort_over_projection(sort, &projection)?;
@@ -4154,16 +4199,18 @@ impl Unparser<'_> {
                 "when the projection is the build side of an EXISTS-style join",
             );
         }
-        // A sort key reading such an output builds the same derived table, with
-        // the same consequence for the appended predicates.
-        if sort_scope_within_select(right_plan)? {
-            return unrepeatable_sort_key_refusal(
-                "when the projection is the build side of an EXISTS-style join",
-            );
-        }
 
+        // A sort key reading such an output needs no refusal here. The body's
+        // SELECT is marked as one, so the key is scoped only where a row bound
+        // makes the sort's order observable (`sort_order_is_observable`), and a
+        // bounded body is moved below into a scope of its own, under the build
+        // side's name, before the correlation is added. Unbounded, the order
+        // reaches nothing, and the key keeps the form it has without a scope.
         let mut query_builder = Some(QueryBuilder::default());
-        let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
+        let mut body_select = SelectBuilder::default();
+        body_select.mark_exists_body();
+        let body =
+            self.select_to_sql_expr_with(right_plan, &mut query_builder, body_select)?;
         let mut query_builder = query_builder.unwrap();
 
         // Reduce the build side to a single SELECT to use as the EXISTS body.

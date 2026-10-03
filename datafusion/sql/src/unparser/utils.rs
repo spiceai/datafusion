@@ -1120,31 +1120,6 @@ pub(crate) fn sort_keys_scope_their_projection(
     Ok(sort_keys_read_unrepeatable_output(keys, &projection).then_some(projection))
 }
 
-/// Whether `plan`, unparsed into one `SELECT`, holds a `Sort` that puts its
-/// projection in a scope ([`sort_keys_scope_their_projection`]), looking through the
-/// filters, projections and `DISTINCT` that share that `SELECT`. A `Limit` ends the
-/// walk: a bounded plan is emitted as an aliased derived table of its own, and a
-/// scope inside it binds under that alias.
-pub(crate) fn sort_scope_within_select(plan: &LogicalPlan) -> Result<bool> {
-    let mut plan = plan;
-    loop {
-        match plan {
-            LogicalPlan::Sort(sort) => {
-                if sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
-                    .is_some()
-                {
-                    return Ok(true);
-                }
-                plan = sort.input.as_ref();
-            }
-            LogicalPlan::Filter(filter) => plan = filter.input.as_ref(),
-            LogicalPlan::Projection(projection) => plan = projection.input.as_ref(),
-            LogicalPlan::Distinct(Distinct::All(input)) => plan = input.as_ref(),
-            _ => return Ok(false),
-        }
-    }
-}
-
 /// `keys` as the `ORDER BY` above a scope reads them: every reference unqualified,
 /// so it binds by name to the derived table's output, for the reason
 /// [`scope_filters_over_projection`] gives for a predicate's references. A key

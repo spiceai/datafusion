@@ -265,6 +265,9 @@ pub struct SelectBuilder {
     /// inputs with this one builder, so while this is non-zero the relation being
     /// unparsed is not the SELECT's only one — see [`Self::within_join_input`].
     join_inputs_in_progress: usize,
+    /// Whether this SELECT is the body of an `EXISTS` built for an EXISTS-style
+    /// join — see [`Self::within_exists_body`].
+    exists_body: bool,
     /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
     /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so
     /// a second aggregate below it belongs in a derived table.
@@ -417,6 +420,20 @@ impl SelectBuilder {
     /// outputs by bare name, taking the SELECT list for itself — is wrong here.
     pub fn within_join_input(&self) -> bool {
         self.join_inputs_in_progress > 0
+    }
+
+    /// Marks this SELECT as the body of an `EXISTS` built for an EXISTS-style join.
+    /// Only this builder carries the mark: a derived table inside the body is
+    /// unparsed with a builder of its own.
+    pub fn mark_exists_body(&mut self) {
+        self.exists_body = true;
+    }
+
+    /// Whether this SELECT is the body of an `EXISTS` built for an EXISTS-style
+    /// join, whose rows are only tested for existence: the order they come in
+    /// reaches nothing unless a row bound picks some of them.
+    pub fn within_exists_body(&self) -> bool {
+        self.exists_body
     }
 
     /// Register a table alias as pointing to a LATERAL FLATTEN relation.
@@ -780,6 +797,7 @@ impl SelectBuilder {
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             join_inputs_in_progress: 0,
+            exists_body: false,
             aggregated: false,
             input_predicates_stay_scoped: false,
             predicates_added: 0,

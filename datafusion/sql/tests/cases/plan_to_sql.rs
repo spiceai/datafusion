@@ -14541,40 +14541,147 @@ fn test_sort_key_reading_a_dropped_column_named_like_an_output_is_refused() -> R
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_is_refused_on_an_exists_build_side()
+fn test_sort_key_reading_a_volatile_output_is_left_inline_on_an_unbounded_exists_build_side()
 -> Result<()> {
-    // The EXISTS body is built with a builder of its own and the correlation
-    // `t.a = u.a` is appended after it, so a scoped build side would leave that
-    // predicate naming the `u` the derived table hides — whether the sort is the
-    // build side's top or sits below a filter. Refused, for semi and anti joins.
+    // An EXISTS body's rows are only tested for existence, so without a row bound
+    // the order its sort produces reaches nothing, and a second draw in the key
+    // orders nothing a reader can see. The key keeps the form it has without a
+    // scope, which a scope would break: the correlation appended to the body names
+    // the `u` a derived table would hide. Semi and anti joins alike, with the sort
+    // at the top of the build side, below a filter, and under a list the sort fold
+    // keeps `r` in.
     let schema = int32_schema(&["a"]);
-    for join_type in [
-        datafusion_expr::JoinType::LeftSemi,
-        datafusion_expr::JoinType::LeftAnti,
+    let key = || col("r").add(lit(1.0)).sort(true, true);
+    for (join_type, exists) in [
+        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
+        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
     ] {
-        let sorted = table_scan(Some("u"), &schema, Some(vec![0]))?
-            .project(vec![col("u.a"), random().alias("r")])?
-            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
-            .build()?;
+        let sorted = volatile_projection("u")?.sort(vec![key()])?.build()?;
         let filtered_above = table_scan(Some("u"), &schema, Some(vec![0]))?
             .project(vec![col("u.a").alias("a"), random().alias("r")])?
-            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .sort(vec![key()])?
             .filter(col("a").gt(lit(0)))?
             .build()?;
-        for build in [sorted, filtered_above] {
+        let folded = volatile_projection("u")?
+            .sort(vec![key()])?
+            .project(vec![col("u.a"), col("r")])?
+            .build()?;
+        for (build, body_filter) in [
+            (sorted, ""),
+            (filtered_above, "(u.a > 0) AND "),
+            (folded, ""),
+        ] {
             let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
                 .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
                 .build()?;
-
-            let err = plan_to_sql(&plan)
-                .expect_err("a sort-scoped EXISTS build side must be refused");
             assert_eq!(
-                err.to_string(),
-                "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection is the build side of an EXISTS-style join",
+                plan_to_sql(&plan)?.to_string(),
+                format!(
+                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM u WHERE {body_filter}(t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST)"
+                ),
                 "{join_type:?}"
             );
         }
     }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_under_a_fetched_exists_build_side_is_scoped()
+-> Result<()> {
+    // The sort's own fetch bounds the body, so its order decides which rows the
+    // EXISTS tests: the key reads `r` by name from a scope, and the bounded body is
+    // carried under the build side's name, which the correlation binds to.
+    let schema = int32_schema(&["a"]);
+    let build = volatile_projection("u")?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_inline() -> Result<()>
+{
+    // A join leaves its output order unspecified, so the order of one of its inputs
+    // reaches nothing: not the rows, not their order, and not which rows a LIMIT
+    // above the join keeps. The key keeps the form it has without a scope, which a
+    // scope would break, since the join's ON clause shares this SELECT with the
+    // relation a derived table would hide.
+    let schema = int32_schema(&["a"]);
+    let sorted = || -> Result<LogicalPlan> {
+        volatile_projection("u")?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()
+    };
+    let on = || vec![col("t.a").eq(col("u.a"))];
+
+    let right = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(sorted()?, datafusion_expr::JoinType::Inner, on())?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&right)?,
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST"#
+    );
+
+    let left = LogicalPlanBuilder::from(sorted()?)
+        .join_on(
+            table_scan(Some("t"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            on(),
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&left)?,
+        @r#"SELECT u.a, random() AS r, t.a FROM u INNER JOIN t ON (t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST"#
+    );
+
+    let limited = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(sorted()?, datafusion_expr::JoinType::Inner, on())?
+        .limit(0, Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&limited)?,
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_fetched_sort_key_reading_a_volatile_output_in_a_join_input_is_refused()
+-> Result<()> {
+    // A fetch makes the input's order decide which of its rows the join reads, but
+    // a derived table in the SELECT the join shares would hide the relation its ON
+    // clause names, so the scope cannot be built there and the shape is refused.
+    let schema = int32_schema(&["a"]);
+    let right = volatile_projection("u")?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    let err = plan_to_sql(&plan)
+        .expect_err("a fetched sort scope in a join input must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the sort's fetch bounds an input of a join"
+    );
     Ok(())
 }
 
