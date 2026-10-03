@@ -646,10 +646,12 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// The qualifier is everything before the last identifier when that names an enclosed
 /// relation, so a multi-part one (`db.schema.t`) is recognised whole. A reference that
 /// goes on past the column — a field path, `t.payload.x` — has a shorter qualifier, and
-/// keeps the column and its path: the longest leading run naming an enclosed relation
-/// whose next identifier is one of that relation's columns. The column has to be checked,
-/// because on names alone `t.s.a` is as much column `a` of a relation `t.s` the SELECT
-/// reads beside the derived table, which keeps its qualifier.
+/// is re-pointed only where the derived table is the SELECT's only relation (`None`):
+/// there the qualifier is the longest leading run naming an enclosed relation whose next
+/// identifier is one of that relation's columns, and the column and its path are kept.
+/// Beside another relation, a join's other input, a shorter run cannot be told apart on
+/// names alone from that relation's own name — `t.s.a` is as much column `a` of a
+/// relation `t.s` — so with `Some(alias)` only the full qualifier is matched.
 ///
 /// Both tests are on names alone, so neither distinguishes a correlated reference to an
 /// enclosing query — that qualifier can name the very same relation. A caller must not
@@ -662,7 +664,12 @@ pub fn requalify_column_onto_derived_table(
     derived_relations: &HashMap<String, HashSet<String>>,
     alias: Option<&Ident>,
 ) {
-    let qualifier_len = (1..idents.len()).rev().find(|&len| {
+    let shortest = if alias.is_some() {
+        idents.len().saturating_sub(1).max(1)
+    } else {
+        1
+    };
+    let qualifier_len = (shortest..idents.len()).rev().find(|&len| {
         let qualifier = idents[..len]
             .iter()
             .map(|ident| ident.value.clone())

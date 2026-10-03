@@ -15412,41 +15412,55 @@ fn test_derived_aggregate_keeps_a_sibling_relation_whose_name_extends_an_enclose
     // A derived aggregate over `t` re-points the clauses its SELECT already carries.
     // With fully qualified columns the GROUP BY of the aggregate above the join reads
     // `t.s.a`: column `a` of the relation `t.s` the join reads beside the derived
-    // table. `s` is not a column of the enclosed `t`, so the reference is not a field
-    // path of it, and it keeps its qualifier.
+    // table. On names alone that is also a field path through a column `s` of the
+    // enclosed `t`, which `t` does or does not have here, so beside the join's other
+    // input only the full qualifier is matched, and the reference keeps it.
     let ts = || TableReference::partial("t", "s");
-    let inner = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
-        .aggregate(
-            vec![col("t.a")],
-            vec![datafusion_functions_aggregate::count::count(col("t.b")).alias("n")],
-        )?
-        .build()?;
-    let plan = LogicalPlanBuilder::from(inner)
-        .join(
-            table_scan(Some(ts()), &int32_schema(&["a", "c"]), None)?.build()?,
-            datafusion_common::JoinType::Inner,
-            (
-                vec![Column::from_qualified_name("t.a")],
-                vec![Column::new(Some(ts()), "a")],
-            ),
-            None,
-        )?
-        .aggregate(
-            vec![Expr::Column(Column::new(Some(ts()), "a"))],
-            vec![datafusion_functions_aggregate::count::count(lit(1)).alias("m")],
-        )?
-        .build()?;
+    for grouped_s in [false, true] {
+        let (columns, groups): (&[&str], _) = if grouped_s {
+            (&["a", "s", "b"], vec![col("t.a"), col("t.s")])
+        } else {
+            (&["a", "b"], vec![col("t.a")])
+        };
+        let inner = table_scan(Some("t"), &int32_schema(columns), None)?
+            .aggregate(
+                groups,
+                vec![datafusion_functions_aggregate::count::count(col("t.b")).alias("n")],
+            )?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(inner)
+            .join(
+                table_scan(Some(ts()), &int32_schema(&["a", "c"]), None)?.build()?,
+                datafusion_common::JoinType::Inner,
+                (
+                    vec![Column::from_qualified_name("t.a")],
+                    vec![Column::new(Some(ts()), "a")],
+                ),
+                None,
+            )?
+            .aggregate(
+                vec![Expr::Column(Column::new(Some(ts()), "a"))],
+                vec![datafusion_functions_aggregate::count::count(lit(1)).alias("m")],
+            )?
+            .build()?;
 
-    let dialect = CustomDialectBuilder::default()
-        .with_full_qualified_col(true)
-        .build();
-    let sql = Unparser::new(&dialect).plan_to_sql(&plan)?.to_string();
-    assert!(
-        sql.starts_with("SELECT count(1) AS m, t.s.a FROM "),
-        "{sql}"
-    );
-    assert!(sql.ends_with(" GROUP BY t.s.a"), "{sql}");
-    assert!(!sql.contains("derived_aggregate_1.s"), "{sql}");
+        let dialect = CustomDialectBuilder::default()
+            .with_full_qualified_col(true)
+            .build();
+        let sql = Unparser::new(&dialect).plan_to_sql(&plan)?.to_string();
+        assert!(
+            sql.starts_with("SELECT count(1) AS m, t.s.a FROM "),
+            "grouped_s={grouped_s}: {sql}"
+        );
+        assert!(
+            sql.ends_with(" GROUP BY t.s.a"),
+            "grouped_s={grouped_s}: {sql}"
+        );
+        assert!(
+            !sql.contains("derived_aggregate_1.s"),
+            "grouped_s={grouped_s}: {sql}"
+        );
+    }
     Ok(())
 }
 
