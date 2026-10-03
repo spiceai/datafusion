@@ -15074,7 +15074,8 @@ fn test_sort_key_reading_a_volatile_output_beside_a_wildcard_is_refused() -> Res
     // for any number of the input's columns, so its expressions do not line up with
     // its fields by position, and neither the scope nor the inliner can tell which
     // expression the key's `r` names. Beside an output that cannot be repeated the
-    // shape is refused, before the wildcard or after it.
+    // shape is refused, before the wildcard or after it. A bare key naming the alias
+    // is emitted as that name and never inlined, so it keeps the plain form.
     let scan = || table_scan(Some("t"), &int32_schema(&["a", "b"]), None);
     for wildcard_first in [true, false] {
         #[expect(deprecated)]
@@ -15108,6 +15109,25 @@ fn test_sort_key_reading_a_volatile_output_beside_a_wildcard_is_refused() -> Res
         assert_eq!(
             err.to_string(),
             "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection also holds a wildcard",
+            "wildcard_first={wildcard_first}"
+        );
+
+        let LogicalPlan::Sort(sort) = plan else {
+            unreachable!("the plan was built with a sort on top");
+        };
+        let bare = LogicalPlan::Sort(datafusion_expr::Sort {
+            expr: vec![col("r").sort(true, true)],
+            input: sort.input,
+            fetch: None,
+        });
+        let select = if wildcard_first {
+            "*, random() AS r"
+        } else {
+            "random() AS r, *"
+        };
+        assert_eq!(
+            plan_to_sql(&bare)?.to_string(),
+            format!("SELECT {select} FROM t ORDER BY r ASC NULLS FIRST"),
             "wildcard_first={wildcard_first}"
         );
     }

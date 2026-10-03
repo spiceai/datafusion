@@ -1112,7 +1112,9 @@ fn sort_keys_read_unrepeatable_output(
 /// its expressions no longer line up with its schema's fields by position, and
 /// neither this decision nor the inliner can tell which expression a key's column
 /// names. Beside an output that cannot be repeated, with the keys reading the
-/// projection's outputs, the shape is refused rather than guessed at.
+/// projection's outputs, the shape is refused rather than guessed at. A bare key
+/// naming an alias the projection lists is left to the normal path: it is
+/// emitted as that name, which needs no position, and is never inlined.
 pub(crate) fn sort_keys_scope_their_projection<'a>(
     keys: &[SortExpr],
     input: &'a LogicalPlan,
@@ -1131,6 +1133,18 @@ pub(crate) fn sort_keys_scope_their_projection<'a>(
             .iter()
             .any(|expr| !output_is_repeatable(expr))
         && keys.iter().any(|key| {
+            if let Expr::Column(Column {
+                relation: None,
+                name,
+                ..
+            }) = &key.expr
+                && projection
+                    .expr
+                    .iter()
+                    .any(|expr| matches!(expr, Expr::Alias(alias) if alias.name == *name))
+            {
+                return false;
+            }
             key.expr
                 .column_refs()
                 .into_iter()
