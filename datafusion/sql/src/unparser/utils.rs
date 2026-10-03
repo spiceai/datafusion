@@ -680,7 +680,7 @@ fn find_repeatable_projection_expr<'a>(
 /// Stacked filters collapse into one `WHERE`, which is why the walk looks through
 /// them; a node that opens a scope of its own — a relation, a subquery, a derived
 /// table — is addressable by name from outside, so the walk stops there.
-fn filter_stack(plan: &LogicalPlan) -> (Vec<&Filter>, &LogicalPlan) {
+pub(crate) fn filter_stack(plan: &LogicalPlan) -> (Vec<&Filter>, &LogicalPlan) {
     let mut filters = Vec::new();
     let mut node = plan;
     while let LogicalPlan::Filter(filter) = node {
@@ -1010,7 +1010,7 @@ pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<Logica
     };
     if filters
         .iter()
-        .any(|filter| expr_contains_subquery(&filter.predicate))
+        .any(|filter| holds_subquery(&filter.predicate))
     {
         return unrepeatable_output_refusal("when the predicate holds a subquery");
     }
@@ -1285,7 +1285,7 @@ pub(crate) fn sort_keys_scope_their_projection<'a>(
 pub(crate) fn scope_sort_keys(keys: &[SortExpr]) -> Result<Vec<SortExpr>> {
     keys.iter()
         .map(|key| {
-            if expr_contains_subquery(&key.expr) {
+            if holds_subquery(&key.expr) {
                 return unrepeatable_sort_key_refusal("when the key holds a subquery");
             }
             Ok(SortExpr {
@@ -1648,6 +1648,16 @@ pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
         ))
     })
     .unwrap_or(false)
+}
+
+/// Whether `expr` holds a subquery a scope would hide a relation from: the kinds
+/// [`expr_contains_subquery`] looks for, and a set comparison (`= ANY`, `> ALL`),
+/// whose body may correlate against the hidden relation just the same.
+fn holds_subquery(expr: &Expr) -> bool {
+    expr_contains_subquery(expr)
+        || expr
+            .exists(|e| Ok(matches!(e, Expr::SetComparison(_))))
+            .unwrap_or(false)
 }
 
 /// Partitions filters into `(non_subquery, subquery)` based on whether

@@ -15465,6 +15465,132 @@ fn test_derived_aggregate_keeps_a_sibling_relation_whose_name_extends_an_enclose
 }
 
 #[test]
+fn test_scope_refuses_an_outer_reference_its_alias_would_capture() -> Result<()> {
+    // Inside a correlated scalar subquery the scope's derived table takes the alias
+    // `derived_projection` on a dialect that names every derived table, and the
+    // outer reference `derived_projection.r`, to the enclosing query's relation of
+    // that name, would bind to it: `r * r`. That scope is refused, for a sort key
+    // and for a filter, while a dialect that leaves the table unnamed keeps it.
+    let outer_r = || out_ref_col(DataType::Float64, "derived_projection.r");
+    let pick = |inner: LogicalPlan| -> Result<LogicalPlan> {
+        table_scan(
+            Some("derived_projection"),
+            &Schema::new(vec![Field::new("r", DataType::Float64, false)]),
+            None,
+        )?
+        .project(vec![
+            col("derived_projection.r"),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_r()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()
+    };
+    let draws = || {
+        table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .project(vec![random().alias("r")])
+    };
+
+    let sorted = pick(
+        draws()?
+            .sort_with_limit(vec![(col("r") * outer_r()).sort(false, false)], Some(1))?
+            .project(vec![col("r")])?
+            .build()?,
+    )?;
+    let filtered = pick(
+        draws()?
+            .filter(col("r").gt(outer_r()))?
+            .limit(0, Some(1))?
+            .build()?,
+    )?;
+
+    let postgres = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_eq!(
+        postgres
+            .plan_to_sql(&sorted)
+            .expect_err("the sort scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the outer reference derived_projection.r carries a name the unparser gives a derived table"
+    );
+    assert_eq!(
+        postgres
+            .plan_to_sql(&filtered)
+            .expect_err("the filter scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the outer reference derived_projection.r carries a name the unparser gives a derived table"
+    );
+
+    assert_snapshot!(
+        plan_to_sql(&sorted)?,
+        @r#"SELECT derived_projection.r, (SELECT r FROM (SELECT random() AS r FROM t) ORDER BY (r * derived_projection.r) DESC NULLS LAST LIMIT 1) AS pick FROM derived_projection"#
+    );
+    assert_snapshot!(
+        plan_to_sql(&filtered)?,
+        @r#"SELECT derived_projection.r, (SELECT r FROM (SELECT random() AS r FROM t) WHERE (r > derived_projection.r) LIMIT 1) AS pick FROM derived_projection"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_scope_refuses_a_set_comparison_subquery() -> Result<()> {
+    // A set comparison (`= ANY`) holds a subquery whose body may correlate against
+    // the relation the scope would hide, here `t.b`, so a key or a predicate
+    // holding one is refused like any other subquery.
+    let any = || -> Result<Expr> {
+        let body = table_scan(Some("v"), &int32_schema(&["a", "b"]), None)?
+            .filter(col("v.b").eq(out_ref_col(DataType::Int32, "t.b")))?
+            .project(vec![col("v.a")])?
+            .build()?;
+        Ok(Expr::SetComparison(
+            datafusion_expr::expr::SetComparison::new(
+                Box::new(col("t.a")),
+                datafusion_expr::Subquery {
+                    subquery: Arc::new(body),
+                    outer_ref_columns: vec![out_ref_col(DataType::Int32, "t.b")],
+                    spans: datafusion_common::Spans::new(),
+                },
+                datafusion_expr::Operator::Eq,
+                datafusion_expr::expr::SetQuantifier::Any,
+            ),
+        ))
+    };
+    let projection = || {
+        table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?.project(vec![
+            col("t.a"),
+            col("t.b"),
+            random().alias("r"),
+        ])
+    };
+
+    let sorted = projection()?
+        .sort(vec![
+            (col("r") + lit(1.0)).sort(true, true),
+            any()?.sort(true, true),
+        ])?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&sorted)
+            .expect_err("the sort scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the key holds a subquery"
+    );
+
+    let filtered = projection()?
+        .filter(col("r").gt(lit(0.5)).and(any()?))?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&filtered)
+            .expect_err("the filter scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the predicate holds a subquery"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach

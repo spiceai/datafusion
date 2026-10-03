@@ -31,7 +31,7 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        EnclosedRelations, enclosed_qualifiers, expr_contains_subquery,
+        EnclosedRelations, enclosed_qualifiers, expr_contains_subquery, filter_stack,
         filters_scope_their_projection, find_agg_node_within_select,
         find_unnest_node_within_select, find_window_nodes_within_select,
         hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
@@ -1129,6 +1129,43 @@ impl Unparser<'_> {
     /// dialect gate, the refusal inside a join input — which a sort reaches only
     /// with a fetch, see [`Self::sort_order_is_observable`] — and the re-pointing of
     /// the clauses already emitted against the relations that table hides.
+    /// Refuses, with `refuse`, a scope whose `exprs` hold an outer reference the
+    /// derived table's own alias would capture. On a dialect that names every
+    /// derived table, the scope's table takes an alias the unparser invents
+    /// (`derived_projection`), and an outer reference spelled with that same name,
+    /// to a relation of the enclosing query that carries it, would bind to the
+    /// derived table instead.
+    fn ensure_scope_alias_captures_no_outer_reference<'a>(
+        &self,
+        exprs: impl IntoIterator<Item = &'a Expr>,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        if !self.dialect.requires_derived_table_alias() {
+            return Ok(());
+        }
+        for expr in exprs {
+            let mut captured = None;
+            expr.apply(|node| {
+                if let Expr::OuterReferenceColumn(_, column) = node
+                    && let Some(relation) = &column.relation
+                    && Self::is_unparser_derived_alias(
+                        &self.emitted_qualifier_key(relation),
+                    )
+                {
+                    captured = Some(column.flat_name());
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            if let Some(reference) = captured {
+                return refuse(&format!(
+                    "when the outer reference {reference} carries a name the unparser gives a derived table"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn prepare_sort_key_scope(
         &self,
         hidden: &DFSchema,
@@ -2104,6 +2141,15 @@ impl Unparser<'_> {
                                 .collect::<Result<Vec<_>>>()?
                         };
                         let lowered = if keys_scope {
+                            self.ensure_scope_alias_captures_no_outer_reference(
+                                sort.expr.iter().map(|key| &key.expr).chain(
+                                    filter_stack(&lowered)
+                                        .0
+                                        .into_iter()
+                                        .map(|filter| &filter.predicate),
+                                ),
+                                unrepeatable_sort_key_refusal,
+                            )?;
                             self.prepare_sort_key_scope(sorted.schema(), query, select)?;
                             Arc::new(scope_filters_over_projection(&lowered)?)
                         } else {
@@ -2202,6 +2248,13 @@ impl Unparser<'_> {
                                         .extend(columns);
                                 }
                             }
+                            self.ensure_scope_alias_captures_no_outer_reference(
+                                filter_stack(plan)
+                                    .0
+                                    .into_iter()
+                                    .map(|filter| &filter.predicate),
+                                unrepeatable_output_refusal,
+                            )?;
                             Self::repoint_clauses_onto_derived_table(
                                 &hidden_qualifiers,
                                 query,
@@ -2331,6 +2384,10 @@ impl Unparser<'_> {
                             relation,
                         );
                     }
+                    self.ensure_scope_alias_captures_no_outer_reference(
+                        sort.expr.iter().map(|key| &key.expr),
+                        unrepeatable_sort_key_refusal,
+                    )?;
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;
                     let scoped = scope_sort_over_projection(sort, projection)?;
                     return self
