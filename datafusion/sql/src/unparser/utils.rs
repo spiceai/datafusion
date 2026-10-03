@@ -1122,14 +1122,19 @@ pub(crate) fn sort_keys_scope_their_projection(
 
 /// Whether `plan`, unparsed into one `SELECT`, holds a `Sort` that puts its
 /// projection in a scope ([`sort_keys_scope_their_projection`]), looking through the
-/// filters, projections and `DISTINCT` that share that `SELECT`. A `Limit` ends the
-/// walk: a bounded plan is emitted as an aliased derived table of its own, and a
-/// scope inside it binds under that alias.
+/// filters, projections and `DISTINCT` that share that `SELECT`. A row bound ends
+/// the walk: a bounded plan is emitted as an aliased derived table of its own, and
+/// a scope inside it binds under that alias. The bound is a `Limit` of its own or a
+/// `Sort` carrying its own `fetch`: both reach `QueryBuilder::bounds_rows()` as the
+/// emitted `LIMIT`, which is what moves the body into that derived table.
 pub(crate) fn sort_scope_within_select(plan: &LogicalPlan) -> Result<bool> {
     let mut plan = plan;
     loop {
         match plan {
             LogicalPlan::Sort(sort) => {
+                if sort.fetch.is_some() {
+                    return Ok(false);
+                }
                 if sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
                     .is_some()
                 {
