@@ -27,10 +27,10 @@ use datafusion_expr::test::function_stub::{
 };
 use datafusion_expr::{
     ColumnarValue, EmptyRelation, Expr, ExprFunctionExt, Extension, LogicalPlan,
-    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
-    UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
-    WindowFunctionDefinition, cast, col, exists, in_subquery, lit, out_ref_col,
-    scalar_subquery, table_scan, wildcard,
+    LogicalPlanBuilder, Projection, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Union, UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility,
+    WindowFrame, WindowFunctionDefinition, cast, col, exists, in_subquery, lit,
+    out_ref_col, scalar_subquery, table_scan, wildcard,
 };
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
@@ -14873,7 +14873,7 @@ fn test_sort_key_reading_a_volatile_output_named_by_a_declared_schema_is_scoped(
         vec![Field::new("x", DataType::Float64, false)].into(),
         std::collections::HashMap::new(),
     )?;
-    let projection = datafusion_expr::Projection::try_new_with_schema(
+    let projection = Projection::try_new_with_schema(
         vec![random()],
         Arc::new(scan),
         Arc::new(declared),
@@ -14938,7 +14938,7 @@ fn test_sort_fold_keeps_the_names_a_declared_schema_gives() -> Result<()> {
     };
     let scan = || table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build();
 
-    let inner = datafusion_expr::Projection::try_new_with_schema(
+    let inner = Projection::try_new_with_schema(
         vec![col("t.a") + lit(1)],
         Arc::new(scan()?),
         Arc::new(declared(DataType::Int32)?),
@@ -14953,7 +14953,7 @@ fn test_sort_fold_keeps_the_names_a_declared_schema_gives() -> Result<()> {
     );
 
     // A volatile output under that name is recognised through it and scoped.
-    let inner = datafusion_expr::Projection::try_new_with_schema(
+    let inner = Projection::try_new_with_schema(
         vec![random()],
         Arc::new(scan()?),
         Arc::new(declared(DataType::Float64)?),
@@ -14988,7 +14988,7 @@ fn test_sort_fold_under_a_renaming_list_keeps_the_name_the_key_reads() -> Result
         ],
         std::collections::HashMap::new(),
     )?;
-    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+    let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
         vec![col("u.a"), col("r")],
         Arc::new(sorted),
         Arc::new(renamed),
@@ -15035,7 +15035,7 @@ fn test_sort_fold_matches_each_listed_expression_to_its_own_output() -> Result<(
         ],
         std::collections::HashMap::new(),
     )?;
-    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+    let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
         vec![col("t.b") * lit(2), col("t.a"), col("t.b")],
         Arc::new(sorted),
         Arc::new(renamed),
@@ -15056,7 +15056,7 @@ fn test_sort_fold_matches_each_listed_expression_to_its_own_output() -> Result<(
         ],
         std::collections::HashMap::new(),
     )?;
-    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+    let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
         vec![col("t.a"), col("t.a")],
         Arc::new(sorted),
         Arc::new(repeated),
@@ -15590,6 +15590,37 @@ fn test_a_distinct_scope_repoints_a_clause_naming_its_alias() -> Result<()> {
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT a FROM (SELECT DISTINCT sq.a FROM (SELECT sq.a FROM t AS sq) AS sq) WHERE (random() < 0.5) ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_named_only_by_a_preserved_schema_is_scoped()
+-> Result<()> {
+    // An optimizer that rewrites a projection's expressions through
+    // `Projection::try_new_with_schema` keeps the outputs' declared names while the
+    // expression under one of them loses the alias that produced its name. The
+    // declared name is still the one a sort key reads, so the output has to be found
+    // under it: resolving the key against the expressions alone would miss `r`,
+    // leaving `ORDER BY (random() + 1.0)` to draw a second time. The expression is
+    // aliased back to its declared name, and the key reads that one value.
+    let scan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?.build()?;
+    let named = Projection::try_new(
+        vec![col("t.a"), random().alias("r")],
+        Arc::new(scan.clone()),
+    )?;
+    let rewritten = Projection::try_new_with_schema(
+        vec![col("t.a"), random()],
+        Arc::new(scan),
+        Arc::clone(&named.schema),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(rewritten))
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
     );
     Ok(())
 }
