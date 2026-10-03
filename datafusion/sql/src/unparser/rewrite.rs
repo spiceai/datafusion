@@ -25,7 +25,8 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
-use sqlparser::ast::Ident;
+use sqlparser::ast::{self, Ident};
+use sqlparser::tokenizer::{Location, Span};
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -634,25 +635,152 @@ pub fn requalify_column_onto_derived_table(
     };
 }
 
-/// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
-/// Removes any table identifiers that are not present in the list of available identifiers, retains original column names.
-pub fn remove_dangling_identifiers(idents: &mut Vec<Ident>, available_idents: &[String]) {
-    if idents.len() > 1 {
-        // sqlparser 0.61 made `display_separated` pub(crate); join via Display instead.
-        let ident_source = idents
-            .iter()
-            .take(idents.len() - 1)
-            .map(ToString::to_string)
-            .collect::<Vec<String>>()
-            .join(".");
-        // If the identifier is not present in the list of all identifiers, it refers to a table that does not exist
-        if !available_idents.contains(&ident_source) {
-            let Some(last) = idents.last() else {
-                unreachable!("CompoundIdentifier must have a last element");
-            };
-            // Reset the identifiers to only the last element, which is the column name
-            *idents = vec![last.clone()];
+/// The relations an emitted `SELECT` can name.
+///
+/// Every qualifier its `FROM` makes visible, spelled as the identifier parts a column
+/// reference uses for it: an aliased relation is visible only as its alias; a bare
+/// table as its last name part, the form [`super::Unparser::emitted_qualifier`]
+/// writes by default, and as its full name for a dialect that writes every part.
+///
+/// A correlated reference binds in an enclosing query, not in this `FROM`, and is not
+/// judged against it at all: see [`mark_outer_reference`].
+#[derive(Debug, Default)]
+pub(super) struct VisibleScope {
+    relations: Vec<Vec<String>>,
+}
+
+impl VisibleScope {
+    /// Everything `factor`, a relation of the emitted `FROM`, makes visible.
+    pub(super) fn add_relation(&mut self, factor: &ast::TableFactor) {
+        match factor {
+            ast::TableFactor::Table { name, alias, .. } => match alias {
+                Some(alias) => self.add_alias(alias),
+                None => self.add_table_name(name),
+            },
+            ast::TableFactor::Derived { alias, .. }
+            | ast::TableFactor::TableFunction { alias, .. }
+            | ast::TableFactor::Function { alias, .. }
+            | ast::TableFactor::UNNEST { alias, .. }
+            | ast::TableFactor::JsonTable { alias, .. }
+            | ast::TableFactor::OpenJsonTable { alias, .. }
+            | ast::TableFactor::NestedJoin { alias, .. }
+            | ast::TableFactor::Pivot { alias, .. }
+            | ast::TableFactor::Unpivot { alias, .. }
+            | ast::TableFactor::MatchRecognize { alias, .. }
+            | ast::TableFactor::XmlTable { alias, .. }
+            | ast::TableFactor::SemanticView { alias, .. } => {
+                if let Some(alias) = alias {
+                    self.add_alias(alias);
+                }
+            }
         }
+    }
+
+    /// An aliased relation is visible as its alias alone.
+    pub(super) fn add_alias(&mut self, alias: &ast::TableAlias) {
+        self.relations.push(vec![alias.name.value.clone()]);
+    }
+
+    /// A bare table is visible as its last name part and, for a dialect that writes
+    /// every part of a qualifier, as its full name.
+    pub(super) fn add_table_name(&mut self, name: &ast::ObjectName) {
+        let parts: Vec<String> = name
+            .0
+            .iter()
+            .filter_map(|part| part.as_ident().map(|ident| ident.value.clone()))
+            .collect();
+        if let Some(last) = parts.last() {
+            self.relations.push(vec![last.clone()]);
+        }
+        if parts.len() > 1 {
+            self.relations.push(parts);
+        }
+    }
+
+    /// Whether `idents` is a qualifier this scope makes visible followed by exactly
+    /// one column name. A shorter visible name that merely prefixes the qualifier does
+    /// not count: an alias `d` does not make `d.t.id` bind when `d.t` is enclosed.
+    fn names_visible_relation(&self, idents: &[Ident]) -> bool {
+        self.relations.iter().any(|relation| {
+            relation.len() + 1 == idents.len()
+                && relation
+                    .iter()
+                    .zip(idents)
+                    .all(|(part, ident)| *part == ident.value)
+        })
+    }
+}
+
+/// The span the unparser gives every identifier of a correlated reference.
+///
+/// An [`Expr::OuterReferenceColumn`] prints exactly like a local column, but it binds
+/// in an enclosing query, so [`strip_dangling_qualifier`] must leave it alone even
+/// when its qualifier spells the same as a relation this `FROM` encloses. The span
+/// is the one field of an [`Ident`] that neither prints nor takes part in equality,
+/// so it carries that provenance without changing the statement. A synthesized
+/// identifier otherwise has an empty span, so a non-empty one at line 0 cannot come
+/// from parsed text.
+const OUTER_REFERENCE_SPAN: Span = Span {
+    start: Location { line: 0, column: 1 },
+    end: Location { line: 0, column: 1 },
+};
+
+/// Marks the identifiers of `expr`, an emitted correlated column reference, as
+/// binding outside the `SELECT` that contains them.
+pub(super) fn mark_outer_reference(mut expr: ast::Expr) -> ast::Expr {
+    match &mut expr {
+        ast::Expr::Identifier(ident) => ident.span = OUTER_REFERENCE_SPAN,
+        ast::Expr::CompoundIdentifier(idents) => {
+            for ident in idents {
+                ident.span = OUTER_REFERENCE_SPAN;
+            }
+        }
+        _ => {}
+    }
+    expr
+}
+
+fn is_outer_reference(ident: &Ident) -> bool {
+    ident.span == OUTER_REFERENCE_SPAN
+}
+
+/// Strips a relation qualifier the enclosing `FROM` does not make visible from a
+/// column reference, so the statement binds in an engine that resolves qualifiers
+/// against the `FROM` alone.
+///
+/// DataFusion keeps a derived table's qualifiers on its output columns, so a
+/// projection over an un-aliased derived table — or one aliased under another name —
+/// carries `ta.j1_id` with no `ta` in the `FROM`, and PostgreSQL, MySQL and SQLite
+/// refuse the statement.
+///
+/// A [`ast::Expr::CompoundIdentifier`] here is a qualifier followed by one column
+/// name, whatever the dialect's qualifier width: the unparser emits a struct field
+/// path as an [`ast::Expr::CompoundFieldAccess`] whose root is the column reference,
+/// so the path is never mistaken for part of the qualifier and stays as it is while
+/// the root is judged on its own. A reference left with one part becomes a plain
+/// identifier, which is what the parser produces for it and what a planner handed the
+/// AST directly expects.
+pub(super) fn strip_dangling_qualifier(expr: &mut ast::Expr, scope: &VisibleScope) {
+    match expr {
+        ast::Expr::CompoundFieldAccess { root, .. } => {
+            strip_dangling_qualifier(root, scope);
+        }
+        ast::Expr::CompoundIdentifier(idents) => {
+            // `@root.name` is a scalar variable, not a qualified column (the planner
+            // draws the same line on an unquoted leading `@`); a correlated reference
+            // binds outside this SELECT and is not judged against its FROM.
+            let exempt = idents.first().is_some_and(|root| {
+                (root.value.starts_with('@') && root.quote_style.is_none())
+                    || is_outer_reference(root)
+            });
+            if idents.len() < 2 || exempt || scope.names_visible_relation(idents) {
+                return;
+            }
+            if let Some(column) = idents.pop() {
+                *expr = ast::Expr::Identifier(column);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -661,38 +789,178 @@ mod tests {
     use super::*;
     use arrow::datatypes::{DataType, Field};
     use datafusion_expr::{LogicalPlanBuilder, col, table_scan};
+    use sqlparser::dialect::GenericDialect;
+    use sqlparser::parser::Parser;
+
+    fn idents(parts: &[&str]) -> Vec<Ident> {
+        parts.iter().map(|part| Ident::new(*part)).collect()
+    }
+
+    fn compound(parts: &[&str]) -> ast::Expr {
+        ast::Expr::CompoundIdentifier(idents(parts))
+    }
+
+    fn field_path(root: ast::Expr, fields: &[&str]) -> ast::Expr {
+        ast::Expr::CompoundFieldAccess {
+            root: Box::new(root),
+            access_chain: fields
+                .iter()
+                .map(|field| {
+                    ast::AccessExpr::Dot(ast::Expr::Identifier(Ident::new(*field)))
+                })
+                .collect(),
+        }
+    }
+
+    fn stripped(mut expr: ast::Expr, scope: &VisibleScope) -> ast::Expr {
+        strip_dangling_qualifier(&mut expr, scope);
+        expr
+    }
+
+    fn alias(name: &str) -> ast::TableAlias {
+        ast::TableAlias {
+            explicit: true,
+            name: Ident::new(name),
+            columns: vec![],
+            at: None,
+        }
+    }
 
     #[test]
-    fn test_remove_dangling_identifiers() {
-        let tests = vec![
-            (vec![], vec![Ident::new("column1".to_string())]),
-            (
-                vec!["table1.table2".to_string()],
-                vec![
-                    Ident::new("table1".to_string()),
-                    Ident::new("table2".to_string()),
-                    Ident::new("column1".to_string()),
-                ],
-            ),
-            (
-                vec!["table1".to_string()],
-                vec![Ident::new("column1".to_string())],
-            ),
-        ];
+    fn a_qualifier_the_from_makes_visible_is_kept() {
+        let mut scope = VisibleScope::default();
+        scope.add_alias(&alias("ta"));
+        assert_eq!(
+            stripped(compound(&["ta", "j1_id"]), &scope),
+            compound(&["ta", "j1_id"])
+        );
+    }
 
-        for test in tests {
-            let test_in = test.0;
-            let test_out = test.1;
+    #[test]
+    fn a_dangling_qualifier_is_stripped_to_a_plain_identifier() {
+        let scope = VisibleScope::default();
+        assert_eq!(
+            stripped(compound(&["ta", "j1_id"]), &scope),
+            ast::Expr::Identifier(Ident::new("j1_id"))
+        );
+    }
 
-            let mut idents = vec![
-                Ident::new("table1".to_string()),
-                Ident::new("table2".to_string()),
-                Ident::new("column1".to_string()),
-            ];
+    #[test]
+    fn a_field_path_is_judged_by_its_root_and_kept_whole() {
+        let mut scope = VisibleScope::default();
+        scope.add_alias(&alias("ta"));
+        let visible = field_path(compound(&["ta", "metadata"]), &["product", "name"]);
+        assert_eq!(stripped(visible.clone(), &scope), visible);
 
-            remove_dangling_identifiers(&mut idents, &test_in);
-            assert_eq!(idents, test_out);
-        }
+        let dangling = field_path(compound(&["tb", "metadata"]), &["product", "name"]);
+        assert_eq!(
+            stripped(dangling, &scope),
+            field_path(
+                ast::Expr::Identifier(Ident::new("metadata")),
+                &["product", "name"]
+            )
+        );
+    }
+
+    #[test]
+    fn a_field_path_on_an_unqualified_column_needs_no_scope() {
+        let scope = VisibleScope::default();
+        let path = field_path(ast::Expr::Identifier(Ident::new("s")), &["a"]);
+        assert_eq!(stripped(path.clone(), &scope), path);
+    }
+
+    #[test]
+    fn a_bare_table_is_visible_by_its_last_name_part_and_by_its_full_name() {
+        let mut scope = VisibleScope::default();
+        scope.add_table_name(&ast::ObjectName::from(idents(&[
+            "catalog", "schema", "table",
+        ])));
+        assert_eq!(
+            stripped(compound(&["table", "id"]), &scope),
+            compound(&["table", "id"])
+        );
+        assert_eq!(
+            stripped(compound(&["catalog", "schema", "table", "id"]), &scope),
+            compound(&["catalog", "schema", "table", "id"])
+        );
+    }
+
+    #[test]
+    fn a_dangling_qualifier_of_any_width_leaves_only_the_column() {
+        let scope = VisibleScope::default();
+        assert_eq!(
+            stripped(compound(&["catalog", "schema", "table", "id"]), &scope),
+            ast::Expr::Identifier(Ident::new("id"))
+        );
+    }
+
+    #[test]
+    fn a_derived_table_is_visible_only_through_its_alias() {
+        let mut scope = VisibleScope::default();
+        let query = Parser::new(&GenericDialect {})
+            .try_with_sql("SELECT t.t, t.id FROM t")
+            .expect("parser accepts the statement")
+            .parse_query()
+            .expect("statement is a query");
+        scope.add_relation(&ast::TableFactor::Derived {
+            lateral: false,
+            subquery: query,
+            alias: None,
+            sample: None,
+        });
+        // The enclosed table is not visible, whatever its columns are named.
+        assert_eq!(
+            stripped(compound(&["t", "id"]), &scope),
+            ast::Expr::Identifier(Ident::new("id"))
+        );
+    }
+
+    #[test]
+    fn a_visible_name_that_only_prefixes_the_qualifier_does_not_bind_it() {
+        let mut scope = VisibleScope::default();
+        scope.add_alias(&alias("derived_projection"));
+        // `derived_projection.t` is the enclosed table; the alias alone is visible.
+        assert_eq!(
+            stripped(compound(&["derived_projection", "t", "id"]), &scope),
+            ast::Expr::Identifier(Ident::new("id"))
+        );
+    }
+
+    #[test]
+    fn a_scalar_variable_is_not_a_qualified_column() {
+        let scope = VisibleScope::default();
+        let variable = compound(&["@root", "foo"]);
+        assert_eq!(stripped(variable.clone(), &scope), variable);
+        // Quoted, it is an ordinary (dangling) qualifier.
+        let mut quoted = idents(&["@root", "foo"]);
+        quoted[0].quote_style = Some('"');
+        assert_eq!(
+            stripped(ast::Expr::CompoundIdentifier(quoted), &scope),
+            ast::Expr::Identifier(Ident::new("foo"))
+        );
+    }
+
+    #[test]
+    fn a_correlated_reference_is_kept_whatever_the_from_encloses() {
+        let scope = VisibleScope::default();
+        let outer = mark_outer_reference(compound(&["t", "x"]));
+        assert_eq!(stripped(outer.clone(), &scope), outer);
+        // The marker is invisible to text and to equality, so the same spelling as a
+        // local reference still compares equal and prints the same.
+        assert_eq!(outer, compound(&["t", "x"]));
+        assert_eq!(outer.to_string(), "t.x");
+        // The local spelling, unmarked, is still judged against the FROM.
+        assert_eq!(
+            stripped(compound(&["t", "x"]), &scope),
+            ast::Expr::Identifier(Ident::new("x"))
+        );
+    }
+
+    #[test]
+    fn anything_but_a_column_reference_is_left_alone() {
+        let scope = VisibleScope::default();
+        let expr = ast::Expr::Identifier(Ident::new("j1_id"));
+        assert_eq!(stripped(expr.clone(), &scope), expr);
     }
 
     // this is a regression test: when the outer projection has fewer expressions than

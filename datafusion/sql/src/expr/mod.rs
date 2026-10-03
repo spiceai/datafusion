@@ -1091,12 +1091,18 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
         schema: &DFSchema,
         planner_context: &mut PlannerContext,
     ) -> Result<(Expr, Vec<AccessExpr>)> {
-        let SQLExpr::Identifier(root_ident) = root else {
-            let root = self.sql_expr_to_logical_expr(root, schema, planner_context)?;
-            return Ok((root, access_chain));
+        // An identifier chain arrives either as a plain or a compound identifier
+        // root followed by `Dot` identifiers; either way the whole chain is one
+        // qualified reference, resolved as the parser's `a.b.c` would be.
+        let mut compound_idents = match root {
+            SQLExpr::Identifier(root_ident) => vec![root_ident],
+            SQLExpr::CompoundIdentifier(idents) => idents,
+            root => {
+                let root =
+                    self.sql_expr_to_logical_expr(root, schema, planner_context)?;
+                return Ok((root, access_chain));
+            }
         };
-
-        let mut compound_idents = vec![root_ident];
         let first_non_ident = access_chain
             .iter()
             .position(|access| !matches!(access, AccessExpr::Dot(SQLExpr::Identifier(_))))

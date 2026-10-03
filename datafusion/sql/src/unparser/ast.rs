@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use super::rewrite::VisibleScope;
 use core::fmt;
 use std::ops::ControlFlow;
 
@@ -881,6 +882,33 @@ impl RelationBuilder {
                 value.alias.as_ref().map(|a| a.name.to_string())
             }
             _ => None,
+        }
+    }
+    /// Adds what this relation makes visible to the enclosing `SELECT` to `scope`,
+    /// before the `FROM` is built.
+    pub(super) fn add_visible_to(&self, scope: &mut VisibleScope) {
+        match &self.relation {
+            Some(TableFactorBuilder::Table(table)) => match (&table.alias, &table.name) {
+                (Some(alias), _) => scope.add_alias(alias),
+                (None, Some(name)) => scope.add_table_name(name),
+                (None, None) => {}
+            },
+            Some(TableFactorBuilder::Derived(derived)) => {
+                if let Some(alias) = &derived.alias {
+                    scope.add_alias(alias);
+                }
+            }
+            Some(TableFactorBuilder::Unnest(unnest)) => {
+                if let Some(alias) = &unnest.alias {
+                    scope.add_alias(alias);
+                }
+            }
+            Some(TableFactorBuilder::Flatten(flatten)) => {
+                if let Some(alias) = &flatten.alias {
+                    scope.add_alias(alias);
+                }
+            }
+            Some(TableFactorBuilder::Empty) | None => {}
         }
     }
     pub fn table(&mut self, value: TableRelationBuilder) -> &mut Self {

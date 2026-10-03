@@ -57,6 +57,8 @@ use datafusion_expr::{
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::tokenizer::Span;
 
+use super::rewrite::mark_outer_reference;
+
 /// Convert a DataFusion [`Expr`] to [`ast::Expr`]
 ///
 /// This function is the opposite of [`SqlToRel::sql_to_expr`] and can be used
@@ -695,7 +697,9 @@ impl Unparser<'_> {
             Expr::Placeholder(p) => {
                 Ok(ast::Expr::value(ast::Value::Placeholder(p.id.to_string())))
             }
-            Expr::OuterReferenceColumn(_, col) => self.col_to_sql(col),
+            Expr::OuterReferenceColumn(_, col) => {
+                Ok(mark_outer_reference(self.col_to_sql(col)?))
+            }
             Expr::Unnest(unnest) => self.unnest_to_sql(unnest),
             Expr::HigherOrderFunction(HigherOrderFunction { func, args }) => {
                 let func_name = func.name();
@@ -857,40 +861,29 @@ impl Unparser<'_> {
             fields.push(field);
         }
 
-        match &args[0] {
-            Expr::Column(col) => {
-                let mut id = match self.col_to_sql(col)? {
-                    ast::Expr::Identifier(ident) => vec![ident],
-                    ast::Expr::CompoundIdentifier(idents) => idents,
-                    other => {
-                        return internal_err!(
-                            "expected col_to_sql to return an Identifier or CompoundIdentifier, but received: {:?}",
-                            other
-                        );
-                    }
-                };
-                id.extend(fields);
-                Ok(ast::Expr::CompoundIdentifier(id))
-            }
+        let root = match &args[0] {
+            Expr::Column(col) => self.col_to_sql(col)?,
             Expr::ScalarFunction(struct_expr) => {
-                let root = self
-                    .scalar_function_to_sql(struct_expr.func.name(), &struct_expr.args)?;
-                let access_chain = fields
-                    .into_iter()
-                    .map(|field| ast::AccessExpr::Dot(ast::Expr::Identifier(field)))
-                    .collect();
-                Ok(ast::Expr::CompoundFieldAccess {
-                    root: Box::new(root),
-                    access_chain,
-                })
+                self.scalar_function_to_sql(struct_expr.func.name(), &struct_expr.args)?
             }
             _ => {
-                internal_err!(
+                return internal_err!(
                     "get_field expects first argument to be column or scalar function, but received: {:?}",
                     &args[0]
-                )
+                );
             }
-        }
+        };
+        // The root keeps its own node rather than being flattened into one compound
+        // identifier, so a pass over the finished statement can tell a column's
+        // relation qualifier from the field path that follows it. Both print the same.
+        let access_chain = fields
+            .into_iter()
+            .map(|field| ast::AccessExpr::Dot(ast::Expr::Identifier(field)))
+            .collect();
+        Ok(ast::Expr::CompoundFieldAccess {
+            root: Box::new(root),
+            access_chain,
+        })
     }
 
     fn map_to_sql(&self, args: &[Expr]) -> Result<ast::Expr> {
