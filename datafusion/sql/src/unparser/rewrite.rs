@@ -217,17 +217,6 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     };
 
     let mut map = HashMap::new();
-    let mut position = HashMap::new();
-    for (i, f) in inner_p.expr.iter().enumerate() {
-        let key = match f {
-            Expr::Alias(alias) => Expr::Column(alias.name.clone().into()),
-            _ => Expr::Column(inner_p.schema.field(i).name().into()),
-        };
-        position.insert(key, i);
-        if matches!(f, Expr::Column(_)) {
-            position.insert(f.clone(), i);
-        }
-    }
     let inner_exprs = inner_p
         .expr
         .iter()
@@ -252,6 +241,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         })
         .collect::<Vec<_>>();
+
+    // The inner output each outer expression reads, matched by the spelling the
+    // comparison below uses, so every expression the fold accepts finds its own.
+    let position = inner_exprs
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.to_string(), i))
+        .collect::<HashMap<_, _>>();
 
     // Compare outer collects Expr::to_string with inner collected transformed values
     // alias -> alias column
@@ -360,19 +357,23 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // inner output the outer list reads, so it keeps that output's field: the
         // name the sort's keys and the inliner (`unproject_sort_expr` resolves a
         // key's column by position) look it up by, at the position the expression
-        // now sits at. Carrying the inner schema over unchanged would name each
-        // output after the inner expression at the same index, `ORDER BY a + 1`
-        // emitted over the expression at `a`'s inner index; taking the outer schema
-        // would rename an output the outer list renames, so the key that reads it
-        // by its inner name resolves to nothing.
+        // takes in the outer list. Carrying the inner schema over unchanged would
+        // name each output after the inner expression at the same index, `ORDER BY
+        // a + 1` emitted over the expression at `a`'s inner index; taking the outer
+        // schema would rename an output the outer list renames, so the key that
+        // reads it by its inner name resolves to nothing. An output the outer list
+        // repeats takes the outer field the second time, since one schema cannot
+        // name two outputs alike, and fields that still collide leave the outer
+        // schema in place rather than the plan unfolded.
+        let mut read = HashSet::new();
         let fields = p
             .expr
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let (schema, index) = match position.get(e) {
-                    Some(&k) => (&inner_p.schema, k),
-                    None => (&p.schema, i),
+                let (schema, index) = match position.get(&e.to_string()) {
+                    Some(&k) if read.insert(k) => (&inner_p.schema, k),
+                    _ => (&p.schema, i),
                 };
                 let (qualifier, _) = schema.qualified_field(index);
                 (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
@@ -380,11 +381,11 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             .collect::<Vec<_>>();
         let schema =
             DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
-                .ok()?;
+                .map_or_else(|_| Arc::clone(&p.schema), Arc::new);
         let inner_p = Projection::try_new_with_schema(
             new_exprs,
             Arc::clone(&inner_p.input),
-            Arc::new(schema),
+            schema,
         )
         .ok()?;
         sort.input = Arc::new(LogicalPlan::Projection(inner_p));

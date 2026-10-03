@@ -15006,6 +15006,69 @@ fn test_sort_fold_under_a_renaming_list_keeps_the_name_the_key_reads() -> Result
 }
 
 #[test]
+fn test_sort_fold_matches_each_listed_expression_to_its_own_output() -> Result<()> {
+    // The fold matches the outer list's expressions to the inner outputs by the
+    // spelling it compares them by, so an unaliased expression output keeps its own
+    // field when the outer list renames it through a declared schema, and the key
+    // naming that field resolves to the expression and inlines it. An output the
+    // outer list repeats keeps the fold, under the outer field the second time.
+    let t = || table_scan(Some("t"), &int32_schema(&["a", "b"]), None);
+
+    let inner = t()?
+        .project(vec![col("t.b") * lit(2), col("t.a"), col("t.b")])?
+        .build()?;
+    let key = Expr::Column(Column::new_unqualified("t.b * Int32(2)")).add(lit(1));
+    let sorted = LogicalPlanBuilder::from(inner)
+        .sort(vec![key.sort(true, true)])?
+        .build()?;
+    let renamed = DFSchema::new_with_metadata(
+        vec![
+            (None, Arc::new(Field::new("dbl", DataType::Int32, false))),
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("a", DataType::Int32, false)),
+            ),
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("b", DataType::Int32, false)),
+            ),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("t.b") * lit(2), col("t.a"), col("t.b")],
+        Arc::new(sorted),
+        Arc::new(renamed),
+    )?);
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.b * 2), t.a, t.b FROM t ORDER BY ((t.b * 2) + 1) ASC NULLS FIRST"#
+    );
+
+    let sorted = t()?
+        .project(vec![col("t.a"), col("t.b")])?
+        .sort(vec![col("t.b").sort(true, true)])?
+        .build()?;
+    let repeated = DFSchema::new_with_metadata(
+        vec![
+            (None, Arc::new(Field::new("a1", DataType::Int32, false))),
+            (None, Arc::new(Field::new("a2", DataType::Int32, false))),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("t.a"), col("t.a")],
+        Arc::new(sorted),
+        Arc::new(repeated),
+    )?);
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a, t.a FROM t ORDER BY t.b ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach
