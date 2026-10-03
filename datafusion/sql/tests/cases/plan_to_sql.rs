@@ -14713,6 +14713,67 @@ fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_
 }
 
 #[test]
+fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_side_is_scoped()
+-> Result<()> {
+    // A `Sort` carrying its own `fetch` bounds the build side exactly as a `Limit`
+    // above the sort does: the emitted `LIMIT` is what `bounds_rows()` reads, so the
+    // body moves into a derived table under the build side's own name and the
+    // correlation binds to that alias, outside the scope. The preflight therefore
+    // stops at the bound instead of refusing, and the emitted SQL is the one the
+    // `Limit` form of this plan already produces.
+    let schema = int32_schema(&["a"]);
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
+    ] {
+        let build = table_scan(Some("u"), &schema, Some(vec![0]))?
+            .project(vec![col("u.a"), random().alias("r")])?
+            .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
+            .build()?;
+        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+            .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
+            .build()?;
+
+        let sql = plan_to_sql(&plan)?.to_string();
+        let expected = match join_type {
+            datafusion_expr::JoinType::LeftAnti => "SELECT t.a FROM t WHERE NOT EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))",
+            _ => "SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))",
+        };
+        assert_eq!(sql, expected, "{join_type:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_scoped()
+-> Result<()> {
+    // The bound ends the walk, so a scope the preflight would otherwise find
+    // *below* it is inside the derived table too and stays built.
+    let schema = int32_schema(&["a"]);
+    let build = table_scan(Some("u"), &schema, Some(vec![0]))?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .sort_with_limit(vec![col("a").sort(true, true)], Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    // Whatever shape the nested sorts take, the correlation is appended outside a
+    // derived table, never onto a SELECT whose relation a scope has hidden.
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert!(
+        sql.ends_with(") AS u WHERE (t.a = u.a))"),
+        "correlation must bind to the bounded scope's alias: {sql}"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_struct_field_filter_above_a_sort_keyed_on_the_volatile_output_reads_the_scope()
 -> Result<()> {
     // The WHERE above the sort reads a field of a struct column, `t.payload.x`: the
