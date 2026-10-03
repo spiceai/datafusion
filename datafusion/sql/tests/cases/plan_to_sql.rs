@@ -14389,9 +14389,9 @@ fn test_sort_key_reading_a_volatile_output_the_list_above_drops_is_inlined_once(
 fn test_sort_key_reading_a_volatile_output_under_a_reordering_list_keeps_that_order()
 -> Result<()> {
     // `Projection[r, a] → Sort → Projection[a, random() AS r]`: the fold puts the
-    // outer list's expressions into the inner projection but leaves its schema in
-    // the old order, so the scope is built on the projection rebuilt from those
-    // expressions, and the derived table's outputs come out in the order asked for.
+    // outer list's expressions into the inner projection, in the outer list's order
+    // and under its schema, so the derived table's outputs come out in the order
+    // asked for.
     let plan = volatile_projection("t")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
         .project(vec![col("r"), col("t.a")])?
@@ -14407,9 +14407,10 @@ fn test_sort_key_reading_a_volatile_output_under_a_reordering_list_keeps_that_or
 #[test]
 fn test_sort_key_reading_a_repeatable_output_under_a_reordering_list_is_still_inlined()
 -> Result<()> {
-    // The same fold with the key reading the repeatable output: looked up through
-    // the stale schema, `a` would land on `random()` and the sort would be scoped
-    // — and reordered — for nothing. Rebuilt, the key reads `t.a` and stays inlined.
+    // The same fold with the key reading the repeatable output: resolved by
+    // position against the inner projection's own order, `a` would land on
+    // `random()` and the sort would be scoped, and reordered, for nothing. Under the
+    // outer list's schema the key reads `t.a` and stays inlined.
     let plan = volatile_projection("t")?
         .sort(vec![col("t.a").add(lit(1)).sort(true, true)])?
         .project(vec![col("r"), col("t.a")])?
@@ -14426,8 +14427,9 @@ fn test_sort_key_reading_a_repeatable_output_under_a_reordering_list_is_still_in
 fn test_sort_key_reading_a_repeatable_output_the_list_above_drops_is_still_inlined()
 -> Result<()> {
     // The outer list keeps only `r`; the key reads `t.a`, which the fold inlines
-    // and no longer projects. Through the stale schema `a` would resolve to
-    // `random()` and the scope would emit a derived table exposing no `a`.
+    // and does not project. Resolved by position against the inner projection's
+    // own order, `a` would land on `random()` and the scope would emit a derived
+    // table exposing no `a`.
     let plan = volatile_projection("t")?
         .sort(vec![col("t.a").add(lit(1)).sort(true, true)])?
         .project(vec![col("r")])?
@@ -14541,15 +14543,14 @@ fn test_sort_key_reading_a_dropped_column_named_like_an_output_is_refused() -> R
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_is_left_inline_on_an_unbounded_exists_build_side()
+fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_build_side()
 -> Result<()> {
     // An EXISTS body's rows are only tested for existence, so without a row bound
-    // the order its sort produces reaches nothing, and a second draw in the key
-    // orders nothing a reader can see. The key keeps the form it has without a
-    // scope, which a scope would break: the correlation appended to the body names
-    // the `u` a derived table would hide. Semi and anti joins alike, with the sort
-    // at the top of the build side, below a filter, and under a list the sort fold
-    // keeps `r` in.
+    // the order its sort produces reaches nothing, and the sort is left out: no
+    // second draw to order by, and no derived table hiding the `u` the correlation
+    // appended to the body names. Semi and anti joins alike, with the sort at the
+    // top of the build side, below a filter, and under a list the sort fold keeps
+    // `r` in.
     let schema = int32_schema(&["a"]);
     let key = || col("r").add(lit(1.0)).sort(true, true);
     for (join_type, exists) in [
@@ -14577,7 +14578,7 @@ fn test_sort_key_reading_a_volatile_output_is_left_inline_on_an_unbounded_exists
             assert_eq!(
                 plan_to_sql(&plan)?.to_string(),
                 format!(
-                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM u WHERE {body_filter}(t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST)"
+                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM u WHERE {body_filter}(t.a = u.a))"
                 ),
                 "{join_type:?}"
             );
@@ -14587,13 +14588,12 @@ fn test_sort_key_reading_a_volatile_output_is_left_inline_on_an_unbounded_exists
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_inline() -> Result<()>
-{
+fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_out() -> Result<()> {
     // A join leaves its output order unspecified, so the order of one of its inputs
     // reaches nothing: not the rows, not their order, and not which rows a LIMIT
-    // above the join keeps. The key keeps the form it has without a scope, which a
-    // scope would break, since the join's ON clause shares this SELECT with the
-    // relation a derived table would hide.
+    // above the join keeps. The sort is left out. Written onto the SELECT the join
+    // shares, its ORDER BY would replace the one a sort above the join set, and the
+    // LIMIT there would keep rows by a second draw instead of by `t.a`.
     let schema = int32_schema(&["a"]);
     let sorted = || -> Result<LogicalPlan> {
         volatile_projection("u")?
@@ -14607,7 +14607,7 @@ fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_inline() -> R
         .build()?;
     assert_snapshot!(
         plan_to_sql(&right)?,
-        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST"#
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a)"#
     );
 
     let left = LogicalPlanBuilder::from(sorted()?)
@@ -14619,7 +14619,7 @@ fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_inline() -> R
         .build()?;
     assert_snapshot!(
         plan_to_sql(&left)?,
-        @r#"SELECT u.a, random() AS r, t.a FROM u INNER JOIN t ON (t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST"#
+        @r#"SELECT u.a, random() AS r, t.a FROM u INNER JOIN t ON (t.a = u.a)"#
     );
 
     let limited = table_scan(Some("t"), &schema, Some(vec![0]))?
@@ -14628,7 +14628,52 @@ fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_inline() -> R
         .build()?;
     assert_snapshot!(
         plan_to_sql(&limited)?,
-        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) ORDER BY (random() + 1.0) ASC NULLS FIRST LIMIT 3"#
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) LIMIT 3"#
+    );
+
+    let sorted_above = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(sorted()?, datafusion_expr::JoinType::Inner, on())?
+        .sort_with_limit(vec![col("t.a").sort(true, true)], Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&sorted_above)?,
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) ORDER BY t.a ASC NULLS FIRST LIMIT 3"#
+    );
+
+    // The probe side of a semi join is read the same way.
+    let probe_sorted = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+    let semi = LogicalPlanBuilder::from(probe_sorted)
+        .join_on(
+            table_scan(Some("u"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::LeftSemi,
+            on(),
+        )?
+        .sort_with_limit(vec![col("t.a").sort(true, true)], Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&semi)?,
+        @r#"SELECT t.a, random() AS r FROM t WHERE EXISTS (SELECT 1 FROM u WHERE (t.a = u.a)) ORDER BY t.a ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_below_another_sort_is_left_out() -> Result<()>
+{
+    // The sort above re-orders every row the one below passes on, so the order the
+    // lower sort produces reaches nothing. It is left out, and the ORDER BY and LIMIT
+    // the upper sort set stay on the query.
+    let plan = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT u.a, random() AS r FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2"#
     );
     Ok(())
 }
@@ -14697,42 +14742,37 @@ fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_sid
     // order observable, so the scope is built, and the emitted SQL is the one the
     // `Limit` form of this plan produces.
     let schema = int32_schema(&["a"]);
-    for join_type in [
-        datafusion_expr::JoinType::LeftSemi,
-        datafusion_expr::JoinType::LeftAnti,
+    for (join_type, exists) in [
+        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
+        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
     ] {
-        let build = table_scan(Some("u"), &schema, Some(vec![0]))?
-            .project(vec![col("u.a"), random().alias("r")])?
+        let build = volatile_projection("u")?
             .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
             .build()?;
         let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
             .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
             .build()?;
 
-        let sql = plan_to_sql(&plan)?.to_string();
-        let expected = match join_type {
-            datafusion_expr::JoinType::LeftAnti => {
-                "SELECT t.a FROM t WHERE NOT EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
-            }
-            _ => {
-                "SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
-            }
-        };
-        assert_eq!(sql, expected, "{join_type:?}");
+        assert_eq!(
+            plan_to_sql(&plan)?.to_string(),
+            format!(
+                "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
+            ),
+            "{join_type:?}"
+        );
     }
     Ok(())
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_scoped()
+fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_left_out()
 -> Result<()> {
-    // Below a fetched sort, the bound is already on the body when the inner sort is
-    // reached, so the inner sort's scope is built inside the derived table the bound
-    // moves the body into. This pins where the correlation binds; the ORDER BY a
-    // sort directly over another sort emits is spiceai/spiceai#14733.
+    // Below a fetched sort on the build side, the lower sort's order reaches
+    // nothing: the upper sort re-orders the rows and its fetch picks them. The
+    // lower sort is left out, the body is bounded by the upper sort's key, and the
+    // correlation binds to the alias the bounded body is carried under.
     let schema = int32_schema(&["a"]);
-    let build = table_scan(Some("u"), &schema, Some(vec![0]))?
-        .project(vec![col("u.a"), random().alias("r")])?
+    let build = volatile_projection("u")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
         .sort_with_limit(vec![col("a").sort(true, true)], Some(2))?
         .build()?;
@@ -14744,12 +14784,9 @@ fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_sid
         )?
         .build()?;
 
-    // Whatever shape the nested sorts take, the correlation is appended outside a
-    // derived table, never onto a SELECT whose relation a scope has hidden.
-    let sql = plan_to_sql(&plan)?.to_string();
-    assert!(
-        sql.ends_with(") AS u WHERE (t.a = u.a))"),
-        "correlation must bind to the bounded scope's alias: {sql}"
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.a, random() AS r FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"#
     );
     Ok(())
 }
@@ -14836,8 +14873,8 @@ fn test_sort_key_reading_a_volatile_output_named_by_a_declared_schema_is_scoped(
 fn test_sort_fold_that_reorders_its_list_keeps_a_key_on_its_own_output() -> Result<()> {
     // `Projection[c, a] → Sort[(a + 1)] → Projection[t.a AS a, (t.b * 2) AS c]`: the
     // fold gives the projection below the sort the outer list's expressions, in the
-    // outer list's order, and rebuilds its schema with them, so the key's `a`
-    // resolves to the output that is `a`, not to whatever now sits where `a` was:
+    // outer list's order and under its schema, so the key's `a` resolves to the
+    // output that is `a`, not to the expression at `a`'s index in the inner list:
     // `ORDER BY ((t.b * 2) + 1)` would order the rows by another column. With and
     // without a volatile output beside it.
     let schema = int32_schema(&["a", "b"]);
@@ -14862,6 +14899,51 @@ fn test_sort_fold_that_reorders_its_list_keeps_a_key_on_its_own_output() -> Resu
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT random() AS r, t.a AS a FROM t ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_fold_keeps_the_names_a_declared_schema_gives() -> Result<()> {
+    // `Projection[x] → Sort → Projection{[expr], declared schema [x]}`: the fold
+    // takes the outer projection's schema, so the output keeps the name `x` the
+    // sort key reads. Renamed after its expression, `x` would bind to the table's
+    // own column `x` instead, and the rows would be ordered by another column.
+    let declared = |data_type| {
+        DFSchema::from_unqualified_fields(
+            vec![Field::new("x", data_type, false)].into(),
+            std::collections::HashMap::new(),
+        )
+    };
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build();
+
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![col("t.a") + lit(1)],
+        Arc::new(scan()?),
+        Arc::new(declared(DataType::Int32)?),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort(vec![col("x").sort(false, true)])?
+        .project(vec![col("x")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.a + 1) FROM t ORDER BY (t.a + 1) DESC NULLS FIRST"#
+    );
+
+    // A volatile output under that name is recognised through it and scoped.
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![random()],
+        Arc::new(scan()?),
+        Arc::new(declared(DataType::Float64)?),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort(vec![col("x").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("x")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) ORDER BY (x + 1.0) ASC NULLS FIRST"#
     );
     Ok(())
 }

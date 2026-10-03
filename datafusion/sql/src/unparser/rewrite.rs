@@ -345,14 +345,21 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         }
 
-        // The inner Projection now computes the outer one's expressions, so its
-        // schema is rebuilt from them. Kept, the schema would still name each
-        // output after the expression that used to sit at its position, and a
-        // lookup through it (`unproject_sort_expr` resolves a key's column by
+        // The inner Projection takes the outer one's expressions, so it produces the
+        // outer one's outputs and takes the outer one's schema. Carrying its own
+        // over would name each output after the inner expression at the same index,
+        // and a lookup through it (`unproject_sort_expr` resolves a key's column by
         // position) would read another output's expression: `ORDER BY a + 1`
-        // emitted over whatever replaced `a`. Expressions the rebuild cannot type
-        // leave the plan unfolded.
-        let inner_p = Projection::try_new(new_exprs, Arc::clone(&inner_p.input)).ok()?;
+        // emitted over the expression at `a`'s inner index. Rebuilding the schema
+        // from the expressions would rename an output that a declared schema
+        // (`Projection::try_new_with_schema`) names after its expression instead.
+        // There is one expression per outer output, so the lengths agree.
+        let inner_p = Projection::try_new_with_schema(
+            new_exprs,
+            Arc::clone(&inner_p.input),
+            Arc::clone(&p.schema),
+        )
+        .ok()?;
         sort.input = Arc::new(LogicalPlan::Projection(inner_p));
 
         Some(LogicalPlan::Sort(sort))

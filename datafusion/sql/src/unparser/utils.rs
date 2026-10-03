@@ -1162,14 +1162,6 @@ pub(crate) fn scope_sort_over_projection(
         .iter()
         .map(|field| field.name().clone())
         .collect::<Vec<_>>();
-    // A key may read a column the projection does not output: folding an outer
-    // list that drops an output inlines that output's expression into the key, and
-    // its columns are the projection's input's. The derived table carries them as
-    // further outputs, which the ORDER BY above reads without the SELECT list
-    // showing them; one the input does not hold either is refused. The column is
-    // looked up with its qualifier: a `t2.a` beside an output `t1.a` is not that
-    // output, and carrying it gives the derived table two outputs named `a`, which
-    // `projection_of_outputs` refuses rather than letting the key bind to either.
     // Each output keeps the name the projection's schema gives it, the name the
     // identity projection above reads it by: an expression whose own name differs,
     // in a projection built with a declared schema, is aliased to it.
@@ -1185,6 +1177,14 @@ pub(crate) fn scope_sort_over_projection(
             }
         })
         .collect::<Vec<_>>();
+    // A key may read a column the projection does not output: folding an outer
+    // list that drops an output inlines that output's expression into the key, and
+    // its columns are the projection's input's. The derived table carries them as
+    // further outputs, which the ORDER BY above reads without the SELECT list
+    // showing them; one the input does not hold either is refused. The column is
+    // looked up with its qualifier: a `t2.a` beside an output `t1.a` is not that
+    // output, and carrying it gives the derived table two outputs named `a`, which
+    // `projection_of_outputs` refuses rather than letting the key bind to either.
     let input_schema = projection.input.schema();
     for key in &sort.expr {
         key.expr.apply(|sub_expr| {

@@ -1097,14 +1097,14 @@ impl Unparser<'_> {
     /// output that cannot be repeated a wrong answer rather than one of the orders
     /// the plan allows.
     ///
-    /// A join leaves its output order unspecified, so the order of one of its
-    /// inputs reaches nothing, and an EXISTS body's rows are only tested for
-    /// existence. There an unbounded sort keeps the form it has without a scope,
-    /// which is correct, and which a scope would break: the join's `ON` clause and
-    /// the EXISTS correlation both name the relation the derived table hides. A row
-    /// bound makes the order decide which rows survive: the sort's own fetch, or a
-    /// `LIMIT` already on an EXISTS body, which [`Self::build_exists_subquery`]
-    /// then moves into a scope of its own under the build side's name.
+    /// A sort without a fetch decides nothing a reader can see when a join reads
+    /// its rows, since a join leaves its output order unspecified; when an
+    /// `ORDER BY` is already on this query, since the sort that set it re-orders
+    /// every row; and in an EXISTS body, whose rows are only tested for existence,
+    /// unless a row bound on that body picks some of them. A row bound makes the
+    /// order decide which rows survive: the sort's own fetch, or a `LIMIT` already
+    /// on an EXISTS body, which [`Self::build_exists_subquery`] then moves into a
+    /// scope of its own under the build side's name.
     fn sort_order_is_observable(
         fetch: Option<usize>,
         query: &Option<QueryBuilder>,
@@ -1113,7 +1113,9 @@ impl Unparser<'_> {
         if fetch.is_some() {
             return true;
         }
-        if select.within_join_input() {
+        if select.within_join_input()
+            || query.as_ref().is_some_and(QueryBuilder::has_order_by)
+        {
             return false;
         }
         if select.within_exists_body() {
@@ -2061,11 +2063,19 @@ impl Unparser<'_> {
                         // projection in a scope, built here around the
                         // lowered stack so the ORDER BY the sort emits above it
                         // reads the outputs by name, on the same guarantee and
-                        // with the same refusals.
+                        // with the same refusals. Where it cannot, the lowered
+                        // stack is unparsed without the sort, which the `Sort`
+                        // arm leaves out in the same place.
                         let keys_scope = !filters_scope
-                            && Self::sort_order_is_observable(sort.fetch, query, select)
                             && sort_keys_scope_their_projection(&sort.expr, sorted)
                                 .is_some();
+                        if keys_scope
+                            && !Self::sort_order_is_observable(sort.fetch, query, select)
+                        {
+                            return self.select_to_sql_recursively(
+                                &lowered, query, select, relation,
+                            );
+                        }
                         let expr = if keys_scope {
                             scope_sort_keys(&sort.expr)?
                         } else if filters_scope {
@@ -2300,10 +2310,21 @@ impl Unparser<'_> {
                 // by name from a SELECT above the one computing it, so the projection
                 // becomes a derived table — the repair a predicate on such an
                 // output gets, on the same guarantee, gated and refused the same way.
-                if Self::sort_order_is_observable(sort.fetch, query, select)
-                    && let Some(projection) =
-                        sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())
+                // Where it cannot, the sort is left out: its order reaches nothing,
+                // a derived table there would hide the relation a join's `ON` or an
+                // EXISTS correlation names, and its `ORDER BY` written onto this
+                // query could replace the one a sort above already set.
+                if let Some(projection) =
+                    sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())
                 {
+                    if !Self::sort_order_is_observable(sort.fetch, query, select) {
+                        return self.select_to_sql_recursively(
+                            sort.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;
                     let scoped = scope_sort_over_projection(sort, projection)?;
                     return self
@@ -4200,12 +4221,12 @@ impl Unparser<'_> {
             );
         }
 
-        // A sort key reading such an output needs no refusal here. The body's
-        // SELECT is marked as one, so the key is scoped only where a row bound
-        // makes the sort's order observable (`sort_order_is_observable`), and a
-        // bounded body is moved below into a scope of its own, under the build
-        // side's name, before the correlation is added. Unbounded, the order
-        // reaches nothing, and the key keeps the form it has without a scope.
+        // A sort key reading such an output is scoped only where a row bound
+        // makes the sort's order observable (`sort_order_is_observable`), which
+        // the body's SELECT is marked as an EXISTS body to decide; a bounded body
+        // is moved below into a scope of its own, under the build side's name,
+        // before the correlation is added. Unbounded, the order reaches nothing,
+        // and the sort is left out.
         let mut query_builder = Some(QueryBuilder::default());
         let mut body_select = SelectBuilder::default();
         body_select.mark_exists_body();
