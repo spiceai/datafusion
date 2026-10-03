@@ -15069,6 +15069,52 @@ fn test_sort_fold_matches_each_listed_expression_to_its_own_output() -> Result<(
 }
 
 #[test]
+fn test_sort_key_reading_a_volatile_output_beside_a_wildcard_is_refused() -> Result<()> {
+    // A projection built with a declared schema can hold a wildcard, which stands
+    // for any number of the input's columns, so its expressions do not line up with
+    // its fields by position, and neither the scope nor the inliner can tell which
+    // expression the key's `r` names. Beside an output that cannot be repeated the
+    // shape is refused, before the wildcard or after it.
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "b"]), None);
+    for wildcard_first in [true, false] {
+        #[expect(deprecated)]
+        let wildcard = Expr::Wildcard {
+            qualifier: None,
+            options: Box::default(),
+        };
+        let (exprs, listed) = if wildcard_first {
+            (
+                vec![wildcard, random().alias("r")],
+                vec![col("t.a"), col("t.b"), random().alias("r")],
+            )
+        } else {
+            (
+                vec![random().alias("r"), wildcard],
+                vec![random().alias("r"), col("t.a"), col("t.b")],
+            )
+        };
+        let declared = scan()?.project(listed)?.build()?;
+        let projection = Projection::try_new_with_schema(
+            exprs,
+            Arc::new(scan()?.build()?),
+            Arc::clone(declared.schema()),
+        )?;
+        let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+
+        let err = plan_to_sql(&plan)
+            .expect_err("a wildcard beside the volatile output must be refused");
+        assert_eq!(
+            err.to_string(),
+            "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection also holds a wildcard",
+            "wildcard_first={wildcard_first}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach

@@ -2066,7 +2066,7 @@ impl Unparser<'_> {
                         // stack is unparsed without the sort, which the `Sort`
                         // arm leaves out in the same place.
                         let keys_scope = !filters_scope
-                            && sort_keys_scope_their_projection(&sort.expr, sorted)
+                            && sort_keys_scope_their_projection(&sort.expr, sorted)?
                                 .is_some();
                         if keys_scope
                             && !Self::sort_order_is_observable(sort.fetch, query, select)
@@ -2314,7 +2314,7 @@ impl Unparser<'_> {
                 // EXISTS correlation names, and its `ORDER BY` written onto this
                 // query could replace the one a sort above already set.
                 if let Some(projection) =
-                    sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())
+                    sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
                 {
                     if !Self::sort_order_is_observable(sort.fetch, query, select) {
                         return self.select_to_sql_recursively(

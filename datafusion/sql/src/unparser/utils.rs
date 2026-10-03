@@ -1107,18 +1107,41 @@ fn sort_keys_read_unrepeatable_output(
 /// apart from the expressions (`Projection::try_new_with_schema`) keeps its names,
 /// and the sort fold, which replaces a projection's expressions, rebuilds the
 /// schema with them (`rewrite_plan_for_sort_on_non_projected_fields`).
+///
+/// A wildcard in the projection stands for any number of the input's columns, so
+/// its expressions no longer line up with its schema's fields by position, and
+/// neither this decision nor the inliner can tell which expression a key's column
+/// names. Beside an output that cannot be repeated, with the keys reading the
+/// projection's outputs, the shape is refused rather than guessed at.
 pub(crate) fn sort_keys_scope_their_projection<'a>(
     keys: &[SortExpr],
     input: &'a LogicalPlan,
-) -> Option<&'a Projection> {
-    match input {
-        LogicalPlan::Projection(projection)
-            if sort_keys_read_unrepeatable_output(keys, projection) =>
-        {
-            Some(projection)
-        }
-        _ => None,
+) -> Result<Option<&'a Projection>> {
+    let LogicalPlan::Projection(projection) = input else {
+        return Ok(None);
+    };
+    #[expect(deprecated)]
+    let holds_wildcard = projection
+        .expr
+        .iter()
+        .any(|expr| matches!(expr, Expr::Wildcard { .. }));
+    if holds_wildcard
+        && projection
+            .expr
+            .iter()
+            .any(|expr| !output_is_repeatable(expr))
+        && keys.iter().any(|key| {
+            key.expr
+                .column_refs()
+                .into_iter()
+                .any(|column| projection.schema.has_column(column))
+        })
+    {
+        return unrepeatable_sort_key_refusal(
+            "when the projection also holds a wildcard",
+        );
     }
+    Ok(sort_keys_read_unrepeatable_output(keys, projection).then_some(projection))
 }
 
 /// `keys` as the `ORDER BY` above a scope reads them: every reference unqualified,
