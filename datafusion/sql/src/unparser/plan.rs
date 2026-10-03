@@ -2064,7 +2064,7 @@ impl Unparser<'_> {
                         // with the same refusals.
                         let keys_scope = !filters_scope
                             && Self::sort_order_is_observable(sort.fetch, query, select)
-                            && sort_keys_scope_their_projection(&sort.expr, sorted)?
+                            && sort_keys_scope_their_projection(&sort.expr, sorted)
                                 .is_some();
                         let expr = if keys_scope {
                             scope_sort_keys(&sort.expr)?
@@ -2302,10 +2302,10 @@ impl Unparser<'_> {
                 // output gets, on the same guarantee, gated and refused the same way.
                 if Self::sort_order_is_observable(sort.fetch, query, select)
                     && let Some(projection) =
-                        sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
+                        sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())
                 {
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;
-                    let scoped = scope_sort_over_projection(sort, &projection)?;
+                    let scoped = scope_sort_over_projection(sort, projection)?;
                     return self
                         .select_to_sql_recursively(&scoped, query, select, relation);
                 }

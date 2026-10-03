@@ -1101,23 +1101,24 @@ fn sort_keys_read_unrepeatable_output(
 /// [Projection] and [`sort_keys_read_unrepeatable_output`] holds for it. `None`
 /// when the sort leaves its input as it is.
 ///
-/// The projection is returned rebuilt from its expressions, and the caller scopes
-/// that one. Folding an outer projection into the one below a sort
-/// (`rewrite_plan_for_sort_on_non_projected_fields`) replaces the projection's
-/// expressions and keeps its schema, so an output looked up by name through that
-/// schema lands on the position another expression may now occupy, and an identity
-/// projection read off it would list the outputs in the outer list's old order.
-/// Rebuilt, the projection carries the schema its expressions produce.
-pub(crate) fn sort_keys_scope_their_projection(
+/// The projection is read with the schema it carries, which is what
+/// [`unproject_sort_expr`] resolves a key's columns through, so the scope is
+/// decided on exactly the expressions that would be inlined. A schema declared
+/// apart from the expressions (`Projection::try_new_with_schema`) keeps its names,
+/// and the sort fold, which replaces a projection's expressions, rebuilds the
+/// schema with them (`rewrite_plan_for_sort_on_non_projected_fields`).
+pub(crate) fn sort_keys_scope_their_projection<'a>(
     keys: &[SortExpr],
-    input: &LogicalPlan,
-) -> Result<Option<Projection>> {
-    let LogicalPlan::Projection(projection) = input else {
-        return Ok(None);
-    };
-    let projection =
-        Projection::try_new(projection.expr.clone(), Arc::clone(&projection.input))?;
-    Ok(sort_keys_read_unrepeatable_output(keys, &projection).then_some(projection))
+    input: &'a LogicalPlan,
+) -> Option<&'a Projection> {
+    match input {
+        LogicalPlan::Projection(projection)
+            if sort_keys_read_unrepeatable_output(keys, projection) =>
+        {
+            Some(projection)
+        }
+        _ => None,
+    }
 }
 
 /// `keys` as the `ORDER BY` above a scope reads them: every reference unqualified,
@@ -1169,7 +1170,21 @@ pub(crate) fn scope_sort_over_projection(
     // looked up with its qualifier: a `t2.a` beside an output `t1.a` is not that
     // output, and carrying it gives the derived table two outputs named `a`, which
     // `projection_of_outputs` refuses rather than letting the key bind to either.
-    let mut exprs = projection.expr.clone();
+    // Each output keeps the name the projection's schema gives it, the name the
+    // identity projection above reads it by: an expression whose own name differs,
+    // in a projection built with a declared schema, is aliased to it.
+    let mut exprs = projection
+        .expr
+        .iter()
+        .zip(projection.schema.fields())
+        .map(|(expr, field)| {
+            if expr.qualified_name().1 == *field.name() {
+                expr.clone()
+            } else {
+                expr.clone().alias(field.name())
+            }
+        })
+        .collect::<Vec<_>>();
     let input_schema = projection.input.schema();
     for key in &sort.expr {
         key.expr.apply(|sub_expr| {
