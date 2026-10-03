@@ -1012,11 +1012,67 @@ pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<Logica
     ) else {
         return internal_err!("a filter stack has at least one predicate");
     };
+    // The identity projection above reads each output by the name the projection's
+    // schema reports. An alias a declared schema names apart from, `random() AS z`
+    // declared as `x`, would show the output as `z` and leave `x` bound to nothing,
+    // so the projection is rebuilt with its outputs named as declared.
+    let input = match bottom.input.as_ref() {
+        LogicalPlan::Projection(projection) if aliases_an_output_apart(projection) => {
+            Arc::new(LogicalPlan::Projection(Projection::try_new(
+                exprs_named_as_declared(projection),
+                Arc::clone(&projection.input),
+            )?))
+        }
+        _ => Arc::clone(&bottom.input),
+    };
     // `Filter::try_new` rather than the builder, whose `filter` normalizes every
     // column back to its qualified form and would undo the rewrite above.
-    let filtered =
-        LogicalPlan::Filter(Filter::try_new(predicate, Arc::clone(&bottom.input))?);
+    let filtered = LogicalPlan::Filter(Filter::try_new(predicate, input)?);
     identity_projection_over(Arc::new(filtered), unrepeatable_output_refusal)
+}
+
+/// Whether a schema declared apart from `projection`'s expressions
+/// (`Projection::try_new_with_schema`) names an aliased output apart from its
+/// alias: `random() AS z` declared as `x`. Beside a wildcard the expressions do not
+/// line up with the fields by position, and no output is taken to be.
+fn aliases_an_output_apart(projection: &Projection) -> bool {
+    !projection_holds_wildcard(projection)
+        && projection
+            .expr
+            .iter()
+            .zip(projection.schema.fields())
+            .any(|(expr, field)| {
+                matches!(expr, Expr::Alias(alias) if alias.name != *field.name())
+            })
+}
+
+/// `projection`'s expressions, each aliased to the name its schema declares for it
+/// where the expression's own name differs: an unnamed expression, or an alias a
+/// declared schema names apart from. A derived table built from them shows every
+/// output under the name the `SELECT` reading it binds.
+fn exprs_named_as_declared(projection: &Projection) -> Vec<Expr> {
+    projection
+        .expr
+        .iter()
+        .zip(projection.schema.fields())
+        .map(|(expr, field)| {
+            if expr.qualified_name().1 == *field.name() {
+                expr.clone()
+            } else {
+                expr.clone().alias(field.name())
+            }
+        })
+        .collect()
+}
+
+/// Whether `projection` lists a wildcard, which stands for a run of its input's
+/// columns, so its expressions do not line up with its schema's fields by position.
+#[expect(deprecated)]
+fn projection_holds_wildcard(projection: &Projection) -> bool {
+    projection
+        .expr
+        .iter()
+        .any(|expr| matches!(expr, Expr::Wildcard { .. }))
 }
 
 /// An identity projection over `input` — one bare column per output, under the name
@@ -1067,15 +1123,13 @@ fn projection_of_outputs(
 /// applies to a key that is not a bare output name — would inline an output that
 /// cannot be repeated ([`output_is_repeatable`]).
 ///
-/// A bare unqualified key naming an output whose alias is that same name is emitted
-/// as that name, which every dialect accepts as a top-level sort key, so it is never
-/// inlined. A declared schema can name an output apart from its alias, `random() AS
-/// z` declared as `x`, and then the key's name is not in the `SELECT` list and would
-/// bind a column of the input instead. Any other key reading such an output would
-/// have the expression inlined — `ORDER BY (r + 1)` as `ORDER BY (random() + 1)` —
-/// ordering the rows by a second draw the `SELECT` list never showed. Such a key has
-/// to read the output by name from a `SELECT` above the one computing it, which is
-/// what [`scope_sort_over_projection`] builds.
+/// A bare unqualified key reading an output under the name the `SELECT` list shows
+/// it by ([`bare_sort_key_reads_a_listed_alias`]) is emitted as that name, which
+/// every dialect accepts as a top-level sort key, so it is never inlined. Any other
+/// key reading such an output would have the expression inlined — `ORDER BY (r + 1)`
+/// as `ORDER BY (random() + 1)` — ordering the rows by a second draw the `SELECT`
+/// list never showed. Such a key has to read the output by name from a `SELECT`
+/// above the one computing it, which is what [`scope_sort_over_projection`] builds.
 fn sort_keys_read_unrepeatable_output(
     keys: &[SortExpr],
     projection: &Projection,
@@ -1091,13 +1145,35 @@ fn sort_keys_read_unrepeatable_output(
             name,
             ..
         }) = &key.expr
-            && let Some(index) = projection.schema.index_of_column_by_name(None, name)
-            && matches!(projection.expr.get(index), Some(Expr::Alias(alias)) if alias.name == *name)
+            && bare_sort_key_reads_a_listed_alias(projection, name)
         {
             return false;
         }
         predicate_reads_unrepeatable_output(&key.expr, &outputs)
     })
+}
+
+/// Whether a bare unqualified sort key `name` reads an output under the name the
+/// projection's `SELECT` list shows it by, so it is emitted as that name and never
+/// inlined.
+///
+/// The output a key names is the expression at the key's position in the schema,
+/// and the list shows it under that name only when its alias carries the name. A
+/// declared schema can name an output apart from its alias, `random() AS z` declared
+/// as `x`, and then `x` is not in the list and would bind a column of the input
+/// instead. Beside a wildcard the positions do not line up, and the key reads the
+/// output whose listed alias carries its name.
+fn bare_sort_key_reads_a_listed_alias(projection: &Projection, name: &str) -> bool {
+    let carries_name =
+        |expr: &Expr| matches!(expr, Expr::Alias(alias) if alias.name == name);
+    if projection_holds_wildcard(projection) {
+        return projection.expr.iter().any(carries_name);
+    }
+    projection
+        .schema
+        .index_of_column_by_name(None, name)
+        .and_then(|index| projection.expr.get(index))
+        .is_some_and(carries_name)
 }
 
 /// The projection a `Sort` with `keys` over `input` puts in a scope: `input` is a
@@ -1125,12 +1201,7 @@ pub(crate) fn sort_keys_scope_their_projection<'a>(
     let LogicalPlan::Projection(projection) = input else {
         return Ok(None);
     };
-    #[expect(deprecated)]
-    let holds_wildcard = projection
-        .expr
-        .iter()
-        .any(|expr| matches!(expr, Expr::Wildcard { .. }));
-    if holds_wildcard
+    if projection_holds_wildcard(projection)
         && projection
             .expr
             .iter()
@@ -1141,10 +1212,7 @@ pub(crate) fn sort_keys_scope_their_projection<'a>(
                 name,
                 ..
             }) = &key.expr
-                && projection
-                    .expr
-                    .iter()
-                    .any(|expr| matches!(expr, Expr::Alias(alias) if alias.name == *name))
+                && bare_sort_key_reads_a_listed_alias(projection, name)
             {
                 return false;
             }
@@ -1205,18 +1273,7 @@ pub(crate) fn scope_sort_over_projection(
     // Each output keeps the name the projection's schema gives it, the name the
     // identity projection above reads it by: an expression whose own name differs,
     // in a projection built with a declared schema, is aliased to it.
-    let mut exprs = projection
-        .expr
-        .iter()
-        .zip(projection.schema.fields())
-        .map(|(expr, field)| {
-            if expr.qualified_name().1 == *field.name() {
-                expr.clone()
-            } else {
-                expr.clone().alias(field.name())
-            }
-        })
-        .collect::<Vec<_>>();
+    let mut exprs = exprs_named_as_declared(projection);
     // A key may read a column the projection does not output: folding an outer
     // list that drops an output inlines that output's expression into the key, and
     // its columns are the projection's input's. The derived table carries them as

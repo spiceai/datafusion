@@ -15164,6 +15164,114 @@ fn test_bare_sort_key_naming_a_declared_output_its_alias_does_not_name_is_scoped
 }
 
 #[test]
+fn test_bare_sort_key_naming_a_listed_alias_beside_a_wildcard_keeps_the_plain_form()
+-> Result<()> {
+    // Beside a wildcard the projection's expressions do not line up with its fields
+    // by position: the key `s` is the third field, where the third expression is
+    // `random() AS r`. The key names the listed alias `s`, so it is emitted as that
+    // name, with or without a fetch, and the plan is unparsed in the plain form.
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "b"]), None);
+    let declared = scan()?
+        .project(vec![
+            col("t.a"),
+            col("t.b"),
+            (col("t.a") + lit(1)).alias("s"),
+            random().alias("r"),
+        ])?
+        .build()?;
+    #[expect(deprecated)]
+    let wildcard = Expr::Wildcard {
+        qualifier: None,
+        options: Box::default(),
+    };
+    let projection = Projection::try_new_with_schema(
+        vec![
+            wildcard,
+            (col("t.a") + lit(1)).alias("s"),
+            random().alias("r"),
+        ],
+        Arc::new(scan()?.build()?),
+        Arc::clone(declared.schema()),
+    )?;
+    for fetch in [None, Some(3)] {
+        let plan = LogicalPlan::Sort(datafusion_expr::Sort {
+            expr: vec![col("s").sort(true, true)],
+            input: Arc::new(LogicalPlan::Projection(projection.clone())),
+            fetch,
+        });
+        let limit = fetch.map_or_else(String::new, |n| format!(" LIMIT {n}"));
+        assert_eq!(
+            plan_to_sql(&plan)?.to_string(),
+            format!(
+                "SELECT *, (t.a + 1) AS s, random() AS r FROM t ORDER BY s ASC NULLS FIRST{limit}"
+            ),
+            "fetch={fetch:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_naming_a_declared_output_above_a_lowered_filter_reads_the_scope()
+-> Result<()> {
+    // The filter above the sort is lowered beneath it, and the key alone puts the
+    // projection in a scope built around the filter. The derived table names the
+    // output `x`, the name its declared schema gives `random() AS z`, which the
+    // `ORDER BY` above reads.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Int32, false),
+        ]
+        .into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = Projection::try_new_with_schema(
+        vec![random().alias("z"), (col("t.a") + lit(1)).alias("y")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .sort(vec![col("x").sort(true, true)])?
+        .filter(col("y").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x, y FROM (SELECT random() AS x, (t.a + 1) AS y FROM t) WHERE (y > 1) ORDER BY x ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_reading_a_declared_output_its_alias_does_not_name_reads_the_scope()
+-> Result<()> {
+    // The derived table a filter scope builds names each output as the projection's
+    // schema does, so a declared name the alias does not carry is the one the
+    // `WHERE` above reads.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![Field::new("x", DataType::Float64, false)].into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = Projection::try_new_with_schema(
+        vec![random().alias("z")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .filter(col("x").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) WHERE (x > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach
