@@ -80,11 +80,6 @@ impl QueryBuilder {
     pub fn get_order_by(&self) -> Option<OrderByKind> {
         self.order_by_kind.clone()
     }
-
-    /// Whether this query already carries an `ORDER BY`.
-    pub fn has_order_by(&self) -> bool {
-        self.order_by_kind.is_some()
-    }
     /// Applies `f` to every expression in this query's `ORDER BY`, nested ones
     /// included, so a caller that replaces the relation the `SELECT` reads — unparsing
     /// a sub-plan as a derived table — can re-point the references that addressed the

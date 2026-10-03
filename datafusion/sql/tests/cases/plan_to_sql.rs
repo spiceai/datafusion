@@ -14390,8 +14390,8 @@ fn test_sort_key_reading_a_volatile_output_under_a_reordering_list_keeps_that_or
 -> Result<()> {
     // `Projection[r, a] → Sort → Projection[a, random() AS r]`: the fold puts the
     // outer list's expressions into the inner projection, in the outer list's order
-    // and under its schema, so the derived table's outputs come out in the order
-    // asked for.
+    // and with the inner field of each, so the derived table's outputs come out in
+    // the order asked for.
     let plan = volatile_projection("t")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
         .project(vec![col("r"), col("t.a")])?
@@ -14409,8 +14409,8 @@ fn test_sort_key_reading_a_repeatable_output_under_a_reordering_list_is_still_in
 -> Result<()> {
     // The same fold with the key reading the repeatable output: resolved by
     // position against the inner projection's own order, `a` would land on
-    // `random()` and the sort would be scoped, and reordered, for nothing. Under the
-    // outer list's schema the key reads `t.a` and stays inlined.
+    // `random()` and the sort would be scoped, and reordered, for nothing. With the
+    // fields moved along with the expressions the key reads `t.a` and stays inlined.
     let plan = volatile_projection("t")?
         .sort(vec![col("t.a").add(lit(1)).sort(true, true)])?
         .project(vec![col("r"), col("t.a")])?
@@ -14661,19 +14661,38 @@ fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_out() -> Resu
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_below_another_sort_is_left_out() -> Result<()>
-{
-    // The sort above re-orders every row the one below passes on, so the order the
-    // lower sort produces reaches nothing. It is left out, and the ORDER BY and LIMIT
-    // the upper sort set stay on the query.
-    let plan = volatile_projection("u")?
+fn test_sort_key_reading_a_volatile_output_under_a_limit_below_another_sort_is_scoped()
+-> Result<()> {
+    // `Sort(t.a) → Limit(1) → Sort[(r + 1.0)] → Projection`: the LIMIT keeps the row
+    // the lower sort ranks first, so that sort's order can be observed although an
+    // ORDER BY sits above it, and its key reads `r` from a scope. Ordering the one
+    // row the LIMIT keeps by `t.a` changes nothing. The same on an EXISTS build
+    // side, where the bound moves the body under the build side's name.
+    let plan = volatile_projection("t")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
-        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .limit(0, Some(1))?
+        .sort(vec![col("t.a").sort(true, true)])?
         .build()?;
-
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT u.a, random() AS r FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2"#
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1"#
+    );
+
+    let build = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .limit(0, Some(1))?
+        .sort(vec![col("u.a").sort(true, true)])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1) AS u WHERE (t.a = u.a))"#
     );
     Ok(())
 }
@@ -14765,12 +14784,12 @@ fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_sid
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_left_out()
+fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_scoped()
 -> Result<()> {
-    // Below a fetched sort on the build side, the lower sort's order reaches
-    // nothing: the upper sort re-orders the rows and its fetch picks them. The
-    // lower sort is left out, the body is bounded by the upper sort's key, and the
-    // correlation binds to the alias the bounded body is carried under.
+    // The upper sort's fetch bounds the body, so the lower sort is reached with a
+    // row bound on it and its scope is built, inside the derived table the bound
+    // moves the body into. This pins where the correlation binds; the ORDER BY a
+    // sort directly over another sort emits is spiceai/spiceai#14733.
     let schema = int32_schema(&["a"]);
     let build = volatile_projection("u")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
@@ -14784,9 +14803,10 @@ fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_sid
         )?
         .build()?;
 
-    assert_snapshot!(
-        plan_to_sql(&plan)?,
-        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT u.a, random() AS r FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"#
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert!(
+        sql.ends_with(") AS u WHERE (t.a = u.a))"),
+        "correlation must bind to the bounded scope's alias: {sql}"
     );
     Ok(())
 }
@@ -14873,8 +14893,8 @@ fn test_sort_key_reading_a_volatile_output_named_by_a_declared_schema_is_scoped(
 fn test_sort_fold_that_reorders_its_list_keeps_a_key_on_its_own_output() -> Result<()> {
     // `Projection[c, a] → Sort[(a + 1)] → Projection[t.a AS a, (t.b * 2) AS c]`: the
     // fold gives the projection below the sort the outer list's expressions, in the
-    // outer list's order and under its schema, so the key's `a` resolves to the
-    // output that is `a`, not to the expression at `a`'s index in the inner list:
+    // outer list's order and with the inner field of each, so the key's `a` resolves
+    // to the output that is `a`, not to the expression at `a`'s index in the inner list:
     // `ORDER BY ((t.b * 2) + 1)` would order the rows by another column. With and
     // without a volatile output beside it.
     let schema = int32_schema(&["a", "b"]);
@@ -14906,9 +14926,10 @@ fn test_sort_fold_that_reorders_its_list_keeps_a_key_on_its_own_output() -> Resu
 #[test]
 fn test_sort_fold_keeps_the_names_a_declared_schema_gives() -> Result<()> {
     // `Projection[x] → Sort → Projection{[expr], declared schema [x]}`: the fold
-    // takes the outer projection's schema, so the output keeps the name `x` the
-    // sort key reads. Renamed after its expression, `x` would bind to the table's
-    // own column `x` instead, and the rows would be ordered by another column.
+    // keeps the inner field of each output it lists, so the output keeps the name
+    // `x` the sort key reads. Renamed after its expression, `x` would bind to the
+    // table's own column `x` instead, and the rows would be ordered by another
+    // column.
     let declared = |data_type| {
         DFSchema::from_unqualified_fields(
             vec![Field::new("x", data_type, false)].into(),
@@ -14945,6 +14966,42 @@ fn test_sort_fold_keeps_the_names_a_declared_schema_gives() -> Result<()> {
         plan_to_sql(&plan)?,
         @r#"SELECT x FROM (SELECT random() AS x FROM t) ORDER BY (x + 1.0) ASC NULLS FIRST"#
     );
+    Ok(())
+}
+
+#[test]
+fn test_sort_fold_under_a_renaming_list_keeps_the_name_the_key_reads() -> Result<()> {
+    // `Projection{[u.a, r], declared [u.a, z]} → Sort[(r + 1.0)] → Projection[u.a,
+    // random() AS r]`: the outer list renames `r` through its schema. The fold keeps
+    // the inner field the key reads by, `r`, so the volatile output is recognised,
+    // scoped, and refused where a derived table does not fix it.
+    let sorted = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+    let renamed = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("u")),
+                Arc::new(Field::new("a", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("z", DataType::Float64, false))),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("u.a"), col("r")],
+        Arc::new(sorted),
+        Arc::new(renamed),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    let err = Unparser::new(&SqliteDialect {})
+        .plan_to_sql(&plan)
+        .expect_err("the SQLite dialect must refuse the scope");
+    assert_eq!(err.to_string(), VOLATILE_SORT_SCOPE_REFUSAL);
     Ok(())
 }
 

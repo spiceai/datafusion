@@ -1098,13 +1098,14 @@ impl Unparser<'_> {
     /// the plan allows.
     ///
     /// A sort without a fetch decides nothing a reader can see when a join reads
-    /// its rows, since a join leaves its output order unspecified; when an
-    /// `ORDER BY` is already on this query, since the sort that set it re-orders
-    /// every row; and in an EXISTS body, whose rows are only tested for existence,
-    /// unless a row bound on that body picks some of them. A row bound makes the
-    /// order decide which rows survive: the sort's own fetch, or a `LIMIT` already
-    /// on an EXISTS body, which [`Self::build_exists_subquery`] then moves into a
-    /// scope of its own under the build side's name.
+    /// its rows, since a join leaves its output order unspecified, or in an EXISTS
+    /// body, whose rows are only tested for existence, unless a row bound on that
+    /// body picks some of them. A row bound makes the order decide which rows
+    /// survive: the sort's own fetch, or a `LIMIT` already on an EXISTS body, which
+    /// [`Self::build_exists_subquery`] then moves into a scope of its own under the
+    /// build side's name. An `ORDER BY` a sort above has already put on the query
+    /// does not make a lower sort unobservable: a `LIMIT` between the two keeps the
+    /// rows the lower sort ranks first.
     fn sort_order_is_observable(
         fetch: Option<usize>,
         query: &Option<QueryBuilder>,
@@ -1113,9 +1114,7 @@ impl Unparser<'_> {
         if fetch.is_some() {
             return true;
         }
-        if select.within_join_input()
-            || query.as_ref().is_some_and(QueryBuilder::has_order_by)
-        {
+        if select.within_join_input() {
             return false;
         }
         if select.within_exists_body() {

@@ -20,7 +20,7 @@ use std::{collections::HashSet, sync::Arc};
 use arrow::datatypes::Schema;
 use datafusion_common::tree_node::TreeNodeContainer;
 use datafusion_common::{
-    Column, HashMap, Result, TableReference,
+    Column, DFSchema, HashMap, Result, TableReference,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
@@ -217,6 +217,17 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     };
 
     let mut map = HashMap::new();
+    let mut position = HashMap::new();
+    for (i, f) in inner_p.expr.iter().enumerate() {
+        let key = match f {
+            Expr::Alias(alias) => Expr::Column(alias.name.clone().into()),
+            _ => Expr::Column(inner_p.schema.field(i).name().into()),
+        };
+        position.insert(key, i);
+        if matches!(f, Expr::Column(_)) {
+            position.insert(f.clone(), i);
+        }
+    }
     let inner_exprs = inner_p
         .expr
         .iter()
@@ -345,19 +356,35 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         }
 
-        // The inner Projection takes the outer one's expressions, so it produces the
-        // outer one's outputs and takes the outer one's schema. Carrying its own
-        // over would name each output after the inner expression at the same index,
-        // and a lookup through it (`unproject_sort_expr` resolves a key's column by
-        // position) would read another output's expression: `ORDER BY a + 1`
-        // emitted over the expression at `a`'s inner index. Rebuilding the schema
-        // from the expressions would rename an output that a declared schema
-        // (`Projection::try_new_with_schema`) names after its expression instead.
-        // There is one expression per outer output, so the lengths agree.
+        // The inner Projection takes the outer one's expressions, and each is the
+        // inner output the outer list reads, so it keeps that output's field: the
+        // name the sort's keys and the inliner (`unproject_sort_expr` resolves a
+        // key's column by position) look it up by, at the position the expression
+        // now sits at. Carrying the inner schema over unchanged would name each
+        // output after the inner expression at the same index, `ORDER BY a + 1`
+        // emitted over the expression at `a`'s inner index; taking the outer schema
+        // would rename an output the outer list renames, so the key that reads it
+        // by its inner name resolves to nothing.
+        let fields = p
+            .expr
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let (schema, index) = match position.get(e) {
+                    Some(&k) => (&inner_p.schema, k),
+                    None => (&p.schema, i),
+                };
+                let (qualifier, _) = schema.qualified_field(index);
+                (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
+            })
+            .collect::<Vec<_>>();
+        let schema =
+            DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
+                .ok()?;
         let inner_p = Projection::try_new_with_schema(
             new_exprs,
             Arc::clone(&inner_p.input),
-            Arc::clone(&p.schema),
+            Arc::new(schema),
         )
         .ok()?;
         sort.input = Arc::new(LogicalPlan::Projection(inner_p));
