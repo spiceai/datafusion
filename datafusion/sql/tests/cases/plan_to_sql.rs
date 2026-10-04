@@ -27,10 +27,10 @@ use datafusion_expr::test::function_stub::{
 };
 use datafusion_expr::{
     ColumnarValue, EmptyRelation, Expr, ExprFunctionExt, Extension, LogicalPlan,
-    LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Union,
-    UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility, WindowFrame,
-    WindowFunctionDefinition, cast, col, exists, in_subquery, lit, out_ref_col,
-    scalar_subquery, table_scan, wildcard,
+    LogicalPlanBuilder, Projection, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl,
+    Signature, Union, UserDefinedLogicalNode, UserDefinedLogicalNodeCore, Volatility,
+    WindowFrame, WindowFunctionDefinition, cast, col, exists, in_subquery, lit,
+    out_ref_col, scalar_subquery, table_scan, wildcard,
 };
 use datafusion_functions::unicode;
 use datafusion_functions_aggregate::grouping::grouping_udaf;
@@ -14199,6 +14199,1688 @@ fn test_filter_below_an_unfetched_sort_under_a_taken_list_is_scoped_and_gated()
     Ok(())
 }
 
+/// The refusal a dialect whose derived tables do not fix a volatile value must produce
+/// for a sort key that would read one through a derived table, spelled once.
+const VOLATILE_SORT_SCOPE_REFUSAL: &str = "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported for this dialect: its engine evaluates the expression again for the key instead of reading the value the SELECT list produced, and would order the rows by a value that list never showed";
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_inside_an_expression_is_scoped() -> Result<()>
+{
+    // A key that is not the bare output name has the output's expression inlined,
+    // so `ORDER BY (r + 1.0)` would read `ORDER BY (random() + 1.0)`: a second
+    // draw, ordering the rows by a value the SELECT list never showed. The
+    // projection becomes a derived table instead, and the key reads its `r` from
+    // the SELECT above it, the one value that list holds.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_naming_an_unnamed_volatile_output_is_scoped() -> Result<()> {
+    // Only an aliased output is emitted by name as a bare key; an unnamed one is
+    // inlined like any other reference, so `ORDER BY random()` would draw again.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![random()])?
+        .sort(vec![col("random()").sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "random()" FROM (SELECT random() AS "random()" FROM t) ORDER BY "random()" ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_keeps_its_fetch_above_the_scope() -> Result<()>
+{
+    // The fetch bounds the ordered rows, so it stays the LIMIT of the query above
+    // the derived table rather than moving inside it.
+    let plan = volatile_projection("t")?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_is_unqualified_with_its_neighbours()
+-> Result<()> {
+    // Every reference in the key reads from the derived table, so one still
+    // qualified by the relation inside it would bind to nothing: unqualified along
+    // with the volatile one, as a scoped predicate's references are.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").add(col("r")).sort(false, false)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (a + r) DESC NULLS LAST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_repeatable_output_is_still_inlined() -> Result<()> {
+    // The repeatable counterpart keeps the inlining: the expression draws the same
+    // value at either point of use, and PostgreSQL rejects a bare alias inside a
+    // compound key.
+    let plan = summed_projection()?
+        .sort(vec![col("s").add(lit(1)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a, (t.a + t.b) AS s FROM t ORDER BY ((t.a + t.b) + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_below_a_sort_keyed_on_an_expression_of_the_volatile_output_is_scoped()
+-> Result<()> {
+    // `Filter → Sort → Projection`, the stack reading a renamed column: lowered
+    // beneath the sort, it meets the projection and would fold it in, since nothing
+    // it reads needs a scope — and the sort's key, resolved against that fold, would
+    // be inlined into a second draw. The key alone puts the projection in a scope,
+    // built around the lowered stack, and the ORDER BY above reads its `r`.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").alias("a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("a").gt(lit(0)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a AS a, random() AS r FROM t) WHERE (a > 0) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_limit_above_a_filter_below_a_sort_keyed_on_the_volatile_output_bounds_the_scope()
+-> Result<()> {
+    // The shape that selects a different row: under a LIMIT, a second draw would
+    // keep whichever row *it* ordered first and return the first draw's `r` beside it.
+    // The stack reads a repeatable output, so the projection would have folded in.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("s").gt(lit(0)))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s, r FROM (SELECT (t.a + 1) AS s, random() AS r FROM t) WHERE (s > 0) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_on_bare_columns_above_a_sort_keyed_on_the_volatile_output_reads_the_scope()
+-> Result<()> {
+    // A stack reading only bare columns is left above the sort, and its WHERE was
+    // emitted against `t` before the sort built the scope that hides it. The clause
+    // is re-pointed onto the derived table's output, as a scoped filter re-points
+    // the clauses above it.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) WHERE (a > 1) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_the_list_above_keeps_is_scoped() -> Result<()>
+{
+    // `Projection → Sort → Projection` with the outer list reading every inner
+    // output folds into one SELECT (`rewrite_plan_for_sort_on_non_projected_fields`),
+    // and the sort then stands over the projection: the scope is built as for a
+    // free list.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("t.a"), col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_the_list_above_drops_is_inlined_once()
+-> Result<()> {
+    // The same fold with the outer list dropping `r`: the rewrite inlines the
+    // dropped output's expression into the key, and that is the one draw — no
+    // SELECT list shows the value, so there is nothing for the key to disagree
+    // with, and no scope is needed.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t ORDER BY (random() + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_under_a_reordering_list_keeps_that_order()
+-> Result<()> {
+    // `Projection[r, a] → Sort → Projection[a, random() AS r]`: the fold puts the
+    // outer list's expressions into the inner projection, in the outer list's order
+    // and with the inner field of each, so the derived table's outputs come out in
+    // the order asked for.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("r"), col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r, a FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_repeatable_output_under_a_reordering_list_is_still_inlined()
+-> Result<()> {
+    // The same fold with the key reading the repeatable output: resolved by
+    // position against the inner projection's own order, `a` would land on
+    // `random()` and the sort would be scoped, and reordered, for nothing. With the
+    // fields moved along with the expressions the key reads `t.a` and stays inlined.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("r"), col("t.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT random() AS r, t.a FROM t ORDER BY (t.a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_repeatable_output_the_list_above_drops_is_still_inlined()
+-> Result<()> {
+    // The outer list keeps only `r`; the key reads `t.a`, which the fold inlines
+    // and does not project. Resolved by position against the inner projection's
+    // own order, `a` would land on `random()` and the scope would emit a derived
+    // table exposing no `a`.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("t.a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT random() AS r FROM t ORDER BY (t.a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_and_a_dropped_column_carries_the_column()
+-> Result<()> {
+    // `Projection[r] → Sort[(r + t.a)] → Projection[t.a, random() AS r]`: the fold
+    // drops `t.a` from the projection, and the key still reads it. The derived
+    // table carries `t.a` as a further output the ORDER BY reads, while the SELECT
+    // list above shows only `r`.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(col("t.a")).sort(true, true)])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + a) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_keys_reading_a_volatile_output_and_a_dropped_column_apart_carry_the_column()
+-> Result<()> {
+    // The same dependency as its own key, beside the one reading `r`.
+    let plan = volatile_projection("t")?
+        .sort(vec![
+            col("r").add(lit(1.0)).sort(true, true),
+            col("t.a").sort(true, true),
+        ])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST, a ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_and_a_dropped_expression_carries_its_columns()
+-> Result<()> {
+    // The dropped output is an expression, `(t.a + 1) AS s`: the fold inlines it
+    // into the key, and the column it reads is what the derived table carries.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").add(lit(1)).alias("s"), random().alias("r")])?
+        .sort(vec![col("r").add(col("s")).sort(true, true)])?
+        .project(vec![col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r FROM (SELECT random() AS r, t.a FROM t) ORDER BY (r + (a + 1)) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_dropped_column_from_another_relation_carries_it_qualified()
+-> Result<()> {
+    // Over a join, the dropped column comes from the other relation: it is carried
+    // under its own qualifier, so the key reads `b` of `t2`, not a column of `t1`.
+    let schema = int32_schema(&["a", "b"]);
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .cross_join(table_scan(Some("t2"), &schema, Some(vec![1]))?.build()?)?
+        .project(vec![col("t1.a"), col("t2.b"), random().alias("r")])?
+        .sort(vec![col("r").add(col("t2.b")).sort(true, true)])?
+        .project(vec![col("t1.a"), col("r")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t1.a, random() AS r, t2.b FROM t1 CROSS JOIN t2) ORDER BY (r + b) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_dropped_column_named_like_an_output_is_refused() -> Result<()>
+{
+    // `t2.a` dropped by the outer list is not the output `t1.a` the derived table
+    // shows under the name `a`: looked up by name alone it would pass for it, and
+    // the unqualified key would order by `t1.a`. Carried, the derived table has two
+    // outputs named `a`, and that is refused.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .cross_join(table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?)?
+        .project(vec![col("t1.a"), col("t2.a"), random().alias("r")])?
+        .sort(vec![col("r").add(col("t2.a")).sort(true, true)])?
+        .project(vec![col("t1.a"), col("r")])?
+        .build()?;
+
+    let err = plan_to_sql(&plan)
+        .expect_err("a dropped column named like an output must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection has two outputs named a"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_build_side()
+-> Result<()> {
+    // An EXISTS body's rows are only tested for existence, so without a row bound
+    // the order its sort produces reaches nothing, and the sort is left out: no
+    // second draw to order by, and no derived table hiding the `u` the correlation
+    // appended to the body names. Semi and anti joins alike, with the sort at the
+    // top of the build side, below a filter, and under a list the sort fold keeps
+    // `r` in.
+    let schema = int32_schema(&["a"]);
+    let key = || col("r").add(lit(1.0)).sort(true, true);
+    for (join_type, exists) in [
+        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
+        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
+    ] {
+        let sorted = volatile_projection("u")?.sort(vec![key()])?.build()?;
+        let filtered_above = table_scan(Some("u"), &schema, Some(vec![0]))?
+            .project(vec![col("u.a").alias("a"), random().alias("r")])?
+            .sort(vec![key()])?
+            .filter(col("a").gt(lit(0)))?
+            .build()?;
+        let folded = volatile_projection("u")?
+            .sort(vec![key()])?
+            .project(vec![col("u.a"), col("r")])?
+            .build()?;
+        for (build, body_filter) in [
+            (sorted, ""),
+            (filtered_above, "(u.a > 0) AND "),
+            (folded, ""),
+        ] {
+            let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+                .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
+                .build()?;
+            assert_eq!(
+                plan_to_sql(&plan)?.to_string(),
+                format!(
+                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM u WHERE {body_filter}(t.a = u.a))"
+                ),
+                "{join_type:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_out() -> Result<()> {
+    // A join leaves its output order unspecified, so the order of one of its inputs
+    // reaches nothing: not the rows, not their order, and not which rows a LIMIT
+    // above the join keeps. The sort is left out. Written onto the SELECT the join
+    // shares, its ORDER BY would replace the one a sort above the join set, and the
+    // LIMIT there would keep rows by a second draw instead of by `t.a`.
+    let schema = int32_schema(&["a"]);
+    let sorted = || -> Result<LogicalPlan> {
+        volatile_projection("u")?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()
+    };
+    let on = || vec![col("t.a").eq(col("u.a"))];
+
+    let right = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(sorted()?, datafusion_expr::JoinType::Inner, on())?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&right)?,
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a)"#
+    );
+
+    let left = LogicalPlanBuilder::from(sorted()?)
+        .join_on(
+            table_scan(Some("t"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            on(),
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&left)?,
+        @r#"SELECT u.a, random() AS r, t.a FROM u INNER JOIN t ON (t.a = u.a)"#
+    );
+
+    let limited = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(sorted()?, datafusion_expr::JoinType::Inner, on())?
+        .limit(0, Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&limited)?,
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) LIMIT 3"#
+    );
+
+    let sorted_above = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(sorted()?, datafusion_expr::JoinType::Inner, on())?
+        .sort_with_limit(vec![col("t.a").sort(true, true)], Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&sorted_above)?,
+        @r#"SELECT t.a, u.a, random() AS r FROM t INNER JOIN u ON (t.a = u.a) ORDER BY t.a ASC NULLS FIRST LIMIT 3"#
+    );
+
+    // The probe side of a semi join is read the same way.
+    let probe_sorted = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+    let semi = LogicalPlanBuilder::from(probe_sorted)
+        .join_on(
+            table_scan(Some("u"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::LeftSemi,
+            on(),
+        )?
+        .sort_with_limit(vec![col("t.a").sort(true, true)], Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&semi)?,
+        @r#"SELECT t.a, random() AS r FROM t WHERE EXISTS (SELECT 1 FROM u WHERE (t.a = u.a)) ORDER BY t.a ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_under_a_limit_below_another_sort_is_scoped()
+-> Result<()> {
+    // `Sort(t.a) → Limit(1) → Sort[(r + 1.0)] → Projection`: the LIMIT keeps the row
+    // the lower sort ranks first, so that sort's order can be observed although an
+    // ORDER BY sits above it, and its key reads `r` from a scope. Ordering the one
+    // row the LIMIT keeps by `t.a` changes nothing. The same on an EXISTS build
+    // side, where the bound moves the body under the build side's name.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .limit(0, Some(1))?
+        .sort(vec![col("t.a").sort(true, true)])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1"#
+    );
+
+    let build = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .limit(0, Some(1))?
+        .sort(vec![col("u.a").sort(true, true)])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1) AS u WHERE (t.a = u.a))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_fetched_sort_key_reading_a_volatile_output_in_a_join_input_is_refused()
+-> Result<()> {
+    // A fetch makes the input's order decide which of its rows the join reads, but
+    // a derived table in the SELECT the join shares would hide the relation its ON
+    // clause names, so the scope cannot be built there and the shape is refused.
+    let schema = int32_schema(&["a"]);
+    let right = volatile_projection("u")?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    let err = plan_to_sql(&plan)
+        .expect_err("a fetched sort scope in a join input must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the sort's fetch bounds an input of a join"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_scoped()
+-> Result<()> {
+    // A bounded build side is emitted as a derived table under the build side's
+    // own name, and the correlation binds to that alias, so the scope inside it
+    // is sound and is built.
+    let schema = int32_schema(&["a"]);
+    let build = table_scan(Some("u"), &schema, Some(vec![0]))?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .limit(0, Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_side_is_scoped()
+-> Result<()> {
+    // A `Sort` carrying its own `fetch` bounds the build side exactly as a `Limit`
+    // above the sort does: the emitted `LIMIT` is what `bounds_rows()` reads, so the
+    // body moves into a derived table under the build side's own name and the
+    // correlation binds to that alias, outside the scope. The bound makes the sort's
+    // order observable, so the scope is built, and the emitted SQL is the one the
+    // `Limit` form of this plan produces.
+    let schema = int32_schema(&["a"]);
+    for (join_type, exists) in [
+        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
+        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
+    ] {
+        let build = volatile_projection("u")?
+            .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
+            .build()?;
+        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+            .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
+            .build()?;
+
+        assert_eq!(
+            plan_to_sql(&plan)?.to_string(),
+            format!(
+                "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
+            ),
+            "{join_type:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_scoped()
+-> Result<()> {
+    // The upper sort's fetch bounds the body, so the lower sort is reached with a
+    // row bound on it and its scope is built, inside the derived table the bound
+    // moves the body into. This pins where the correlation binds; the ORDER BY a
+    // sort directly over another sort emits is spiceai/spiceai#14733.
+    let schema = int32_schema(&["a"]);
+    let build = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .sort_with_limit(vec![col("a").sort(true, true)], Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert!(
+        sql.ends_with(") AS u WHERE (t.a = u.a))"),
+        "correlation must bind to the bounded scope's alias: {sql}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_struct_field_filter_above_a_sort_keyed_on_the_volatile_output_reads_the_scope()
+-> Result<()> {
+    // The WHERE above the sort reads a field of a struct column, `t.payload.x`: the
+    // relation is the leading part only, and re-pointing it onto the derived table
+    // keeps the column and its field path.
+    use datafusion_functions::core::expr_ext::FieldAccessor;
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new(
+            "payload",
+            DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into()),
+            false,
+        ),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.a"), col("t.payload"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("t.payload").field("x").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, payload, r FROM (SELECT t.a, t.payload, random() AS r FROM t) WHERE (payload.x > 1) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_re_pointed_onto_a_sort_scope_is_a_plain_identifier() -> Result<()> {
+    // The re-pointed reference is the node a one-part name is planned as, not a
+    // compound identifier of one part, which prints the same and plans differently.
+    let plan = volatile_projection("t")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("t.a").gt(lit(1)))?
+        .build()?;
+
+    let ast = format!("{:?}", plan_to_sql(&plan)?);
+    assert!(
+        ast.contains(r#"Identifier(Ident { value: "a""#),
+        "the re-pointed `a` must be an Identifier: {ast}"
+    );
+    assert!(
+        !ast.contains(r#"CompoundIdentifier([Ident { value: "a""#),
+        "the re-pointed `a` must not be a one-part CompoundIdentifier: {ast}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_named_by_a_declared_schema_is_scoped()
+-> Result<()> {
+    // A projection built with a declared schema names its output `x` while the
+    // expression is a bare `random()`. The key's `x` is resolved through that
+    // schema, as the inliner resolves it, so it is recognised as a second draw and
+    // scoped, and the derived table aliases the expression to the declared name the
+    // SELECT above reads.
+    let scan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![Field::new("x", DataType::Float64, false)].into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = Projection::try_new_with_schema(
+        vec![random()],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .sort(vec![col("x").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) ORDER BY (x + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_fold_that_reorders_its_list_keeps_a_key_on_its_own_output() -> Result<()> {
+    // `Projection[c, a] → Sort[(a + 1)] → Projection[t.a AS a, (t.b * 2) AS c]`: the
+    // fold gives the projection below the sort the outer list's expressions, in the
+    // outer list's order and with the inner field of each, so the key's `a` resolves
+    // to the output that is `a`, not to the expression at `a`'s index in the inner list:
+    // `ORDER BY ((t.b * 2) + 1)` would order the rows by another column. With and
+    // without a volatile output beside it.
+    let schema = int32_schema(&["a", "b"]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![
+            col("t.a").alias("a"),
+            (col("t.b") * lit(2)).alias("c"),
+        ])?
+        .sort(vec![col("a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("c"), col("a")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.b * 2) AS c, t.a AS a FROM t ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.a").alias("a"), random().alias("r")])?
+        .sort(vec![col("a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("r"), col("a")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT random() AS r, t.a AS a FROM t ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_fold_keeps_the_names_a_declared_schema_gives() -> Result<()> {
+    // `Projection[x] → Sort → Projection{[expr], declared schema [x]}`: the fold
+    // keeps the inner field of each output it lists, so the output keeps the name
+    // `x` the sort key reads. Renamed after its expression, `x` would bind to the
+    // table's own column `x` instead, and the rows would be ordered by another
+    // column.
+    let declared = |data_type| {
+        DFSchema::from_unqualified_fields(
+            vec![Field::new("x", data_type, false)].into(),
+            std::collections::HashMap::new(),
+        )
+    };
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build();
+
+    let inner = Projection::try_new_with_schema(
+        vec![col("t.a") + lit(1)],
+        Arc::new(scan()?),
+        Arc::new(declared(DataType::Int32)?),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort(vec![col("x").sort(false, true)])?
+        .project(vec![col("x")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.a + 1) FROM t ORDER BY (t.a + 1) DESC NULLS FIRST"#
+    );
+
+    // A volatile output under that name is recognised through it and scoped.
+    let inner = Projection::try_new_with_schema(
+        vec![random()],
+        Arc::new(scan()?),
+        Arc::new(declared(DataType::Float64)?),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort(vec![col("x").add(lit(1.0)).sort(true, true)])?
+        .project(vec![col("x")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) ORDER BY (x + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_fold_under_a_renaming_list_keeps_the_name_the_key_reads() -> Result<()> {
+    // `Projection{[u.a, r], declared [u.a, z]} → Sort[(r + 1.0)] → Projection[u.a,
+    // random() AS r]`: the outer list renames `r` through its schema. The fold keeps
+    // the inner field the key reads by, `r`, so the volatile output is recognised,
+    // scoped, and refused where a derived table does not fix it.
+    let sorted = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+    let renamed = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("u")),
+                Arc::new(Field::new("a", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("z", DataType::Float64, false))),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![col("u.a"), col("r")],
+        Arc::new(sorted),
+        Arc::new(renamed),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    let err = Unparser::new(&SqliteDialect {})
+        .plan_to_sql(&plan)
+        .expect_err("the SQLite dialect must refuse the scope");
+    assert_eq!(err.to_string(), VOLATILE_SORT_SCOPE_REFUSAL);
+    Ok(())
+}
+
+#[test]
+fn test_sort_fold_matches_each_listed_expression_to_its_own_output() -> Result<()> {
+    // The fold matches the outer list's expressions to the inner outputs by the
+    // spelling it compares them by, so an unaliased expression output keeps its own
+    // field when the outer list renames it through a declared schema, and the key
+    // naming that field resolves to the expression and inlines it. An output the
+    // outer list repeats keeps the fold, under the outer field the second time.
+    let t = || table_scan(Some("t"), &int32_schema(&["a", "b"]), None);
+
+    let inner = t()?
+        .project(vec![col("t.b") * lit(2), col("t.a"), col("t.b")])?
+        .build()?;
+    let key = Expr::Column(Column::new_unqualified("t.b * Int32(2)")).add(lit(1));
+    let sorted = LogicalPlanBuilder::from(inner)
+        .sort(vec![key.sort(true, true)])?
+        .build()?;
+    let renamed = DFSchema::new_with_metadata(
+        vec![
+            (None, Arc::new(Field::new("dbl", DataType::Int32, false))),
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("a", DataType::Int32, false)),
+            ),
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("b", DataType::Int32, false)),
+            ),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![col("t.b") * lit(2), col("t.a"), col("t.b")],
+        Arc::new(sorted),
+        Arc::new(renamed),
+    )?);
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT (t.b * 2), t.a, t.b FROM t ORDER BY ((t.b * 2) + 1) ASC NULLS FIRST"#
+    );
+
+    let sorted = t()?
+        .project(vec![col("t.a"), col("t.b")])?
+        .sort(vec![col("t.b").sort(true, true)])?
+        .build()?;
+    let repeated = DFSchema::new_with_metadata(
+        vec![
+            (None, Arc::new(Field::new("a1", DataType::Int32, false))),
+            (None, Arc::new(Field::new("a2", DataType::Int32, false))),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![col("t.a"), col("t.a")],
+        Arc::new(sorted),
+        Arc::new(repeated),
+    )?);
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.a, t.a FROM t ORDER BY t.b ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_beside_a_wildcard_is_refused() -> Result<()> {
+    // A projection built with a declared schema can hold a wildcard, which stands
+    // for any number of the input's columns, so its expressions do not line up with
+    // its fields by position, and neither the scope nor the inliner can tell which
+    // expression the key's `r` names. Beside an output that cannot be repeated the
+    // shape is refused, before the wildcard or after it. A bare key naming the alias
+    // is emitted as that name and never inlined, so it keeps the plain form.
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "b"]), None);
+    for wildcard_first in [true, false] {
+        #[expect(deprecated)]
+        let wildcard = Expr::Wildcard {
+            qualifier: None,
+            options: Box::default(),
+        };
+        let (exprs, listed) = if wildcard_first {
+            (
+                vec![wildcard, random().alias("r")],
+                vec![col("t.a"), col("t.b"), random().alias("r")],
+            )
+        } else {
+            (
+                vec![random().alias("r"), wildcard],
+                vec![random().alias("r"), col("t.a"), col("t.b")],
+            )
+        };
+        let declared = scan()?.project(listed)?.build()?;
+        let projection = Projection::try_new_with_schema(
+            exprs,
+            Arc::new(scan()?.build()?),
+            Arc::clone(declared.schema()),
+        )?;
+        let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+
+        let err = plan_to_sql(&plan)
+            .expect_err("a wildcard beside the volatile output must be refused");
+        assert_eq!(
+            err.to_string(),
+            "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection also holds a wildcard",
+            "wildcard_first={wildcard_first}"
+        );
+
+        let LogicalPlan::Sort(sort) = plan else {
+            unreachable!("the plan was built with a sort on top");
+        };
+        let bare = LogicalPlan::Sort(datafusion_expr::Sort {
+            expr: vec![col("r").sort(true, true)],
+            input: sort.input,
+            fetch: None,
+        });
+        let select = if wildcard_first {
+            "*, random() AS r"
+        } else {
+            "random() AS r, *"
+        };
+        assert_eq!(
+            plan_to_sql(&bare)?.to_string(),
+            format!("SELECT {select} FROM t ORDER BY r ASC NULLS FIRST"),
+            "wildcard_first={wildcard_first}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_bare_sort_key_naming_a_declared_output_its_alias_does_not_name_is_scoped()
+-> Result<()> {
+    // A declared schema can name an output `x` while its expression keeps an alias
+    // of its own, `random() AS z`. The bare key `x` is not emitted as an output's
+    // name, since the SELECT list shows `z`, so `ORDER BY x` would bind the table's
+    // own column `x`. It is scoped instead, and the derived table names the output
+    // `x`.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![Field::new("x", DataType::Float64, false)].into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = Projection::try_new_with_schema(
+        vec![random().alias("z")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .sort(vec![col("x").sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) ORDER BY x ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bare_sort_key_naming_a_listed_alias_beside_a_wildcard_keeps_the_plain_form()
+-> Result<()> {
+    // Beside a wildcard the projection's expressions do not line up with its fields
+    // by position: the key `s` is the third field, where the third expression is
+    // `random() AS r`. The key names the listed alias `s`, so it is emitted as that
+    // name, with or without a fetch, and the plan is unparsed in the plain form.
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "b"]), None);
+    let declared = scan()?
+        .project(vec![
+            col("t.a"),
+            col("t.b"),
+            (col("t.a") + lit(1)).alias("s"),
+            random().alias("r"),
+        ])?
+        .build()?;
+    #[expect(deprecated)]
+    let wildcard = Expr::Wildcard {
+        qualifier: None,
+        options: Box::default(),
+    };
+    let projection = Projection::try_new_with_schema(
+        vec![
+            wildcard,
+            (col("t.a") + lit(1)).alias("s"),
+            random().alias("r"),
+        ],
+        Arc::new(scan()?.build()?),
+        Arc::clone(declared.schema()),
+    )?;
+    for fetch in [None, Some(3)] {
+        let plan = LogicalPlan::Sort(datafusion_expr::Sort {
+            expr: vec![col("s").sort(true, true)],
+            input: Arc::new(LogicalPlan::Projection(projection.clone())),
+            fetch,
+        });
+        let limit = fetch.map_or_else(String::new, |n| format!(" LIMIT {n}"));
+        assert_eq!(
+            plan_to_sql(&plan)?.to_string(),
+            format!(
+                "SELECT *, (t.a + 1) AS s, random() AS r FROM t ORDER BY s ASC NULLS FIRST{limit}"
+            ),
+            "fetch={fetch:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_naming_a_declared_output_above_a_lowered_filter_reads_the_scope()
+-> Result<()> {
+    // The filter above the sort is lowered beneath it, and the key alone puts the
+    // projection in a scope built around the filter. The derived table names the
+    // output `x`, the name its declared schema gives `random() AS z`, which the
+    // `ORDER BY` above reads.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("x", DataType::Float64, false),
+            Field::new("y", DataType::Int32, false),
+        ]
+        .into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = Projection::try_new_with_schema(
+        vec![random().alias("z"), (col("t.a") + lit(1)).alias("y")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .sort(vec![col("x").sort(true, true)])?
+        .filter(col("y").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x, y FROM (SELECT random() AS x, (t.a + 1) AS y FROM t) WHERE (y > 1) ORDER BY x ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_reading_a_declared_output_its_alias_does_not_name_reads_the_scope()
+-> Result<()> {
+    // The derived table a filter scope builds names each output as the projection's
+    // schema does, so a declared name the alias does not carry is the one the
+    // `WHERE` above reads.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "x"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![Field::new("x", DataType::Float64, false)].into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = Projection::try_new_with_schema(
+        vec![random().alias("z")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .filter(col("x").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) WHERE (x > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_scope_names_a_declared_column_output_as_declared() -> Result<()> {
+    // A declared schema can rename a column output too: `t.a` declared as `b`. The
+    // scope a filter builds, alone or around a sort key lowered beneath it, shows
+    // the column as `b`, the name the `SELECT` above reads.
+    let scan = table_scan(Some("t"), &int32_schema(&["a", "c"]), None)?.build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("r", DataType::Float64, false),
+            Field::new("b", DataType::Int32, false),
+        ]
+        .into(),
+        std::collections::HashMap::new(),
+    )?;
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![random().alias("r"), col("t.a")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?);
+
+    let filtered = LogicalPlanBuilder::from(projection.clone())
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&filtered)?,
+        @r#"SELECT r, b FROM (SELECT random() AS r, t.a AS b FROM t) WHERE (r > 0.5)"#
+    );
+
+    let sorted = LogicalPlanBuilder::from(projection)
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&sorted)?,
+        @r#"SELECT r, b FROM (SELECT random() AS r, t.a AS b FROM t) WHERE (b > 0) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_scope_names_a_declared_output_through_a_distinct_or_an_alias() -> Result<()>
+{
+    // The filter scope reaches its projection through a `DISTINCT` or a
+    // `SubqueryAlias`, and shows each output there under its declared name too.
+    let scan = || table_scan(Some("t"), &int32_schema(&["a", "x"]), None);
+    let declared = || {
+        DFSchema::from_unqualified_fields(
+            vec![Field::new("x", DataType::Float64, false)].into(),
+            std::collections::HashMap::new(),
+        )
+    };
+    let projection = |expr: Expr| -> Result<LogicalPlan> {
+        Ok(LogicalPlan::Projection(Projection::try_new_with_schema(
+            vec![expr],
+            Arc::new(scan()?.build()?),
+            Arc::new(declared()?),
+        )?))
+    };
+
+    let distinct = LogicalPlanBuilder::from(projection(random().alias("z"))?)
+        .distinct()?
+        .filter(col("x").gt(lit(0.5)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&distinct)?,
+        @r#"SELECT x FROM (SELECT DISTINCT random() AS x FROM t) WHERE (x > 0.5)"#
+    );
+
+    let aliased = LogicalPlanBuilder::from(projection(random().alias("z"))?)
+        .alias("sq")?
+        .filter(col("sq.x").gt(lit(0.5)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&aliased)?,
+        @r#"SELECT x FROM (SELECT random() AS x FROM t) AS sq WHERE (x > 0.5)"#
+    );
+
+    let repeatable = LogicalPlanBuilder::from(projection(
+        cast(col("t.a"), DataType::Float64).alias("z"),
+    )?)
+    .alias("sq")?
+    .filter(col("sq.x").gt(lit(0.5)))?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&repeatable)?,
+        @r#"SELECT x FROM (SELECT CAST(t.a AS DOUBLE) AS x FROM t) AS sq WHERE (x > 0.5)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_scope_over_two_declared_outputs_of_one_name_is_refused() -> Result<()> {
+    // Two declared outputs of one name cannot be told apart once the scope's
+    // references are unqualified, so either scope refuses the projection before
+    // renaming its outputs, rather than failing to build the renamed one.
+    let scan = table_scan(Some("t"), &int32_schema(&["a"]), None)?.build()?;
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("q1")),
+                Arc::new(Field::new("x", DataType::Float64, false)),
+            ),
+            (
+                Some(TableReference::bare("q2")),
+                Arc::new(Field::new("x", DataType::Int32, false)),
+            ),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![random().alias("z"), col("t.a")],
+        Arc::new(scan),
+        Arc::new(declared),
+    )?);
+
+    let filtered = LogicalPlanBuilder::from(projection.clone())
+        .filter(col("q1.x").gt(lit(0.5)))?
+        .build()?;
+    let err = plan_to_sql(&filtered).expect_err("the filter scope must refuse");
+    assert_eq!(
+        err.to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the projection has two outputs named x"
+    );
+
+    let sorted = LogicalPlanBuilder::from(projection)
+        .sort(vec![col("q1.x").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+    let err = plan_to_sql(&sorted).expect_err("the sort scope must refuse");
+    assert_eq!(
+        err.to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection has two outputs named x"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_aggregate_keeps_a_sibling_relation_whose_name_extends_an_enclosed_one()
+-> Result<()> {
+    // A derived aggregate over `t` re-points the clauses its SELECT already carries.
+    // With fully qualified columns the GROUP BY of the aggregate above the join reads
+    // `t.s.a`: column `a` of the relation `t.s` the join reads beside the derived
+    // table. On names alone that is also a field path through a column `s` of the
+    // enclosed `t`, which `t` does or does not have here, so beside the join's other
+    // input only the full qualifier is matched, and the reference keeps it.
+    let ts = || TableReference::partial("t", "s");
+    for grouped_s in [false, true] {
+        let (columns, groups): (&[&str], _) = if grouped_s {
+            (&["a", "s", "b"], vec![col("t.a"), col("t.s")])
+        } else {
+            (&["a", "b"], vec![col("t.a")])
+        };
+        let inner = table_scan(Some("t"), &int32_schema(columns), None)?
+            .aggregate(
+                groups,
+                vec![datafusion_functions_aggregate::count::count(col("t.b")).alias("n")],
+            )?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(inner)
+            .join(
+                table_scan(Some(ts()), &int32_schema(&["a", "c"]), None)?.build()?,
+                datafusion_common::JoinType::Inner,
+                (
+                    vec![Column::from_qualified_name("t.a")],
+                    vec![Column::new(Some(ts()), "a")],
+                ),
+                None,
+            )?
+            .aggregate(
+                vec![Expr::Column(Column::new(Some(ts()), "a"))],
+                vec![datafusion_functions_aggregate::count::count(lit(1)).alias("m")],
+            )?
+            .build()?;
+
+        let dialect = CustomDialectBuilder::default()
+            .with_full_qualified_col(true)
+            .build();
+        let sql = Unparser::new(&dialect).plan_to_sql(&plan)?.to_string();
+        assert!(
+            sql.starts_with("SELECT count(1) AS m, t.s.a FROM "),
+            "grouped_s={grouped_s}: {sql}"
+        );
+        assert!(
+            sql.ends_with(" GROUP BY t.s.a"),
+            "grouped_s={grouped_s}: {sql}"
+        );
+        assert!(
+            !sql.contains("derived_aggregate_1.s"),
+            "grouped_s={grouped_s}: {sql}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_scope_refuses_an_outer_reference_its_alias_would_capture() -> Result<()> {
+    // Inside a correlated scalar subquery the scope's derived table takes the alias
+    // `derived_projection` on a dialect that names every derived table, and the
+    // outer reference `derived_projection.r`, to the enclosing query's relation of
+    // that name, would bind to it: `r * r`. That scope is refused, for a sort key
+    // and for a filter, while a dialect that leaves the table unnamed keeps it.
+    let outer_r = || out_ref_col(DataType::Float64, "derived_projection.r");
+    let pick = |inner: LogicalPlan| -> Result<LogicalPlan> {
+        table_scan(
+            Some("derived_projection"),
+            &Schema::new(vec![Field::new("r", DataType::Float64, false)]),
+            None,
+        )?
+        .project(vec![
+            col("derived_projection.r"),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_r()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()
+    };
+    let draws = || {
+        table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .project(vec![random().alias("r")])
+    };
+
+    let sorted = pick(
+        draws()?
+            .sort_with_limit(vec![(col("r") * outer_r()).sort(false, false)], Some(1))?
+            .project(vec![col("r")])?
+            .build()?,
+    )?;
+    let filtered = pick(
+        draws()?
+            .filter(col("r").gt(outer_r()))?
+            .limit(0, Some(1))?
+            .build()?,
+    )?;
+
+    let postgres = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_eq!(
+        postgres
+            .plan_to_sql(&sorted)
+            .expect_err("the sort scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the outer reference derived_projection.r carries a name the unparser gives a derived table"
+    );
+    assert_eq!(
+        postgres
+            .plan_to_sql(&filtered)
+            .expect_err("the filter scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the outer reference derived_projection.r carries a name the unparser gives a derived table"
+    );
+
+    assert_snapshot!(
+        plan_to_sql(&sorted)?,
+        @r#"SELECT derived_projection.r, (SELECT r FROM (SELECT random() AS r FROM t) ORDER BY (r * derived_projection.r) DESC NULLS LAST LIMIT 1) AS pick FROM derived_projection"#
+    );
+    assert_snapshot!(
+        plan_to_sql(&filtered)?,
+        @r#"SELECT derived_projection.r, (SELECT r FROM (SELECT random() AS r FROM t) WHERE (r > derived_projection.r) LIMIT 1) AS pick FROM derived_projection"#
+    );
+
+    // The same reference in a clause above the scope, an ORDER BY the filter scope
+    // re-points, is refused the same way.
+    let reordered = pick(
+        table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .project(vec![random().alias("r"), col("t.a")])?
+            .filter(col("r").gt(lit(0.5)))?
+            .sort(vec![(col("a") * outer_r()).sort(false, false)])?
+            .project(vec![col("r")])?
+            .limit(0, Some(1))?
+            .build()?,
+    )?;
+    assert_eq!(
+        postgres
+            .plan_to_sql(&reordered)
+            .expect_err("the re-pointed ORDER BY must be refused")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the outer reference derived_projection.r carries a name the unparser gives a derived table"
+    );
+    assert_snapshot!(
+        plan_to_sql(&reordered)?,
+        @r#"SELECT derived_projection.r, (SELECT r FROM (SELECT r, a FROM (SELECT random() AS r, t.a FROM t) WHERE (r > 0.5) ORDER BY (a * derived_projection.r) DESC NULLS LAST) LIMIT 1) AS pick FROM derived_projection"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_scope_refuses_a_set_comparison_subquery() -> Result<()> {
+    // A set comparison (`= ANY`) holds a subquery whose body may correlate against
+    // the relation the scope would hide, here `t.b`, so a key or a predicate
+    // holding one is refused like any other subquery.
+    let any = || -> Result<Expr> {
+        let body = table_scan(Some("v"), &int32_schema(&["a", "b"]), None)?
+            .filter(col("v.b").eq(out_ref_col(DataType::Int32, "t.b")))?
+            .project(vec![col("v.a")])?
+            .build()?;
+        Ok(Expr::SetComparison(
+            datafusion_expr::expr::SetComparison::new(
+                Box::new(col("t.a")),
+                datafusion_expr::Subquery {
+                    subquery: Arc::new(body),
+                    outer_ref_columns: vec![out_ref_col(DataType::Int32, "t.b")],
+                    spans: datafusion_common::Spans::new(),
+                },
+                datafusion_expr::Operator::Eq,
+                datafusion_expr::expr::SetQuantifier::Any,
+            ),
+        ))
+    };
+    let projection = || {
+        table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?.project(vec![
+            col("t.a"),
+            col("t.b"),
+            random().alias("r"),
+        ])
+    };
+
+    let sorted = projection()?
+        .sort(vec![
+            (col("r") + lit(1.0)).sort(true, true),
+            any()?.sort(true, true),
+        ])?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&sorted)
+            .expect_err("the sort scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the key holds a subquery"
+    );
+
+    let filtered = projection()?
+        .filter(col("r").gt(lit(0.5)).and(any()?))?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&filtered)
+            .expect_err("the filter scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the predicate holds a subquery"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_an_output_holding_a_set_comparison_is_scoped() -> Result<()> {
+    // An output holding a set comparison (`< ANY`) holds a subquery, which a key
+    // inlining it would evaluate again: here a second draw of `random()`. It is
+    // scoped like an output holding any other subquery.
+    let body = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .project(vec![random().alias("d")])?
+        .build()?;
+    let any = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+        Box::new(lit(0.5)),
+        datafusion_expr::Subquery {
+            subquery: Arc::new(body),
+            outer_ref_columns: vec![],
+            spans: datafusion_common::Spans::new(),
+        },
+        datafusion_expr::Operator::Lt,
+        datafusion_expr::expr::SetQuantifier::Any,
+    ));
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .project(vec![col("t.a"), any.alias("r")])?
+        .sort(vec![datafusion_expr::not(col("r")).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, 0.5 < ANY(SELECT random() AS d FROM v) AS r FROM t) ORDER BY NOT r ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_repointed_outer_reference_is_not_read_as_a_field_path_the_types_lack()
+-> Result<()> {
+    // With fully qualified columns the ORDER BY above a filter scope reads `t.s.a`:
+    // column `a` of the enclosing query's relation `t.s`. The scope encloses a `t`
+    // with a struct column `s`, which has no field `a`, so the reference is not a
+    // field path through it and keeps its qualifier.
+    let struct_type =
+        DataType::Struct(vec![Field::new("q", DataType::Int32, false)].into());
+    let inner_t = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("s", struct_type, false),
+    ]);
+    let ts = || TableReference::partial("t", "s");
+    let outer_a = || out_ref_col(DataType::Int32, Column::new(Some(ts()), "a"));
+    let inner = table_scan(Some("t"), &inner_t, None)?
+        .project(vec![random().alias("r"), col("t.k"), col("t.s")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .sort(vec![(col("k") * outer_a()).sort(false, false)])?
+        .project(vec![col("r")])?
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = table_scan(Some(ts()), &int32_schema(&["a"]), None)?
+        .project(vec![
+            Expr::Column(Column::new(Some(ts()), "a")),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_a()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @r#"SELECT t.s.a, (SELECT r FROM (SELECT r, k, s FROM (SELECT random() AS r, t.k, t.s FROM t) WHERE (r > 0.5) ORDER BY (k * t.s.a) DESC NULLS LAST) LIMIT 1) AS pick FROM t.s"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_scope_refuses_an_unqualified_outer_reference_named_like_its_output() -> Result<()>
+{
+    // In a correlated subquery the key `r + x` reads `x` from the enclosing query:
+    // a compound key does not see the SELECT list's alias `x`. The scope's derived
+    // table exposes its own `x`, which the unqualified reference would bind to
+    // instead, on any dialect, so the scope is refused.
+    let outer_x = || out_ref_col(DataType::Int64, "x");
+    let inner = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .project(vec![
+            (col("u.a") + lit(1i64)).alias("x"),
+            random().alias("r"),
+        ])?
+        .sort_with_limit(vec![(col("r") + outer_x()).sort(true, true)], Some(1))?
+        .project(vec![col("r")])?
+        .build()?;
+    let plan = table_scan(Some("o"), &int32_schema(&["a"]), None)?
+        .project(vec![(col("o.a") + lit(1i64)).alias("x")])?
+        .project(vec![
+            col("x"),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_x()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)
+            .expect_err("the scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the outer reference x carries the name of an output the derived table exposes"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
+    // A subquery in the key may correlate against the relation the derived table
+    // would hide, and its outer references cannot be told from ones that reach
+    // further out, so the shape is refused rather than rebound blindly.
+    let schema = int32_schema(&["a"]);
+    let subquery = Arc::new(
+        table_scan(Some("u"), &schema, Some(vec![0]))?
+            .aggregate(Vec::<Expr>::new(), vec![count(col("u.a"))])?
+            .build()?,
+    );
+    let plan = volatile_projection("t")?
+        .sort(vec![
+            col("r").add(scalar_subquery(subquery)).sort(true, true),
+        ])?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a key holding a subquery must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the key holds a subquery"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_refuses_two_outputs_of_one_name() -> Result<()>
+{
+    // Two outputs that differ only by qualifier cannot be told apart once the
+    // derived table has replaced the qualifiers.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t1"), &schema, Some(vec![0]))?
+        .join_on(
+            table_scan(Some("t2"), &schema, Some(vec![0]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t1.a").eq(col("t2.a"))],
+        )?
+        .project(vec![col("t1.a"), col("t2.a"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("two outputs named a must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the projection has two outputs named a"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_is_refused_where_a_derived_table_does_not_fix_it()
+-> Result<()> {
+    // The same engines that evaluate a derived table's volatile output again for a
+    // predicate do so for a key: every route to the sort's scope is refused there.
+    for dialect in [
+        &SqliteDialect {} as &dyn UnparserDialect,
+        &UnparserMySqlDialect {},
+    ] {
+        let unparser = Unparser::new(dialect);
+
+        let sort_arm = volatile_projection("t")?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+        let err = unparser
+            .plan_to_sql(&sort_arm)
+            .expect_err("a key that would build the scope must be refused");
+        assert_eq!(err.to_string(), VOLATILE_SORT_SCOPE_REFUSAL);
+
+        // The stack lowered beneath the sort folds the projection in on its own; the
+        // key builds the scope around it, and is gated there too.
+        let below_a_filter = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+            .project(vec![col("t.a").alias("a"), random().alias("r")])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .filter(col("a").gt(lit(0)))?
+            .build()?;
+        let err = unparser
+            .plan_to_sql(&below_a_filter)
+            .expect_err("a key below a lowered stack must be refused");
+        assert_eq!(err.to_string(), VOLATILE_SORT_SCOPE_REFUSAL);
+    }
+    Ok(())
+}
+
+#[test]
+fn test_having_below_a_sort_keyed_on_the_volatile_output_stays_inside_the_scope()
+-> Result<()> {
+    // `Sort → Projection → Filter → Aggregate`: the HAVING belongs to the aggregate
+    // the derived table encloses, so it is emitted inside it, under the SELECT
+    // that computes the aggregate, and the ORDER BY above reads `r` by name.
+    let schema = int32_schema(&["a", "b"]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .filter(col("sum(t.b)").gt(lit(0)))?
+        .project(vec![
+            col("t.a"),
+            col("sum(t.b)").alias("s"),
+            random().alias("r"),
+        ])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, s, r FROM (SELECT t.a, sum(t.b) AS s, random() AS r FROM t GROUP BY t.a HAVING (sum(t.b) > 0)) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_having_above_a_sort_keyed_on_the_volatile_output_is_refused() -> Result<()> {
+    // `Filter → Sort → Projection → Aggregate`, the filter reading the aggregate:
+    // it is emitted as a HAVING before the sort is reached, against the aggregate
+    // the scope would enclose. A HAVING cannot be lifted over a derived table —
+    // the aggregate it reads is nameable only in the SELECT computing it — and
+    // re-pointing it would leave `HAVING (sum(b) > 0)` outside a derived table
+    // that exposes no `b`. Refused rather than emitted unbindable.
+    let schema = int32_schema(&["a", "b"]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .project(vec![col("t.a"), col("sum(t.b)"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("sum(t.b)").gt(lit(0)))?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a HAVING above the scope must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when a HAVING or QUALIFY above it reads an aggregate or window the derived table would hide"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_qualify_above_a_sort_keyed_on_the_volatile_output_is_refused() -> Result<()> {
+    // The window counterpart: a filter on a window output above the sort is
+    // emitted as a QUALIFY, which reads the window the derived table would hide.
+    let schema = int32_schema(&["a"]);
+    let row_number = Expr::from(WindowFunction::new(
+        WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        vec![],
+    ));
+    let plan = table_scan(Some("t"), &schema, None)?
+        .window(vec![row_number.alias("rn")])?
+        .project(vec![col("t.a"), col("rn"), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("rn").gt(lit(1)))?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a QUALIFY above the scope must be refused");
+    assert_snapshot!(
+        err,
+        @"This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when a HAVING or QUALIFY above it reads an aggregate or window the derived table would hide"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_filter_above_a_subquery_alias_on_a_volatile_output_under_a_free_list_is_scoped()
 -> Result<()> {
@@ -14565,6 +16247,37 @@ fn test_a_distinct_scope_repoints_a_clause_naming_its_alias() -> Result<()> {
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @r#"SELECT a FROM (SELECT DISTINCT sq.a FROM (SELECT sq.a FROM t AS sq) AS sq) WHERE (random() < 0.5) ORDER BY (a + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_named_only_by_a_preserved_schema_is_scoped()
+-> Result<()> {
+    // An optimizer that rewrites a projection's expressions through
+    // `Projection::try_new_with_schema` keeps the outputs' declared names while the
+    // expression under one of them loses the alias that produced its name. The
+    // declared name is still the one a sort key reads, so the output has to be found
+    // under it: resolving the key against the expressions alone would miss `r`,
+    // leaving `ORDER BY (random() + 1.0)` to draw a second time. The expression is
+    // aliased back to its declared name, and the key reads that one value.
+    let scan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?.build()?;
+    let named = Projection::try_new(
+        vec![col("t.a"), random().alias("r")],
+        Arc::new(scan.clone()),
+    )?;
+    let rewritten = Projection::try_new_with_schema(
+        vec![col("t.a"), random()],
+        Arc::new(scan),
+        Arc::clone(&named.schema),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(rewritten))
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
     );
     Ok(())
 }
