@@ -16386,3 +16386,53 @@ fn test_struct_field_filter_re_pointed_onto_a_scope_reads_the_emitted_column_nam
     );
     Ok(())
 }
+
+#[test]
+fn test_scope_refuses_two_outputs_the_dialect_emits_under_one_name() -> Result<()> {
+    // BigQuery emits the output `x*` as `x_42`, the name of the projection's other
+    // output. The derived table a sort key reading `r` needs would expose two
+    // columns named `x_42`, which the SELECT reading it cannot tell apart, so the
+    // scope is refused rather than built.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1i64)).alias("x*"),
+            (col("t.a") + lit(2i64)).alias("x_42"),
+            random().alias("r"),
+        ])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_eq!(
+        Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)
+            .expect_err("the scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when two outputs the derived table exposes are both emitted as x_42"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_scope_refuses_two_outputs_the_dialect_emits_under_one_name() -> Result<()>
+{
+    // The filter counterpart: a predicate reading the volatile output `r` needs the
+    // projection as a derived table, which on BigQuery would expose `x*` and `x_42`
+    // both as `x_42`.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1i64)).alias("x*"),
+            (col("t.a") + lit(2i64)).alias("x_42"),
+            random().alias("r"),
+        ])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_eq!(
+        Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)
+            .expect_err("the scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when two outputs the derived table exposes are both emitted as x_42"
+    );
+    Ok(())
+}

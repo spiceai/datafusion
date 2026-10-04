@@ -68,7 +68,11 @@ use datafusion_expr::{
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::{collections::HashSet, sync::Arc, vec};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    vec,
+};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -128,7 +132,7 @@ fn merged_without_conflict(have: &DFSchema, add: &DFSchema) -> Option<DFSchema> 
             Err(_) => {
                 let addition = DFSchema::new_with_metadata(
                     vec![(qualifier.cloned(), Arc::clone(field))],
-                    std::collections::HashMap::new(),
+                    HashMap::new(),
                 )
                 .ok()?;
                 merged = merged.join(&addition).ok()?;
@@ -1133,6 +1137,9 @@ impl Unparser<'_> {
     ///   fields of `scope`, on any dialect;
     /// - on a dialect that names every derived table, one spelled with an alias the
     ///   unparser invents (`derived_projection`), which the scope's table takes.
+    ///
+    /// Refused first is a scope exposing two outputs the dialect emits under one
+    /// name ([`Self::scope_output_keys`]).
     fn ensure_scope_captures_no_outer_reference<'a>(
         &self,
         exprs: impl IntoIterator<Item = &'a Expr>,
@@ -1140,13 +1147,7 @@ impl Unparser<'_> {
         refuse: fn(&str) -> Result<()>,
     ) -> Result<()> {
         let names_derived_table = self.dialect.requires_derived_table_alias();
-        // Compared as the statement spells them: BigQuery writes an output `x*` as
-        // `x_42`, which an outer reference already named `x_42` would bind to.
-        let outputs = scope
-            .fields()
-            .iter()
-            .map(|field| self.emitted_column_key(field.name()))
-            .collect::<Result<HashSet<_>>>()?;
+        let outputs = self.scope_output_keys(scope, refuse)?;
         for expr in exprs {
             let mut captured = None;
             expr.apply(|node| {
@@ -1181,6 +1182,38 @@ impl Unparser<'_> {
             }
         }
         Ok(())
+    }
+
+    /// The outputs `scope` exposes, as the statement spells them
+    /// ([`Self::emitted_column_key`]): BigQuery writes an output `x*` as `x_42`, which
+    /// an outer reference already named `x_42` would bind to.
+    ///
+    /// Two outputs spelled alike are refused, with `refuse`. The `SELECT` reading the
+    /// derived table names its outputs unqualified, so it could not tell them apart —
+    /// `x*` and `x_42` both read as `x_42` — even though the plan's names differ and
+    /// pass the check [`super::utils::scope_sort_over_projection`] makes on them. Two
+    /// outputs the plan already names alike are refused as that check words it.
+    fn scope_output_keys(
+        &self,
+        scope: &DFSchema,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<HashSet<String>> {
+        let mut keys = HashMap::with_capacity(scope.fields().len());
+        for field in scope.fields() {
+            let key = self.emitted_column_key(field.name())?;
+            if let Some(first) = keys.insert(key, field.name()) {
+                if first == field.name() {
+                    refuse(&format!(
+                        "when the projection has two outputs named {first}"
+                    ))?;
+                }
+                refuse(&format!(
+                    "when two outputs the derived table exposes are both emitted as {}",
+                    self.emitted_column_name(field.name())?
+                ))?;
+            }
+        }
+        Ok(keys.into_keys().collect())
     }
 
     /// Refuses the derived table a sort key reading an output that cannot be
