@@ -16281,3 +16281,108 @@ fn test_sort_key_reading_a_volatile_output_named_only_by_a_preserved_schema_is_s
     );
     Ok(())
 }
+
+#[test]
+fn test_scope_refuses_an_outer_reference_named_like_the_emitted_spelling_of_its_output()
+-> Result<()> {
+    // BigQuery emits the output `x*` as `x_42`, since `*` is not legal in its column
+    // names. An unqualified outer reference already named `x_42` would bind to the
+    // derived table's output once the scope is built, so the scope compares the
+    // names the statement contains rather than the plan's.
+    let outer_x = || out_ref_col(DataType::Int64, "x_42");
+    let inner = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .project(vec![
+            (col("u.a") + lit(1i64)).alias("x*"),
+            random().alias("r"),
+        ])?
+        .sort_with_limit(vec![(col("r") + outer_x()).sort(true, true)], Some(1))?
+        .project(vec![col("r")])?
+        .build()?;
+    let plan = table_scan(Some("o"), &int32_schema(&["a"]), None)?
+        .project(vec![(col("o.a") + lit(1i64)).alias("x_42")])?
+        .project(vec![
+            col("x_42"),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_x()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()?;
+
+    assert_eq!(
+        Unparser::new(&BigQueryDialect {})
+            .plan_to_sql(&plan)
+            .expect_err("the scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the outer reference x_42 carries the name of an output the derived table exposes"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_scope_refuses_an_outer_reference_named_like_a_column_it_carries() -> Result<()> {
+    // The fold drops `u.y` from the projection while the key `r + u.y + y` still
+    // reads it, so the derived table carries `u.y` as a further output. The outer
+    // reference `y` would bind to that carried column, as it would to a listed
+    // output, so the scope is refused.
+    let outer_y = || out_ref_col(DataType::Int64, "y");
+    let inner = table_scan(Some("u"), &int32_schema(&["a", "y"]), None)?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .sort_with_limit(
+            vec![(col("r") + col("u.y") + outer_y()).sort(true, true)],
+            Some(1),
+        )?
+        .project(vec![col("r")])?
+        .build()?;
+    let plan = table_scan(Some("o"), &int32_schema(&["a"]), None)?
+        .project(vec![(col("o.a") + lit(1i64)).alias("y")])?
+        .project(vec![
+            col("y"),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_y()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)
+            .expect_err("the scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the outer reference y carries the name of an output the derived table exposes"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_struct_field_filter_re_pointed_onto_a_scope_reads_the_emitted_column_name()
+-> Result<()> {
+    // BigQuery emits the struct column `payload*` as `payload_42`. The WHERE above
+    // the sort reads `t.payload_42.x`, and the field path is recognised through the
+    // emitted spelling, so the relation the derived table hides is dropped from it.
+    use datafusion_functions::core::expr_ext::FieldAccessor;
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new(
+            "payload*",
+            DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into()),
+            false,
+        ),
+    ]);
+    let payload = || Expr::Column(Column::new(Some("t"), "payload*"));
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.a"), payload(), random().alias("r")])?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(payload().field("x").gt(lit(1)))?
+        .build()?;
+
+    assert_snapshot!(
+        Unparser::new(&BigQueryDialect {}).plan_to_sql(&plan)?,
+        @r#"SELECT `a`, `payload_42`, `r` FROM (SELECT `t`.`a`, `t`.`payload_42`, random() AS `r` FROM `t`) WHERE (`payload_42`.`x` > 1) ORDER BY (`r` + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}

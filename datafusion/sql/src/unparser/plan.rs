@@ -986,7 +986,8 @@ impl Unparser<'_> {
         // reference still qualified by a relation the derived table encloses binds
         // to nothing. DataFusion re-plans such SQL, but a stricter remote binder
         // rejects it, which is what breaks a federated pushdown.
-        let derived_qualifiers = enclosed_qualifiers(p.input.schema());
+        let derived_qualifiers =
+            enclosed_qualifiers(p.input.schema(), |name| self.emitted_column_name(name))?;
         select.visit_expressions_in_clauses_mut(|expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
                 requalify_column_onto_derived_table(
@@ -1139,18 +1140,20 @@ impl Unparser<'_> {
         refuse: fn(&str) -> Result<()>,
     ) -> Result<()> {
         let names_derived_table = self.dialect.requires_derived_table_alias();
+        // Compared as the statement spells them: BigQuery writes an output `x*` as
+        // `x_42`, which an outer reference already named `x_42` would bind to.
         let outputs = scope
             .fields()
             .iter()
-            .map(|field| self.identifier_comparison_key(field.name()))
-            .collect::<HashSet<_>>();
+            .map(|field| self.emitted_column_key(field.name()))
+            .collect::<Result<HashSet<_>>>()?;
         for expr in exprs {
             let mut captured = None;
             expr.apply(|node| {
                 if let Expr::OuterReferenceColumn(_, column) = node {
                     let carries = match &column.relation {
                         None if outputs
-                            .contains(&self.identifier_comparison_key(&column.name)) =>
+                            .contains(&self.emitted_column_key(&column.name)?) =>
                         {
                             Some("the name of an output the derived table exposes")
                         }
@@ -1198,7 +1201,7 @@ impl Unparser<'_> {
             );
         }
         self.repoint_clauses_onto_derived_table(
-            &enclosed_qualifiers(hidden),
+            &enclosed_qualifiers(hidden, |name| self.emitted_column_name(name))?,
             query,
             select,
             unrepeatable_sort_key_refusal,
@@ -2289,13 +2292,17 @@ impl Unparser<'_> {
                             // the alias is a level further down, enclosed by an
                             // unnamed derived table, and the name it gave those
                             // outputs is hidden like the relation's own.
-                            let mut hidden_qualifiers =
-                                enclosed_qualifiers(&filtered.projection.schema);
+                            let mut hidden_qualifiers = enclosed_qualifiers(
+                                &filtered.projection.schema,
+                                |name| self.emitted_column_name(name),
+                            )?;
                             if let Some(alias) = filtered.alias
                                 && filtered.through_distinct
                             {
                                 for (spelling, columns) in
-                                    enclosed_qualifiers(&alias.schema)
+                                    enclosed_qualifiers(&alias.schema, |name| {
+                                        self.emitted_column_name(name)
+                                    })?
                                 {
                                     hidden_qualifiers
                                         .entry(spelling)
@@ -2440,13 +2447,16 @@ impl Unparser<'_> {
                             relation,
                         );
                     }
+                    // The derived table exposes every column a key carries through
+                    // it beside the projection's outputs, and an outer reference
+                    // binds to either alike.
+                    let (scoped, derived) = scope_sort_over_projection(sort, projection)?;
                     self.ensure_scope_captures_no_outer_reference(
                         sort.expr.iter().map(|key| &key.expr),
-                        &projection.schema,
+                        &derived,
                         unrepeatable_sort_key_refusal,
                     )?;
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;
-                    let scoped = scope_sort_over_projection(sort, projection)?;
                     return self
                         .select_to_sql_recursively(&scoped, query, select, relation);
                 }
@@ -2538,7 +2548,10 @@ impl Unparser<'_> {
                     // reference still qualified by a relation the derived table encloses
                     // binds to nothing. DataFusion re-plans such SQL, but a stricter remote
                     // binder rejects it, which is what breaks a federated pushdown.
-                    let derived_qualifiers = enclosed_qualifiers(plan.schema());
+                    let derived_qualifiers =
+                        enclosed_qualifiers(plan.schema(), |name| {
+                            self.emitted_column_name(name)
+                        })?;
                     select.visit_expressions_in_clauses_mut(|expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
                             requalify_column_onto_derived_table(

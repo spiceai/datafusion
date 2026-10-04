@@ -25,8 +25,8 @@ use super::{
 };
 use arrow::datatypes::DataType;
 use datafusion_common::{
-    Column, DFSchema, DataFusionError, HashMap, Result, ScalarValue, TableReference,
-    assert_eq_or_internal_err, internal_err, not_impl_err,
+    Column, DFSchema, DFSchemaRef, DataFusionError, HashMap, Result, ScalarValue,
+    TableReference, assert_eq_or_internal_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
 use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
@@ -826,20 +826,29 @@ pub(crate) fn unrepeatable_sort_key_refusal<T>(detail: &str) -> Result<T> {
 pub(crate) type EnclosedRelations = HashMap<String, HashMap<String, DataType>>;
 
 /// The [`EnclosedRelations`] of a derived table built from a plan with `schema`.
-pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> EnclosedRelations {
+///
+/// Each column is keyed by `emitted_name`, the name the dialect writes for it, since
+/// the references these relations are matched against are already emitted: BigQuery
+/// writes the column `payload*` as `payload_42`, and a field path through it reads
+/// `t.payload_42.x`.
+pub(crate) fn enclosed_qualifiers(
+    schema: &DFSchema,
+    emitted_name: impl Fn(&str) -> Result<String>,
+) -> Result<EnclosedRelations> {
     let mut relations = EnclosedRelations::new();
     for (qualifier, field) in schema.iter() {
         let Some(qualifier) = qualifier else {
             continue;
         };
+        let name = emitted_name(field.name())?;
         for spelling in [qualifier.to_string(), qualifier.table().to_string()] {
             relations
                 .entry(spelling)
                 .or_default()
-                .insert(field.name().clone(), field.data_type().clone());
+                .insert(name.clone(), field.data_type().clone());
         }
     }
-    relations
+    Ok(relations)
 }
 
 /// Whether `predicate` reads a [Projection] output that cannot be repeated at the
@@ -1308,10 +1317,14 @@ pub(crate) fn scope_sort_keys(keys: &[SortExpr]) -> Result<Vec<SortExpr>> {
 /// `ORDER BY` emitted above then names. The fetch stays on the sort, above the
 /// scope: it bounds the ordered rows, and a derived table's row order does not
 /// reach the query reading it.
+///
+/// Returned beside the plan is the derived table's schema: the projection's outputs
+/// and every column a key carries through it, each of which the `ORDER BY` above
+/// can bind to.
 pub(crate) fn scope_sort_over_projection(
     sort: &Sort,
     projection: &Projection,
-) -> Result<LogicalPlan> {
+) -> Result<(LogicalPlan, DFSchemaRef)> {
     let expr = scope_sort_keys(&sort.expr)?;
     let outputs = projection
         .schema
@@ -1352,16 +1365,18 @@ pub(crate) fn scope_sort_over_projection(
         })?;
     }
     let inner = Projection::try_new(exprs, Arc::clone(&projection.input))?;
+    let derived = Arc::clone(&inner.schema);
     let input = projection_of_outputs(
         Arc::new(LogicalPlan::Projection(inner)),
         &outputs,
         unrepeatable_sort_key_refusal,
     )?;
-    Ok(LogicalPlan::Sort(Sort {
+    let scoped = LogicalPlan::Sort(Sort {
         expr,
         input: Arc::new(input),
         fetch: sort.fetch,
-    }))
+    });
+    Ok((scoped, derived))
 }
 
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {
