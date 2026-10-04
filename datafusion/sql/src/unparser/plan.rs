@@ -1124,48 +1124,67 @@ impl Unparser<'_> {
         true
     }
 
-    /// Readies this `SELECT` for the derived table a sort key reading an output that
-    /// cannot be repeated builds around the plan whose schema is `hidden`: the
-    /// dialect gate, the refusal inside a join input — which a sort reaches only
-    /// with a fetch, see [`Self::sort_order_is_observable`] — and the re-pointing of
-    /// the clauses already emitted against the relations that table hides.
     /// Refuses, with `refuse`, a scope whose `exprs` hold an outer reference the
-    /// derived table's own alias would capture. On a dialect that names every
-    /// derived table, the scope's table takes an alias the unparser invents
-    /// (`derived_projection`), and an outer reference spelled with that same name,
-    /// to a relation of the enclosing query that carries it, would bind to the
-    /// derived table instead.
-    fn ensure_scope_alias_captures_no_outer_reference<'a>(
+    /// derived table would capture, so that it read the scope instead of the
+    /// enclosing query:
+    ///
+    /// - an unqualified one named like an output the derived table exposes, the
+    ///   fields of `scope`, on any dialect;
+    /// - on a dialect that names every derived table, one spelled with an alias the
+    ///   unparser invents (`derived_projection`), which the scope's table takes.
+    fn ensure_scope_captures_no_outer_reference<'a>(
         &self,
         exprs: impl IntoIterator<Item = &'a Expr>,
+        scope: &DFSchema,
         refuse: fn(&str) -> Result<()>,
     ) -> Result<()> {
-        if !self.dialect.requires_derived_table_alias() {
-            return Ok(());
-        }
+        let names_derived_table = self.dialect.requires_derived_table_alias();
+        let outputs = scope
+            .fields()
+            .iter()
+            .map(|field| self.identifier_comparison_key(field.name()))
+            .collect::<HashSet<_>>();
         for expr in exprs {
             let mut captured = None;
             expr.apply(|node| {
-                if let Expr::OuterReferenceColumn(_, column) = node
-                    && let Some(relation) = &column.relation
-                    && Self::is_unparser_derived_alias(
-                        &self.emitted_qualifier_key(relation),
-                    )
-                {
-                    captured = Some(column.flat_name());
-                    return Ok(TreeNodeRecursion::Stop);
+                if let Expr::OuterReferenceColumn(_, column) = node {
+                    let carries = match &column.relation {
+                        None if outputs
+                            .contains(&self.identifier_comparison_key(&column.name)) =>
+                        {
+                            Some("the name of an output the derived table exposes")
+                        }
+                        Some(relation)
+                            if names_derived_table
+                                && Self::is_unparser_derived_alias(
+                                    &self.emitted_qualifier_key(relation),
+                                ) =>
+                        {
+                            Some("a name the unparser gives a derived table")
+                        }
+                        _ => None,
+                    };
+                    if let Some(carries) = carries {
+                        captured = Some((column.flat_name(), carries));
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
                 }
                 Ok(TreeNodeRecursion::Continue)
             })?;
-            if let Some(reference) = captured {
+            if let Some((reference, carries)) = captured {
                 return refuse(&format!(
-                    "when the outer reference {reference} carries a name the unparser gives a derived table"
+                    "when the outer reference {reference} carries {carries}"
                 ));
             }
         }
         Ok(())
     }
 
+    /// Readies this `SELECT` for the derived table a sort key reading an output that
+    /// cannot be repeated builds around the plan whose schema is `hidden`: the
+    /// dialect gate, the refusal inside a join input — which a sort reaches only
+    /// with a fetch, see [`Self::sort_order_is_observable`] — and the re-pointing of
+    /// the clauses already emitted against the relations that table hides.
     fn prepare_sort_key_scope(
         &self,
         hidden: &DFSchema,
@@ -1197,7 +1216,7 @@ impl Unparser<'_> {
     /// dialect that names every derived table one spelled with an alias the
     /// unparser invents (`derived_projection`) would bind to the scope's own table
     /// instead: refused the same way, as
-    /// [`Self::ensure_scope_alias_captures_no_outer_reference`] refuses one in the
+    /// [`Self::ensure_scope_captures_no_outer_reference`] refuses one in the
     /// expressions the scope places.
     fn repoint_clauses_onto_derived_table(
         &self,
@@ -2176,13 +2195,14 @@ impl Unparser<'_> {
                                 .collect::<Result<Vec<_>>>()?
                         };
                         let lowered = if keys_scope {
-                            self.ensure_scope_alias_captures_no_outer_reference(
+                            self.ensure_scope_captures_no_outer_reference(
                                 sort.expr.iter().map(|key| &key.expr).chain(
                                     filter_stack(&lowered)
                                         .0
                                         .into_iter()
                                         .map(|filter| &filter.predicate),
                                 ),
+                                sorted.schema(),
                                 unrepeatable_sort_key_refusal,
                             )?;
                             self.prepare_sort_key_scope(sorted.schema(), query, select)?;
@@ -2283,11 +2303,12 @@ impl Unparser<'_> {
                                         .extend(columns);
                                 }
                             }
-                            self.ensure_scope_alias_captures_no_outer_reference(
+                            self.ensure_scope_captures_no_outer_reference(
                                 filter_stack(plan)
                                     .0
                                     .into_iter()
                                     .map(|filter| &filter.predicate),
+                                &filtered.projection.schema,
                                 unrepeatable_output_refusal,
                             )?;
                             self.repoint_clauses_onto_derived_table(
@@ -2419,8 +2440,9 @@ impl Unparser<'_> {
                             relation,
                         );
                     }
-                    self.ensure_scope_alias_captures_no_outer_reference(
+                    self.ensure_scope_captures_no_outer_reference(
                         sort.expr.iter().map(|key| &key.expr),
+                        &projection.schema,
                         unrepeatable_sort_key_refusal,
                     )?;
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;

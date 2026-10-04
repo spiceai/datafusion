@@ -15688,6 +15688,44 @@ fn test_repointed_outer_reference_is_not_read_as_a_field_path_the_types_lack()
 }
 
 #[test]
+fn test_scope_refuses_an_unqualified_outer_reference_named_like_its_output() -> Result<()>
+{
+    // In a correlated subquery the key `r + x` reads `x` from the enclosing query:
+    // a compound key does not see the SELECT list's alias `x`. The scope's derived
+    // table exposes its own `x`, which the unqualified reference would bind to
+    // instead, on any dialect, so the scope is refused.
+    let outer_x = || out_ref_col(DataType::Int64, "x");
+    let inner = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .project(vec![
+            (col("u.a") + lit(1i64)).alias("x"),
+            random().alias("r"),
+        ])?
+        .sort_with_limit(vec![(col("r") + outer_x()).sort(true, true)], Some(1))?
+        .project(vec![col("r")])?
+        .build()?;
+    let plan = table_scan(Some("o"), &int32_schema(&["a"]), None)?
+        .project(vec![(col("o.a") + lit(1i64)).alias("x")])?
+        .project(vec![
+            col("x"),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_x()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)
+            .expect_err("the scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the outer reference x carries the name of an output the derived table exposes"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach
