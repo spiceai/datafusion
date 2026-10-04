@@ -1183,23 +1183,31 @@ impl Unparser<'_> {
         Ok(())
     }
 
-    /// Readies this `SELECT` for the derived table a sort key reading an output that
-    /// cannot be repeated builds around the plan whose schema is `hidden`: the
-    /// dialect gate, the refusal inside a join input — which a sort reaches only
-    /// with a fetch, see [`Self::sort_order_is_observable`] — and the re-pointing of
-    /// the clauses already emitted against the relations that table hides.
-    fn prepare_sort_key_scope(
-        &self,
-        hidden: &DFSchema,
-        query: &mut Option<QueryBuilder>,
-        select: &mut SelectBuilder,
-    ) -> Result<()> {
+    /// Refuses the derived table a sort key reading an output that cannot be
+    /// repeated needs where it cannot fix the key: on a dialect that evaluates the
+    /// output again, and inside a join input, which a sort reaches only with a
+    /// fetch — see [`Self::sort_order_is_observable`].
+    fn ensure_sort_key_scope_is_possible(&self, select: &SelectBuilder) -> Result<()> {
         self.ensure_derived_table_fixes_volatile_sort_keys()?;
         if select.within_join_input() {
             return unrepeatable_sort_key_refusal(
                 "when the sort's fetch bounds an input of a join",
             );
         }
+        Ok(())
+    }
+
+    /// Readies this `SELECT` for the derived table a sort key reading an output that
+    /// cannot be repeated builds around the plan whose schema is `hidden`: the
+    /// refusals of [`Self::ensure_sort_key_scope_is_possible`] and the re-pointing
+    /// of the clauses already emitted against the relations that table hides.
+    fn prepare_sort_key_scope(
+        &self,
+        hidden: &DFSchema,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+    ) -> Result<()> {
+        self.ensure_sort_key_scope_is_possible(select)?;
         self.repoint_clauses_onto_derived_table(
             &enclosed_qualifiers(hidden, |name| self.emitted_column_name(name))?,
             query,
@@ -2447,6 +2455,9 @@ impl Unparser<'_> {
                             relation,
                         );
                     }
+                    // Refused first, so a dialect or join input the scope cannot fix
+                    // is what is reported rather than a failure building the scope.
+                    self.ensure_sort_key_scope_is_possible(select)?;
                     // The derived table exposes every column a key carries through
                     // it beside the projection's outputs, and an outer reference
                     // binds to either alike.
