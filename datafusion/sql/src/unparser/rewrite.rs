@@ -17,7 +17,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
-use arrow::datatypes::Schema;
+use arrow::datatypes::{DataType, Schema};
 use datafusion_common::tree_node::TreeNodeContainer;
 use datafusion_common::{
     Column, DFSchema, HashMap, Result, TableReference,
@@ -647,11 +647,14 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// relation, so a multi-part one (`db.schema.t`) is recognised whole. A reference that
 /// goes on past the column — a field path, `t.payload.x` — has a shorter qualifier, and
 /// is re-pointed only where the derived table is the SELECT's only relation (`None`):
-/// there the qualifier is the longest leading run naming an enclosed relation whose next
-/// identifier is one of that relation's columns, and the column and its path are kept.
-/// Beside another relation, a join's other input, a shorter run cannot be told apart on
-/// names alone from that relation's own name — `t.s.a` is as much column `a` of a
-/// relation `t.s` — so with `Some(alias)` only the full qualifier is matched.
+/// there the qualifier is the longest leading run naming an enclosed relation through
+/// whose columns the rest is a field path — a column, then a field of each struct in
+/// turn — and the column and its path are kept. Beside another relation, a join's other
+/// input, a shorter run cannot be told apart on names alone from that relation's own
+/// name — `t.s.a` is as much column `a` of a relation `t.s` — so with `Some(alias)` only
+/// the full qualifier is matched. Requiring the path to exist in the enclosed types keeps
+/// a correlated reference to an enclosing `t.s` as it is unless `t` also has a struct
+/// column `s` with a field `a`, where the SQL text itself reads either way.
 ///
 /// Both tests are on names alone, so neither distinguishes a correlated reference to an
 /// enclosing query — that qualifier can name the very same relation. A caller must not
@@ -661,7 +664,7 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
 pub fn requalify_column_onto_derived_table(
     idents: &mut Vec<Ident>,
-    derived_relations: &HashMap<String, HashSet<String>>,
+    derived_relations: &HashMap<String, HashMap<String, DataType>>,
     alias: Option<&Ident>,
 ) {
     let shortest = if alias.is_some() {
@@ -676,7 +679,7 @@ pub fn requalify_column_onto_derived_table(
             .collect::<Vec<String>>()
             .join(".");
         derived_relations.get(&qualifier).is_some_and(|columns| {
-            len + 1 == idents.len() || columns.contains(&idents[len].value)
+            len + 1 == idents.len() || is_field_path(columns, &idents[len..])
         })
     });
     let Some(qualifier_len) = qualifier_len else {
@@ -687,6 +690,27 @@ pub fn requalify_column_onto_derived_table(
         Some(alias) => std::iter::once(alias.clone()).chain(rest).collect(),
         None => rest,
     };
+}
+
+/// Whether `path` — a column, then a field of each struct in turn — names a field
+/// path through `columns`.
+fn is_field_path(columns: &HashMap<String, DataType>, path: &[Ident]) -> bool {
+    let Some((column, fields)) = path.split_first() else {
+        return false;
+    };
+    let Some(mut data_type) = columns.get(&column.value) else {
+        return false;
+    };
+    for field in fields {
+        let DataType::Struct(struct_fields) = data_type else {
+            return false;
+        };
+        let Some(next) = struct_fields.iter().find(|f| *f.name() == field.value) else {
+            return false;
+        };
+        data_type = next.data_type();
+    }
+    true
 }
 
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.

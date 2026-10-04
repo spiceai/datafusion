@@ -644,7 +644,7 @@ pub(crate) fn unproject_projection_exprs(
 /// subquery is treated as the volatile case and evaluated once, in a scope of its
 /// own.
 fn output_is_repeatable(expr: &Expr) -> bool {
-    !expr.is_volatile() && !expr_contains_subquery(expr)
+    !expr.is_volatile() && !holds_subquery(expr)
 }
 
 /// The expression behind `column`, when the projection computes it and repeating it
@@ -822,8 +822,8 @@ pub(crate) fn unrepeatable_sort_key_refusal<T>(detail: &str) -> Result<T> {
 
 /// The relations a derived table hides from the `SELECT` reading it, each in both
 /// the full and the bare-table spelling a reference may carry, with the columns it
-/// provides.
-pub(crate) type EnclosedRelations = HashMap<String, HashSet<String>>;
+/// provides and their types.
+pub(crate) type EnclosedRelations = HashMap<String, HashMap<String, DataType>>;
 
 /// The [`EnclosedRelations`] of a derived table built from a plan with `schema`.
 pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> EnclosedRelations {
@@ -836,7 +836,7 @@ pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> EnclosedRelations {
             relations
                 .entry(spelling)
                 .or_default()
-                .insert(field.name().clone());
+                .insert(field.name().clone(), field.data_type().clone());
         }
     }
     relations

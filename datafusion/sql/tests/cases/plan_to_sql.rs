@@ -15614,6 +15614,80 @@ fn test_scope_refuses_a_set_comparison_subquery() -> Result<()> {
 }
 
 #[test]
+fn test_sort_key_reading_an_output_holding_a_set_comparison_is_scoped() -> Result<()> {
+    // An output holding a set comparison (`< ANY`) holds a subquery, which a key
+    // inlining it would evaluate again: here a second draw of `random()`. It is
+    // scoped like an output holding any other subquery.
+    let body = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .project(vec![random().alias("d")])?
+        .build()?;
+    let any = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+        Box::new(lit(0.5)),
+        datafusion_expr::Subquery {
+            subquery: Arc::new(body),
+            outer_ref_columns: vec![],
+            spans: datafusion_common::Spans::new(),
+        },
+        datafusion_expr::Operator::Lt,
+        datafusion_expr::expr::SetQuantifier::Any,
+    ));
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .project(vec![col("t.a"), any.alias("r")])?
+        .sort(vec![datafusion_expr::not(col("r")).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT t.a, 0.5 < ANY(SELECT random() AS d FROM v) AS r FROM t) ORDER BY NOT r ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_repointed_outer_reference_is_not_read_as_a_field_path_the_types_lack()
+-> Result<()> {
+    // With fully qualified columns the ORDER BY above a filter scope reads `t.s.a`:
+    // column `a` of the enclosing query's relation `t.s`. The scope encloses a `t`
+    // with a struct column `s`, which has no field `a`, so the reference is not a
+    // field path through it and keeps its qualifier.
+    let struct_type =
+        DataType::Struct(vec![Field::new("q", DataType::Int32, false)].into());
+    let inner_t = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("s", struct_type, false),
+    ]);
+    let ts = || TableReference::partial("t", "s");
+    let outer_a = || out_ref_col(DataType::Int32, Column::new(Some(ts()), "a"));
+    let inner = table_scan(Some("t"), &inner_t, None)?
+        .project(vec![random().alias("r"), col("t.k"), col("t.s")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .sort(vec![(col("k") * outer_a()).sort(false, false)])?
+        .project(vec![col("r")])?
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = table_scan(Some(ts()), &int32_schema(&["a"]), None)?
+        .project(vec![
+            Expr::Column(Column::new(Some(ts()), "a")),
+            Expr::ScalarSubquery(datafusion_expr::Subquery {
+                subquery: Arc::new(inner),
+                outer_ref_columns: vec![outer_a()],
+                spans: datafusion_common::Spans::new(),
+            })
+            .alias("pick"),
+        ])?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @r#"SELECT t.s.a, (SELECT r FROM (SELECT r, k, s FROM (SELECT random() AS r, t.k, t.s FROM t) WHERE (r > 0.5) ORDER BY (k * t.s.a) DESC NULLS LAST) LIMIT 1) AS pick FROM t.s"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_holding_a_subquery_is_refused() -> Result<()> {
     // A subquery in the key may correlate against the relation the derived table
     // would hide, and its outer references cannot be told from ones that reach
