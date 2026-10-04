@@ -31,17 +31,19 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        enclosed_qualifiers, expr_contains_subquery, filters_scope_their_projection,
-        find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
-        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
+        EnclosedRelations, enclosed_qualifiers, expr_contains_subquery, filter_stack,
+        filters_scope_their_projection, find_agg_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
+        name_scope_outputs, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
-        scope_filters_over_projection, select_list_wraps_a_grouping_expr,
+        scope_filters_over_projection, scope_sort_keys, scope_sort_over_projection,
+        select_list_wraps_a_grouping_expr, sort_keys_scope_their_projection,
         stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
-        unrepeatable_output_refusal,
+        unrepeatable_output_refusal, unrepeatable_sort_key_refusal,
     },
 };
 use crate::unparser::extension_unparser::{
@@ -66,7 +68,11 @@ use datafusion_expr::{
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::{collections::HashSet, sync::Arc, vec};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    vec,
+};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -126,7 +132,7 @@ fn merged_without_conflict(have: &DFSchema, add: &DFSchema) -> Option<DFSchema> 
             Err(_) => {
                 let addition = DFSchema::new_with_metadata(
                     vec![(qualifier.cloned(), Arc::clone(field))],
-                    std::collections::HashMap::new(),
+                    HashMap::new(),
                 )
                 .ok()?;
                 merged = merged.join(&addition).ok()?;
@@ -716,7 +722,17 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         query: &mut Option<QueryBuilder>,
     ) -> Result<SetExpr> {
-        let mut select_builder = SelectBuilder::default();
+        self.select_to_sql_expr_with(plan, query, SelectBuilder::default())
+    }
+
+    /// [`Self::select_to_sql_expr`] into a `SELECT` the caller has already set up,
+    /// such as one marked as an EXISTS body.
+    fn select_to_sql_expr_with(
+        &self,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        mut select_builder: SelectBuilder,
+    ) -> Result<SetExpr> {
         select_builder.push_from(TableWithJoinsBuilder::default());
         let mut relation_builder = RelationBuilder::default();
         self.select_to_sql_recursively(
@@ -974,7 +990,8 @@ impl Unparser<'_> {
         // reference still qualified by a relation the derived table encloses binds
         // to nothing. DataFusion re-plans such SQL, but a stricter remote binder
         // rejects it, which is what breaks a federated pushdown.
-        let derived_qualifiers = enclosed_qualifiers(p.input.schema());
+        let derived_qualifiers =
+            enclosed_qualifiers(p.input.schema(), |name| self.emitted_column_name(name))?;
         select.visit_expressions_in_clauses_mut(|expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
                 requalify_column_onto_derived_table(
@@ -1068,6 +1085,246 @@ impl Unparser<'_> {
         unrepeatable_output_refusal(
             "for this dialect: its engine evaluates the expression again for the predicate instead of reading the value the SELECT list produced, and would return rows the predicate should have excluded",
         )
+    }
+
+    /// [`Self::ensure_derived_table_fixes_volatile_outputs`] for a sort key reading
+    /// such an output: the same guarantee, refused in the key's own words.
+    fn ensure_derived_table_fixes_volatile_sort_keys(&self) -> Result<()> {
+        if self.dialect.derived_table_evaluates_volatile_outputs_once() {
+            return Ok(());
+        }
+        unrepeatable_sort_key_refusal(
+            "for this dialect: its engine evaluates the expression again for the key instead of reading the value the SELECT list produced, and would order the rows by a value that list never showed",
+        )
+    }
+
+    /// Whether the order a sort with `fetch` produces can be observed from where it
+    /// is being unparsed, which is what makes a key ordering by a second draw of an
+    /// output that cannot be repeated a wrong answer rather than one of the orders
+    /// the plan allows.
+    ///
+    /// A sort without a fetch decides nothing a reader can see when a join reads
+    /// its rows, since a join leaves its output order unspecified, or in an EXISTS
+    /// body, whose rows are only tested for existence, unless a row bound on that
+    /// body picks some of them. A row bound makes the order decide which rows
+    /// survive: the sort's own fetch, or a `LIMIT` already on an EXISTS body, which
+    /// [`Self::build_exists_subquery`] then moves into a scope of its own under the
+    /// build side's name. An `ORDER BY` a sort above has already put on the query
+    /// does not make a lower sort unobservable: a `LIMIT` between the two keeps the
+    /// rows the lower sort ranks first.
+    fn sort_order_is_observable(
+        fetch: Option<usize>,
+        query: &Option<QueryBuilder>,
+        select: &SelectBuilder,
+    ) -> bool {
+        if fetch.is_some() {
+            return true;
+        }
+        if select.within_join_input() {
+            return false;
+        }
+        if select.within_exists_body() {
+            return query.as_ref().is_some_and(QueryBuilder::bounds_rows);
+        }
+        true
+    }
+
+    /// Refuses, with `refuse`, a scope whose `exprs` hold an outer reference the
+    /// derived table would capture, so that it read the scope instead of the
+    /// enclosing query:
+    ///
+    /// - an unqualified one named like an output the derived table exposes, the
+    ///   fields of `scope`, on any dialect;
+    /// - on a dialect that names every derived table, one spelled with an alias the
+    ///   unparser invents (`derived_projection`), which the scope's table takes.
+    ///
+    /// Refused first is a scope exposing two outputs the dialect emits under one
+    /// name ([`Self::scope_output_keys`]).
+    fn ensure_scope_captures_no_outer_reference<'a>(
+        &self,
+        exprs: impl IntoIterator<Item = &'a Expr>,
+        scope: &DFSchema,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        let names_derived_table = self.dialect.requires_derived_table_alias();
+        let outputs = self.scope_output_keys(scope, refuse)?;
+        for expr in exprs {
+            let mut captured = None;
+            expr.apply(|node| {
+                if let Expr::OuterReferenceColumn(_, column) = node {
+                    let carries = match &column.relation {
+                        None if outputs
+                            .contains(&self.emitted_column_key(&column.name)?) =>
+                        {
+                            Some("the name of an output the derived table exposes")
+                        }
+                        Some(relation)
+                            if names_derived_table
+                                && Self::is_unparser_derived_alias(
+                                    &self.emitted_qualifier_key(relation),
+                                ) =>
+                        {
+                            Some("a name the unparser gives a derived table")
+                        }
+                        _ => None,
+                    };
+                    if let Some(carries) = carries {
+                        captured = Some((column.flat_name(), carries));
+                        return Ok(TreeNodeRecursion::Stop);
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            if let Some((reference, carries)) = captured {
+                return refuse(&format!(
+                    "when the outer reference {reference} carries {carries}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The outputs `scope` exposes, as the statement spells them
+    /// ([`Self::emitted_column_key`]): BigQuery writes an output `x*` as `x_42`, which
+    /// an outer reference already named `x_42` would bind to.
+    ///
+    /// Two outputs spelled alike are refused, with `refuse`. The `SELECT` reading the
+    /// derived table names its outputs unqualified, so it could not tell them apart —
+    /// `x*` and `x_42` both read as `x_42` — even though the plan's names differ and
+    /// pass the check [`super::utils::scope_sort_over_projection`] makes on them. Two
+    /// outputs the plan already names alike are refused as that check words it.
+    fn scope_output_keys(
+        &self,
+        scope: &DFSchema,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<HashSet<String>> {
+        let mut keys = HashMap::with_capacity(scope.fields().len());
+        for field in scope.fields() {
+            let key = self.emitted_column_key(field.name())?;
+            if let Some(first) = keys.insert(key, field.name()) {
+                if first == field.name() {
+                    refuse(&format!(
+                        "when the projection has two outputs named {first}"
+                    ))?;
+                }
+                refuse(&format!(
+                    "when two outputs the derived table exposes are both emitted as {}",
+                    self.emitted_column_name(field.name())?
+                ))?;
+            }
+        }
+        Ok(keys.into_keys().collect())
+    }
+
+    /// Refuses the derived table a sort key reading an output that cannot be
+    /// repeated needs where it cannot fix the key: on a dialect that evaluates the
+    /// output again, and inside a join input, which a sort reaches only with a
+    /// fetch — see [`Self::sort_order_is_observable`].
+    fn ensure_sort_key_scope_is_possible(&self, select: &SelectBuilder) -> Result<()> {
+        self.ensure_derived_table_fixes_volatile_sort_keys()?;
+        if select.within_join_input() {
+            return unrepeatable_sort_key_refusal(
+                "when the sort's fetch bounds an input of a join",
+            );
+        }
+        Ok(())
+    }
+
+    /// Readies this `SELECT` for the derived table a sort key reading an output that
+    /// cannot be repeated builds around the plan whose schema is `hidden`: the
+    /// refusals of [`Self::ensure_sort_key_scope_is_possible`] and the re-pointing
+    /// of the clauses already emitted against the relations that table hides.
+    fn prepare_sort_key_scope(
+        &self,
+        hidden: &DFSchema,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+    ) -> Result<()> {
+        self.ensure_sort_key_scope_is_possible(select)?;
+        self.repoint_clauses_onto_derived_table(
+            &enclosed_qualifiers(hidden, |name| self.emitted_column_name(name))?,
+            query,
+            select,
+            unrepeatable_sort_key_refusal,
+        )
+    }
+
+    /// Re-points the clauses this `SELECT` already carries — an ORDER BY from a sort
+    /// above the node being scoped, a WHERE from a filter above that — onto the
+    /// derived table about to hide `hidden_qualifiers`, the relations they were
+    /// emitted against, so they read its outputs by name like the references the
+    /// scope rewrites itself. A clause holding a subquery is left alone by the
+    /// visitors and would keep naming a hidden relation: refused, with `refuse`.
+    ///
+    /// A reference left qualified reads a relation of an enclosing query, and on a
+    /// dialect that names every derived table one spelled with an alias the
+    /// unparser invents (`derived_projection`) would bind to the scope's own table
+    /// instead: refused the same way, as
+    /// [`Self::ensure_scope_captures_no_outer_reference`] refuses one in the
+    /// expressions the scope places.
+    fn repoint_clauses_onto_derived_table(
+        &self,
+        hidden_qualifiers: &EnclosedRelations,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        // A HAVING or QUALIFY already on this SELECT was emitted by a filter above
+        // against the aggregate or window the derived table is about to enclose,
+        // and it cannot be lifted: the expression it reads is nameable only in
+        // the SELECT that computes it. Re-pointing its references would leave it
+        // outside, reading names the derived table does not expose.
+        if select.has_grouped_predicate() {
+            return refuse(
+                "when a HAVING or QUALIFY above it reads an aggregate or window the derived table would hide",
+            );
+        }
+        let names_derived_table = self.dialect.requires_derived_table_alias();
+        let mut captured = None;
+        let mut repoint = |expr: &mut ast::Expr| {
+            if let ast::Expr::CompoundIdentifier(idents) = expr {
+                requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+                if names_derived_table
+                    && captured.is_none()
+                    && let Some((_, qualifier)) = idents.split_last()
+                    && Self::is_unparser_derived_alias(
+                        &self.qualifier_key(
+                            &qualifier
+                                .iter()
+                                .map(|ident| ident.value.clone())
+                                .collect::<Vec<_>>(),
+                        ),
+                    )
+                {
+                    captured = Some(
+                        idents
+                            .iter()
+                            .map(|ident| ident.value.as_str())
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    );
+                }
+                // A reference reduced to its bare column is a plain identifier,
+                // the node the planner reads a one-part name as.
+                if idents.len() == 1 {
+                    let ident = idents.remove(0);
+                    *expr = ast::Expr::Identifier(ident);
+                }
+            }
+        };
+        let mut skipped = select.visit_expressions_in_clauses_mut(&mut repoint);
+        if let Some(query) = query.as_mut() {
+            skipped |= query.visit_order_by_mut(&mut repoint);
+        }
+        if skipped {
+            return refuse("when a clause above it holds a subquery");
+        }
+        if let Some(reference) = captured {
+            return refuse(&format!(
+                "when the outer reference {reference} carries a name the unparser gives a derived table"
+            ));
+        }
+        Ok(())
     }
 
     /// Unparses one input of a join into the shared `select`, marked as such for
@@ -1932,7 +2189,31 @@ impl Unparser<'_> {
                         // derives a table of its own, so either way the stack below
                         // it meets a SELECT whose list is free.
                         let sorted = sort.input.as_ref();
-                        let expr = if filters_scope_their_projection(&lowered, false) {
+                        let filters_scope =
+                            filters_scope_their_projection(&lowered, false);
+                        // With the stack folding the projection in, a key reading
+                        // an output that cannot be repeated would be resolved into
+                        // a second draw — see the `Sort` arm. Where the sort's
+                        // order can be observed, the key alone then puts the
+                        // projection in a scope, built here around the
+                        // lowered stack so the ORDER BY the sort emits above it
+                        // reads the outputs by name, on the same guarantee and
+                        // with the same refusals. Where it cannot, the lowered
+                        // stack is unparsed without the sort, which the `Sort`
+                        // arm leaves out in the same place.
+                        let keys_scope = !filters_scope
+                            && sort_keys_scope_their_projection(&sort.expr, sorted)?
+                                .is_some();
+                        if keys_scope
+                            && !Self::sort_order_is_observable(sort.fetch, query, select)
+                        {
+                            return self.select_to_sql_recursively(
+                                &lowered, query, select, relation,
+                            );
+                        }
+                        let expr = if keys_scope {
+                            scope_sort_keys(&sort.expr)?
+                        } else if filters_scope {
                             sort.expr.clone()
                         } else {
                             let agg =
@@ -1956,6 +2237,22 @@ impl Unparser<'_> {
                                     )
                                 })
                                 .collect::<Result<Vec<_>>>()?
+                        };
+                        let lowered = if keys_scope {
+                            self.ensure_scope_captures_no_outer_reference(
+                                sort.expr.iter().map(|key| &key.expr).chain(
+                                    filter_stack(&lowered)
+                                        .0
+                                        .into_iter()
+                                        .map(|filter| &filter.predicate),
+                                ),
+                                sorted.schema(),
+                                unrepeatable_sort_key_refusal,
+                            )?;
+                            self.prepare_sort_key_scope(sorted.schema(), query, select)?;
+                            Arc::new(scope_filters_over_projection(&lowered)?)
+                        } else {
+                            lowered
                         };
                         let hoisted = LogicalPlan::Sort(Sort {
                             expr,
@@ -2036,33 +2333,38 @@ impl Unparser<'_> {
                             // the alias is a level further down, enclosed by an
                             // unnamed derived table, and the name it gave those
                             // outputs is hidden like the relation's own.
-                            let mut hidden_qualifiers =
-                                enclosed_qualifiers(&filtered.projection.schema);
+                            let mut hidden_qualifiers = enclosed_qualifiers(
+                                &filtered.projection.schema,
+                                |name| self.emitted_column_name(name),
+                            )?;
                             if let Some(alias) = filtered.alias
                                 && filtered.through_distinct
                             {
-                                hidden_qualifiers
-                                    .extend(enclosed_qualifiers(&alias.schema));
-                            }
-                            let mut repoint = |expr: &mut ast::Expr| {
-                                if let ast::Expr::CompoundIdentifier(idents) = expr {
-                                    requalify_column_onto_derived_table(
-                                        idents,
-                                        &hidden_qualifiers,
-                                        None,
-                                    );
+                                for (spelling, columns) in
+                                    enclosed_qualifiers(&alias.schema, |name| {
+                                        self.emitted_column_name(name)
+                                    })?
+                                {
+                                    hidden_qualifiers
+                                        .entry(spelling)
+                                        .or_default()
+                                        .extend(columns);
                                 }
-                            };
-                            let mut skipped =
-                                select.visit_expressions_in_clauses_mut(&mut repoint);
-                            if let Some(query) = query.as_mut() {
-                                skipped |= query.visit_order_by_mut(&mut repoint);
                             }
-                            if skipped {
-                                return unrepeatable_output_refusal(
-                                    "when a clause above it holds a subquery",
-                                );
-                            }
+                            self.ensure_scope_captures_no_outer_reference(
+                                filter_stack(plan)
+                                    .0
+                                    .into_iter()
+                                    .map(|filter| &filter.predicate),
+                                &filtered.projection.schema,
+                                unrepeatable_output_refusal,
+                            )?;
+                            self.repoint_clauses_onto_derived_table(
+                                &hidden_qualifiers,
+                                query,
+                                select,
+                                unrepeatable_output_refusal,
+                            )?;
                             let scoped = scope_filters_over_projection(plan)?;
                             return self.select_to_sql_recursively(
                                 &scoped, query, select, relation,
@@ -2162,6 +2464,47 @@ impl Unparser<'_> {
                     );
                 }
 
+                // A key that is not the bare output name has the output's expression
+                // inlined below (`unproject_sort_expr`), and for an output that
+                // cannot be repeated that is a second draw: `ORDER BY (r + 1)`
+                // inlined as `ORDER BY (random() + 1)` would order the rows by a
+                // value the SELECT list never showed. Where that order can be
+                // observed (`sort_order_is_observable`), such a key reads the output
+                // by name from a SELECT above the one computing it, so the projection
+                // becomes a derived table — the repair a predicate on such an
+                // output gets, on the same guarantee, gated and refused the same way.
+                // Where it cannot, the sort is left out: its order reaches nothing,
+                // a derived table there would hide the relation a join's `ON` or an
+                // EXISTS correlation names, and its `ORDER BY` written onto this
+                // query could replace the one a sort above already set.
+                if let Some(projection) =
+                    sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
+                {
+                    if !Self::sort_order_is_observable(sort.fetch, query, select) {
+                        return self.select_to_sql_recursively(
+                            sort.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
+                    // Refused first, so a dialect or join input the scope cannot fix
+                    // is what is reported rather than a failure building the scope.
+                    self.ensure_sort_key_scope_is_possible(select)?;
+                    // The derived table exposes every column a key carries through
+                    // it beside the projection's outputs, and an outer reference
+                    // binds to either alike.
+                    let (scoped, derived) = scope_sort_over_projection(sort, projection)?;
+                    self.ensure_scope_captures_no_outer_reference(
+                        sort.expr.iter().map(|key| &key.expr),
+                        &derived,
+                        unrepeatable_sort_key_refusal,
+                    )?;
+                    self.prepare_sort_key_scope(&projection.schema, query, select)?;
+                    return self
+                        .select_to_sql_recursively(&scoped, query, select, relation);
+                }
+
                 let Some(query_ref) = query else {
                     return internal_err!(
                         "Sort operator only valid in a statement context."
@@ -2249,7 +2592,10 @@ impl Unparser<'_> {
                     // reference still qualified by a relation the derived table encloses
                     // binds to nothing. DataFusion re-plans such SQL, but a stricter remote
                     // binder rejects it, which is what breaks a federated pushdown.
-                    let derived_qualifiers = enclosed_qualifiers(plan.schema());
+                    let derived_qualifiers =
+                        enclosed_qualifiers(plan.schema(), |name| {
+                            self.emitted_column_name(name)
+                        })?;
                     select.visit_expressions_in_clauses_mut(|expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
                             requalify_column_onto_derived_table(
@@ -4052,8 +4398,17 @@ impl Unparser<'_> {
             );
         }
 
+        // A sort key reading such an output is scoped only where a row bound
+        // makes the sort's order observable (`sort_order_is_observable`), which
+        // the body's SELECT is marked as an EXISTS body to decide; a bounded body
+        // is moved below into a scope of its own, under the build side's name,
+        // before the correlation is added. Unbounded, the order reaches nothing,
+        // and the sort is left out.
         let mut query_builder = Some(QueryBuilder::default());
-        let body = self.select_to_sql_expr(right_plan, &mut query_builder)?;
+        let mut body_select = SelectBuilder::default();
+        body_select.mark_exists_body();
+        let body =
+            self.select_to_sql_expr_with(right_plan, &mut query_builder, body_select)?;
         let mut query_builder = query_builder.unwrap();
 
         // Reduce the build side to a single SELECT to use as the EXISTS body.

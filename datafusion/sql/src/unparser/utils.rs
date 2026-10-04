@@ -25,15 +25,15 @@ use super::{
 };
 use arrow::datatypes::DataType;
 use datafusion_common::{
-    Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
-    assert_eq_or_internal_err, internal_err, not_impl_err,
-    tree_node::{Transformed, TransformedResult, TreeNode},
+    Column, DFSchema, DFSchemaRef, DataFusionError, HashMap, Result, ScalarValue,
+    TableReference, assert_eq_or_internal_err, internal_err, not_impl_err,
+    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
 };
 use datafusion_expr::type_coercion::binary::BinaryTypeCoercer;
 use datafusion_expr::type_coercion::functions::fields_with_udf;
 use datafusion_expr::{
     Aggregate, Distinct, DistinctOn, Expr, Filter, LogicalPlan, LogicalPlanBuilder,
-    Projection, ReturnFieldArgs, SortExpr, SubqueryAlias, Unnest, Window, expr,
+    Projection, ReturnFieldArgs, Sort, SortExpr, SubqueryAlias, Unnest, Window, expr,
     expr::{Cast, TryCast},
     utils::{conjunction, grouping_set_to_exprlist},
 };
@@ -644,7 +644,7 @@ pub(crate) fn unproject_projection_exprs(
 /// subquery is treated as the volatile case and evaluated once, in a scope of its
 /// own.
 fn output_is_repeatable(expr: &Expr) -> bool {
-    !expr.is_volatile() && !expr_contains_subquery(expr)
+    !expr.is_volatile() && !holds_subquery(expr)
 }
 
 /// The expression behind `column`, when the projection computes it and repeating it
@@ -680,7 +680,7 @@ fn find_repeatable_projection_expr<'a>(
 /// Stacked filters collapse into one `WHERE`, which is why the walk looks through
 /// them; a node that opens a scope of its own — a relation, a subquery, a derived
 /// table — is addressable by name from outside, so the walk stops there.
-fn filter_stack(plan: &LogicalPlan) -> (Vec<&Filter>, &LogicalPlan) {
+pub(crate) fn filter_stack(plan: &LogicalPlan) -> (Vec<&Filter>, &LogicalPlan) {
     let mut filters = Vec::new();
     let mut node = plan;
     while let LogicalPlan::Filter(filter) = node {
@@ -812,15 +812,43 @@ pub(crate) fn unrepeatable_output_refusal<T>(detail: &str) -> Result<T> {
     )
 }
 
-/// The qualifiers a derived table built from a plan with `schema` hides from the
-/// `SELECT` reading it, in both the full and the bare-table spelling a reference may
-/// carry.
-pub(crate) fn enclosed_qualifiers(schema: &DFSchema) -> HashSet<String> {
-    schema
-        .iter()
-        .filter_map(|(qualifier, _)| qualifier)
-        .flat_map(|qualifier| [qualifier.to_string(), qualifier.table().to_string()])
-        .collect()
+/// [`unrepeatable_output_refusal`] for a sort key: the same shapes, refused in the
+/// key's own words.
+pub(crate) fn unrepeatable_sort_key_refusal<T>(detail: &str) -> Result<T> {
+    not_impl_err!(
+        "Unparsing a sort key reading a projection output that cannot be repeated is not supported {detail}"
+    )
+}
+
+/// The relations a derived table hides from the `SELECT` reading it, each in both
+/// the full and the bare-table spelling a reference may carry, with the columns it
+/// provides and their types.
+pub(crate) type EnclosedRelations = HashMap<String, HashMap<String, DataType>>;
+
+/// The [`EnclosedRelations`] of a derived table built from a plan with `schema`.
+///
+/// Each column is keyed by `emitted_name`, the name the dialect writes for it, since
+/// the references these relations are matched against are already emitted: BigQuery
+/// writes the column `payload*` as `payload_42`, and a field path through it reads
+/// `t.payload_42.x`.
+pub(crate) fn enclosed_qualifiers(
+    schema: &DFSchema,
+    emitted_name: impl Fn(&str) -> Result<String>,
+) -> Result<EnclosedRelations> {
+    let mut relations = EnclosedRelations::new();
+    for (qualifier, field) in schema.iter() {
+        let Some(qualifier) = qualifier else {
+            continue;
+        };
+        let name = emitted_name(field.name())?;
+        for spelling in [qualifier.to_string(), qualifier.table().to_string()] {
+            relations
+                .entry(spelling)
+                .or_default()
+                .insert(name.clone(), field.data_type().clone());
+        }
+    }
+    Ok(relations)
 }
 
 /// Whether `predicate` reads a [Projection] output that cannot be repeated at the
@@ -983,7 +1011,7 @@ pub(crate) fn filters_scope_their_projection(
 /// reference from one that reaches further out — the same reason the alias pushdown
 /// declines a predicate holding one.
 pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<LogicalPlan> {
-    let (filters, input) = filter_stack(plan);
+    let (filters, _) = filter_stack(plan);
     let Some(bottom) = filters.last() else {
         return internal_err!(
             "scope_filters_over_projection called on a plan that is not a Filter"
@@ -991,20 +1019,9 @@ pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<Logica
     };
     if filters
         .iter()
-        .any(|filter| expr_contains_subquery(&filter.predicate))
+        .any(|filter| holds_subquery(&filter.predicate))
     {
         return unrepeatable_output_refusal("when the predicate holds a subquery");
-    }
-
-    let schema = input.schema();
-    let mut names = HashSet::with_capacity(schema.fields().len());
-    for field in schema.fields() {
-        if !names.insert(field.name()) {
-            return unrepeatable_output_refusal(&format!(
-                "when the projection has two outputs named {}",
-                field.name()
-            ));
-        }
     }
 
     let Some(predicate) = conjunction(
@@ -1015,16 +1032,351 @@ pub(crate) fn scope_filters_over_projection(plan: &LogicalPlan) -> Result<Logica
     ) else {
         return internal_err!("a filter stack has at least one predicate");
     };
+    // The identity projection above reads each output by the name the projection's
+    // schema reports. An output a declared schema names apart from its own name,
+    // `random() AS z` declared as `x`, would show as `z` and leave `x` bound to
+    // nothing, so the projection is rebuilt with its outputs named as declared.
+    let input = match name_scoped_outputs_as_declared(&bottom.input)? {
+        Some(named) => Arc::new(named),
+        None => Arc::clone(&bottom.input),
+    };
     // `Filter::try_new` rather than the builder, whose `filter` normalizes every
     // column back to its qualified form and would undo the rewrite above.
-    let filtered =
-        LogicalPlan::Filter(Filter::try_new(predicate, Arc::clone(&bottom.input))?);
-    let outputs = schema
+    let filtered = LogicalPlan::Filter(Filter::try_new(predicate, input)?);
+    identity_projection_over(Arc::new(filtered), unrepeatable_output_refusal)
+}
+
+/// The node a filter scope's derived table is built from — a [Projection], reached
+/// through any `DISTINCT` and a `SubqueryAlias` the way [`projection_below_filters`]
+/// walks to it — with the projection rebuilt to show each output under the name its
+/// schema declares ([`exprs_named_as_declared`]). `None` where every output already
+/// shows it, or beside a wildcard, whose expressions do not line up with the fields
+/// by position.
+fn name_scoped_outputs_as_declared(plan: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    match plan {
+        LogicalPlan::Distinct(Distinct::All(input)) => {
+            Ok(name_scoped_outputs_as_declared(input)?
+                .map(|named| LogicalPlan::Distinct(Distinct::All(Arc::new(named)))))
+        }
+        LogicalPlan::SubqueryAlias(alias) => {
+            let LogicalPlan::Projection(projection) = alias.input.as_ref() else {
+                return Ok(None);
+            };
+            let Some(named) = projection_named_as_declared(projection)? else {
+                return Ok(None);
+            };
+            SubqueryAlias::try_new(Arc::new(named), alias.alias.clone())
+                .map(|alias| Some(LogicalPlan::SubqueryAlias(alias)))
+        }
+        LogicalPlan::Projection(projection) => projection_named_as_declared(projection),
+        _ => Ok(None),
+    }
+}
+
+/// `projection` rebuilt with each output shown under the name its schema declares,
+/// or `None` where every output already shows it or the projection holds a wildcard.
+fn projection_named_as_declared(projection: &Projection) -> Result<Option<LogicalPlan>> {
+    if projection_holds_wildcard(projection)
+        || projection
+            .expr
+            .iter()
+            .zip(projection.schema.fields())
+            .all(|(expr, field)| expr.qualified_name().1 == *field.name())
+    {
+        return Ok(None);
+    }
+    ensure_one_output_per_name(&projection.schema, unrepeatable_output_refusal)?;
+    Projection::try_new(
+        exprs_named_as_declared(projection),
+        Arc::clone(&projection.input),
+    )
+    .map(|projection| Some(LogicalPlan::Projection(projection)))
+}
+
+/// `projection`'s expressions, each aliased to the name its schema declares for it
+/// where the expression's own name differs: an unnamed expression, a column, or an
+/// alias a declared schema names apart from. A derived table built from them shows
+/// every output under the name the `SELECT` reading it binds.
+fn exprs_named_as_declared(projection: &Projection) -> Vec<Expr> {
+    projection
+        .expr
+        .iter()
+        .zip(projection.schema.fields())
+        .map(|(expr, field)| {
+            if expr.qualified_name().1 == *field.name() {
+                expr.clone()
+            } else {
+                expr.clone().alias(field.name())
+            }
+        })
+        .collect()
+}
+
+/// Refuses, with `refuse`, a schema carrying two fields of one name, which a derived
+/// table's unqualified references cannot tell apart. Checked before the outputs are
+/// renamed, so the refusal is what the caller sees rather than the schema error
+/// building the renamed projection would raise.
+fn ensure_one_output_per_name(
+    schema: &DFSchema,
+    refuse: fn(&str) -> Result<LogicalPlan>,
+) -> Result<()> {
+    let mut names = HashSet::with_capacity(schema.fields().len());
+    for field in schema.fields() {
+        if !names.insert(field.name()) {
+            refuse(&format!(
+                "when the projection has two outputs named {}",
+                field.name()
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Whether `projection` lists a wildcard, which stands for a run of its input's
+/// columns, so its expressions do not line up with its schema's fields by position.
+#[expect(deprecated)]
+fn projection_holds_wildcard(projection: &Projection) -> bool {
+    projection
+        .expr
+        .iter()
+        .any(|expr| matches!(expr, Expr::Wildcard { .. }))
+}
+
+/// An identity projection over `input` — one bare column per output, under the name
+/// the schema reports — which unparses as the `SELECT` list reading `input` as a
+/// derived table. Two outputs of one name cannot be told apart once the qualifiers
+/// are gone, so a schema carrying any is refused, with `refuse`.
+fn identity_projection_over(
+    input: Arc<LogicalPlan>,
+    refuse: fn(&str) -> Result<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    let outputs = input
+        .schema()
         .fields()
         .iter()
-        .map(|field| Expr::Column(Column::new_unqualified(field.name())))
+        .map(|field| field.name().clone())
         .collect::<Vec<_>>();
-    Projection::try_new(outputs, Arc::new(filtered)).map(LogicalPlan::Projection)
+    projection_of_outputs(input, &outputs, refuse)
+}
+
+/// The projection listing `outputs` of `input` by bare name, which unparses as the
+/// `SELECT` list reading `input` as a derived table. The table shows every column of
+/// `input` to the clauses of that `SELECT`, so each name has to be unique across the
+/// whole schema, not only among `outputs`: a schema carrying two of one name is
+/// refused, with `refuse`.
+fn projection_of_outputs(
+    input: Arc<LogicalPlan>,
+    outputs: &[String],
+    refuse: fn(&str) -> Result<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    ensure_one_output_per_name(input.schema(), refuse)?;
+    let outputs = outputs
+        .iter()
+        .map(|name| Expr::Column(Column::new_unqualified(name)))
+        .collect::<Vec<_>>();
+    Projection::try_new(outputs, input).map(LogicalPlan::Projection)
+}
+
+/// Whether resolving `keys` against `projection` — the repair [`unproject_sort_expr`]
+/// applies to a key that is not a bare output name — would inline an output that
+/// cannot be repeated ([`output_is_repeatable`]).
+///
+/// A bare unqualified key reading an output under the name the `SELECT` list shows
+/// it by ([`bare_sort_key_reads_a_listed_alias`]) is emitted as that name, which
+/// every dialect accepts as a top-level sort key, so it is never inlined. Any other
+/// key reading such an output would have the expression inlined — `ORDER BY (r + 1)`
+/// as `ORDER BY (random() + 1)` — ordering the rows by a second draw the `SELECT`
+/// list never showed. Such a key has to read the output by name from a `SELECT`
+/// above the one computing it, which is what [`scope_sort_over_projection`] builds.
+fn sort_keys_read_unrepeatable_output(
+    keys: &[SortExpr],
+    projection: &Projection,
+) -> bool {
+    let outputs = FilteredProjection {
+        projection,
+        alias: None,
+        through_distinct: false,
+    };
+    keys.iter().any(|key| {
+        if let Expr::Column(Column {
+            relation: None,
+            name,
+            ..
+        }) = &key.expr
+            && bare_sort_key_reads_a_listed_alias(projection, name)
+        {
+            return false;
+        }
+        predicate_reads_unrepeatable_output(&key.expr, &outputs)
+    })
+}
+
+/// Whether a bare unqualified sort key `name` reads an output under the name the
+/// projection's `SELECT` list shows it by, so it is emitted as that name and never
+/// inlined.
+///
+/// The output a key names is the expression at the key's position in the schema,
+/// and the list shows it under that name only when its alias carries the name. A
+/// declared schema can name an output apart from its alias, `random() AS z` declared
+/// as `x`, and then `x` is not in the list and would bind a column of the input
+/// instead. Beside a wildcard the positions do not line up, and the key reads the
+/// output whose listed alias carries its name.
+fn bare_sort_key_reads_a_listed_alias(projection: &Projection, name: &str) -> bool {
+    let carries_name =
+        |expr: &Expr| matches!(expr, Expr::Alias(alias) if alias.name == name);
+    if projection_holds_wildcard(projection) {
+        return projection.expr.iter().any(carries_name);
+    }
+    projection
+        .schema
+        .index_of_column_by_name(None, name)
+        .and_then(|index| projection.expr.get(index))
+        .is_some_and(carries_name)
+}
+
+/// The projection a `Sort` with `keys` over `input` puts in a scope: `input` is a
+/// [Projection] and [`sort_keys_read_unrepeatable_output`] holds for it. `None`
+/// when the sort leaves its input as it is.
+///
+/// The projection is read with the schema it carries, which is what
+/// [`unproject_sort_expr`] resolves a key's columns through, so the scope is
+/// decided on exactly the expressions that would be inlined. A schema declared
+/// apart from the expressions (`Projection::try_new_with_schema`) keeps its names,
+/// and the sort fold, which replaces a projection's expressions, rebuilds the
+/// schema with them (`rewrite_plan_for_sort_on_non_projected_fields`).
+///
+/// A wildcard in the projection stands for any number of the input's columns, so
+/// its expressions no longer line up with its schema's fields by position, and
+/// neither this decision nor the inliner can tell which expression a key's column
+/// names. Beside an output that cannot be repeated, with the keys reading the
+/// projection's outputs, the shape is refused rather than guessed at. A bare key
+/// naming an alias the projection lists is left to the normal path: it is
+/// emitted as that name, which needs no position, and is never inlined.
+pub(crate) fn sort_keys_scope_their_projection<'a>(
+    keys: &[SortExpr],
+    input: &'a LogicalPlan,
+) -> Result<Option<&'a Projection>> {
+    let LogicalPlan::Projection(projection) = input else {
+        return Ok(None);
+    };
+    if projection_holds_wildcard(projection)
+        && projection
+            .expr
+            .iter()
+            .any(|expr| !output_is_repeatable(expr))
+        && keys.iter().any(|key| {
+            if let Expr::Column(Column {
+                relation: None,
+                name,
+                ..
+            }) = &key.expr
+                && bare_sort_key_reads_a_listed_alias(projection, name)
+            {
+                return false;
+            }
+            key.expr
+                .column_refs()
+                .into_iter()
+                .any(|column| projection.schema.has_column(column))
+        })
+    {
+        return unrepeatable_sort_key_refusal(
+            "when the projection also holds a wildcard",
+        );
+    }
+    Ok(sort_keys_read_unrepeatable_output(keys, projection).then_some(projection))
+}
+
+/// `keys` as the `ORDER BY` above a scope reads them: every reference unqualified,
+/// so it binds by name to the derived table's output, for the reason
+/// [`scope_filters_over_projection`] gives for a predicate's references. A key
+/// holding a subquery is refused for the reason given there too.
+pub(crate) fn scope_sort_keys(keys: &[SortExpr]) -> Result<Vec<SortExpr>> {
+    keys.iter()
+        .map(|key| {
+            if holds_subquery(&key.expr) {
+                return unrepeatable_sort_key_refusal("when the key holds a subquery");
+            }
+            Ok(SortExpr {
+                expr: unqualify_columns(key.expr.clone())?,
+                asc: key.asc,
+                nulls_first: key.nulls_first,
+            })
+        })
+        .collect()
+}
+
+/// A `Sort` over `projection` — its input, as [`sort_keys_scope_their_projection`]
+/// returns it — re-expressed so the projection is emitted as a derived table and
+/// the keys name its outputs from the `SELECT` that reads them: the form a key
+/// reading an output that cannot be repeated has to take.
+///
+/// The projection gets the identity projection above it that
+/// [`scope_filters_over_projection`] gives a filter stack; unparsed, that becomes
+/// this `SELECT`'s list and the projection a derived table, whose outputs the
+/// `ORDER BY` emitted above then names. The fetch stays on the sort, above the
+/// scope: it bounds the ordered rows, and a derived table's row order does not
+/// reach the query reading it.
+///
+/// Returned beside the plan is the derived table's schema: the projection's outputs
+/// and every column a key carries through it, each of which the `ORDER BY` above
+/// can bind to.
+pub(crate) fn scope_sort_over_projection(
+    sort: &Sort,
+    projection: &Projection,
+) -> Result<(LogicalPlan, DFSchemaRef)> {
+    let expr = scope_sort_keys(&sort.expr)?;
+    let outputs = projection
+        .schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect::<Vec<_>>();
+    // Each output keeps the name the projection's schema gives it, the name the
+    // identity projection above reads it by: an expression whose own name differs,
+    // in a projection built with a declared schema, is aliased to it.
+    ensure_one_output_per_name(&projection.schema, unrepeatable_sort_key_refusal)?;
+    let mut exprs = exprs_named_as_declared(projection);
+    // A key may read a column the projection does not output: folding an outer
+    // list that drops an output inlines that output's expression into the key, and
+    // its columns are the projection's input's. The derived table carries them as
+    // further outputs, which the ORDER BY above reads without the SELECT list
+    // showing them; one the input does not hold either is refused. The column is
+    // looked up with its qualifier: a `t2.a` beside an output `t1.a` is not that
+    // output, and carrying it gives the derived table two outputs named `a`, which
+    // `projection_of_outputs` refuses rather than letting the key bind to either.
+    let input_schema = projection.input.schema();
+    for key in &sort.expr {
+        key.expr.apply(|sub_expr| {
+            if let Expr::Column(column) = sub_expr
+                && projection.schema.index_of_column(column).is_err()
+            {
+                if input_schema.index_of_column(column).is_err() {
+                    return unrepeatable_sort_key_refusal(&format!(
+                        "when the key reads {column}, which neither the projection nor its input provides"
+                    ));
+                }
+                let carried = Expr::Column(column.clone());
+                if !exprs.contains(&carried) {
+                    exprs.push(carried);
+                }
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    let inner = Projection::try_new(exprs, Arc::clone(&projection.input))?;
+    let derived = Arc::clone(&inner.schema);
+    let input = projection_of_outputs(
+        Arc::new(LogicalPlan::Projection(inner)),
+        &outputs,
+        unrepeatable_sort_key_refusal,
+    )?;
+    let scoped = LogicalPlan::Sort(Sort {
+        expr,
+        input: Arc::new(input),
+        fetch: sort.fetch,
+    });
+    Ok((scoped, derived))
 }
 
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {
@@ -1311,6 +1663,16 @@ pub(crate) fn expr_contains_subquery(expr: &Expr) -> bool {
         ))
     })
     .unwrap_or(false)
+}
+
+/// Whether `expr` holds a subquery a scope would hide a relation from: the kinds
+/// [`expr_contains_subquery`] looks for, and a set comparison (`= ANY`, `> ALL`),
+/// whose body may correlate against the hidden relation just the same.
+fn holds_subquery(expr: &Expr) -> bool {
+    expr_contains_subquery(expr)
+        || expr
+            .exists(|e| Ok(matches!(e, Expr::SetComparison(_))))
+            .unwrap_or(false)
 }
 
 /// Partitions filters into `(non_subquery, subquery)` based on whether
