@@ -14568,3 +14568,439 @@ fn test_a_distinct_scope_repoints_a_clause_naming_its_alias() -> Result<()> {
     );
     Ok(())
 }
+
+/// A join that is the right input of another join keeps its own shape: it is
+/// a parenthesised joined table on the right of the outer join, with its own
+/// `ON`, and `b` is in scope where the outer `ON` names it. Linearising it
+/// into the outer `FROM` put the nested join's right side before the relation
+/// it joins to (`FROM a INNER JOIN c ON b.id = c.id FULL JOIN b …`), which
+/// `PostgreSQL` and `DuckDB` reject as an unbound `b` (spiceai/spiceai#14373).
+#[test]
+fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, Inner};
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let nested = |join_type| -> Result<LogicalPlan> {
+        let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+        let b = table_scan_with_filters(
+            Some("b"),
+            &schema,
+            Some(vec![0]),
+            vec![col("b.id").eq(lit("x"))],
+        )?
+        .build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let inner = LogicalPlanBuilder::from(b)
+            .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()?;
+        LogicalPlanBuilder::from(a)
+            .join(inner, join_type, (vec!["a.id"], vec!["b.id"]), None)?
+            .build()
+    };
+
+    assert_snapshot!(
+        plan_to_sql(&nested(Inner)?)?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id WHERE (b.id = 'x')"
+    );
+
+    // The same right-nested shape under a FULL JOIN, without a scan filter (a
+    // FULL JOIN input's filters have their own scoping, out of scope here).
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let inner = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .join(inner, Full, (vec!["a.id"], vec!["b.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM a FULL JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id"
+    );
+
+    // A nested join's scan filter must not reach the shared `WHERE` when the
+    // outer join null-extends that input: under a LEFT JOIN it folds into the
+    // outer `ON`; under a RIGHT JOIN the right input is preserved and `WHERE`
+    // is right; under a FULL JOIN neither clause serves, so the filtered scan
+    // keeps its filter in a derived table of its own.
+    use datafusion_expr::JoinType::{Left, Right};
+    assert_snapshot!(
+        plan_to_sql(&nested(Left)?)?,
+        @"SELECT a.id, b.id, c.id FROM a LEFT OUTER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id AND (b.id = 'x')"
+    );
+    assert_snapshot!(
+        plan_to_sql(&nested(Right)?)?,
+        @"SELECT a.id, b.id, c.id FROM a RIGHT OUTER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id WHERE (b.id = 'x')"
+    );
+    assert_snapshot!(
+        plan_to_sql(&nested(Full)?)?,
+        @"SELECT a.id, b.id, c.id FROM a FULL JOIN ((SELECT b.id FROM b WHERE (b.id = 'x')) AS b INNER JOIN c ON b.id = c.id) ON a.id = b.id"
+    );
+    // The same on the FULL JOIN's left, at the top and nested on a LEFT JOIN's
+    // right: neither lets the filter escape to the enclosing `WHERE` or `ON`.
+    let filtered_join_on_the_left = |outer: Option<LogicalPlan>| -> Result<LogicalPlan> {
+        let b = table_scan_with_filters(
+            Some("b"),
+            &schema,
+            Some(vec![0]),
+            vec![col("b.id").eq(lit("x"))],
+        )?
+        .build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let d = table_scan(Some("d"), &schema, Some(vec![0]))?.build()?;
+        let inner = LogicalPlanBuilder::from(b)
+            .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()?;
+        let full = LogicalPlanBuilder::from(inner)
+            .join(d, Full, (vec!["b.id"], vec!["d.id"]), None)?
+            .build()?;
+        match outer {
+            None => Ok(full),
+            Some(a) => LogicalPlanBuilder::from(a)
+                .join(full, Left, (vec!["a.id"], vec!["d.id"]), None)?
+                .build(),
+        }
+    };
+    assert_snapshot!(
+        plan_to_sql(&filtered_join_on_the_left(None)?)?,
+        @"SELECT b.id, c.id, d.id FROM (SELECT b.id FROM b WHERE (b.id = 'x')) AS b INNER JOIN c ON b.id = c.id FULL JOIN d ON b.id = d.id"
+    );
+    assert_snapshot!(
+        plan_to_sql(&filtered_join_on_the_left(Some(
+            table_scan(Some("a"), &schema, Some(vec![0]))?.build()?
+        ))?)?,
+        @"SELECT a.id, b.id, c.id, d.id FROM a LEFT OUTER JOIN (((SELECT b.id FROM b WHERE (b.id = 'x')) AS b INNER JOIN c ON b.id = c.id) FULL JOIN d ON b.id = d.id) ON a.id = d.id"
+    );
+
+    // A nested join whose scan filter holds a subquery contributes a conjunct
+    // that some dialects refuse in `ON`, and `WHERE` is not this join's to
+    // use for its right input: refused.
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let b = table_scan_with_filters(
+        Some("b"),
+        &schema,
+        Some(vec![0]),
+        vec![exists(Arc::new(allowed))],
+    )?
+    .build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let inner = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .join(inner, Left, (vec!["a.id"], vec!["b.id"]), None)?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a subquery conjunct from a nested right input has no clause under a LEFT JOIN",
+    );
+    assert_contains!(
+        error.to_string(),
+        "LEFT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+    );
+    // The mirror image: a semi join on a RIGHT JOIN's null-extended left
+    // contributes its `EXISTS`, which the left hoist would fold into `ON`.
+    use datafusion_expr::JoinType::LeftSemi;
+    let semi =
+        LogicalPlanBuilder::from(table_scan(Some("b"), &schema, Some(vec![0]))?.build()?)
+            .join(
+                table_scan(Some("c"), &schema, Some(vec![0]))?.build()?,
+                LeftSemi,
+                (vec!["b.id"], vec!["c.id"]),
+                None,
+            )?
+            .build()?;
+    let plan = LogicalPlanBuilder::from(semi)
+        .join(
+            table_scan(Some("a"), &schema, Some(vec![0]))?.build()?,
+            Right,
+            (vec!["b.id"], vec!["a.id"]),
+            None,
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a subquery conjunct from a nested left input has no clause under a RIGHT JOIN",
+    );
+    assert_contains!(
+        error.to_string(),
+        "RIGHT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+    );
+
+    // A mark join on an input an outer join null-extends is refused: the
+    // `EXISTS` that replaces its mark is never NULL, but the mark is on a row
+    // the outer join adds, so `NOT c.mark` or `c.mark IS NULL` above would
+    // answer differently from the plan. On a preserved input the mark join
+    // rewrites the mark in place, which the walk keeps possible.
+    use datafusion_expr::JoinType::LeftMark;
+    let marked = || -> Result<LogicalPlan> {
+        let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        LogicalPlanBuilder::from(b)
+            .join(c, LeftMark, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()
+    };
+    let scan = |name| table_scan(Some(name), &schema, Some(vec![0]))?.build();
+    // A FULL JOIN input is refused by the FULL JOIN's own rule, which also
+    // covers semi and anti joins there.
+    let refused: Vec<(&str, &str, LogicalPlan)> = vec![
+        (
+            "a LEFT JOIN (b MARK c)",
+            "mark join as an input an outer join null-extends is not supported",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Left, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a FULL JOIN (b MARK c)",
+            "semi, anti or mark join as a FULL JOIN input is not supported",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Full, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+        (
+            "(b MARK c) RIGHT JOIN a",
+            "mark join as an input an outer join null-extends is not supported",
+            LogicalPlanBuilder::from(marked()?)
+                .join(scan("a")?, Right, (vec!["b.id"], vec!["a.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a LEFT JOIN ((b MARK c) RIGHT JOIN d)",
+            "mark join as an input an outer join null-extends is not supported",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(
+                    LogicalPlanBuilder::from(marked()?)
+                        .join(scan("d")?, Right, (vec!["b.id"], vec!["d.id"]), None)?
+                        .build()?,
+                    Left,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )?
+                .build()?,
+        ),
+    ];
+    for (shape, expected, joined) in refused {
+        let plan = LogicalPlanBuilder::from(joined)
+            .filter(!col("c.mark"))?
+            .project(vec![col("a.id")])?
+            .build()?;
+        let error = plan_to_sql(&plan).expect_err(shape);
+        assert_contains!(error.to_string(), expected);
+    }
+    let preserved: Vec<(&str, LogicalPlan)> = vec![
+        (
+            "(b MARK c) LEFT JOIN a",
+            LogicalPlanBuilder::from(marked()?)
+                .join(scan("a")?, Left, (vec!["b.id"], vec!["a.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a RIGHT JOIN (b MARK c)",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Right, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+    ];
+    for (shape, joined) in preserved {
+        let plan = LogicalPlanBuilder::from(joined)
+            .filter(col("c.mark"))?
+            .project(vec![col("a.id")])?
+            .build()?;
+        let sql = plan_to_sql(&plan)?.to_string();
+        assert!(
+            sql.contains("WHERE EXISTS (SELECT 1 FROM c WHERE (b.id = c.id))")
+                && !sql.contains("mark"),
+            "the mark read above {shape} must be replaced in place: {sql}"
+        );
+    }
+
+    // An aliased join as the right input is a scope of its own, so its scan
+    // filter stays inside the derived table the alias names, and the outer
+    // join addresses the alias.
+    let c_schema = Schema::new(vec![Field::new("cid", DataType::Utf8, false)]);
+    let b = table_scan_with_filters(
+        Some("b"),
+        &schema,
+        Some(vec![0]),
+        vec![col("b.id").eq(lit("x"))],
+    )?
+    .build()?;
+    let c = table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?;
+    let aliased = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.cid"]), None)?
+        .alias("j")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(aliased, Left, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, j.id, j.cid FROM a LEFT OUTER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid WHERE (b.id = 'x')) AS j ON a.id = j.id"
+    );
+
+    // An aliased join under a filter is a joined input still: derived under
+    // the alias, with the filter inside.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?;
+    let aliased = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.cid"]), None)?
+        .filter(col("b.id").eq(lit("x")))?
+        .alias("j")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(aliased, Left, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, j.id, j.cid FROM a LEFT OUTER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid WHERE (b.id = 'x')) AS j ON a.id = j.id"
+    );
+
+    // A subquery conjunct the outer join's `ON` would scope onto a joined right
+    // input has no single name for the derived table it needs: refused.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let inner = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(
+            inner,
+            Left,
+            (vec!["a.id"], vec!["b.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a scoped subquery conjunct on a joined input has no name to bind to",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
+    // The same joined input under a projection that only picks its columns.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let projected = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .project(vec![col("b.id"), col("c.id")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(
+            projected,
+            Left,
+            (vec!["a.id"], vec!["b.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("a projected joined input is a joined input still");
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
+    // The mirror image: a RIGHT JOIN scopes the conjunct onto its left input.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let inner = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(inner)
+        .join(
+            scan("a")?,
+            Right,
+            (vec!["b.id"], vec!["a.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a scoped subquery conjunct on a joined left input has no name to bind to",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
+
+    // An aliased join behind a filter and a second alias is a joined input
+    // still: the outer alias derives all of it, so the inner alias's filter
+    // stays inside rather than naming `i` where only `o` is in scope.
+    let nested_aliases = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .alias("i")?
+        .filter(col("i.id").eq(lit("x")))?
+        .alias("o")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(nested_aliases, Left, (vec!["a.id"], vec!["o.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a.id, o.id, o."id:1" FROM a LEFT OUTER JOIN (SELECT * FROM (SELECT b.id, c.id AS "id:1" FROM b INNER JOIN c ON b.id = c.id) AS i WHERE (i.id = 'x')) AS o ON a.id = o.id"#
+    );
+
+    // An aliased join on the right of a join inside an EXISTS build side is
+    // derived there too, so the correlation on its primary output binds
+    // inside the subquery. A key on another of its outputs is still refused by
+    // the correlation check, which models the alias as renaming only its
+    // primary relation.
+    use datafusion_expr::JoinType::LeftSemi as Semi;
+    let build_side = || -> Result<LogicalPlan> {
+        let j = LogicalPlanBuilder::from(scan("b")?)
+            .join(
+                table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?,
+                Inner,
+                (vec!["b.id"], vec!["c.cid"]),
+                None,
+            )?
+            .alias("j")?
+            .build()?;
+        LogicalPlanBuilder::from(scan("d")?)
+            .join(j, Inner, (vec!["d.id"], vec!["j.id"]), None)?
+            .build()
+    };
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(build_side()?, Semi, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM d INNER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid) AS j ON d.id = j.id WHERE (a.id = j.id))"
+    );
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(build_side()?, Semi, (vec!["a.id"], vec!["j.cid"]), None)?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err("the correlation check refuses it");
+    assert_contains!(
+        error.to_string(),
+        "a build-side join key names an output only the build side's projection binds"
+    );
+
+    // An aliased joined input that renames its columns takes the dialect's
+    // column-alias fallback: a dialect that refuses `AS j (x, y)` gets the
+    // names inside the derived table instead.
+    let renamed = || -> Result<LogicalPlan> {
+        let joined = LogicalPlanBuilder::from(scan("b")?)
+            .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .project(vec![col("b.id"), col("c.id")])?
+            .build()?;
+        let renamed = LogicalPlanBuilder::from(joined)
+            .project(vec![col("b.id").alias("x"), col("c.id").alias("y")])?
+            .alias("j")?
+            .build()?;
+        LogicalPlanBuilder::from(scan("a")?)
+            .join(renamed, Left, (vec!["a.id"], vec!["j.x"]), None)?
+            .build()
+    };
+    assert_snapshot!(
+        plan_to_sql(&renamed()?)?,
+        @"SELECT a.id, j.x, j.y FROM a LEFT OUTER JOIN (SELECT b.id, c.id FROM b INNER JOIN c ON b.id = c.id) AS j (x, y) ON a.id = j.x"
+    );
+    assert_snapshot!(
+        Unparser::new(&SqliteDialect {}).plan_to_sql(&renamed()?)?,
+        @"SELECT `a`.`id`, `j`.`x`, `j`.`y` FROM `a` LEFT OUTER JOIN (SELECT `b`.`id` AS `x`, `c`.`id` AS `y` FROM `b` INNER JOIN `c` ON `b`.`id` = `c`.`id`) AS `j` ON `a`.`id` = `j`.`x`"
+    );
+    Ok(())
+}
