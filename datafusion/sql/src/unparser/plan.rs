@@ -290,6 +290,7 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
 ///
 /// An unaliased nested join (`a JOIN (b JOIN c ON …) ON …`) does not hide the
 /// relations inside it, so their names stay in scope.
+#[cfg_attr(feature = "recursive_protection", recursive::recursive)]
 fn collect_relation_idents(relation: &ast::TableFactor, idents: &mut Vec<String>) {
     match relation {
         ast::TableFactor::Table { alias, name, .. } => {
@@ -893,6 +894,26 @@ impl Unparser<'_> {
         Ok(SetExpr::Select(Box::new(select_builder.build()?)))
     }
 
+    /// Whether a join input is a joined table — a `Join`, possibly under the
+    /// projections that only pick its columns and the filters over it — as
+    /// opposed to one scan.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn is_joined_relation(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Join(_) => true,
+            LogicalPlan::Projection(projection) => {
+                Self::is_joined_relation(projection.input.as_ref())
+            }
+            LogicalPlan::Filter(filter) => {
+                Self::is_joined_relation(filter.input.as_ref())
+            }
+            LogicalPlan::SubqueryAlias(alias) => {
+                Self::is_joined_relation(alias.input.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     /// Reconstructs a SELECT SQL statement from a logical plan by
     /// unprojecting column expressions found in a [Projection] node. This
     /// requires scanning the plan tree for relevant Aggregate and Window
@@ -1259,6 +1280,226 @@ impl Unparser<'_> {
         walked
     }
 
+    // The helpers below keep the join arms' bookkeeping out of
+    // `select_to_sql_recursively_inner`: every local there takes a slot in the
+    // frame each level of the plan walk pays for, so its size bounds how deep a
+    // plan an unoptimised build can unparse on a given stack.
+
+    /// [`Self::walk_join_input`], counted as an input the join null-extends
+    /// when `null_extended` — see [`SelectBuilder::in_null_extended_join_input`].
+    fn walk_possibly_null_extended_join_input(
+        &self,
+        null_extended: bool,
+        plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        if null_extended {
+            select.enter_null_extended_join_input();
+        }
+        let walked = self.walk_join_input(plan, query, select, relation);
+        if null_extended {
+            select.leave_null_extended_join_input();
+        }
+        walked
+    }
+
+    /// Walks a regular join's right input into `right_relation`, and returns
+    /// what that walk contributed to the shared `WHERE` when it belongs in
+    /// this join's `ON` instead.
+    ///
+    /// A LEFT JOIN null-extends its right input, so a predicate a nested join
+    /// there contributes to the shared `WHERE` would discard the left rows this
+    /// join preserves; it belongs in this join's `ON`. Below a FULL JOIN's
+    /// input, as on the left, the marked walk keeps every predicate scoped, so
+    /// there is nothing to relocate.
+    ///
+    /// The predicate already there stays in place for the walk: a mark join in
+    /// this input rewrites the mark it produces wherever that predicate reads
+    /// it, which it can only do where the predicate is. What the walk adds is
+    /// `AND`ed on after it, so it is told apart by position.
+    fn walk_right_join_input(
+        &self,
+        join_type: JoinType,
+        enclosed_by_full_join: bool,
+        right_plan: &LogicalPlan,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        right_relation: &mut RelationBuilder,
+    ) -> Result<Option<ast::Expr>> {
+        let contribution_is_hoisted =
+            join_type == JoinType::Left && !enclosed_by_full_join;
+        let outer_conjuncts_before = if contribution_is_hoisted {
+            select.selection_conjunct_count()
+        } else {
+            0
+        };
+        select.enter_right_join_input();
+        let walked = self.walk_possibly_null_extended_join_input(
+            matches!(join_type, JoinType::Left | JoinType::Full),
+            right_plan,
+            query,
+            select,
+            right_relation,
+        );
+        select.leave_right_join_input();
+        walked?;
+        if !contribution_is_hoisted {
+            return Ok(None);
+        }
+        Self::take_contribution_for_on(select, outer_conjuncts_before, "LEFT JOIN")
+    }
+
+    /// Splits off what the walk of an input `outer_join` null-extends `AND`ed
+    /// onto the shared `WHERE` after its first `kept` conjuncts, to be folded
+    /// into that join's `ON`.
+    ///
+    /// A subquery is refused in `ON` by some dialects, which is why an inner
+    /// join moves such a conjunct to `WHERE` — the clause the outer join cannot
+    /// use for its null-extended input. It is refused rather than folded into
+    /// `ON`.
+    fn take_contribution_for_on(
+        select: &mut SelectBuilder,
+        kept: usize,
+        outer_join: &str,
+    ) -> Result<Option<ast::Expr>> {
+        let contributed = select.take_selection_added_after(kept);
+        if contributed
+            .as_ref()
+            .is_some_and(super::ast::contains_subquery)
+        {
+            return not_impl_err!(
+                "Unparsing a {outer_join} input that is a join with a subquery predicate on its own inputs is not supported"
+            );
+        }
+        Ok(contributed)
+    }
+
+    /// A subquery conjunct an outer join's `ON` moves onto one input's own
+    /// scope needs a derived table that keeps the input's names addressable; a
+    /// joined input has no single name for that, so it is refused rather than
+    /// wrapped anonymously.
+    fn refuse_scoped_subquery_on_joined_input(
+        scoped: &[Expr],
+        input: &LogicalPlan,
+    ) -> Result<()> {
+        if !scoped.is_empty() && Self::is_joined_relation(input) {
+            return not_impl_err!(
+                "Unparsing an outer join's subquery predicate scoped onto a joined input is not supported"
+            );
+        }
+        Ok(())
+    }
+
+    /// Attaches `join` to the left side its join walked: appended to the shared
+    /// `FROM`, or — for a join that is another join's right input, whose left
+    /// side was walked into the relation the enclosing join handed down — in
+    /// place of that left side, as a parenthesised joined table.
+    fn attach_join(
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+        is_right_join_input: bool,
+        join: ast::Join,
+    ) -> Result<()> {
+        if !is_right_join_input {
+            let mut from = select.pop_from().unwrap();
+            from.push_join(join);
+            select.push_from(from);
+            return Ok(());
+        }
+        let Ok(Some(left_side)) = relation.build() else {
+            return internal_err!("Failed to build the left relation of a nested join");
+        };
+        relation.nested_join(
+            ast::TableWithJoins {
+                relation: left_side,
+                joins: vec![join],
+            },
+            None,
+        );
+        Ok(())
+    }
+
+    /// [`Self::and_into_join_constraint`] for each input's hoisted predicate in
+    /// turn, returning to the shared `WHERE` what cannot be appended.
+    fn and_hoisted_into_join_constraint(
+        mut constraint: ast::JoinConstraint,
+        hoisted: [Option<ast::Expr>; 2],
+        select: &mut SelectBuilder,
+    ) -> ast::JoinConstraint {
+        for predicate in hoisted {
+            let (anded, unhoistable) =
+                Self::and_into_join_constraint(constraint, predicate);
+            select.selection(unhoistable);
+            constraint = anded;
+        }
+        constraint
+    }
+
+    /// A mark join's mark is replaced by `EXISTS` wherever the enclosing query
+    /// reads it, and `EXISTS` is never NULL. On an input an outer join
+    /// null-extends the mark is NULL for the rows that join adds, so `NOT
+    /// x.mark` or `x.mark IS NULL` above it would keep or drop those rows
+    /// differently from the plan. Refused there; computing the mark inside a
+    /// derived input the outer join null-extends is the lift.
+    fn refuse_mark_join_on_null_extended_input(
+        select: &SelectBuilder,
+        join_type: JoinType,
+    ) -> Result<()> {
+        if select.in_null_extended_join_input()
+            && matches!(join_type, JoinType::LeftMark | JoinType::RightMark)
+        {
+            return not_impl_err!(
+                "Unparsing a mark join as an input an outer join null-extends is not supported"
+            );
+        }
+        Ok(())
+    }
+
+    /// Derives `plan`, an aliased join that is another join's right input,
+    /// under `plan_alias` as a scope of its own (see the `SubqueryAlias` arm),
+    /// with its columns as that side's select items.
+    fn derive_aliased_joined_right_input(
+        &self,
+        plan_alias: &datafusion_expr::SubqueryAlias,
+        plan: &LogicalPlan,
+        columns: Vec<Ident>,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        if !select.already_projected() {
+            let items = plan_alias
+                .schema
+                .columns()
+                .into_iter()
+                .map(|column| self.select_item_to_sql(&Expr::Column(column)))
+                .collect::<Result<Vec<_>>>()?;
+            select.projection(items);
+        }
+        // A dialect that refuses a column list on a table alias gets the names
+        // inside the derived table instead, as the other derived paths do.
+        if !columns.is_empty() && !self.dialect.supports_column_alias_in_table_alias() {
+            let Ok(rewritten_plan) =
+                inject_column_aliases_into_subquery(plan.clone(), columns)
+            else {
+                return internal_err!("Failed to transform SubqueryAlias plan");
+            };
+            return self.derive(
+                &rewritten_plan,
+                relation,
+                Some(self.new_table_alias(plan_alias.alias.table().to_string(), vec![])),
+                false,
+            );
+        }
+        self.derive(
+            plan,
+            relation,
+            Some(self.new_table_alias(plan_alias.alias.table().to_string(), columns)),
+            false,
+        )
+    }
+
     fn derive_with_dialect_alias(
         &self,
         alias: &str,
@@ -1340,7 +1581,7 @@ impl Unparser<'_> {
     ) -> Result<()> {
         let Some(table_ref) = Self::scanned_relation_of(plan) else {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is only supported when the limited input is a single table scan"
+                "Unparsing a row limit in a scope of its own is only supported when the limited input is a single table scan"
             );
         };
 
@@ -1348,7 +1589,7 @@ impl Unparser<'_> {
         // with the full path would be left pointing at a name that is gone.
         if self.dialect.full_qualified_col() && table_ref.to_vec().len() > 1 {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is not supported for a qualified table name on a dialect that spells columns in full"
+                "Unparsing a row limit in a scope of its own is not supported for a qualified table name on a dialect that spells columns in full"
             );
         }
 
@@ -1360,7 +1601,7 @@ impl Unparser<'_> {
         let fields = plan.schema().fields();
         if fields.is_empty() {
             return not_impl_err!(
-                "Unparsing a filter applied after a row limit is not supported for an input projecting no columns"
+                "Unparsing a row limit in a scope of its own is not supported for an input projecting no columns"
             );
         }
 
@@ -1407,6 +1648,56 @@ impl Unparser<'_> {
             }
             _ => None,
         }
+    }
+
+    /// Derives a `Limit` that is a join input.
+    ///
+    /// Over one scan it takes the scan's own name, so the enclosing join's
+    /// `ON` and select list keep binding to it, with that scan's columns as
+    /// this side's select items — exactly what a row limit under a filter
+    /// needs, so the same scope is used. Over anything else there is no name
+    /// for the derived table to take: with a projection already above the
+    /// join it keeps the dialect's derived-limit alias, as before, while the
+    /// input's columns are unqualified; without one, or over qualified
+    /// columns the derived table would hide, it is refused rather than
+    /// emitting SQL that bounds the join's output or names an unbound relation.
+    fn derive_join_input_limit(
+        &self,
+        plan: &LogicalPlan,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        // A limited scan that projects no columns feeds only a count: with the
+        // projection already above the join, the dialect-alias derived table
+        // (`SELECT 1 FROM b LIMIT n`) keeps its cardinality, as before.
+        let projects_nothing = plan.schema().fields().is_empty();
+        if Self::scanned_relation_of(plan).is_some() && !projects_nothing {
+            return self.derive_row_limited_scope(plan, select, relation);
+        }
+        if select.already_projected() {
+            // The derived table hides every relation inside it, so an output
+            // column still qualified by one of them (a grouping's key, a join's
+            // columns) is one the enclosing `ON` and select list cannot reach.
+            if plan
+                .schema()
+                .iter()
+                .any(|(qualifier, _)| qualifier.is_some())
+            {
+                return not_impl_err!(
+                    "Unparsing a row limit on a join input whose columns are qualified is not supported unless the input is a single table scan"
+                );
+            }
+            return self.derive_with_dialect_alias(
+                DERIVED_LIMIT_ALIAS,
+                plan,
+                relation,
+                false,
+                vec![],
+            );
+        }
+        not_impl_err!(
+            "Unparsing a row limit on a join input that is not a single table scan is not supported without a projection above the join"
+        )
     }
 
     /// Isolates what a join input's `TableScan` did in a derived table:
@@ -2551,6 +2842,17 @@ impl Unparser<'_> {
                 )
             }
             LogicalPlan::Limit(limit) => {
+                // A join input's limit has no faithful home in the enclosing
+                // query, whatever else that query carries: its `LIMIT` bounds
+                // the join's output, not one input's contribution to it. The
+                // derived table takes the scan's own name, which is what the
+                // join's `ON` and the select list already call this input
+                // (spiceai/spiceai#14375).
+                if select.within_join_input()
+                    && (limit.fetch.is_some() || limit.skip.is_some())
+                {
+                    return self.derive_join_input_limit(plan, select, relation);
+                }
                 // Limit can be top-level plan for derived table
                 if select.already_projected() {
                     return self.derive_with_dialect_alias(
@@ -2895,6 +3197,13 @@ impl Unparser<'_> {
                 // In that case, we don't need to worry about setting up the projection here.
                 // The outer projection plan will handle projecting the correct columns.
                 let already_projected = select.already_projected();
+                // A join that is another join's right input is a joined table
+                // of its own on that join's right, not a further entry in
+                // the shared `FROM` — whose last entry is the enclosing
+                // join's left side, so appending there would put this join's
+                // right side before the relation it joins to (#14373).
+                let is_right_join_input = select.in_right_join_input();
+                Self::refuse_mark_join_on_null_extended_input(select, join.join_type)?;
 
                 let mut left_scan_fetch = None;
                 let mut left_scan_only_filters = vec![];
@@ -2936,21 +3245,34 @@ impl Unparser<'_> {
                 // preserved. A FULL JOIN also null-extends its left input, but
                 // preserves left rows, so moving the predicate into ON would
                 // make filtered-out left rows reappear as unmatched rows.
+                // The predicate already there stays in place for the walk — a
+                // mark join in this input rewrites the mark it produces wherever
+                // that predicate reads it — and what the walk adds is `AND`ed on
+                // after it, so it is told apart by position.
                 // Below a FULL JOIN's input there is nothing to relocate: the
                 // marked walk keeps every predicate the left subtree carries in
-                // that subtree's own scope. Setting the accumulated predicate
-                // aside would only hide it from the walk — a row-limited input
-                // reads it to decide it needs a scope of its own, and a mark
-                // join rewrites the mark it names in place.
+                // that subtree's own scope.
                 let left_is_null_extended =
                     matches!(join.join_type, JoinType::Right) && !enclosed_by_full_join;
-                let outer_selection = if left_is_null_extended {
-                    select.take_selection()
+                let outer_conjuncts_before_left = if left_is_null_extended {
+                    select.selection_conjunct_count()
                 } else {
-                    None
+                    0
                 };
 
-                self.walk_join_input(left_plan.as_ref(), query, select, relation)?;
+                // A RIGHT JOIN null-extends its left input, a FULL JOIN both of
+                // its inputs: a mark join reached there is refused (see above).
+                self.walk_possibly_null_extended_join_input(
+                    matches!(join.join_type, JoinType::Right | JoinType::Full),
+                    left_plan.as_ref(),
+                    query,
+                    select,
+                    relation,
+                )?;
+                Self::refuse_scoped_subquery_on_joined_input(
+                    &left_scoped,
+                    left_plan.as_ref(),
+                )?;
 
                 // A FULL JOIN preserves both sides, so neither `ON` nor
                 // `WHERE` can express a filter that came from just one
@@ -2985,9 +3307,11 @@ impl Unparser<'_> {
                 }
 
                 let hoisted_from_left = if left_is_null_extended {
-                    let contributed = select.take_selection();
-                    select.restore_selection(outer_selection);
-                    contributed
+                    Self::take_contribution_for_on(
+                        select,
+                        outer_conjuncts_before_left,
+                        "RIGHT JOIN",
+                    )?
                 } else {
                     None
                 };
@@ -3016,6 +3340,12 @@ impl Unparser<'_> {
                 // clauses into the outer query. Regular joins unparse it into
                 // the shared `select` as usual.
                 let mut right_relation = RelationBuilder::default();
+                // What a null-extended right input's *nested* joins add to the
+                // shared `WHERE`, folded into this join's `ON` below — see
+                // `left_is_null_extended` for the mirror image. A scan's own
+                // filters never reach here: they are peeled above and routed by
+                // `split_join_on_and_where_filters`.
+                let mut hoisted_from_right: Option<ast::Expr> = None;
                 let right_plan: Arc<LogicalPlan> = if is_exists_join {
                     Arc::clone(right_plan)
                 } else {
@@ -3049,7 +3379,10 @@ impl Unparser<'_> {
                     // nested join rather than a derived table, so the join
                     // condition can still name the aliases inside it. Not below
                     // a FULL JOIN, whose inputs keep their predicates in scopes
-                    // this nested walk does not track.
+                    // this nested walk does not track. It is walked with a
+                    // `SELECT` of its own and falls back to the walk below when
+                    // that `SELECT` gains a predicate, so it contributes nothing
+                    // to the shared `WHERE`.
                     if already_projected
                         && !select.input_predicates_stay_scoped()
                         && let Some(nested_relation) = self
@@ -3060,13 +3393,19 @@ impl Unparser<'_> {
                     {
                         right_relation = nested_relation;
                     } else {
-                        self.walk_join_input(
+                        hoisted_from_right = self.walk_right_join_input(
+                            join.join_type,
+                            enclosed_by_full_join,
                             right_plan.as_ref(),
                             query,
                             select,
                             &mut right_relation,
                         )?;
                     }
+                    Self::refuse_scoped_subquery_on_joined_input(
+                        &right_scoped,
+                        right_plan.as_ref(),
+                    )?;
                     if right_scan_fetch.is_some()
                         || (inputs_keep_predicates && !right_scan_filters.is_empty())
                         || !right_scoped.is_empty()
@@ -3135,7 +3474,7 @@ impl Unparser<'_> {
                 // else to go: returning it to the SELECT-global `WHERE` would
                 // discard unmatched rows from the preserved side. Downgrade
                 // to an equivalent `ON` constraint so it can be appended.
-                if hoisted_from_left.is_some()
+                if (hoisted_from_left.is_some() || hoisted_from_right.is_some())
                     && matches!(
                         join_constraint,
                         ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural
@@ -3144,9 +3483,11 @@ impl Unparser<'_> {
                     join_constraint =
                         self.join_conditions_to_sql_on(&join.on, join_filters.as_ref())?;
                 }
-                let (join_constraint, unhoistable) =
-                    Self::and_into_join_constraint(join_constraint, hoisted_from_left);
-                select.selection(unhoistable);
+                let join_constraint = Self::and_hoisted_into_join_constraint(
+                    join_constraint,
+                    [hoisted_from_left, hoisted_from_right],
+                    select,
+                );
 
                 let right_projection: Option<Vec<ast::SelectItem>> =
                     if !already_projected && !is_exists_join {
@@ -3207,18 +3548,21 @@ impl Unparser<'_> {
                     | JoinType::Left
                     | JoinType::Right
                     | JoinType::Full => {
-                        let Ok(Some(relation)) = right_relation.build() else {
+                        let Ok(Some(right_factor)) = right_relation.build() else {
                             return internal_err!("Failed to build right relation");
                         };
                         let ast_join = ast::Join {
-                            relation,
+                            relation: right_factor,
                             global: false,
                             join_operator: self
                                 .join_operator_to_sql(join.join_type, join_constraint)?,
                         };
-                        let mut from = select.pop_from().unwrap();
-                        from.push_join(ast_join);
-                        select.push_from(from);
+                        Self::attach_join(
+                            select,
+                            relation,
+                            is_right_join_input,
+                            ast_join,
+                        )?;
                         if !already_projected {
                             let Some(left_projection) = left_projection else {
                                 return internal_err!("Left projection is missing");
@@ -3243,6 +3587,17 @@ impl Unparser<'_> {
                 let (plan, mut columns) =
                     subquery_alias_inner_query_and_columns(plan_alias);
 
+                // An aliased join that is another join's right input is a
+                // scope of its own: walked into the shared SELECT, its scans'
+                // filters would be hoisted or placed under names the alias
+                // then hides (`b.id = 'x'` beside `(b JOIN c) AS j`). Derived,
+                // they stay inside and the alias is what the enclosing query
+                // addresses.
+                if select.in_right_join_input() && Self::is_joined_relation(plan) {
+                    return self.derive_aliased_joined_right_input(
+                        plan_alias, plan, columns, select, relation,
+                    );
+                }
                 // The `TableScan` arm's reasoning, reached through a plain
                 // alias: below a FULL JOIN's input, a scan that still carries
                 // its filters keeps them in a derived table of its own, since
