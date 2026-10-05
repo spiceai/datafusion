@@ -804,6 +804,61 @@ mod tests {
         assert_eq!(cache.list_entries(), HashMap::from([]));
     }
 
+    /// The hit counter is part of the cached entry, so every eviction path leaves the hit map
+    /// holding exactly the keys the queue holds. `evict_entries` (reached from `put` and
+    /// `update_cache_limit`) must drop the evicted key from `hits`, otherwise the map gains
+    /// one `(Path, usize)` pair per evicted key for the life of the process.
+    /// Regression test for spiceai/spiceai#12952.
+    #[test]
+    fn evicting_an_entry_also_drops_its_hit_counter() {
+        /// The hit map's keys, sorted, after checking it holds exactly as many as the queue.
+        fn hit_keys(cache: &DefaultCache<Path, CachedFileMetadataEntry>) -> Vec<String> {
+            let state = cache.state.lock().unwrap();
+            assert_eq!(state.hits.len(), state.lru_queue.len());
+            let mut keys: Vec<String> =
+                state.hits.keys().map(ToString::to_string).collect();
+            keys.sort();
+            keys
+        }
+
+        // Room for exactly three entries: a 2-byte key and a 100-byte footer each.
+        let entry_size = 2 + 100;
+        let cache = DefaultCache::new(3 * entry_size);
+
+        // Every path is used once, as a refresh or compaction writes files under a fresh
+        // directory: 50 puts of distinct keys evict 47 entries through `put`.
+        for i in 0..50 {
+            let (meta, metadata) =
+                generate_test_metadata_with_size(&format!("{i:02}"), 100);
+            cache.put(
+                &meta.location,
+                CachedFileMetadataEntry::new(meta.clone(), metadata),
+            );
+        }
+        assert_eq!(cache.len(), 3);
+        assert_eq!(cache.memory_used(), 3 * entry_size);
+        assert_eq!(hit_keys(&cache), ["47", "48", "49"]);
+        assert!(!cache.contains_key(&Path::from("00")));
+
+        // A recorded hit on a live entry survives; the evicted entry's counter does not come
+        // back with it.
+        assert!(cache.get(&Path::from("49")).is_some());
+        assert!(cache.get(&Path::from("00")).is_none());
+        assert_eq!(hit_keys(&cache), ["47", "48", "49"]);
+        assert_eq!(cache.list_entries()[&Path::from("49")].hits, 1);
+
+        // Eviction through a lowered limit prunes the same way.
+        cache.update_cache_limit(entry_size);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.memory_used(), entry_size);
+        assert_eq!(hit_keys(&cache), ["49"]);
+
+        // `list_entries` still resolves a hit count for the surviving entry.
+        let entries = cache.list_entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[&Path::from("49")].hits, 1);
+    }
+
     fn create_test_meta(path: &str, size: u64) -> ObjectMeta {
         ObjectMeta {
             location: Path::from(path),
