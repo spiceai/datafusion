@@ -7694,8 +7694,8 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
     );
 
     // A filtered scan reached through a row limit rather than a projection,
-    // with no select list taken: nothing lists the scan's columns for a
-    // derived table, so the filters keep the pushdown rewrite and the refusal.
+    // with no select list taken: the limited join input is derived under the
+    // scan's own name, so its filters and its `LIMIT` both stay in that scope.
     let limited = table_scan_with_filters(
         Some("a"),
         &schema,
@@ -7707,10 +7707,9 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
     let plan = LogicalPlanBuilder::from(limited)
         .join(c.clone(), Full, (vec!["a.id"], vec!["c.id"]), None)?
         .build()?;
-    let error = plan_to_sql(&plan).expect_err("the scan's columns are unlisted");
-    assert_contains!(
-        error.to_string(),
-        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x') LIMIT 1) AS a FULL JOIN c ON a.id = c.id"
     );
 
     // A semi join's EXISTS is a predicate on the enclosing WHERE.
@@ -13971,6 +13970,169 @@ fn test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date() -> Re
     assert!(
         sql.contains("AS TIMESTAMP)") && sql.matches("CAST(").count() >= 2,
         "both sides have to be brought to one type BigQuery accepts: {sql}"
+    );
+    Ok(())
+}
+
+/// A `Limit` that is a join input is derived unconditionally, under the scan's
+/// own name: the enclosing query has no clause that bounds one input's
+/// contribution to the join (its `LIMIT` bounds the join's output), and the
+/// join's `ON` and the select list go on naming the input by the scan's name.
+/// Neither a `WHERE` nor a projection above the join is what decides it
+/// (spiceai/spiceai#14375).
+#[test]
+fn limit_join_input_is_derived_under_the_scans_name() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, Inner};
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let bare = |join_type| -> Result<LogicalPlan> {
+        let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let limited_c = LogicalPlanBuilder::from(c).limit(0, Some(1))?.build()?;
+        LogicalPlanBuilder::from(b)
+            .join(limited_c, join_type, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()
+    };
+
+    // No projection and no filter above the join: the limit must still be the
+    // input's, not the join's.
+    assert_snapshot!(
+        plan_to_sql(&bare(Full)?)?,
+        @"SELECT b.id, c.id FROM b FULL JOIN (SELECT c.id FROM c LIMIT 1) AS c ON b.id = c.id"
+    );
+    assert_snapshot!(
+        plan_to_sql(&bare(Inner)?)?,
+        @"SELECT b.id, c.id FROM b INNER JOIN (SELECT c.id FROM c LIMIT 1) AS c ON b.id = c.id"
+    );
+
+    // With a projection above the join the derived table was already made,
+    // but carried no alias the references above could bind to.
+    let projected = LogicalPlanBuilder::from(bare(Full)?)
+        .project(vec![col("b.id"), col("c.id")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&projected)?,
+        @"SELECT b.id, c.id FROM b FULL JOIN (SELECT c.id FROM c LIMIT 1) AS c ON b.id = c.id"
+    );
+
+    // The limit on the left input.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let limited_b = LogicalPlanBuilder::from(b).limit(0, Some(1))?.build()?;
+    let plan = LogicalPlanBuilder::from(limited_b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT b.id, c.id FROM (SELECT b.id FROM b LIMIT 1) AS b INNER JOIN c ON b.id = c.id"
+    );
+
+    // A qualified scan on a dialect that spells columns in full is refused,
+    // and the refusal names the row limit, not a filter the plan does not have.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("s.c"), &schema, Some(vec![0]))?
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let error = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("the alias cannot carry the full path");
+    assert_contains!(
+        error.to_string(),
+        "Unparsing a row limit in a scope of its own is not supported for a qualified table name on a dialect that spells columns in full"
+    );
+    Ok(())
+}
+
+/// A `Limit` over something other than one scan, as a join input with a
+/// projection above, keeps the dialect-alias derived table only while its
+/// output columns are unqualified: a qualified one names a relation inside the
+/// derived table, which the enclosing `ON` and select list cannot reach.
+#[test]
+fn limit_join_input_over_qualified_outputs_is_refused() -> Result<()> {
+    use datafusion_expr::JoinType::Inner;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let scan = |name| table_scan(Some(name), &schema, Some(vec![0]))?.build();
+    let joined_on = |input: LogicalPlan, key: Expr| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(scan("a")?)
+            .join_on(input, Inner, vec![col("a.id").eq(key.clone())])?
+            .project(vec![col("a.id"), key])?
+            .build()
+    };
+
+    // Renamed outputs carry no qualifier, so the enclosing query binds them.
+    let renamed = LogicalPlanBuilder::from(scan("b")?)
+        .project(vec![col("b.id").alias("x")])?
+        .limit(0, Some(1))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&joined_on(renamed, col("x"))?)?,
+        @"SELECT a.id, x FROM a INNER JOIN (SELECT b.id AS x FROM b LIMIT 1) ON (a.id = x)"
+    );
+
+    let grouped = LogicalPlanBuilder::from(scan("b")?)
+        .aggregate(vec![col("b.id")], Vec::<Expr>::new())?
+        .limit(0, Some(1))?
+        .build()?;
+    let joined = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .limit(0, Some(1))?
+        .build()?;
+    for input in [grouped, joined] {
+        let error = plan_to_sql(&joined_on(input, col("b.id"))?)
+            .expect_err("`b` is not addressable outside the derived table");
+        assert_contains!(
+            error.to_string(),
+            "Unparsing a row limit on a join input whose columns are qualified is not supported unless the input is a single table scan"
+        );
+    }
+    Ok(())
+}
+
+/// A `Limit` with neither `fetch` nor `skip` bounds nothing, so as a join
+/// input it takes no scope of its own.
+#[test]
+fn no_op_limit_join_input_is_passed_through() -> Result<()> {
+    use datafusion_expr::JoinType::Inner;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?
+        .limit(0, None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT b.id, c.id FROM b INNER JOIN c ON b.id = c.id"
+    );
+    Ok(())
+}
+
+/// A limited scan that projects no columns, as a join input under a count:
+/// it keeps the dialect-alias derived table it had, `SELECT 1 FROM b LIMIT n`,
+/// which preserves the cardinality the count needs and names nothing.
+#[test]
+fn limit_join_input_projecting_no_columns_keeps_its_count_scope() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![]))?
+        .limit(0, Some(3))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .cross_join(b)?
+        .aggregate(
+            Vec::<Expr>::new(),
+            vec![datafusion_functions_aggregate::count::count(lit(1))],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT count(1) FROM a CROSS JOIN (SELECT 1 FROM b LIMIT 3)"
     );
     Ok(())
 }
