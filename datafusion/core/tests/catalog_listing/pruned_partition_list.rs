@@ -24,9 +24,11 @@ use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
 use datafusion::execution::SessionStateBuilder;
 use datafusion_catalog_listing::helpers::{
     describe_partition, list_partitions, pruned_partition_list,
+    pruned_partition_list_with_metadata,
 };
 use datafusion_common::ScalarValue;
 use datafusion_datasource::ListingTableUrl;
+use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_expr::{Expr, col, lit};
 use datafusion_session::Session;
 
@@ -231,6 +233,64 @@ async fn test_list_partition() {
             ("tablepath/part1=p1v3/part2=p2v1", 2, vec!["file3.parquet"]),
         ]
     );
+}
+
+#[tokio::test]
+async fn test_pruned_partition_list_metadata_size() {
+    // Unpartitioned table pruned by a `_size` metadata predicate: only the large
+    // object survives, and it is filtered from the listing without being opened.
+    let pruned = list_with_metadata(
+        &[("tablepath/small.jsonl", 10), ("tablepath/big.jsonl", 500)],
+        col("_size").gt(lit(100u64)),
+        MetadataColumn::Size,
+    )
+    .await;
+
+    assert_eq!(pruned, ["tablepath/big.jsonl"]);
+}
+
+#[tokio::test]
+async fn test_pruned_partition_list_metadata_location() {
+    let pruned = list_with_metadata(
+        &[
+            ("tablepath/a.jsonl", 10),
+            ("tablepath/b.jsonl", 10),
+            ("tablepath/c.jsonl", 10),
+        ],
+        col("_location").eq(lit("tablepath/b.jsonl")),
+        MetadataColumn::Location(None),
+    )
+    .await;
+
+    assert_eq!(pruned, ["tablepath/b.jsonl"]);
+}
+
+/// Lists `files` from an in-memory store, pruning by a single metadata-column
+/// predicate, and returns the surviving object locations.
+async fn list_with_metadata(
+    files: &[(&str, u64)],
+    filter: Expr,
+    metadata_col: MetadataColumn,
+) -> Vec<String> {
+    let (store, state) = make_test_store_and_state(files);
+    pruned_partition_list_with_metadata(
+        state.as_ref(),
+        store.as_ref(),
+        &ListingTableUrl::parse("file:///tablepath/").unwrap(),
+        &[], // no partition filters
+        ".jsonl",
+        &[], // unpartitioned
+        &[filter],
+        &[metadata_col],
+    )
+    .await
+    .expect("metadata pruning failed")
+    .try_collect::<Vec<_>>()
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|pf| pf.object_meta.location.to_string())
+    .collect()
 }
 
 pub fn make_test_store_and_state(
