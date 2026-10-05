@@ -529,6 +529,9 @@ impl SelectBuilder {
     pub fn pop_from(&mut self) -> Option<TableWithJoinsBuilder> {
         self.from.pop()
     }
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
     pub fn lateral_views(&mut self, value: Vec<ast::LateralView>) -> &mut Self {
         self.lateral_views = value;
         self
@@ -607,11 +610,6 @@ impl SelectBuilder {
         }
 
         self
-    }
-
-    /// Whether this `SELECT` already carries a `WHERE` predicate.
-    pub fn has_selection(&self) -> bool {
-        self.selection.is_some()
     }
 
     /// Whether this `SELECT` already carries a predicate that can only be
@@ -846,6 +844,9 @@ pub struct RelationBuilder {
     /// Whether the enclosing scope names this relation's output columns itself,
     /// through a column list on the alias it attaches once the relation is built.
     columns_named_by_alias: bool,
+    /// The alias the enclosing scope attaches to this relation once it is built,
+    /// when that alias names the relation's own output columns.
+    alias_in_scope: Option<String>,
 }
 
 #[derive(Clone)]
@@ -855,6 +856,7 @@ pub struct RelationBuilder {
 enum TableFactorBuilder {
     Table(TableRelationBuilder),
     Derived(DerivedRelationBuilder),
+    NestedJoin(ast::TableWithJoins, Option<ast::TableAlias>),
     Unnest(UnnestRelationBuilder),
     Flatten(FlattenRelationBuilder),
     Empty,
@@ -892,6 +894,15 @@ impl RelationBuilder {
         self
     }
 
+    pub fn nested_join(
+        &mut self,
+        value: ast::TableWithJoins,
+        alias: Option<ast::TableAlias>,
+    ) -> &mut Self {
+        self.relation = Some(TableFactorBuilder::NestedJoin(value, alias));
+        self
+    }
+
     pub fn unnest(&mut self, value: UnnestRelationBuilder) -> &mut Self {
         self.relation = Some(TableFactorBuilder::Unnest(value));
         self
@@ -915,6 +926,9 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Derived(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
+            Some(TableFactorBuilder::NestedJoin(_, ref mut alias)) => {
+                *alias = value;
+            }
             Some(TableFactorBuilder::Unnest(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
@@ -930,6 +944,12 @@ impl RelationBuilder {
         Ok(match self.relation {
             Some(TableFactorBuilder::Table(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Derived(ref value)) => Some(value.build()?),
+            Some(TableFactorBuilder::NestedJoin(ref table_with_joins, ref alias)) => {
+                Some(ast::TableFactor::NestedJoin {
+                    table_with_joins: Box::new(table_with_joins.clone()),
+                    alias: alias.clone(),
+                })
+            }
             Some(TableFactorBuilder::Unnest(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Flatten(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Empty) => None,
@@ -948,10 +968,21 @@ impl RelationBuilder {
     pub(super) fn has_columns_named_by_alias(&self) -> bool {
         self.columns_named_by_alias
     }
+    /// Declares the alias this relation is given once it has been built, so a
+    /// `SELECT` reading a derived table built in the meantime knows that a
+    /// reference qualified by that alias is in scope.
+    pub(super) fn set_alias_in_scope(&mut self, alias: Option<String>) -> &mut Self {
+        self.alias_in_scope = alias;
+        self
+    }
+    pub(super) fn alias_in_scope(&self) -> Option<&str> {
+        self.alias_in_scope.as_deref()
+    }
     fn create_empty() -> Self {
         Self {
             relation: Default::default(),
             columns_named_by_alias: false,
+            alias_in_scope: None,
         }
     }
 }

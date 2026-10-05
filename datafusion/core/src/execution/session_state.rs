@@ -30,7 +30,9 @@ use crate::datasource::provider_as_source;
 use crate::execution::SessionStateDefaults;
 use crate::execution::context::{EmptySerializerRegistry, FunctionFactory, QueryPlanner};
 use crate::physical_planner::{DefaultPhysicalPlanner, PhysicalPlanner};
-use arrow_schema::{DataType, FieldRef};
+#[cfg(feature = "sql")]
+use arrow_schema::DataType;
+use arrow_schema::FieldRef;
 use datafusion_catalog::MemoryCatalogProviderList;
 use datafusion_catalog::information_schema::{
     INFORMATION_SCHEMA, InformationSchemaProvider,
@@ -53,6 +55,7 @@ use datafusion_execution::runtime_env::RuntimeEnv;
 use datafusion_expr::TableSource;
 use datafusion_expr::execution_props::ExecutionProps;
 use datafusion_expr::expr_rewriter::FunctionRewrite;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use datafusion_expr::planner::ExprPlanner;
 #[cfg(feature = "sql")]
 use datafusion_expr::planner::{RelationPlanner, TypePlanner};
@@ -70,12 +73,10 @@ use datafusion_optimizer::{
 };
 use datafusion_physical_expr::create_physical_expr;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
-use datafusion_physical_optimizer::PhysicalOptimizerContext;
-use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::operator_statistics::StatisticsRegistry;
-use datafusion_session::Session;
+use datafusion_session::{PhysicalOptimizerContext, PhysicalOptimizerRule, Session};
 #[cfg(feature = "sql")]
 use datafusion_sql::{
     parser::{DFParserBuilder, Statement},
@@ -267,6 +268,29 @@ impl Session for SessionState {
         self.config()
     }
 
+    fn catalog_list(&self) -> Arc<dyn CatalogProviderList> {
+        Arc::clone(self.catalog_list())
+    }
+
+    fn query_planner(&self) -> Arc<dyn QueryPlanner + Send + Sync> {
+        // Disambiguate: `SessionState` has an inherent `query_planner` (returning
+        // `&Arc<...>`) with the same name as this trait method. The qualified path
+        // calls the inherent one; a bare `self.query_planner()` would recurse.
+        Arc::clone(SessionState::query_planner(self))
+    }
+
+    fn optimize(&self, plan: &LogicalPlan) -> datafusion_common::Result<LogicalPlan> {
+        SessionState::optimize(self, plan)
+    }
+
+    fn physical_optimizers(&self) -> &[Arc<dyn PhysicalOptimizerRule + Send + Sync>] {
+        SessionState::physical_optimizers(self)
+    }
+
+    fn statistics_registry(&self) -> Option<&StatisticsRegistry> {
+        SessionState::statistics_registry(self)
+    }
+
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
@@ -347,9 +371,10 @@ impl SessionState {
         let resolved_ref = self.resolve_table_ref(table_ref);
         if self.config.information_schema() && *resolved_ref.schema == *INFORMATION_SCHEMA
         {
-            return Ok(Arc::new(InformationSchemaProvider::new(Arc::clone(
-                &self.catalog_list,
-            ))));
+            return Ok(Arc::new(
+                InformationSchemaProvider::new(Arc::clone(&self.catalog_list))
+                    .with_table_functions(self.table_functions.clone()),
+            ));
         }
 
         self.catalog_list
@@ -437,13 +462,12 @@ impl SessionState {
     ) -> datafusion_common::Result<Statement> {
         let dialect = dialect_from_str(dialect).ok_or_else(|| {
             plan_datafusion_err!(
-                "Unsupported SQL dialect: {dialect}. Available dialects: \
-                     Generic, MySQL, PostgreSQL, Hive, SQLite, Snowflake, Redshift, \
-                     MsSQL, ClickHouse, BigQuery, Ansi, DuckDB, Databricks."
+                "Unsupported SQL dialect: {dialect}. Available dialects: {}.",
+                Dialect::available()
             )
         })?;
 
-        let recursion_limit = self.config.options().sql_parser.recursion_limit;
+        let recursion_limit = self.config.options().sql_parser.recursion_limit.get();
 
         let mut statements = DFParserBuilder::new(sql)
             .with_dialect(dialect.as_ref())
@@ -486,13 +510,12 @@ impl SessionState {
     ) -> datafusion_common::Result<SQLExprWithAlias> {
         let dialect = dialect_from_str(dialect).ok_or_else(|| {
             plan_datafusion_err!(
-                "Unsupported SQL dialect: {dialect}. Available dialects: \
-                         Generic, MySQL, PostgreSQL, Hive, SQLite, Snowflake, Redshift, \
-                         MsSQL, ClickHouse, BigQuery, Ansi, DuckDB, Databricks."
+                "Unsupported SQL dialect: {dialect}. Available dialects: {}.",
+                Dialect::available()
             )
         })?;
 
-        let recursion_limit = self.config.options().sql_parser.recursion_limit;
+        let recursion_limit = self.config.options().sql_parser.recursion_limit.get();
         let expr = DFParserBuilder::new(sql)
             .with_dialect(dialect.as_ref())
             .with_recursion_limit(recursion_limit)
@@ -691,6 +714,7 @@ impl SessionState {
                         stringified_plans,
                         schema: Arc::clone(&e.schema),
                         logical_optimization_succeeded: false,
+                        show_statistics: e.show_statistics,
                     }));
                 }
                 Err(e) => return Err(e),
@@ -728,6 +752,7 @@ impl SessionState {
                 stringified_plans,
                 schema: Arc::clone(&e.schema),
                 logical_optimization_succeeded,
+                show_statistics: e.show_statistics,
             }))
         } else {
             let analyzed_plan = self.analyzer.execute_and_check(
@@ -796,7 +821,12 @@ impl SessionState {
                 .transform_up(|expr| rewrite.rewrite(expr, df_schema, config_options))?
                 .data;
         }
-        create_physical_expr(&expr, df_schema, self.execution_props())
+        create_physical_expr(
+            &expr,
+            df_schema,
+            self.execution_props(),
+            &PhysicalPlanningContext::default(),
+        )
     }
 
     /// Return the session ID
@@ -2316,7 +2346,7 @@ impl QueryPlanner for DefaultQueryPlanner {
     async fn create_physical_plan(
         &self,
         logical_plan: &LogicalPlan,
-        session_state: &SessionState,
+        session_state: &dyn Session,
     ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let planner = DefaultPhysicalPlanner::default();
         planner
@@ -2359,22 +2389,33 @@ mod tests {
     use crate::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
     use crate::physical_plan::ExecutionPlan;
     use crate::sql::planner::ContextProvider;
-    use crate::sql::{ResolvedTableReference, TableReference};
     use arrow::array::{ArrayRef, Int32Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion_catalog::MemoryCatalogProviderList;
-    use datafusion_common::DFSchema;
-    use datafusion_common::Result;
     use datafusion_common::config::Dialect;
+    use datafusion_common::{DFSchema, ResolvedTableReference, Result, TableReference};
     use datafusion_execution::config::SessionConfig;
     use datafusion_expr::Expr;
     use datafusion_expr::HigherOrderUDF;
     use datafusion_optimizer::Optimizer;
     use datafusion_optimizer::optimizer::OptimizerRule;
     use datafusion_physical_plan::display::DisplayableExecutionPlan;
+    use datafusion_session::Session;
     use datafusion_sql::planner::{PlannerContext, SqlToRel};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    #[test]
+    #[cfg(feature = "sql")]
+    fn test_configured_dialect_names_are_accepted_by_sqlparser() {
+        for info in Dialect::metadata() {
+            assert!(
+                sqlparser::dialect::dialect_from_str(info.canonical_name).is_some(),
+                "sqlparser should accept configured dialect {}",
+                info.canonical_name
+            );
+        }
+    }
 
     #[test]
     #[cfg(feature = "sql")]
@@ -2451,6 +2492,9 @@ mod tests {
         let session_state = SessionStateBuilder::new()
             .with_catalog_list(Arc::new(MemoryCatalogProviderList::new()))
             .build();
+        let session_catalogs = Session::catalog_list(&session_state);
+        assert!(Arc::ptr_eq(&session_catalogs, session_state.catalog_list()));
+
         let table_ref = session_state.resolve_table_ref("employee").to_string();
         session_state
             .schema_for_ref(&table_ref)?
