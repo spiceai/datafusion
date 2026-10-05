@@ -4366,6 +4366,25 @@ impl Unparser<'_> {
         }
     }
 
+    /// Whether `projection` passes up the mark of a mark join in its input:
+    /// the last column of a `LeftMark`/`RightMark` join's output.
+    fn passes_a_mark_through(projection: &Projection) -> Result<bool> {
+        let mut marks = vec![];
+        projection.input.apply(|node| {
+            if let LogicalPlan::Join(join) = node
+                && matches!(join.join_type, JoinType::LeftMark | JoinType::RightMark)
+                && let Some((qualifier, field)) = join.schema.iter().last()
+            {
+                marks.push(Column::new(qualifier.cloned(), field.name()));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(projection
+            .expr
+            .iter()
+            .any(|expr| matches!(expr, Expr::Column(column) if marks.contains(column))))
+    }
+
     fn is_qualified_passthrough_projection(projection: &Projection) -> bool {
         projection
             .expr
@@ -4398,6 +4417,16 @@ impl Unparser<'_> {
             || !Self::is_qualified_passthrough_projection(projection)
         {
             return Ok(None);
+        }
+        // A mark join replaces its mark with `EXISTS` where the enclosing query
+        // reads it, which the `SELECT` below — not the enclosing one — cannot
+        // reach: the mark join would be dropped and the mark this projection
+        // passes up left unbound. The walk the caller falls back to derives the
+        // projection into a scope of its own, which loses it the same way.
+        if Self::passes_a_mark_through(projection)? {
+            return not_impl_err!(
+                "Unparsing a mark join whose mark is read through a projection over a join is not supported"
+            );
         }
 
         let original_query = query.clone();

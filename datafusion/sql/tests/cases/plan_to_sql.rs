@@ -15529,6 +15529,48 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
         let error = plan_to_sql(&plan).expect_err(shape);
         assert_contains!(error.to_string(), expected);
     }
+    // A mark the input's projection passes up is read in the enclosing query,
+    // which neither a nested joined table nor a derived one can rewrite — the
+    // mark join would be dropped and `c.mark` left unbound — so it is refused
+    // whichever input the outer join preserves.
+    let projected_mark = |columns: Vec<Expr>| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(marked()?)
+            .project(columns)?
+            .build()
+    };
+    for join_type in [Left, Inner, Right] {
+        let plan = LogicalPlanBuilder::from(scan("a")?)
+            .join(
+                projected_mark(vec![col("b.id"), col("c.mark")])?,
+                join_type,
+                (vec!["a.id"], vec!["b.id"]),
+                None,
+            )?
+            .filter(!col("c.mark"))?
+            .project(vec![col("a.id")])?
+            .build()?;
+        let error =
+            plan_to_sql(&plan).expect_err(&format!("a {join_type} JOIN (b MARK c)"));
+        assert_contains!(
+            error.to_string(),
+            "mark join whose mark is read through a projection over a join is not supported"
+        );
+    }
+    // A projection that leaves the mark behind needs no rewrite: the mark join
+    // keeps every row of its left input, which is what the nested join reads.
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(
+            projected_mark(vec![col("b.id")])?,
+            Left,
+            (vec!["a.id"], vec!["b.id"]),
+            None,
+        )?
+        .project(vec![col("a.id"), col("b.id")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id FROM a LEFT OUTER JOIN (b) ON a.id = b.id"
+    );
     let preserved: Vec<(&str, LogicalPlan)> = vec![
         (
             "(b MARK c) LEFT JOIN a",
