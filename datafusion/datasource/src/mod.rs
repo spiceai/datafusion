@@ -122,6 +122,9 @@ impl FileRange {
 /// - `null_count = 0` (partition values extracted from paths are never null)
 /// - `distinct_count = 1` (single distinct value per file for each partition column)
 ///
+/// A file known to hold no rows has no value in any partition column, so it gets
+/// `distinct_count = 0` and no `min`/`max`.
+///
 /// This enables query optimizers to use partition column bounds for pruning and planning.
 pub struct PartitionedFile {
     /// Path for the file (e.g. URL, filesystem path, etc)
@@ -146,7 +149,8 @@ pub struct PartitionedFile {
     ///
     /// These statistics cover the full table schema: file columns plus partition columns.
     /// When set via [`Self::with_statistics`], partition column statistics are automatically
-    /// computed from [`Self::partition_values`] with exact min/max/null_count/distinct_count.
+    /// computed from [`Self::partition_values`] with exact min/max/null_count/distinct_count,
+    /// except that a file known to hold no rows gets no min/max.
     pub statistics: Option<Arc<Statistics>>,
     /// The known lexicographical ordering of the rows in this file, if any.
     ///
@@ -342,6 +346,9 @@ impl PartitionedFile {
     /// - `min = max = partition_value` (all rows have the same value)
     /// - `null_count = 0` (partition values from paths are never null)
     /// - `distinct_count = 1` (all rows have the same partition value)
+    ///
+    /// When `file_statistics` says the file holds exactly zero rows, no row holds the
+    /// partition value: the partition columns get `distinct_count = 0` and no `min`/`max`.
     pub fn with_statistics(mut self, file_statistics: Arc<Statistics>) -> Self {
         if self.partition_values.is_empty() {
             // No partition columns, use stats as-is
@@ -349,12 +356,24 @@ impl PartitionedFile {
         } else {
             // Extend stats with exact partition column statistics
             let mut stats = Arc::unwrap_or_clone(file_statistics);
+            // An exact bound on an empty file would let `MIN`/`MAX` over the table be
+            // answered from statistics with the value of a partition that has no rows.
+            let holds_no_rows = stats.num_rows == Precision::Exact(0);
             for partition_value in &self.partition_values {
+                let (min_value, max_value, distinct_count) = if holds_no_rows {
+                    (Precision::Absent, Precision::Absent, Precision::Exact(0))
+                } else {
+                    (
+                        Precision::Exact(partition_value.clone()),
+                        Precision::Exact(partition_value.clone()),
+                        Precision::Exact(1),
+                    )
+                };
                 let col_stats = ColumnStatistics {
                     null_count: Precision::Exact(0),
-                    max_value: Precision::Exact(partition_value.clone()),
-                    min_value: Precision::Exact(partition_value.clone()),
-                    distinct_count: Precision::Exact(1),
+                    max_value,
+                    min_value,
+                    distinct_count,
                     sum_value: Precision::Absent,
                     byte_size: partition_value
                         .data_type()
@@ -687,6 +706,32 @@ mod tests {
             Precision::Exact(1),
             "Partition column distinct_count should be Exact(1)"
         );
+    }
+
+    #[test]
+    fn test_with_statistics_gives_an_empty_file_no_partition_bounds() {
+        use crate::PartitionedFile;
+        use datafusion_common::stats::Precision;
+        use datafusion_common::{ColumnStatistics, ScalarValue, Statistics};
+
+        // The only file of partition `p=99`, holding no rows.
+        let mut pf = PartitionedFile::new("p=99/empty.parquet", 100);
+        pf.partition_values = vec![ScalarValue::Int32(Some(99))];
+        let file_stats = Arc::new(Statistics {
+            num_rows: Precision::Exact(0),
+            total_byte_size: Precision::Exact(0),
+            column_statistics: vec![ColumnStatistics::new_unknown()],
+        });
+
+        let stats = pf.with_statistics(file_stats).statistics.unwrap();
+
+        let partition_col_stats = &stats.column_statistics[1];
+        assert_eq!(partition_col_stats.null_count, Precision::Exact(0));
+        assert_eq!(partition_col_stats.distinct_count, Precision::Exact(0));
+        // An exact bound would let `MAX(p)` over the table be answered as 99 from
+        // statistics, although no row holds 99.
+        assert_eq!(partition_col_stats.min_value, Precision::Absent);
+        assert_eq!(partition_col_stats.max_value, Precision::Absent);
     }
 
     #[test]
