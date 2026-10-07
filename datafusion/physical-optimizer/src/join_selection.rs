@@ -31,8 +31,8 @@ use datafusion_common::error::Result;
 use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{JoinSide, JoinType, internal_err};
 use datafusion_expr_common::sort_properties::SortProperties;
-use datafusion_physical_expr::LexOrdering;
 use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::{LexOrdering, PhysicalExpr};
 use datafusion_physical_plan::execution_plan::EmissionType;
 use datafusion_physical_plan::joins::utils::ColumnIndex;
 use datafusion_physical_plan::joins::{
@@ -82,16 +82,23 @@ fn get_stats(
 /// 3. If in-memory byte sizes are unavailable, fall back to row counts.
 /// 4. Do not reorder the join if neither statistic is available, or if
 ///    `datafusion.optimizer.join_reordering` is disabled.
+/// 5. Do not reorder a join whose `dynamic_filters` are not empty. A
+///    dynamic filter is created by `FilterPushdown` after join selection and
+///    is wired to the probe side's scans, so the join order is final once it
+///    exists. Swapping then fails in `HashJoinExec::swap_inputs`. This happens
+///    when a plan that was already optimized is optimized again, for example a
+///    table provider that returns a fully optimized sub-plan from `scan`.
 ///
 /// Used configurations inside arg `config`
 /// - `config.optimizer.join_reordering`: allows or forbids statistics-driven join swapping
 pub(crate) fn should_swap_join_order(
+    dynamic_filters: &[Arc<dyn PhysicalExpr>],
     left: &dyn ExecutionPlan,
     right: &dyn ExecutionPlan,
     config: &ConfigOptions,
     registry: Option<&StatisticsRegistry>,
 ) -> Result<bool> {
-    if !config.optimizer.join_reordering {
+    if !config.optimizer.join_reordering || !dynamic_filters.is_empty() {
         return Ok(false);
     }
 
@@ -234,7 +241,13 @@ pub(crate) fn try_collect_left(
             // Don't swap null-aware anti joins as they have specific side requirements
             if hash_join.join_type().supports_swap()
                 && !hash_join.null_aware
-                && should_swap_join_order(&**left, &**right, config, registry)?
+                && should_swap_join_order(
+                    &hash_join.dynamic_expressions_produced(),
+                    &**left,
+                    &**right,
+                    config,
+                    registry,
+                )?
             {
                 Ok(Some(hash_join.swap_inputs(PartitionMode::CollectLeft)?))
             } else {
@@ -285,7 +298,13 @@ pub(crate) fn partitioned_hash_join(
     // Don't swap null-aware anti joins as they have specific side requirements
     if hash_join.join_type().supports_swap()
         && !hash_join.null_aware
-        && should_swap_join_order(&**left, &**right, config, registry)?
+        && should_swap_join_order(
+            &hash_join.dynamic_expressions_produced(),
+            &**left,
+            &**right,
+            config,
+            registry,
+        )?
     {
         hash_join.swap_inputs(PartitionMode::Partitioned)
     } else {
@@ -340,7 +359,13 @@ fn statistical_join_selection_subrule(
                 // Don't swap null-aware anti joins as they have specific side requirements
                 if hash_join.join_type().supports_swap()
                     && !hash_join.null_aware
-                    && should_swap_join_order(&**left, &**right, config, registry)?
+                    && should_swap_join_order(
+                        &hash_join.dynamic_expressions_produced(),
+                        &**left,
+                        &**right,
+                        config,
+                        registry,
+                    )?
                 {
                     hash_join
                         .swap_inputs(PartitionMode::Partitioned)
@@ -353,7 +378,13 @@ fn statistical_join_selection_subrule(
     } else if let Some(cross_join) = plan.downcast_ref::<CrossJoinExec>() {
         let left = cross_join.left();
         let right = cross_join.right();
-        if should_swap_join_order(&**left, &**right, config, registry)? {
+        if should_swap_join_order(
+            &cross_join.dynamic_expressions_produced(),
+            &**left,
+            &**right,
+            config,
+            registry,
+        )? {
             cross_join.swap_inputs().map(Some)?
         } else {
             None
@@ -362,7 +393,13 @@ fn statistical_join_selection_subrule(
         let left = nl_join.left();
         let right = nl_join.right();
         if nl_join.join_type().supports_swap()
-            && should_swap_join_order(&**left, &**right, config, registry)?
+            && should_swap_join_order(
+                &nl_join.dynamic_expressions_produced(),
+                &**left,
+                &**right,
+                config,
+                registry,
+            )?
         {
             nl_join.swap_inputs().map(Some)?
         } else {

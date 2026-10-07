@@ -33,8 +33,8 @@ use datafusion_common::{Result, Statistics};
 use datafusion_execution::{RecordBatchStream, SendableRecordBatchStream, TaskContext};
 use datafusion_expr::Operator;
 use datafusion_physical_expr::PhysicalExprRef;
-use datafusion_physical_expr::expressions::col;
 use datafusion_physical_expr::expressions::{BinaryExpr, Column, NegativeExpr};
+use datafusion_physical_expr::expressions::{DynamicFilterPhysicalExpr, col, lit};
 use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::{EquivalenceProperties, Partitioning, PhysicalExpr};
 use datafusion_physical_expr_common::sort_expr::PhysicalSortExpr;
@@ -268,6 +268,75 @@ async fn test_join_with_swap() {
             .total_byte_size,
         Precision::Inexact(2097152)
     );
+}
+
+/// Once `FilterPushdown` has given a hash join a dynamic filter, the join order
+/// is final: the filter is wired to the probe side's scans, and
+/// `HashJoinExec::swap_inputs` rejects a join that has one.
+///
+/// A plan that is optimized twice (for example a table provider that returns an
+/// already-optimized sub-plan from `scan`) reaches `JoinSelection` with such a
+/// join. It must keep the order and the filter, and must not fail, even when
+/// the statistics would otherwise swap the inputs.
+#[rstest]
+#[case::collect_left(PartitionMode::CollectLeft)]
+#[case::partitioned(PartitionMode::Partitioned)]
+#[tokio::test]
+async fn test_join_with_dynamic_filter_is_not_swapped(#[case] mode: PartitionMode) {
+    let (big, small) = create_big_and_small();
+    let probe_key: Arc<dyn PhysicalExpr> =
+        Arc::new(Column::new_with_schema("small_col", &small.schema()).unwrap());
+
+    let build_join = || {
+        HashJoinExec::try_new(
+            Arc::clone(&big),
+            Arc::clone(&small),
+            vec![(
+                Arc::new(Column::new_with_schema("big_col", &big.schema()).unwrap()),
+                Arc::clone(&probe_key),
+            )],
+            None,
+            &JoinType::Inner,
+            None,
+            mode,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .unwrap()
+    };
+
+    // Control: without a dynamic filter the big build side is swapped.
+    let swapped = JoinSelection::new()
+        .optimize(Arc::new(build_join()), &ConfigOptions::new())
+        .unwrap();
+    assert!(
+        swapped.downcast_ref::<ProjectionExec>().is_some(),
+        "the join should be swapped without a dynamic filter"
+    );
+
+    let dynamic_filter = Arc::new(DynamicFilterPhysicalExpr::new(
+        vec![Arc::clone(&probe_key)],
+        lit(true),
+    ));
+    let join = Arc::new(
+        build_join()
+            .with_dynamic_filter_expr(Arc::clone(&dynamic_filter))
+            .unwrap(),
+    );
+
+    let optimized = JoinSelection::new()
+        .optimize(join, &ConfigOptions::new())
+        .unwrap();
+
+    let kept = optimized
+        .downcast_ref::<HashJoinExec>()
+        .expect("a join with a dynamic filter keeps its inputs, with no swap projection");
+    assert_eq!(
+        kept.left().schema().field(0).name(),
+        "big_col",
+        "the build side must not change"
+    );
+    assert_eq!(kept.dynamic_expressions_produced().len(), 1);
 }
 
 /// `JoinSelection` swaps a hash join's inputs to put the smaller one on the
