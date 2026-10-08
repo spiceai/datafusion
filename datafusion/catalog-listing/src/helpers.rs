@@ -20,6 +20,7 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::ListingFileFilter;
 use datafusion_catalog::Session;
 use datafusion_common::{
     HashMap, Result, ScalarValue, TableReference, assert_or_internal_err,
@@ -401,6 +402,7 @@ pub async fn pruned_partition_list<'a>(
         partition_cols,
         &[],
         &[],
+        None,
     )
     .await
 }
@@ -418,6 +420,11 @@ pub async fn pruned_partition_list<'a>(
 ///
 /// Metadata pruning is orthogonal to partition pruning and is applied to both
 /// partitioned and unpartitioned tables.
+///
+/// `file_filter` drops the listed objects that are not the table's data files
+/// (see [`ListingFileFilter`]) before their partition values are parsed, so an
+/// error it returns for an object is not hidden by partition parsing skipping
+/// that object.
 #[expect(clippy::too_many_arguments)]
 pub async fn pruned_partition_list_with_metadata<'a>(
     ctx: &'a dyn Session,
@@ -428,6 +435,7 @@ pub async fn pruned_partition_list_with_metadata<'a>(
     partition_cols: &'a [(String, DataType)],
     metadata_filters: &'a [Expr],
     metadata_cols: &'a [MetadataColumn],
+    file_filter: Option<&'a dyn ListingFileFilter>,
 ) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
     let prefix = if !partition_cols.is_empty() {
         evaluate_partition_prefix(partition_cols, filters)
@@ -445,6 +453,14 @@ pub async fn pruned_partition_list_with_metadata<'a>(
         .list_prefixed_files(ctx, store, prefix, file_extension)
         .await?
         .try_filter(|object_meta| futures::future::ready(object_meta.size > 0))
+        .try_filter_map(move |object_meta| {
+            futures::future::ready(match file_filter {
+                Some(file_filter) => file_filter
+                    .is_data_file(&object_meta)
+                    .map(|keep| keep.then_some(object_meta)),
+                None => Ok(Some(object_meta)),
+            })
+        })
         .try_filter_map(move |object_meta| {
             futures::future::ready(match &metadata_predicate {
                 Some(predicate) => predicate

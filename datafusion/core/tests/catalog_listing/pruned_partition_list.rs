@@ -282,6 +282,7 @@ async fn list_with_metadata(
         &[], // unpartitioned
         &[filter],
         &[metadata_col],
+        None,
     )
     .await
     .expect("metadata pruning failed")

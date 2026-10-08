@@ -22,13 +22,35 @@ use datafusion_datasource::ListingTableUrl;
 use datafusion_datasource::file_format::FileFormat;
 use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_expr::{Partitioning, SortExpr};
-use futures::StreamExt;
-use futures::TryStreamExt;
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt, future};
 use itertools::AllEqualValueError;
 use itertools::Itertools;
+use object_store::ObjectMeta;
 use parquet::arrow::async_reader::ObjectVersionType;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::sync::Arc;
+
+/// Decides which listed objects are a [`crate::ListingTable`]'s data files,
+/// beyond the [`ListingOptions::file_extension`] suffix (Spice extension).
+///
+/// A suffix cannot describe every layout. A Hive table often stores
+/// extensionless data objects (`000000_0`) next to job markers (`_SUCCESS`,
+/// `.crc`), and no suffix accepts the first without the second. Leaving the
+/// extension empty and deciding here keeps such a table on the regular listing
+/// path, so its scans keep per-file statistics, partition pruning and file
+/// splitting.
+///
+/// The filter sees each listed object that matches the extension, before the
+/// object's partition values are parsed and before any of its bytes are read.
+/// It applies wherever the table lists files: scans, inserts, and schema and
+/// partition inference. An error fails the listing, for an object that must
+/// not be silently left out.
+pub trait ListingFileFilter: Debug + Send + Sync {
+    /// Returns whether `object` is one of the table's data files.
+    fn is_data_file(&self, object: &ObjectMeta) -> datafusion_common::Result<bool>;
+}
 
 /// Options for creating a [`crate::ListingTable`]
 #[derive(Clone, Debug)]
@@ -108,6 +130,11 @@ pub struct ListingOptions {
     /// ensuring that objects listed during planning are consistent with objects
     /// read during execution.
     pub object_versioning_type: Option<ObjectVersionType>,
+    /// Selects the table's data files among the listed objects that match
+    /// [`Self::file_extension`] (Spice extension). `None` accepts every one.
+    ///
+    /// See [`ListingFileFilter`].
+    pub file_filter: Option<Arc<dyn ListingFileFilter>>,
 }
 
 impl ListingOptions {
@@ -124,6 +151,7 @@ impl ListingOptions {
             output_partitioning: None,
             metadata_cols: vec![],
             object_versioning_type: None,
+            file_filter: None,
         }
     }
 
@@ -173,6 +201,38 @@ impl ListingOptions {
     ) -> Self {
         self.object_versioning_type = object_versioning_type;
         self
+    }
+
+    /// Set the [`ListingFileFilter`] on [`ListingOptions`] and returns self.
+    ///
+    /// Pair it with an empty [`Self::file_extension`] when the filter, not a
+    /// suffix, decides which objects are data files.
+    pub fn with_file_filter(
+        mut self,
+        file_filter: Option<Arc<dyn ListingFileFilter>>,
+    ) -> Self {
+        self.file_filter = file_filter;
+        self
+    }
+
+    /// Drops the listed objects that [`Self::file_filter`] rejects, and fails
+    /// the stream on the first object it errors on.
+    fn data_files<'a>(
+        &'a self,
+        objects: BoxStream<'a, datafusion_common::Result<ObjectMeta>>,
+    ) -> BoxStream<'a, datafusion_common::Result<ObjectMeta>> {
+        let Some(file_filter) = self.file_filter.as_deref() else {
+            return objects;
+        };
+        objects
+            .try_filter_map(move |object| {
+                future::ready(
+                    file_filter
+                        .is_data_file(&object)
+                        .map(|keep| keep.then_some(object)),
+                )
+            })
+            .boxed()
     }
 
     /// Validate that the metadata columns don't conflict with existing schema
@@ -372,9 +432,12 @@ impl ListingOptions {
     ) -> datafusion_common::Result<SchemaRef> {
         let store = state.runtime_env().object_store(table_path)?;
 
-        let all_files: Vec<_> = table_path
-            .list_all_files(state, store.as_ref(), &self.file_extension)
-            .await?
+        let all_files: Vec<_> = self
+            .data_files(
+                table_path
+                    .list_all_files(state, store.as_ref(), &self.file_extension)
+                    .await?,
+            )
             .try_collect()
             .await?;
 
@@ -467,9 +530,12 @@ impl ListingOptions {
         // only use 10 files for inference
         // This can fail to detect inconsistent partition keys
         // A DFS traversal approach of the store can help here
-        let files: Vec<_> = table_path
-            .list_all_files(state, store.as_ref(), &self.file_extension)
-            .await?
+        let files: Vec<_> = self
+            .data_files(
+                table_path
+                    .list_all_files(state, store.as_ref(), &self.file_extension)
+                    .await?,
+            )
             .take(10)
             .try_collect()
             .await?;
