@@ -15776,14 +15776,24 @@ fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
         "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))"
     );
 
-    // A whole-second value renders without digits and still names the precision.
+    // The precision follows the unit: a second-precision value takes none, a
+    // millisecond one three, so a cast into a coarser unit still drops the
+    // digits DataFusion would drop.
     let whole = lit(datafusion_common::ScalarValue::TimestampSecond(
         Some(771_683_400),
         None,
     ));
     assert_eq!(
         unparser.expr_to_sql(&whole)?.to_string(),
-        "CAST('1994-06-15 12:30:00' AS DATETIME(6))"
+        "CAST('1994-06-15 12:30:00' AS DATETIME(0))"
+    );
+    let millis = lit(datafusion_common::ScalarValue::TimestampMillisecond(
+        Some(771_683_400_500),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&millis)?.to_string(),
+        "CAST('1994-06-15 12:30:00.500' AS DATETIME(3))"
     );
 
     // A cast of a column keeps its fractional seconds too.
@@ -15803,6 +15813,18 @@ fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
         "SELECT * FROM `t` WHERE (CAST(`t`.`s` AS DATETIME(6)) > CAST('1994-06-15 12:30:00.500' AS DATETIME(6)))"
     );
 
+    // A cast into `Timestamp(Second)` drops fractional seconds in DataFusion, so
+    // its rendering must not keep them: `DATETIME(0)`, not `DATETIME(6)`.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![cast(
+            col("t.s"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+        )])?
+        .build()?;
+    assert_eq!(
+        unparser.plan_to_sql(&plan)?.to_string(),
+        "SELECT CAST(`t`.`s` AS DATETIME(0)) FROM `t`"
+    );
+
     Ok(())
 }
-
