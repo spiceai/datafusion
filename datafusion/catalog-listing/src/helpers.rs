@@ -422,9 +422,9 @@ pub async fn pruned_partition_list<'a>(
 /// partitioned and unpartitioned tables.
 ///
 /// `file_filter` drops the listed objects that are not the table's data files
-/// (see [`ListingFileFilter`]) before their partition values are parsed, so an
-/// error it returns for an object is not hidden by partition parsing skipping
-/// that object.
+/// (see [`ListingFileFilter`]). It runs before zero-byte objects are dropped and
+/// before partition values are parsed, so an error it returns for an object is
+/// hidden by neither.
 #[expect(clippy::too_many_arguments)]
 pub async fn pruned_partition_list_with_metadata<'a>(
     ctx: &'a dyn Session,
@@ -452,7 +452,6 @@ pub async fn pruned_partition_list_with_metadata<'a>(
     let objects = table_path
         .list_prefixed_files(ctx, store, prefix, file_extension)
         .await?
-        .try_filter(|object_meta| futures::future::ready(object_meta.size > 0))
         .try_filter_map(move |object_meta| {
             futures::future::ready(match file_filter {
                 Some(file_filter) => file_filter
@@ -461,6 +460,7 @@ pub async fn pruned_partition_list_with_metadata<'a>(
                 None => Ok(Some(object_meta)),
             })
         })
+        .try_filter(|object_meta| futures::future::ready(object_meta.size > 0))
         .try_filter_map(move |object_meta| {
             futures::future::ready(match &metadata_predicate {
                 Some(predicate) => predicate

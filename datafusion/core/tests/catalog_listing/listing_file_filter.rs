@@ -206,3 +206,73 @@ async fn a_filtered_scan_keeps_per_file_statistics_and_skips_markers() -> Result
     );
     Ok(())
 }
+
+/// A zero-byte object reaches the filter in every listing, so its answer for
+/// the object does not depend on the operation that listed it, and an object
+/// the filter accepts is still never read while it is empty.
+#[tokio::test]
+async fn every_listing_shows_the_file_filter_zero_byte_objects() -> Result<()> {
+    let store = Arc::new(InMemory::new());
+    for (name, bytes) in [
+        ("tablepath/p=1/000000_0", parquet_bytes(&[1, 2, 3])),
+        ("tablepath/stray", Vec::new()),
+    ] {
+        store.put(&Path::from(name), bytes.into()).await?;
+    }
+    let ctx = SessionContext::new();
+    ctx.register_object_store(ObjectStoreUrl::parse("memory://")?.as_ref(), store);
+    let table_path = ListingTableUrl::parse("memory:///tablepath/")?;
+    let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+        .with_file_extension("")
+        .with_table_partition_cols(vec![("p".to_string(), DataType::Utf8)])
+        .with_file_filter(Some(Arc::new(RejectStray)));
+    let expected = "Invalid or Unsupported Configuration: 'tablepath/stray' is not under a partition directory";
+
+    let err = options
+        .infer_schema(&ctx.state(), &table_path)
+        .await
+        .expect_err("schema inference lists the zero-byte stray");
+    assert_eq!(err.strip_backtrace(), expected);
+    let err = options
+        .infer_partitions(&ctx.state(), &table_path)
+        .await
+        .expect_err("partition inference lists the zero-byte stray");
+    assert_eq!(err.strip_backtrace(), expected);
+
+    let file_schema =
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+    let table = Arc::new(ListingTable::try_new(
+        ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(file_schema),
+    )?);
+    let err = table
+        .scan(&ctx.state(), None, &[], None)
+        .await
+        .expect_err("a scan lists the zero-byte stray");
+    assert_eq!(err.strip_backtrace(), expected);
+    ctx.register_table("t", table)?;
+    let err = ctx
+        .sql("INSERT INTO t VALUES (4, '1')")
+        .await?
+        .collect()
+        .await
+        .expect_err("an insert lists the zero-byte stray");
+    assert_eq!(err.strip_backtrace(), expected);
+
+    let files = [
+        ("tablepath/p=1/000000_0", 100),
+        ("tablepath/p=1/000001_0", 0),
+    ];
+    assert_eq!(
+        list(
+            &files,
+            &[("p".to_string(), DataType::Utf8)],
+            Some(&HiveDataFiles)
+        )
+        .await?,
+        ["tablepath/p=1/000000_0"],
+        "an accepted zero-byte object is not scanned"
+    );
+    Ok(())
+}

@@ -42,11 +42,12 @@ use std::sync::Arc;
 /// path, so its scans keep per-file statistics, partition pruning and file
 /// splitting.
 ///
-/// The filter sees each listed object that matches the extension, before the
-/// object's partition values are parsed and before any of its bytes are read.
-/// It applies wherever the table lists files: scans, inserts, and schema and
-/// partition inference. An error fails the listing, for an object that must
-/// not be silently left out.
+/// The filter sees each listed object that matches the extension, zero-byte
+/// objects included, before the object's partition values are parsed and
+/// before any of its bytes are read. It applies wherever the table lists files:
+/// scans, inserts, and schema and partition inference. An error fails the
+/// listing, for an object that must not be silently left out. A zero-byte
+/// object the filter accepts is still never read.
 pub trait ListingFileFilter: Debug + Send + Sync {
     /// Returns whether `object` is one of the table's data files.
     fn is_data_file(&self, object: &ObjectMeta) -> datafusion_common::Result<bool>;
