@@ -17,7 +17,7 @@
 
 use crate::config::SchemaSource;
 use crate::helpers::{
-    expr_applicable_for_cols, filter_partitioned_file, pruned_partition_list,
+    expr_applicable_for_cols, filter_partitioned_file,
     pruned_partition_list_with_metadata,
 };
 use crate::{ListingOptions, ListingTableConfig};
@@ -782,16 +782,29 @@ impl TableProvider for ListingTable {
             );
         }
 
+        let file_extension = self.options().format.get_ext();
+        if let Some(file_filter) = &self.options.file_filter
+            && !file_filter.accepts_inserted_files(&file_extension)
+        {
+            return plan_err!(
+                "Inserting into a ListingTable whose file filter does not accept the `.{file_extension}` files an insert writes is not supported, \
+                because no later scan would read the inserted rows"
+            );
+        }
+
         // Get the object store for the table path.
         let store = state.runtime_env().object_store(table_path)?;
 
-        let file_list_stream = pruned_partition_list(
+        let file_list_stream = pruned_partition_list_with_metadata(
             state,
             store.as_ref(),
             table_path,
             &[],
             &self.options.file_extension,
             &self.options.table_partition_cols,
+            &[],
+            &[],
+            self.options.file_filter.as_deref(),
         )
         .await?;
 
@@ -818,7 +831,7 @@ impl TableProvider for ListingTable {
             table_partition_cols: self.options.table_partition_cols.clone(),
             insert_op,
             keep_partition_by_columns,
-            file_extension: self.options().format.get_ext(),
+            file_extension,
             file_output_mode: FileOutputMode::Automatic,
         };
 
@@ -925,6 +938,7 @@ impl ListingTable {
                 &self.options.table_partition_cols,
                 metadata_filters,
                 &self.options.metadata_cols,
+                self.options.file_filter.as_deref(),
             )
         }))
         .await?;

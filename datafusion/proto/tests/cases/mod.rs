@@ -32,6 +32,7 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 
+mod listing_file_filter;
 mod plans;
 mod public_conversions;
 mod roundtrip_logical_plan;
