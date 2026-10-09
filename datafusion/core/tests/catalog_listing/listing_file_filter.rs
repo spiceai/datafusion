@@ -37,7 +37,9 @@ use datafusion_datasource::ListingTableUrl;
 use datafusion_execution::object_store::ObjectStoreUrl;
 use datafusion_physical_plan::{StatisticsArgs, StatisticsContext, displayable};
 use futures::TryStreamExt;
-use object_store::{ObjectMeta, ObjectStoreExt, memory::InMemory, path::Path};
+use object_store::{
+    ObjectMeta, ObjectStore, ObjectStoreExt, memory::InMemory, path::Path,
+};
 
 use super::pruned_partition_list::make_test_store_and_state;
 
@@ -50,6 +52,10 @@ impl ListingFileFilter for HiveDataFiles {
     fn is_data_file(&self, object: &ObjectMeta) -> Result<bool> {
         let name = object.location.filename().unwrap_or_default();
         Ok(!name.starts_with(['_', '.']) && !name.contains('.'))
+    }
+
+    fn accepts_inserted_files(&self, file_extension: &str) -> bool {
+        file_extension.is_empty()
     }
 }
 
@@ -66,6 +72,10 @@ impl ListingFileFilter for RejectStray {
             )));
         }
         Ok(true)
+    }
+
+    fn accepts_inserted_files(&self, _file_extension: &str) -> bool {
+        true
     }
 }
 
@@ -274,5 +284,91 @@ async fn every_listing_shows_the_file_filter_zero_byte_objects() -> Result<()> {
         ["tablepath/p=1/000000_0"],
         "an accepted zero-byte object is not scanned"
     );
+    Ok(())
+}
+
+async fn count_and_sum(ctx: &SessionContext) -> Result<String> {
+    let batches = ctx
+        .sql("SELECT count(*) AS n, sum(id) AS s FROM t")
+        .await?
+        .collect()
+        .await?;
+    Ok(arrow::util::pretty::pretty_format_batches(&batches)?.to_string())
+}
+
+/// Later scans read the files an insert writes, and an insert whose files the
+/// filter would hide from them fails before it writes anything.
+#[tokio::test]
+async fn an_insert_writes_only_files_its_filter_accepts() -> Result<()> {
+    for (file_filter, inserts) in [
+        (Arc::new(RejectStray) as Arc<dyn ListingFileFilter>, true),
+        (Arc::new(HiveDataFiles), false),
+    ] {
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &Path::from("tablepath/000000_0"),
+                parquet_bytes(&[1, 2, 3]).into(),
+            )
+            .await?;
+        let ctx = SessionContext::new();
+        ctx.register_object_store(
+            ObjectStoreUrl::parse("memory://")?.as_ref(),
+            Arc::clone(&store) as _,
+        );
+        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension("")
+            .with_file_filter(Some(file_filter));
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let table = ListingTable::try_new(
+            ListingTableConfig::new(ListingTableUrl::parse("memory:///tablepath/")?)
+                .with_listing_options(options)
+                .with_schema(schema),
+        )?;
+        ctx.register_table("t", Arc::new(table))?;
+
+        let insert = ctx.sql("INSERT INTO t VALUES (4)").await?.collect().await;
+        let objects: Vec<_> = store
+            .list(None)
+            .map_ok(|object| object.location.to_string())
+            .try_collect()
+            .await?;
+        if inserts {
+            insert?;
+            assert_eq!(objects.len(), 2, "one written file: {objects:?}");
+            assert_eq!(
+                count_and_sum(&ctx).await?,
+                [
+                    "+---+----+",
+                    "| n | s  |",
+                    "+---+----+",
+                    "| 4 | 10 |",
+                    "+---+----+",
+                ]
+                .join("\n")
+            );
+        } else {
+            assert_eq!(
+                insert
+                    .expect_err("the filter hides `.parquet` files")
+                    .strip_backtrace(),
+                "Error during planning: Inserting into a ListingTable whose file filter does not accept the `.parquet` files an insert writes is not supported, \
+                because no later scan would read the inserted rows"
+            );
+            assert_eq!(objects, ["tablepath/000000_0"], "nothing is written");
+            assert_eq!(
+                count_and_sum(&ctx).await?,
+                [
+                    "+---+---+",
+                    "| n | s |",
+                    "+---+---+",
+                    "| 3 | 6 |",
+                    "+---+---+",
+                ]
+                .join("\n")
+            );
+        }
+    }
     Ok(())
 }

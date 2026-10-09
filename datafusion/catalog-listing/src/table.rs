@@ -782,6 +782,16 @@ impl TableProvider for ListingTable {
             );
         }
 
+        let file_extension = self.options().format.get_ext();
+        if let Some(file_filter) = &self.options.file_filter
+            && !file_filter.accepts_inserted_files(&file_extension)
+        {
+            return plan_err!(
+                "Inserting into a ListingTable whose file filter does not accept the `.{file_extension}` files an insert writes is not supported, \
+                because no later scan would read the inserted rows"
+            );
+        }
+
         // Get the object store for the table path.
         let store = state.runtime_env().object_store(table_path)?;
 
@@ -821,7 +831,7 @@ impl TableProvider for ListingTable {
             table_partition_cols: self.options.table_partition_cols.clone(),
             insert_op,
             keep_partition_by_columns,
-            file_extension: self.options().format.get_ext(),
+            file_extension,
             file_output_mode: FileOutputMode::Automatic,
         };
 

@@ -51,6 +51,18 @@ use std::sync::Arc;
 pub trait ListingFileFilter: Debug + Send + Sync {
     /// Returns whether `object` is one of the table's data files.
     fn is_data_file(&self, object: &ObjectMeta) -> datafusion_common::Result<bool>;
+
+    /// Returns whether the files an insert writes are data files to this
+    /// filter.
+    ///
+    /// An insert names each file it writes `<write id>_<n>.<file_extension>`,
+    /// or `<partition directories>/<write id>.<file_extension>` in a
+    /// partitioned table, where the write id is 16 random alphanumeric
+    /// characters and `file_extension` is the format's
+    /// [`FileFormat::get_ext`]. An insert into a table whose filter does not
+    /// accept those files fails before it writes anything, because no later
+    /// scan would read the inserted rows.
+    fn accepts_inserted_files(&self, file_extension: &str) -> bool;
 }
 
 /// Options for creating a [`crate::ListingTable`]
