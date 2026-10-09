@@ -1383,7 +1383,13 @@ impl AsLogicalPlan for LogicalPlanNode {
                 let filters: Vec<protobuf::LogicalExprNode> =
                     serialize_exprs(filters, extension_codec)?;
 
-                if let Some(listing_table) = provider.downcast_ref::<ListingTable>() {
+                // `ListingTableScanNode` has no field for a `ListingFileFilter`
+                // (Spice extension), and a table rebuilt without its filter reads
+                // every object the filter excludes. A filtered table is therefore
+                // encoded by the extension codec, like any custom table.
+                if let Some(listing_table) = provider.downcast_ref::<ListingTable>()
+                    && listing_table.options().file_filter.is_none()
+                {
                     let format = listing_table.options().format.as_ref();
                     let file_format_type = {
                         let mut maybe_some_type = None;
@@ -1572,10 +1578,22 @@ impl AsLogicalPlan for LogicalPlanNode {
                     })
                 } else {
                     let schema: protobuf::Schema = schema.as_ref().try_into()?;
+                    let filtered_listing_table =
+                        provider.downcast_ref::<ListingTable>().is_some();
                     let mut bytes = vec![];
                     extension_codec
                         .try_encode_table_provider(table_name, provider, &mut bytes)
-                        .map_err(|e| context!("Error serializing custom table", e))?;
+                        .map_err(|e| {
+                            if filtered_listing_table {
+                                e.context(format!(
+                                    "Error serializing ListingTable {table_name}: \
+                                    ListingTableScanNode cannot encode its ListingFileFilter, \
+                                    so the LogicalExtensionCodec must encode the table"
+                                ))
+                            } else {
+                                context!("Error serializing custom table", e)
+                            }
+                        })?;
                     let scan = CustomScan(CustomTableScanNode {
                         table_name: Some(protobuf::TableReference::from(
                             table_name.clone(),
