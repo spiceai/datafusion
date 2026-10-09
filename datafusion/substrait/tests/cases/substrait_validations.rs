@@ -21,8 +21,13 @@ mod tests {
     // verify the schema compatibility validations
     mod schema_compatibility {
         use crate::utils::test::read_json;
-        use datafusion::arrow::datatypes::{DataType, Field};
+        use datafusion::arrow::array::{
+            LargeBinaryArray, LargeStringArray, RecordBatch, StringViewArray,
+        };
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::arrow::util::pretty::pretty_format_batches;
         use datafusion::common::{DFSchema, Result, TableReference};
+        use datafusion::datasource::MemTable;
         use datafusion::datasource::empty::EmptyTable;
         use datafusion::prelude::SessionContext;
         use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
@@ -148,6 +153,110 @@ mod tests {
                 generate_context_with_table("DATA", vec![("a", DataType::Date32, true)])?;
             let res = from_substrait_plan(&ctx.state(), &proto_plan).await;
             assert!(res.is_err());
+            Ok(())
+        }
+
+        /// A Substrait `string`, `varchar` or `fixedchar` field reads a string
+        /// column of any width, and a `binary` field a binary column of any
+        /// width. Producers other than DataFusion cannot name the width, and the
+        /// scan keeps the table's own types, which the rows below come back in.
+        #[tokio::test]
+        async fn read_string_and_binary_fields_over_columns_of_any_width() -> Result<()> {
+            let proto_plan = read_json(
+                "tests/testdata/test_plans/read_string_and_binary_widths.substrait.json",
+            );
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("s", DataType::LargeUtf8, true),
+                Field::new("v", DataType::Utf8View, true),
+                Field::new("c", DataType::LargeUtf8, true),
+                Field::new("b", DataType::LargeBinary, true),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(LargeStringArray::from(vec![
+                        Some("a"),
+                        Some("b"),
+                        None,
+                        Some("b"),
+                    ])),
+                    Arc::new(StringViewArray::from(vec![
+                        Some("w"),
+                        Some("x"),
+                        Some("y"),
+                        None,
+                    ])),
+                    Arc::new(LargeStringArray::from(vec![
+                        Some("1"),
+                        Some("2"),
+                        Some("3"),
+                        Some("4"),
+                    ])),
+                    Arc::new(LargeBinaryArray::from_opt_vec(vec![
+                        Some(b"p".as_slice()),
+                        Some(b"q".as_slice()),
+                        None,
+                        None,
+                    ])),
+                ],
+            )?;
+            let ctx = SessionContext::new();
+            ctx.register_table(
+                TableReference::bare("DATA"),
+                Arc::new(MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])?),
+            )?;
+
+            let plan = from_substrait_plan(&ctx.state(), &proto_plan).await?;
+            let df = ctx.execute_logical_plan(plan).await?;
+            let types: Vec<DataType> = df
+                .schema()
+                .fields()
+                .iter()
+                .map(|field| field.data_type().clone())
+                .collect();
+            assert_eq!(
+                types,
+                vec![
+                    DataType::LargeUtf8,
+                    DataType::Utf8View,
+                    DataType::LargeUtf8,
+                    DataType::LargeBinary
+                ]
+            );
+            let results = df.collect().await?;
+            assert_snapshot!(
+                pretty_format_batches(&results)?,
+                @r"
+            +---+---+---+----+
+            | s | v | c | b  |
+            +---+---+---+----+
+            | b | x | 2 | 71 |
+            | b |   | 4 |    |
+            +---+---+---+----+
+            "
+            );
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn reject_string_fields_over_binary_columns() -> Result<()> {
+            let proto_plan = read_json(
+                "tests/testdata/test_plans/read_string_and_binary_widths.substrait.json",
+            );
+            let ctx = generate_context_with_table(
+                "DATA",
+                vec![
+                    ("s", DataType::LargeBinary, true),
+                    ("v", DataType::Utf8, true),
+                    ("c", DataType::Utf8, true),
+                    ("b", DataType::Binary, true),
+                ],
+            )?;
+            let res = from_substrait_plan(&ctx.state(), &proto_plan).await;
+            assert_snapshot!(
+                res.unwrap_err().strip_backtrace(),
+                @"Substrait error: Field 's' in Substrait schema has a different type (Utf8) than the corresponding field in the table schema (LargeBinary)."
+            );
             Ok(())
         }
 

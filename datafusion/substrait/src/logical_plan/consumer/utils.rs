@@ -16,7 +16,9 @@
 // under the License.
 
 use crate::logical_plan::consumer::SubstraitConsumer;
-use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit, UnionFields};
+use datafusion::arrow::datatypes::{
+    DataType, Field, FieldRef, Schema, TimeUnit, UnionFields,
+};
 use datafusion::common::{
     DFSchema, DFSchemaRef, TableReference, exec_err, not_impl_err,
     substrait_datafusion_err, substrait_err,
@@ -314,7 +316,8 @@ pub(super) fn ensure_schema_compatibility(
 /// Ensures that the given Substrait field is compatible with the given DataFusion field
 ///
 /// A field is compatible between Substrait and DataFusion if:
-/// 1. They have logically equivalent types.
+/// 1. They have logically equivalent types, whatever the width of their string and binary
+///    columns (see [`with_uniform_widths`]).
 /// 2. They have the same nullability OR the Substrait field is nullable and the DataFusion fields
 ///    is not nullable.
 /// 3. For Struct fields, every child field's nullability is compatible by the same rule
@@ -331,6 +334,9 @@ fn ensure_field_compatibility(
     if !DFSchema::datatype_is_logically_equal(
         datafusion_field.data_type(),
         substrait_field.data_type(),
+    ) && !DFSchema::datatype_is_logically_equal(
+        &with_uniform_widths(datafusion_field.data_type()),
+        &with_uniform_widths(substrait_field.data_type()),
     ) {
         return substrait_err!(
             "Field '{}' in Substrait schema has a different type ({}) than the corresponding field in the table schema ({}).",
@@ -354,6 +360,57 @@ fn ensure_field_compatibility(
         datafusion_field.data_type(),
         substrait_field.data_type(),
         substrait_field.name(),
+    )
+}
+
+/// `data_type` with every string and binary type at one width, at any depth:
+/// `LargeUtf8` and `Utf8View` become `Utf8`, and `LargeBinary` and `BinaryView`
+/// become `Binary`.
+///
+/// The width of a string or binary column is the table's physical choice, and a
+/// Substrait plan often cannot name it: `varchar` and `fixedchar` carry no type
+/// variation at all, and a producer other than DataFusion declares `string` and
+/// `binary` without one. Comparing widths would reject every such plan over, for
+/// example, a `LargeUtf8` column. The scan keeps the table's own types, so the
+/// plan never reads a width the column does not have.
+fn with_uniform_widths(data_type: &DataType) -> DataType {
+    match data_type {
+        DataType::LargeUtf8 | DataType::Utf8View => DataType::Utf8,
+        DataType::LargeBinary | DataType::BinaryView => DataType::Binary,
+        DataType::List(field) => DataType::List(with_uniform_field_widths(field)),
+        DataType::LargeList(field) => {
+            DataType::LargeList(with_uniform_field_widths(field))
+        }
+        DataType::ListView(field) => DataType::ListView(with_uniform_field_widths(field)),
+        DataType::LargeListView(field) => {
+            DataType::LargeListView(with_uniform_field_widths(field))
+        }
+        DataType::FixedSizeList(field, size) => {
+            DataType::FixedSizeList(with_uniform_field_widths(field), *size)
+        }
+        DataType::Struct(fields) => {
+            DataType::Struct(fields.iter().map(with_uniform_field_widths).collect())
+        }
+        DataType::Map(field, sorted) => {
+            DataType::Map(with_uniform_field_widths(field), *sorted)
+        }
+        DataType::Dictionary(key, value) => {
+            DataType::Dictionary(key.clone(), Box::new(with_uniform_widths(value)))
+        }
+        DataType::RunEndEncoded(run_ends, values) => DataType::RunEndEncoded(
+            Arc::clone(run_ends),
+            with_uniform_field_widths(values),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn with_uniform_field_widths(field: &FieldRef) -> FieldRef {
+    Arc::new(
+        field
+            .as_ref()
+            .clone()
+            .with_data_type(with_uniform_widths(field.data_type())),
     )
 }
 
@@ -953,6 +1010,72 @@ pub(crate) mod tests {
             err.to_string().contains("'s.inner'"),
             "expected error to identify the nested field path 's.inner', got: {err}"
         );
+    }
+
+    fn single_column_schema(data_type: &DataType) -> DFSchema {
+        DFSchema::try_from(Schema::new(vec![Field::new("c", data_type.clone(), true)]))
+            .unwrap()
+    }
+
+    #[test]
+    fn compatibility_ignores_string_and_binary_widths_at_any_depth() {
+        let list = |t| DataType::List(Arc::new(Field::new("item", t, true)));
+        let large_list = |t| DataType::LargeList(Arc::new(Field::new("item", t, true)));
+        let single_field_struct =
+            |t| DataType::Struct(Fields::from(vec![Field::new("f", t, true)]));
+        for (table, plan) in [
+            (DataType::LargeUtf8, DataType::Utf8),
+            (DataType::Utf8View, DataType::Utf8),
+            (DataType::Utf8, DataType::LargeUtf8),
+            (DataType::LargeUtf8, DataType::Utf8View),
+            (DataType::LargeBinary, DataType::Binary),
+            (DataType::BinaryView, DataType::Binary),
+            (DataType::Binary, DataType::LargeBinary),
+            (list(DataType::LargeUtf8), list(DataType::Utf8)),
+            (large_list(DataType::Utf8View), large_list(DataType::Utf8)),
+            (
+                single_field_struct(DataType::LargeBinary),
+                single_field_struct(DataType::Binary),
+            ),
+            (
+                DataType::Dictionary(
+                    Box::new(DataType::Int32),
+                    Box::new(DataType::LargeUtf8),
+                ),
+                DataType::Utf8,
+            ),
+        ] {
+            ensure_schema_compatibility(
+                &single_column_schema(&table),
+                single_column_schema(&plan),
+            )
+            .unwrap_or_else(|e| panic!("a {table} column read as {plan}: {e}"));
+        }
+    }
+
+    #[test]
+    fn compatibility_still_rejects_a_different_kind_or_numeric_width() {
+        let list = |t| DataType::List(Arc::new(Field::new("item", t, true)));
+        for (table, plan) in [
+            (DataType::LargeBinary, DataType::Utf8),
+            (DataType::LargeUtf8, DataType::Binary),
+            (DataType::Utf8View, DataType::BinaryView),
+            (DataType::Int64, DataType::Int32),
+            (list(DataType::Int64), list(DataType::Int32)),
+            (list(DataType::LargeBinary), list(DataType::Utf8)),
+        ] {
+            let err = ensure_schema_compatibility(
+                &single_column_schema(&table),
+                single_column_schema(&plan),
+            )
+            .unwrap_err();
+            assert_eq!(
+                err.strip_backtrace(),
+                format!(
+                    "Substrait error: Field 'c' in Substrait schema has a different type ({plan}) than the corresponding field in the table schema ({table})."
+                )
+            );
+        }
     }
 
     #[test]
