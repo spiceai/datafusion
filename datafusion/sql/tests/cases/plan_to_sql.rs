@@ -15744,3 +15744,87 @@ fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
     );
     Ok(())
 }
+
+/// MySQL's bare `DATETIME` has a fractional-seconds precision of 0, so
+/// `CAST('1994-06-15 12:30:00.5' AS DATETIME)` is `1994-06-15 12:30:00` (MySQL 8,
+/// MariaDB 11): an equality on a `TIMESTAMP(6)` column pushed down that way selects
+/// no row, and a range bound lands up to a second away from the one the query
+/// wrote. The cast must name `DATETIME(6)`, the widest precision MySQL holds, and
+/// a literal carrying more than six sub-second digits is truncated to six before
+/// it is sent, because the server would otherwise round it.
+#[test]
+fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
+    let unparser = Unparser::new(&UnparserMySqlDialect {});
+
+    // 1994-06-15 12:30:00.500 UTC, as the planner types a `TIMESTAMP '...'` literal.
+    let half_second = lit(datafusion_common::ScalarValue::TimestampNanosecond(
+        Some(771_683_400_500_000_000),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&half_second)?.to_string(),
+        "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))"
+    );
+
+    // Nine sub-second digits: cut to the six MySQL stores, never rounded up.
+    let nanos = lit(datafusion_common::ScalarValue::TimestampNanosecond(
+        Some(771_683_400_123_456_789),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&nanos)?.to_string(),
+        "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))"
+    );
+
+    // The precision follows the unit: a second-precision value takes none, a
+    // millisecond one three, so a cast into a coarser unit still drops the
+    // digits DataFusion would drop.
+    let whole = lit(datafusion_common::ScalarValue::TimestampSecond(
+        Some(771_683_400),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&whole)?.to_string(),
+        "CAST('1994-06-15 12:30:00' AS DATETIME(0))"
+    );
+    let millis = lit(datafusion_common::ScalarValue::TimestampMillisecond(
+        Some(771_683_400_500),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&millis)?.to_string(),
+        "CAST('1994-06-15 12:30:00.500' AS DATETIME(3))"
+    );
+
+    // A cast of a column keeps its fractional seconds too.
+    let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .filter(
+            cast(
+                col("t.s"),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            )
+            .gt(half_second),
+        )?
+        .build()?;
+    let sql = unparser.plan_to_sql(&plan)?.to_string();
+    assert_eq!(
+        sql,
+        "SELECT * FROM `t` WHERE (CAST(`t`.`s` AS DATETIME(6)) > CAST('1994-06-15 12:30:00.500' AS DATETIME(6)))"
+    );
+
+    // A cast into `Timestamp(Second)` drops fractional seconds in DataFusion, so
+    // its rendering must not keep them: `DATETIME(0)`, not `DATETIME(6)`.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![cast(
+            col("t.s"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+        )])?
+        .build()?;
+    assert_eq!(
+        unparser.plan_to_sql(&plan)?.to_string(),
+        "SELECT CAST(`t`.`s` AS DATETIME(0)) FROM `t`"
+    );
+
+    Ok(())
+}
