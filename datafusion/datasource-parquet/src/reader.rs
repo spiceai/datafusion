@@ -19,23 +19,25 @@
 //! low level control of parquet file readers
 
 use crate::ParquetFileMetrics;
-use crate::metadata::{DFParquetMetadata, version_from_head_if_same_generation};
+use crate::metadata::{
+    DFParquetMetadata, object_store_pin, version_from_head_if_same_generation,
+};
 use bytes::Bytes;
+use datafusion_common::HashMap;
 use datafusion_datasource::PartitionedFile;
 use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_physical_plan::metrics::ExecutionPlanMetricsSet;
 use futures::FutureExt;
+use futures::TryFutureExt;
 use futures::future::BoxFuture;
-use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
+use object_store::{GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
 use parquet::arrow::arrow_reader::ArrowReaderOptions;
-use parquet::arrow::async_reader::{
-    AsyncFileReader, ObjectVersionType, ParquetObjectReader,
-};
+use parquet::arrow::async_reader::{AsyncFileReader, ObjectVersionType};
+use parquet::errors::ParquetError;
 use parquet::file::metadata::ParquetMetaData;
 use std::any::Any;
-use std::collections::HashMap;
 use std::fmt::Debug;
 use std::ops::Range;
 use std::sync::Arc;
@@ -43,7 +45,7 @@ use std::sync::Arc;
 /// `(location, listed ETag)` → version id discovered by `HEAD` during
 /// metadata load.
 ///
-/// ListObjectsV2 omits version ids. `CachedParquetFileReader::get_metadata`
+/// ListObjectsV2 omits version ids. [`ParquetFileReader::get_metadata`]
 /// promotes one from HEAD when the ETag still matches. Bloom-filter scans
 /// then build a second reader from the original [`PartitionedFile`] (still
 /// `version: None`); looking this map up keeps that reader on the same
@@ -143,62 +145,6 @@ impl DefaultParquetFileReaderFactory {
     }
 }
 
-/// Implements [`AsyncFileReader`] for a parquet file in object storage.
-///
-/// This implementation uses the [`ParquetObjectReader`] to read data from the
-/// object store on demand, as required, tracking the number of bytes read.
-///
-/// This implementation does not coalesce I/O operations or cache bytes. Such
-/// optimizations can be done either at the object store level or by providing a
-/// custom implementation of [`ParquetFileReaderFactory`].
-pub struct ParquetFileReader {
-    pub file_metrics: ParquetFileMetrics,
-    pub inner: ParquetObjectReader,
-    pub partitioned_file: PartitionedFile,
-}
-
-impl AsyncFileReader for ParquetFileReader {
-    fn get_bytes(
-        &mut self,
-        range: Range<u64>,
-    ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
-        let bytes_scanned = range.end - range.start;
-        self.file_metrics.bytes_scanned.add(bytes_scanned as usize);
-        self.inner.get_bytes(range)
-    }
-
-    fn get_byte_ranges(
-        &mut self,
-        ranges: Vec<Range<u64>>,
-    ) -> BoxFuture<'_, parquet::errors::Result<Vec<Bytes>>>
-    where
-        Self: Send,
-    {
-        let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
-        self.file_metrics.bytes_scanned.add(total as usize);
-        self.inner.get_byte_ranges(ranges)
-    }
-
-    fn get_metadata<'a>(
-        &'a mut self,
-        options: Option<&'a ArrowReaderOptions>,
-    ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
-        self.inner.get_metadata(options)
-    }
-}
-
-impl Drop for ParquetFileReader {
-    fn drop(&mut self) {
-        self.file_metrics
-            .scan_efficiency_ratio
-            .add_part(self.file_metrics.bytes_scanned.value());
-        // Multiple ParquetFileReaders may run, so we set_total to avoid adding the total multiple times
-        self.file_metrics
-            .scan_efficiency_ratio
-            .set_total(self.partitioned_file.object_meta.size as usize);
-    }
-}
-
 impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
     fn create_reader(
         &self,
@@ -212,35 +158,28 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
             partitioned_file.object_meta.location.as_ref(),
             metrics,
         );
-        let store = Arc::clone(&self.store);
-        let mut inner = ParquetObjectReader::new_with_meta(
-            store,
-            partitioned_file.object_meta.clone(),
-        )
-        .with_object_versioning_type(self.object_versioning_type.clone());
 
-        if let Some(hint) = metadata_size_hint {
-            inner = inner.with_footer_size_hint(hint)
-        };
-
-        Ok(Box::new(ParquetFileReader {
-            inner,
+        let reader = ParquetFileReader::new(
             file_metrics,
+            Arc::clone(&self.store),
             partitioned_file,
-        }))
+        )
+        .with_metadata_hint(metadata_size_hint)
+        .with_object_versioning_type(self.object_versioning_type.clone());
+        Ok(Box::new(reader))
     }
 }
 
 /// Implementation of [`ParquetFileReaderFactory`] supporting the caching of footer and page
 /// metadata. Reads and updates the [`FileMetadataCache`] with the [`ParquetMetaData`] data.
 ///
-/// [`CachedParquetFileReader::get_metadata`] forwards the [`parquet::file::metadata::PageIndexPolicy`] from
+/// [`ParquetFileReader::get_metadata`] forwards the [`parquet::file::metadata::PageIndexPolicy`] from
 /// [`ArrowReaderOptions`] to [`DFParquetMetadata::fetch_metadata`], so callers such as the
 /// parquet opener can skip page-index I/O during the initial metadata load.
 #[derive(Debug)]
 pub struct CachedParquetFileReaderFactory {
     store: Arc<dyn ObjectStore>,
-    metadata_cache: Arc<dyn FileMetadataCache>,
+    metadata_cache: Arc<FileMetadataCache>,
     object_versioning_type: Option<ObjectVersionType>,
     discovered_versions: DiscoveredVersions,
 }
@@ -248,7 +187,7 @@ pub struct CachedParquetFileReaderFactory {
 impl CachedParquetFileReaderFactory {
     pub fn new(
         store: Arc<dyn ObjectStore>,
-        metadata_cache: Arc<dyn FileMetadataCache>,
+        metadata_cache: Arc<FileMetadataCache>,
     ) -> Self {
         Self {
             store,
@@ -285,108 +224,169 @@ impl ParquetFileReaderFactory for CachedParquetFileReaderFactory {
             partitioned_file.object_meta.location.as_ref(),
             metrics,
         );
-        let store = Arc::clone(&self.store);
+
+        // A replacement reader for the same listing (e.g. after a bloom-filter
+        // pass) must stay on the version discovered by the first reader.
         let mut partitioned_file = partitioned_file;
         apply_discovered_version(
             &self.discovered_versions,
             &mut partitioned_file.object_meta,
         );
 
-        let mut inner = ParquetObjectReader::new_with_meta(
-            store,
-            partitioned_file.object_meta.clone(),
+        let reader = ParquetFileReader::new(
+            file_metrics,
+            Arc::clone(&self.store),
+            partitioned_file,
         )
-        .with_object_versioning_type(self.object_versioning_type.clone());
+        .with_metadata_hint(metadata_size_hint)
+        .with_metadata_cache(Some(Arc::clone(&self.metadata_cache)))
+        .with_object_versioning_type(self.object_versioning_type.clone())
+        .with_discovered_versions(Arc::clone(&self.discovered_versions));
 
-        if let Some(hint) = metadata_size_hint {
-            inner = inner.with_footer_size_hint(hint)
-        };
-
-        Ok(Box::new(
-            CachedParquetFileReader::new(
-                file_metrics,
-                Arc::clone(&self.store),
-                inner,
-                partitioned_file,
-                Arc::clone(&self.metadata_cache),
-                metadata_size_hint,
-            )
-            .with_object_versioning_type(self.object_versioning_type.clone())
-            .with_discovered_versions(Arc::clone(&self.discovered_versions)),
-        ))
+        Ok(Box::new(reader))
     }
 }
 
-/// Implements [`AsyncFileReader`] for a Parquet file in object storage. Reads the file metadata
-/// from the [`FileMetadataCache`], if available, otherwise reads it directly from the file and then
-/// updates the cache.
-pub struct CachedParquetFileReader {
-    pub file_metrics: ParquetFileMetrics,
+/// Implements [`AsyncFileReader`] for a parquet file in object storage.
+///
+/// This implementation reads data directly from the underlying [`ObjectStore`]
+/// on demand, as required, tracking the number of bytes read.
+///
+/// When configured via [`Self::with_metadata_cache`], [`Self::get_metadata`]
+/// reads footer and page metadata from the cache when available and populates
+/// the cache otherwise. Without a cache, metadata is fetched fresh on every call.
+///
+/// # Notes
+///
+/// This implementation does not coalesce I/O operations or cache bytes. Such
+/// optimizations can be done either at the object store level or by providing
+/// a custom implementation of [`ParquetFileReaderFactory`].
+///
+/// When configured via [`Self::with_object_versioning_type`], every footer,
+/// page-index and data-page request is pinned to the listed object
+/// generation (`If-Match` on the listed ETag, or the object version id).
+pub struct ParquetFileReader {
+    file_metrics: ParquetFileMetrics,
     store: Arc<dyn ObjectStore>,
-    pub inner: ParquetObjectReader,
     partitioned_file: PartitionedFile,
-    metadata_cache: Arc<dyn FileMetadataCache>,
+    metadata_cache: Option<Arc<FileMetadataCache>>,
     metadata_size_hint: Option<usize>,
     object_versioning_type: Option<ObjectVersionType>,
-    discovered_versions: DiscoveredVersions,
+    discovered_versions: Option<DiscoveredVersions>,
 }
 
-impl CachedParquetFileReader {
-    pub fn new(
+impl ParquetFileReader {
+    /// Create a new `ParquetFileReader`.
+    ///
+    /// By default the reader has no [`FileMetadataCache`] and no metadata
+    /// size hint, so metadata is fetched fresh on every call (as
+    /// [`DefaultParquetFileReaderFactory`] does). Use
+    /// [`Self::with_metadata_cache`] to read and populate a cache (as
+    /// [`CachedParquetFileReaderFactory`] does), and
+    /// [`Self::with_metadata_hint`] to set the size hint.
+    pub(crate) fn new(
         file_metrics: ParquetFileMetrics,
         store: Arc<dyn ObjectStore>,
-        inner: ParquetObjectReader,
         partitioned_file: PartitionedFile,
-        metadata_cache: Arc<dyn FileMetadataCache>,
-        metadata_size_hint: Option<usize>,
     ) -> Self {
         Self {
             file_metrics,
             store,
-            inner,
             partitioned_file,
-            metadata_cache,
-            metadata_size_hint,
+            metadata_cache: None,
+            metadata_size_hint: None,
             object_versioning_type: None,
-            discovered_versions: Arc::new(Mutex::new(HashMap::new())),
+            discovered_versions: None,
         }
+    }
+
+    /// Returns the metrics tracked while reading this file.
+    pub fn file_metrics(&self) -> &ParquetFileMetrics {
+        &self.file_metrics
+    }
+
+    /// Returns the file this reader is reading.
+    pub fn partitioned_file(&self) -> &PartitionedFile {
+        &self.partitioned_file
+    }
+
+    /// Set the [`FileMetadataCache`] for this reader
+    pub fn with_metadata_cache(
+        mut self,
+        metadata_cache: Option<Arc<FileMetadataCache>>,
+    ) -> Self {
+        self.metadata_cache = metadata_cache;
+        self
+    }
+
+    /// Set the metadata size hint for this reader.
+    ///
+    /// See [`DFParquetMetadata::with_metadata_size_hint`] for more details.
+    pub fn with_metadata_hint(mut self, metadata_size_hint: Option<usize>) -> Self {
+        self.metadata_size_hint = metadata_size_hint;
+        self
     }
 
     /// Pin footer and page reads to the listed object generation.
     ///
-    /// Applied to both this wrapper and `inner`, so
-    /// `new(...).with_object_versioning_type(...)` pins `get_bytes` /
-    /// `get_byte_ranges` as well as metadata fetches. Defaults to `None`
-    /// so existing `new` callers keep compiling.
+    /// Applies to [`AsyncFileReader::get_bytes`],
+    /// [`AsyncFileReader::get_byte_ranges`] and
+    /// [`AsyncFileReader::get_metadata`]. Defaults to `None` (unpinned).
     pub fn with_object_versioning_type(
         mut self,
         object_versioning_type: Option<ObjectVersionType>,
     ) -> Self {
-        // `CachedParquetFileReader` implements `Drop`, so `inner` cannot be
-        // moved out. `ParquetObjectReader` is cheap to clone (store handle
-        // plus metadata).
-        self.inner = self
-            .inner
-            .clone()
-            .with_object_versioning_type(object_versioning_type.clone());
         self.object_versioning_type = object_versioning_type;
         self
     }
 
+    /// Share the map of HEAD-discovered version ids with the factory, so a
+    /// later reader for the same listing reuses the same version pin.
     fn with_discovered_versions(mut self, pins: DiscoveredVersions) -> Self {
-        self.discovered_versions = pins;
+        self.discovered_versions = Some(pins);
         self
+    }
+
+    /// `(if_match, version)` for requests made by this reader.
+    fn pin(&self) -> (Option<String>, Option<String>) {
+        object_store_pin(
+            self.object_versioning_type.as_ref(),
+            &self.partitioned_file.object_meta,
+        )
     }
 }
 
-impl AsyncFileReader for CachedParquetFileReader {
+impl AsyncFileReader for ParquetFileReader {
     fn get_bytes(
         &mut self,
         range: Range<u64>,
     ) -> BoxFuture<'_, parquet::errors::Result<Bytes>> {
         let bytes_scanned = range.end - range.start;
         self.file_metrics.bytes_scanned.add(bytes_scanned as usize);
-        self.inner.get_bytes(range)
+        let (if_match, version) = self.pin();
+        if if_match.is_none() && version.is_none() {
+            return self
+                .store
+                .get_range(&self.partitioned_file.object_meta.location, range)
+                .map_err(|e| ParquetError::External(Box::new(e)))
+                .boxed();
+        }
+        let opts = GetOptions {
+            range: Some(GetRange::Bounded(range)),
+            if_match,
+            version,
+            ..Default::default()
+        };
+        async move {
+            self.store
+                .get_opts(&self.partitioned_file.object_meta.location, opts)
+                .await
+                .map_err(|e| ParquetError::External(Box::new(e)))?
+                .bytes()
+                .await
+                .map_err(|e| ParquetError::External(Box::new(e)))
+        }
+        .boxed()
     }
 
     fn get_byte_ranges(
@@ -398,7 +398,36 @@ impl AsyncFileReader for CachedParquetFileReader {
     {
         let total: u64 = ranges.iter().map(|r| r.end - r.start).sum();
         self.file_metrics.bytes_scanned.add(total as usize);
-        self.inner.get_byte_ranges(ranges)
+        let (if_match, version) = self.pin();
+        async move {
+            let location = &self.partitioned_file.object_meta.location;
+            if if_match.is_none() && version.is_none() {
+                return self
+                    .store
+                    .get_ranges(location, &ranges)
+                    .await
+                    .map_err(|e| ParquetError::External(Box::new(e)));
+            }
+            // Same coalescing as `ObjectStore::get_ranges`, but through
+            // `get_opts` so every range carries the generation pin.
+            let store = &self.store;
+            object_store::coalesce_ranges(
+                &ranges,
+                |range| {
+                    let opts = GetOptions {
+                        range: Some(GetRange::Bounded(range)),
+                        if_match: if_match.clone(),
+                        version: version.clone(),
+                        ..Default::default()
+                    };
+                    async move { store.get_opts(location, opts).await?.bytes().await }
+                },
+                object_store::OBJECT_STORE_COALESCE_DEFAULT,
+            )
+            .await
+            .map_err(|e| ParquetError::External(Box::new(e)))
+        }
+        .boxed()
     }
 
     fn get_metadata<'a>(
@@ -406,7 +435,7 @@ impl AsyncFileReader for CachedParquetFileReader {
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, parquet::errors::Result<Arc<ParquetMetaData>>> {
         let object_meta = self.partitioned_file.object_meta.clone();
-        let metadata_cache = Arc::clone(&self.metadata_cache);
+        let metadata_cache = self.metadata_cache.clone();
 
         async move {
             #[cfg(feature = "parquet_encryption")]
@@ -434,24 +463,21 @@ impl AsyncFileReader for CachedParquetFileReader {
             {
                 object_meta.version = Some(version.clone());
                 self.partitioned_file.object_meta.version = Some(version.clone());
-                record_discovered_version(
-                    &self.discovered_versions,
-                    &object_meta,
-                    &version,
-                );
-                self.inner.set_object_version(version);
+                if let Some(pins) = &self.discovered_versions {
+                    record_discovered_version(pins, &object_meta, &version);
+                }
             }
 
             DFParquetMetadata::new(&self.store, &object_meta)
                 .with_decryption_properties(file_decryption_properties)
-                .with_file_metadata_cache(Some(Arc::clone(&metadata_cache)))
+                .with_file_metadata_cache(metadata_cache)
                 .with_metadata_size_hint(self.metadata_size_hint)
                 .with_page_index_policy(page_index_policy)
                 .with_object_versioning_type(self.object_versioning_type.clone())
                 .fetch_metadata()
                 .await
                 .map_err(|e| {
-                    parquet::errors::ParquetError::General(format!(
+                    ParquetError::General(format!(
                         "Failed to fetch metadata for file {}: {e}",
                         object_meta.location,
                     ))
@@ -461,7 +487,7 @@ impl AsyncFileReader for CachedParquetFileReader {
     }
 }
 
-impl Drop for CachedParquetFileReader {
+impl Drop for ParquetFileReader {
     fn drop(&mut self) {
         self.file_metrics
             .scan_efficiency_ratio
@@ -508,7 +534,8 @@ mod tests {
     use arrow::array::{Int32Array, RecordBatch};
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
-    use datafusion_execution::cache::DefaultFilesMetadataCache;
+    use datafusion_execution::cache::cache_manager::CachedFileMetadataEntry;
+    use datafusion_execution::cache::default_cache::DefaultCache;
     use futures::stream::BoxStream;
     use object_store::memory::InMemory;
     use object_store::path::Path;
@@ -631,6 +658,12 @@ mod tests {
         }
     }
 
+    fn metadata_cache() -> Arc<FileMetadataCache> {
+        Arc::new(DefaultCache::<Path, CachedFileMetadataEntry>::new(
+            64 * 1024 * 1024,
+        ))
+    }
+
     fn write_tiny_parquet() -> Vec<u8> {
         let schema =
             Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
@@ -664,7 +697,7 @@ mod tests {
         });
         let factory = CachedParquetFileReaderFactory::new(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
-            Arc::new(DefaultFilesMetadataCache::new(64 * 1024 * 1024)),
+            metadata_cache(),
         )
         .with_object_versioning_type(Some(ObjectVersionType::Version));
         let file = PartitionedFile::new_from_meta(listed);
@@ -723,18 +756,12 @@ mod tests {
             reads: StdMutex::new(Vec::new()),
         });
         let metrics = ExecutionPlanMetricsSet::new();
-        let inner = ParquetObjectReader::new_with_meta(
-            Arc::clone(&store) as Arc<dyn ObjectStore>,
-            listed.clone(),
-        );
-        let mut reader = CachedParquetFileReader::new(
+        let mut reader = ParquetFileReader::new(
             ParquetFileMetrics::new(0, listed.location.as_ref(), &metrics),
             Arc::clone(&store) as Arc<dyn ObjectStore>,
-            inner,
             PartitionedFile::new_from_meta(listed),
-            Arc::new(DefaultFilesMetadataCache::new(64 * 1024 * 1024)),
-            None,
         )
+        .with_metadata_cache(Some(metadata_cache()))
         .with_object_versioning_type(Some(ObjectVersionType::ETag));
         reader
             .get_bytes(0..8)

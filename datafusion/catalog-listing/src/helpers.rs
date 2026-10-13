@@ -17,23 +17,26 @@
 
 //! Helper functions for the table implementation
 
-use std::mem;
+use std::borrow::Cow;
 use std::sync::Arc;
 
+use crate::ListingFileFilter;
 use datafusion_catalog::Session;
 use datafusion_common::{
     HashMap, Result, ScalarValue, TableReference, assert_or_internal_err,
 };
 use datafusion_datasource::PartitionedFile;
+use datafusion_datasource::metadata::MetadataColumn;
 use datafusion_datasource::{FileExtensions, ListingTableUrl};
 use datafusion_expr::{BinaryExpr, Operator, lit, utils};
 
 use arrow::{
-    array::AsArray,
-    datatypes::{DataType, Field},
+    array::{Array, AsArray},
+    datatypes::{DataType, Field, SchemaRef},
     record_batch::RecordBatch,
 };
 use datafusion_expr::execution_props::ExecutionProps;
+use datafusion_expr::physical_planning_context::PhysicalPlanningContext;
 use futures::stream::FuturesUnordered;
 use futures::{StreamExt, TryStreamExt, stream::BoxStream};
 use log::{debug, trace};
@@ -42,8 +45,13 @@ use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{Column, DFSchema};
 use datafusion_expr::{Expr, Volatility};
 use datafusion_physical_expr::create_physical_expr;
+use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use object_store::path::Path;
 use object_store::{ObjectMeta, ObjectStore};
+use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
+
+const PARTITION_VALUE_ENCODE_SET: &AsciiSet =
+    &CONTROLS.add(b' ').add(b'%').add(b'/').add(b'?').add(b'#');
 
 /// Check whether the given expression can be resolved using only the columns `col_names`.
 /// This means that if this function returns true:
@@ -136,41 +144,6 @@ pub fn expr_applicable_for_cols(col_names: &[&str], expr: &Expr) -> bool {
 
 /// The maximum number of concurrent listing requests
 const CONCURRENCY_LIMIT: usize = 100;
-
-/// Partition the list of files into `n` groups
-#[deprecated(since = "47.0.0", note = "use `FileGroup::split_files` instead")]
-pub fn split_files(
-    mut partitioned_files: Vec<PartitionedFile>,
-    n: usize,
-) -> Vec<Vec<PartitionedFile>> {
-    if partitioned_files.is_empty() {
-        return vec![];
-    }
-
-    // ObjectStore::list does not guarantee any consistent order and for some
-    // implementations such as LocalFileSystem, it may be inconsistent. Thus
-    // Sort files by path to ensure consistent plans when run more than once.
-    partitioned_files.sort_by(|a, b| a.path().cmp(b.path()));
-
-    // effectively this is div with rounding up instead of truncating
-    let chunk_size = partitioned_files.len().div_ceil(n);
-    let mut chunks = Vec::with_capacity(n);
-    let mut current_chunk = Vec::with_capacity(chunk_size);
-    for file in partitioned_files.drain(..) {
-        current_chunk.push(file);
-        if current_chunk.len() == chunk_size {
-            let full_chunk =
-                mem::replace(&mut current_chunk, Vec::with_capacity(chunk_size));
-            chunks.push(full_chunk);
-        }
-    }
-
-    if !current_chunk.is_empty() {
-        chunks.push(current_chunk)
-    }
-
-    chunks
-}
 
 #[derive(Debug)]
 pub struct Partition {
@@ -308,7 +281,16 @@ pub fn evaluate_partition_prefix<'a>(
             Some(PartitionValue::Single(val)) => {
                 // if a partition only has a single literal value, then it can be added to the
                 // prefix
-                parts.push(format!("{p}={val}"));
+                let encoded = encode_partition_value(val);
+                if encoded != val.as_str() {
+                    // The same decoded value can be represented by both raw and
+                    // percent-encoded partition directories. Prefix pruning is
+                    // an optimization, so stop before this partition rather
+                    // than listing only one spelling and potentially skipping
+                    // valid rows.
+                    break;
+                }
+                parts.push(format!("{p}={encoded}"));
             }
             _ => {
                 // break on the first unconstrainted partition to create a common prefix
@@ -325,7 +307,11 @@ pub fn evaluate_partition_prefix<'a>(
     }
 }
 
-fn filter_partitions(
+fn encode_partition_value(value: &str) -> Cow<'_, str> {
+    utf8_percent_encode(value, PARTITION_VALUE_ENCODE_SET).into()
+}
+
+pub fn filter_partitioned_file(
     pf: PartitionedFile,
     filters: &[Expr],
     df_schema: &DFSchema,
@@ -346,7 +332,12 @@ fn filter_partitions(
 
     let filter = utils::conjunction(filters.iter().cloned()).unwrap_or_else(|| lit(true));
     let props = ExecutionProps::new();
-    let expr = create_physical_expr(&filter, df_schema, &props)?;
+    let expr = create_physical_expr(
+        &filter,
+        df_schema,
+        &props,
+        &PhysicalPlanningContext::default(),
+    )?;
 
     // Since we're only operating on a single file, our batch and resulting "array" holds only one
     // value indicating if the input file matches the provided filters
@@ -379,7 +370,7 @@ fn try_into_partitioned_file(
         .into_iter()
         .zip(partition_cols)
         .map(|(parsed, (_, datatype))| {
-            ScalarValue::try_from_string(parsed.to_string(), datatype)
+            ScalarValue::try_from_string(parsed.into_owned(), datatype)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -402,16 +393,82 @@ pub async fn pruned_partition_list<'a>(
     file_extension: &'a str,
     partition_cols: &'a [(String, DataType)],
 ) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
+    pruned_partition_list_with_metadata(
+        ctx,
+        store,
+        table_path,
+        filters,
+        file_extension,
+        partition_cols,
+        &[],
+        &[],
+        None,
+    )
+    .await
+}
+
+/// Like [`pruned_partition_list`], but additionally prunes the file listing by
+/// metadata-column predicates (`_last_modified`, `_size`, `_location`) before any
+/// file is opened.
+///
+/// Metadata columns are materialized from each object's [`ObjectMeta`] (mtime, size,
+/// location) already returned by the listing, so a bound such as
+/// `_last_modified > <watermark>` prunes the file list at listing time rather than
+/// opening and row-filtering every file. `metadata_filters` must reference only
+/// metadata columns (see `expr_applicable_for_cols`); the caller reports those
+/// predicates as `Exact` so no redundant `FilterExec` is planted above the scan.
+///
+/// Metadata pruning is orthogonal to partition pruning and is applied to both
+/// partitioned and unpartitioned tables.
+///
+/// `file_filter` drops the listed objects that are not the table's data files
+/// (see [`ListingFileFilter`]). It runs before zero-byte objects are dropped and
+/// before partition values are parsed, so an error it returns for an object is
+/// hidden by neither.
+#[expect(clippy::too_many_arguments)]
+pub async fn pruned_partition_list_with_metadata<'a>(
+    ctx: &'a dyn Session,
+    store: &'a dyn ObjectStore,
+    table_path: &'a ListingTableUrl,
+    filters: &'a [Expr],
+    file_extension: &'a str,
+    partition_cols: &'a [(String, DataType)],
+    metadata_filters: &'a [Expr],
+    metadata_cols: &'a [MetadataColumn],
+    file_filter: Option<&'a dyn ListingFileFilter>,
+) -> Result<BoxStream<'a, Result<PartitionedFile>>> {
     let prefix = if !partition_cols.is_empty() {
         evaluate_partition_prefix(partition_cols, filters)
     } else {
         None
     };
 
+    let metadata_predicate = MetadataPredicate::try_new(
+        metadata_filters,
+        metadata_cols,
+        ctx.execution_props(),
+    )?;
+
     let objects = table_path
         .list_prefixed_files(ctx, store, prefix, file_extension)
         .await?
-        .try_filter(|object_meta| futures::future::ready(object_meta.size > 0));
+        .try_filter_map(move |object_meta| {
+            futures::future::ready(match file_filter {
+                Some(file_filter) => file_filter
+                    .is_data_file(&object_meta)
+                    .map(|keep| keep.then_some(object_meta)),
+                None => Ok(Some(object_meta)),
+            })
+        })
+        .try_filter(|object_meta| futures::future::ready(object_meta.size > 0))
+        .try_filter_map(move |object_meta| {
+            futures::future::ready(match &metadata_predicate {
+                Some(predicate) => predicate
+                    .matches(&object_meta)
+                    .map(|keep| keep.then_some(object_meta)),
+                None => Ok(Some(object_meta)),
+            })
+        });
 
     if partition_cols.is_empty() {
         assert_or_internal_err!(
@@ -447,9 +504,105 @@ pub async fn pruned_partition_list<'a>(
                 ))
             })
             .try_filter_map(move |pf| {
-                futures::future::ready(filter_partitions(pf, filters, &df_schema))
+                futures::future::ready(filter_partitioned_file(pf, filters, &df_schema))
             })
             .boxed())
+    }
+}
+
+/// A metadata-column predicate compiled once per listing and evaluated against every
+/// [`ObjectMeta`] the listing returns, without opening any file.
+///
+/// The metadata columns (`_last_modified`, `_size`, `_location`) are materialized from
+/// each `ObjectMeta` via [`MetadataColumn::to_scalar_value`], and the conjunction of the
+/// filters is evaluated as a one-row batch. Reusing the same compiled expression across
+/// every object (rather than recompiling per file) gives correct `>`, `>=`, `<`, `<=`,
+/// `=`, `BETWEEN`, `IN`, `LIKE`, cast and NULL semantics identical to a row-level `WHERE`,
+/// at the cost of one expression compilation per listing instead of one per file.
+pub struct MetadataPredicate<'a> {
+    cols: &'a [MetadataColumn],
+    schema: SchemaRef,
+    expr: Arc<dyn PhysicalExpr>,
+}
+
+impl<'a> MetadataPredicate<'a> {
+    /// Compiles `filters` against `cols`, or returns `Ok(None)` when there is nothing to
+    /// prune on (no metadata columns configured, or no filters to evaluate).
+    ///
+    /// `props` must be the caller's session-scoped [`ExecutionProps`] — a filter such as
+    /// `_size > @threshold` uses a `ScalarVariable`, which only resolves through the
+    /// session's variable providers, not a fresh, empty `ExecutionProps`.
+    pub fn try_new(
+        filters: &[Expr],
+        cols: &'a [MetadataColumn],
+        props: &ExecutionProps,
+    ) -> Result<Option<Self>> {
+        if cols.is_empty() {
+            return Ok(None);
+        }
+        let Some(filter) = utils::conjunction(filters.iter().cloned()) else {
+            return Ok(None);
+        };
+
+        let df_schema = DFSchema::from_unqualified_fields(
+            cols.iter().map(MetadataColumn::field).collect(),
+            Default::default(),
+        )?;
+        let expr = create_physical_expr(
+            &filter,
+            &df_schema,
+            props,
+            &PhysicalPlanningContext::default(),
+        )?;
+
+        Ok(Some(Self {
+            cols,
+            schema: Arc::clone(df_schema.inner()),
+            expr,
+        }))
+    }
+
+    /// Whether `object_meta` satisfies every predicate.
+    ///
+    /// A single object produces a single-row result. It is kept only on an explicit
+    /// `TRUE`; a `NULL` (unknown) result prunes it, matching SQL `WHERE` semantics.
+    pub fn matches(&self, object_meta: &ObjectMeta) -> Result<bool> {
+        let arrays = self
+            .cols
+            .iter()
+            .map(|col| col.to_scalar_value(object_meta).to_array())
+            .collect::<Result<Vec<_>>>()?;
+        let batch = RecordBatch::try_new(Arc::clone(&self.schema), arrays)?;
+
+        let matches = self.expr.evaluate(&batch)?.into_array(1)?;
+        let matches = matches.as_boolean();
+        Ok(matches.is_valid(0) && matches.value(0))
+    }
+}
+
+/// Evaluate metadata-column predicates against a single file's [`ObjectMeta`], without
+/// opening the file. Returns `Some(object_meta)` when the object satisfies every
+/// predicate, or `None` when it should be pruned.
+///
+/// A thin wrapper over [`MetadataPredicate`] for a caller that obtains an `ObjectMeta`
+/// another way — e.g. a `HEAD` on a known object key instead of a listing — so it can
+/// apply the identical prune before opening the file, and report the same predicates as
+/// `Exact`. A listing that checks many objects should build a [`MetadataPredicate`]
+/// directly instead, to compile the filter expression once rather than per object.
+///
+/// `props` must be the caller's session-scoped [`ExecutionProps`], for the reason given
+/// on [`MetadataPredicate::try_new`]: a filter such as `_size > @threshold` resolves only
+/// through the session's variable providers. Passing a fresh `ExecutionProps` makes such
+/// a filter fail here while the equivalent row-level filter succeeds.
+pub fn filter_by_metadata(
+    object_meta: ObjectMeta,
+    metadata_filters: &[Expr],
+    metadata_cols: &[MetadataColumn],
+    props: &ExecutionProps,
+) -> Result<Option<ObjectMeta>> {
+    match MetadataPredicate::try_new(metadata_filters, metadata_cols, props)? {
+        Some(predicate) => Ok(predicate.matches(&object_meta)?.then_some(object_meta)),
+        None => Ok(Some(object_meta)),
     }
 }
 
@@ -459,6 +612,7 @@ fn object_meta_to_partitioned_file(
 ) -> Result<Option<PartitionedFile>> {
     Ok(Some(PartitionedFile {
         object_meta,
+        arrow_schema: None,
         partition_values: vec![],
         range: None,
         statistics: None,
@@ -470,12 +624,15 @@ fn object_meta_to_partitioned_file(
 }
 
 /// Extract the partition values for the given `file_path` (in the given `table_path`)
-/// associated to the partitions defined by `table_partition_cols`
+/// associated to the partitions defined by `table_partition_cols`.
+///
+/// Partition values are percent-decoded to match Hive-style object-store paths
+/// that encode special characters in path segments.
 pub fn parse_partitions_for_path<'a, I>(
     table_path: &ListingTableUrl,
     file_path: &'a Path,
     table_partition_cols: I,
-) -> Option<Vec<&'a str>>
+) -> Option<Vec<Cow<'a, str>>>
 where
     I: IntoIterator<Item = &'a str>,
 {
@@ -484,7 +641,13 @@ where
     let mut part_values = vec![];
     for (part, expected_partition) in subpath.zip(table_partition_cols) {
         match part.split_once('=') {
-            Some((name, val)) if name == expected_partition => part_values.push(val),
+            Some((name, val)) if name == expected_partition => {
+                // Preserve the original value if percent-decoding produces invalid UTF-8.
+                let decoded = percent_decode_str(val)
+                    .decode_utf8()
+                    .unwrap_or(Cow::Borrowed(val));
+                part_values.push(decoded);
+            }
             _ => {
                 debug!(
                     "Ignoring file: file_path='{file_path}', table_path='{table_path}', part='{part}', partition_col='{expected_partition}'",
@@ -514,7 +677,92 @@ mod tests {
     use std::ops::Not;
 
     use super::*;
+    use chrono::TimeZone;
     use datafusion_expr::{case, col};
+
+    fn meta_at(path: &str, size: u64, year: i32) -> ObjectMeta {
+        ObjectMeta {
+            location: Path::from(path),
+            last_modified: chrono::Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap(),
+            size,
+            e_tag: None,
+            version: None,
+        }
+    }
+
+    fn ts_lit(year: i32) -> Expr {
+        let dt = chrono::Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+        lit(ScalarValue::TimestampMicrosecond(
+            Some(dt.timestamp_micros()),
+            Some("UTC".into()),
+        ))
+    }
+
+    /// Compiles `filters` against `cols` and evaluates them against `meta`, matching
+    /// `pruned_partition_list_with_metadata`'s per-object check.
+    fn keeps(meta: &ObjectMeta, filters: &[Expr], cols: &[MetadataColumn]) -> bool {
+        match MetadataPredicate::try_new(filters, cols, &ExecutionProps::new())
+            .expect("compile predicate")
+        {
+            Some(predicate) => predicate.matches(meta).expect("eval"),
+            None => true,
+        }
+    }
+
+    #[test]
+    fn filter_by_metadata_prunes_stale_last_modified() {
+        // Reproduces github.com/spiceai/spiceai#14264: a file whose mtime is below the
+        // watermark must be pruned from the listing, never opened.
+        let cols = [MetadataColumn::LastModified];
+        let filters = [col("_last_modified").gt(ts_lit(2023))];
+
+        assert!(
+            !keeps(&meta_at("old.jsonl.gz", 10, 2020), &filters, &cols),
+            "2020 file must be pruned by > 2023"
+        );
+        assert!(
+            keeps(&meta_at("new.jsonl.gz", 10, 2024), &filters, &cols),
+            "2024 file must survive > 2023"
+        );
+    }
+
+    #[test]
+    fn filter_by_metadata_prunes_by_size() {
+        let cols = [MetadataColumn::Size];
+        let filters = [col("_size").lt(lit(100u64))];
+        assert!(!keeps(&meta_at("big", 500, 2024), &filters, &cols));
+        assert!(keeps(&meta_at("small", 50, 2024), &filters, &cols));
+    }
+
+    #[test]
+    fn filter_by_metadata_between_bounds() {
+        let cols = [MetadataColumn::LastModified];
+        let filters = [col("_last_modified").between(ts_lit(2022), ts_lit(2025))];
+        assert!(keeps(&meta_at("in", 10, 2023), &filters, &cols));
+        assert!(!keeps(&meta_at("out", 10, 2019), &filters, &cols));
+    }
+
+    #[test]
+    fn filter_by_metadata_null_comparison_prunes() {
+        // `_last_modified > NULL` is unknown → the file is pruned, matching `WHERE` semantics.
+        let cols = [MetadataColumn::LastModified];
+        let null_ts = lit(ScalarValue::TimestampMicrosecond(None, Some("UTC".into())));
+        let filters = [col("_last_modified").gt(null_ts)];
+        assert!(!keeps(&meta_at("f", 10, 2024), &filters, &cols));
+    }
+
+    #[test]
+    fn filter_by_metadata_noop_without_filters_or_cols() {
+        let cols = [MetadataColumn::LastModified];
+        // No filters → file kept.
+        assert!(keeps(&meta_at("f", 10, 2020), &[], &cols));
+        // No metadata columns configured → nothing to prune on, file kept.
+        assert!(keeps(
+            &meta_at("f", 10, 2020),
+            &[col("_last_modified").gt(ts_lit(2099))],
+            &[]
+        ));
+    }
 
     #[test]
     fn test_split_files() {
@@ -560,7 +808,7 @@ mod tests {
     #[test]
     fn test_parse_partitions_for_path() {
         assert_eq!(
-            Some(vec![]),
+            Some(vec![] as Vec<Cow<'_, str>>),
             parse_partitions_for_path(
                 &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
                 &Path::from("bucket/mytable/file.csv"),
@@ -584,15 +832,51 @@ mod tests {
             )
         );
         assert_eq!(
-            Some(vec!["v1"]),
+            Some(vec![Cow::Borrowed("v1")]),
             parse_partitions_for_path(
                 &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
                 &Path::from("bucket/mytable/mypartition=v1/file.csv"),
                 vec!["mypartition"]
             )
         );
+        for (path, column, expected) in [
+            (
+                "bucket/mytable/mypartition=v%2F1/file.csv",
+                "mypartition",
+                "v/1",
+            ),
+            (
+                "bucket/mytable/name=John%20Doe/file.csv",
+                "name",
+                "John Doe",
+            ),
+            (
+                "bucket/mytable/mypartition=test%20dir%2Ffile/file.csv",
+                "mypartition",
+                "test dir/file",
+            ),
+            (
+                "bucket/mytable/mypartition=%C3%A9/file.csv",
+                "mypartition",
+                "é",
+            ),
+            (
+                "bucket/mytable/mypartition=%FF/file.csv",
+                "mypartition",
+                "%FF",
+            ),
+        ] {
+            assert_eq!(
+                Some(vec![Cow::Borrowed(expected)]),
+                parse_partitions_for_path(
+                    &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
+                    &Path::parse(path).unwrap(),
+                    vec![column]
+                )
+            );
+        }
         assert_eq!(
-            Some(vec!["v1"]),
+            Some(vec![Cow::Borrowed("v1")]),
             parse_partitions_for_path(
                 &ListingTableUrl::parse("file:///bucket/mytable/").unwrap(),
                 &Path::from("bucket/mytable/mypartition=v1/file.csv"),
@@ -609,7 +893,7 @@ mod tests {
             )
         );
         assert_eq!(
-            Some(vec!["v1", "v2"]),
+            Some(vec![Cow::Borrowed("v1"), Cow::Borrowed("v2")]),
             parse_partitions_for_path(
                 &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
                 &Path::from("bucket/mytable/mypartition=v1/otherpartition=v2/file.csv"),
@@ -617,7 +901,7 @@ mod tests {
             )
         );
         assert_eq!(
-            Some(vec!["v1"]),
+            Some(vec![Cow::Borrowed("v1")]),
             parse_partitions_for_path(
                 &ListingTableUrl::parse("file:///bucket/mytable").unwrap(),
                 &Path::from("bucket/mytable/mypartition=v1/otherpartition=v2/file.csv"),
@@ -646,6 +930,32 @@ mod tests {
         assert_eq!(
             pf.partition_values[0],
             ScalarValue::Utf8(Some("2024-01".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_try_into_partitioned_file_decodes_partition_value() {
+        let table_path = ListingTableUrl::parse("file:///bucket/mytable").unwrap();
+        let partition_cols = vec![("category".to_string(), DataType::Utf8)];
+        let meta = ObjectMeta {
+            location: Path::parse(
+                "bucket/mytable/category=Electronics%2FComputers/data.parquet",
+            )
+            .unwrap(),
+            last_modified: chrono::Utc::now(),
+            size: 100,
+            e_tag: None,
+            version: None,
+        };
+
+        let result =
+            try_into_partitioned_file(meta, &partition_cols, &table_path).unwrap();
+        assert!(result.is_some());
+        let pf = result.unwrap();
+        assert_eq!(pf.partition_values.len(), 1);
+        assert_eq!(
+            pf.partition_values[0],
+            ScalarValue::Utf8(Some("Electronics/Computers".to_string()))
         );
     }
 
@@ -800,6 +1110,27 @@ mod tests {
 
         assert_eq!(
             evaluate_partition_prefix(partitions, &[lit("foo").eq(col("a"))]),
+            Some(Path::from("a=foo")),
+        );
+
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[col("a").eq(lit("Electronics/Computers"))],
+            ),
+            None,
+        );
+
+        assert_eq!(
+            evaluate_partition_prefix(partitions, &[col("a").eq(lit("John Doe"))]),
+            None,
+        );
+
+        assert_eq!(
+            evaluate_partition_prefix(
+                partitions,
+                &[col("a").eq(lit("foo")).and(col("b").eq(lit("John Doe")))],
+            ),
             Some(Path::from("a=foo")),
         );
 

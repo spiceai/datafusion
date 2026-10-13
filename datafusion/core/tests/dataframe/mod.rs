@@ -21,9 +21,10 @@ mod describe;
 
 use arrow::array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, FixedSizeListArray,
-    FixedSizeListBuilder, Float32Array, Float64Array, Int8Array, Int32Array,
-    Int32Builder, LargeListArray, ListArray, ListBuilder, RecordBatch, StringArray,
-    StringBuilder, StructBuilder, UInt32Array, UInt32Builder, UnionArray, record_batch,
+    FixedSizeListBuilder, Float16Array, Float32Array, Float64Array, Int8Array,
+    Int16Array, Int32Array, Int32Builder, Int64Array, LargeListArray, ListArray,
+    ListBuilder, RecordBatch, StringArray, StringBuilder, StructBuilder, UInt8Array,
+    UInt16Array, UInt32Array, UInt32Builder, UInt64Array, UnionArray, record_batch,
 };
 use arrow::buffer::ScalarBuffer;
 use arrow::datatypes::{
@@ -843,7 +844,7 @@ async fn test_aggregate_with_pk() -> Result<()> {
     let aggr_expr = vec![];
     let df = df.aggregate(group_expr, aggr_expr)?;
 
-    // Since id and name are functionally dependant, we can use name among
+    // Since id and name are functionally dependent, we can use name among
     // expression even if it is not part of the group by expression and can
     // select "name" column even though it wasn't explicitly grouped
     let df = df.select(vec![col("id"), col("name")])?;
@@ -898,7 +899,7 @@ async fn test_aggregate_with_pk2() -> Result<()> {
     "
     );
 
-    // Since id and name are functionally dependant, we can use name among expression
+    // Since id and name are functionally dependent, we can use name among expression
     // even if it is not part of the group by expression.
     let df_results = df.collect().await?;
 
@@ -946,7 +947,7 @@ async fn test_aggregate_with_pk3() -> Result<()> {
     "
     );
 
-    // Since id and name are functionally dependant, we can use name among expression
+    // Since id and name are functionally dependent, we can use name among expression
     // even if it is not part of the group by expression.
     let df_results = df.collect().await?;
 
@@ -1144,7 +1145,13 @@ async fn test_aggregate_name_collision() -> Result<()> {
         // The select expr has the same display_name as the group_expr,
         // but since they are different expressions, it should fail.
         .expect_err("Expected error");
-    assert_snapshot!(df.strip_backtrace(), @r#"Schema error: No field named aggregate_test_100.c2. Valid fields are "aggregate_test_100.c2 + aggregate_test_100.c3"."#);
+    assert_snapshot!(
+        df.strip_backtrace(),
+        @r#"
+Schema error: No field named aggregate_test_100.c2.
+Valid fields are "aggregate_test_100.c2 + aggregate_test_100.c3".
+"#
+    );
 
     Ok(())
 }
@@ -1207,7 +1214,7 @@ async fn window_using_aggregates() -> Result<()> {
     +-------------+----------+-----------------+---------------+--------+-----+------+----+------+
     | first_value | last_val | approx_distinct | approx_median | median | max | min  | c2 | c3   |
     +-------------+----------+-----------------+---------------+--------+-----+------+----+------+
-    |             |          |                 |               |        |     |      | 1  | -85  |
+    |             |          | 0               |               |        |     |      | 1  | -85  |
     | -85         | -101     | 14              | -12.0         | -12.0  | 83  | -101 | 4  | -54  |
     | -85         | -101     | 17              | -25.0         | -25.0  | 83  | -101 | 5  | -31  |
     | -85         | -12      | 10              | -32.75        | -34.0  | 83  | -85  | 3  | 13   |
@@ -3004,22 +3011,22 @@ async fn test_count_wildcard_on_sort() -> Result<()> {
     assert_snapshot!(
         pretty_format_batches(&sql_results).unwrap(),
         @r"
-    +---------------+------------------------------------------------------------------------------------+
-    | plan_type     | plan                                                                               |
-    +---------------+------------------------------------------------------------------------------------+
-    | logical_plan  | Sort: count(*) ASC NULLS LAST                                                      |
-    |               |   Projection: t1.b, count(Int64(1)) AS count(*)                                    |
-    |               |     Aggregate: groupBy=[[t1.b]], aggr=[[count(Int64(1))]]                          |
-    |               |       TableScan: t1 projection=[b]                                                 |
-    | physical_plan | SortPreservingMergeExec: [count(*)@1 ASC NULLS LAST]                               |
-    |               |   SortExec: expr=[count(*)@1 ASC NULLS LAST], preserve_partitioning=[true]         |
-    |               |     ProjectionExec: expr=[b@0 as b, count(Int64(1))@1 as count(*)]                 |
-    |               |       AggregateExec: mode=FinalPartitioned, gby=[b@0 as b], aggr=[count(Int64(1))] |
-    |               |         RepartitionExec: partitioning=Hash([b@0], 4), input_partitions=1           |
-    |               |           AggregateExec: mode=Partial, gby=[b@0 as b], aggr=[count(Int64(1))]      |
-    |               |             DataSourceExec: partitions=1, partition_sizes=[1]                      |
-    |               |                                                                                    |
-    +---------------+------------------------------------------------------------------------------------+
+    +---------------+-------------------------------------------------------------------------------------+
+    | plan_type     | plan                                                                                |
+    +---------------+-------------------------------------------------------------------------------------+
+    | logical_plan  | Sort: count(*) ASC NULLS LAST                                                       |
+    |               |   Projection: t1.b, count(Int64(1)) AS count(*)                                     |
+    |               |     Aggregate: groupBy=[[t1.b]], aggr=[[count(Int64(1))]]                           |
+    |               |       TableScan: t1 projection=[b]                                                  |
+    | physical_plan | SortPreservingMergeExec: [count(*)@1 ASC NULLS LAST]                                |
+    |               |   ProjectionExec: expr=[b@0 as b, count(Int64(1))@1 as count(*)]                    |
+    |               |     SortExec: expr=[count(Int64(1))@1 ASC NULLS LAST], preserve_partitioning=[true] |
+    |               |       AggregateExec: mode=FinalPartitioned, gby=[b@0 as b], aggr=[count(Int64(1))]  |
+    |               |         RepartitionExec: partitioning=Hash([b@0], 4), input_partitions=1            |
+    |               |           AggregateExec: mode=Partial, gby=[b@0 as b], aggr=[count(Int64(1))]       |
+    |               |             DataSourceExec: partitions=1, partition_sizes=[1]                       |
+    |               |                                                                                     |
+    +---------------+-------------------------------------------------------------------------------------+
     "
     );
 
@@ -3348,7 +3355,11 @@ async fn union_with_mix_of_presorted_and_explicitly_resorted_inputs_impl(
 
     // To be able to remove user specific paths from the plan, for stable assertions
     let testdata_clean = Path::new(&testdata).canonicalize()?.display().to_string();
-    let testdata_clean = testdata_clean.strip_prefix("/").unwrap_or(&testdata_clean);
+    let testdata_clean = testdata_clean.replace("\\", "/");
+    let testdata_clean = testdata_clean
+        .strip_prefix("//?/")
+        .or_else(|| testdata_clean.strip_prefix("/"))
+        .unwrap_or(&testdata_clean);
 
     // Use displayable() rather than explain().collect() to avoid table formatting issues. We need
     // to replace machine-specific paths with variable lengths, which breaks table alignment and
@@ -4361,6 +4372,7 @@ async fn unnest_column_nulls() -> Result<()> {
 
     let options = UnnestOptions::new().with_preserve_nulls(false);
     let results = df
+        .clone()
         .unnest_columns_with_options(&["list"], options)?
         .collect()
         .await?;
@@ -4374,6 +4386,156 @@ async fn unnest_column_nulls() -> Result<()> {
     | 2    | A  |
     | 3    | D  |
     +------+----+
+    "
+    );
+
+    // Outer-unnest semantics: NULL and empty lists both produce a single
+    // output row containing NULL.
+    let options = UnnestOptions::new()
+        .with_null_handling(datafusion_common::NullHandling::PreserveAndExpandEmpty);
+    let results = df
+        .unnest_columns_with_options(&["list"], options)?
+        .collect()
+        .await?;
+    assert_snapshot!(
+       batches_to_string(&results),
+        @r"
+    +------+----+
+    | list | id |
+    +------+----+
+    | 1    | A  |
+    | 2    | A  |
+    |      | B  |
+    |      | C  |
+    | 3    | D  |
+    +------+----+
+    "
+    );
+
+    Ok(())
+}
+
+/// Outer-unnest on a list-of-struct column. Verifies that
+/// (a) struct elements unnest into flattened sub-columns and
+/// (b) NULL and empty lists both still produce a single output row whose
+///     struct sub-columns are all NULL.
+#[tokio::test]
+async fn unnest_outer_list_of_struct() -> Result<()> {
+    use arrow::array::{Int32Array, StructArray};
+
+    // Per-row sub-list lengths: 2, 1, 0 (empty), 0 (null)
+    let names = StringArray::from(vec!["alice", "bob", "carol"]);
+    let ages = Int32Array::from(vec![30, 40, 50]);
+    let struct_values = StructArray::from(vec![
+        (
+            Arc::new(Field::new("name", DataType::Utf8, true)),
+            Arc::new(names) as ArrayRef,
+        ),
+        (
+            Arc::new(Field::new("age", DataType::Int32, true)),
+            Arc::new(ages) as ArrayRef,
+        ),
+    ]);
+    let struct_field =
+        Arc::new(Field::new("item", struct_values.data_type().clone(), true));
+    let offsets = arrow::buffer::OffsetBuffer::<i32>::from_lengths([2, 1, 0, 0]);
+    let validity = arrow::buffer::NullBuffer::from(vec![true, true, true, false]);
+    let people = ListArray::new(
+        struct_field,
+        offsets,
+        Arc::new(struct_values),
+        Some(validity),
+    );
+    let group = Int32Array::from(vec![1, 2, 3, 4]);
+
+    let batch = RecordBatch::try_from_iter(vec![
+        ("people", Arc::new(people) as ArrayRef),
+        ("group", Arc::new(group) as ArrayRef),
+    ])?;
+
+    let ctx = SessionContext::new();
+    ctx.register_batch("teams", batch)?;
+    let df = ctx.table("teams").await?;
+
+    let options = UnnestOptions::new()
+        .with_null_handling(datafusion_common::NullHandling::PreserveAndExpandEmpty);
+    let results = df
+        // Unnest the list, then expand the resulting struct rows into columns.
+        .unnest_columns_with_options(&["people"], options.clone())?
+        .unnest_columns_with_options(&["people"], options)?
+        .collect()
+        .await?;
+    assert_snapshot!(
+       batches_to_string(&results),
+        @r"
+    +-------------+------------+-------+
+    | people.name | people.age | group |
+    +-------------+------------+-------+
+    | alice       | 30         | 1     |
+    | bob         | 40         | 1     |
+    | carol       | 50         | 2     |
+    |             |            | 3     |
+    |             |            | 4     |
+    +-------------+------------+-------+
+    "
+    );
+
+    Ok(())
+}
+
+/// Outer-unnest applied to a `FixedSizeList` column. For fixed-size lists,
+/// every non-null row has the fixed length, so "empty" never occurs —
+/// `PreserveAndExpandEmpty` should behave identically to `Preserve` here.
+/// The test pins that equivalence so we notice if it ever diverges.
+#[tokio::test]
+async fn unnest_outer_fixed_size_list() -> Result<()> {
+    let batch = get_fixed_list_batch()?;
+    let ctx = SessionContext::new();
+    ctx.register_batch("shapes", batch)?;
+    let df = ctx.table("shapes").await?;
+
+    let preserve_results = df
+        .clone()
+        .unnest_columns_with_options(
+            &["tags"],
+            UnnestOptions::new().with_preserve_nulls(true),
+        )?
+        .collect()
+        .await?;
+    let outer_results = df
+        .unnest_columns_with_options(
+            &["tags"],
+            UnnestOptions::new().with_null_handling(
+                datafusion_common::NullHandling::PreserveAndExpandEmpty,
+            ),
+        )?
+        .collect()
+        .await?;
+    assert_eq!(
+        batches_to_sort_string(&preserve_results),
+        batches_to_sort_string(&outer_results),
+        "FixedSizeList has no empty case, so PreserveAndExpandEmpty must \
+         match Preserve exactly"
+    );
+
+    // And the snapshot itself, to make the expected shape explicit.
+    assert_snapshot!(
+        batches_to_sort_string(&outer_results),
+        @r"
+    +----------+-------+
+    | shape_id | tags  |
+    +----------+-------+
+    | 1        |       |
+    | 2        | tag21 |
+    | 2        | tag22 |
+    | 3        | tag31 |
+    | 3        | tag32 |
+    | 4        |       |
+    | 5        | tag51 |
+    | 5        | tag52 |
+    | 6        | tag61 |
+    | 6        | tag62 |
+    +----------+-------+
     "
     );
 
@@ -6308,7 +6470,10 @@ async fn test_alias_nested() -> Result<()> {
     let select2 = df.select(vec![col("alias1.a")]);
     assert_snapshot!(
         select2.unwrap_err().strip_backtrace(),
-        @"Schema error: No field named alias1.a. Valid fields are alias2.a, alias2.b, alias2.one."
+        @r#"
+Schema error: No field named alias1.a. Did you mean 'alias2.a'?
+Valid fields are alias2.a, alias2.b, alias2.one.
+"#
     );
     Ok(())
 }
@@ -6462,11 +6627,8 @@ async fn test_fill_null() -> Result<()> {
 
     // Use fill_null to replace nulls on each column.
     let df_filled = df
-        .fill_null(ScalarValue::Int32(Some(0)), vec!["a".to_string()])?
-        .fill_null(
-            ScalarValue::Utf8(Some("default".to_string())),
-            vec!["b".to_string()],
-        )?;
+        .fill_null(&ScalarValue::Int32(Some(0)), &["a"])?
+        .fill_null(&ScalarValue::Utf8(Some("default".to_string())), &["b"])?;
 
     let results = df_filled.collect().await?;
     assert_snapshot!(
@@ -6492,8 +6654,7 @@ async fn test_fill_null_all_columns() -> Result<()> {
     // Use fill_null to replace nulls on all columns.
     // Only column "b" will be replaced since ScalarValue::Utf8(Some("default".to_string()))
     // can be cast to Utf8.
-    let df_filled =
-        df.fill_null(ScalarValue::Utf8(Some("default".to_string())), vec![])?;
+    let df_filled = df.fill_null(&ScalarValue::Utf8(Some("default".to_string())), &[])?;
 
     let results = df_filled.clone().collect().await?;
 
@@ -6511,7 +6672,7 @@ async fn test_fill_null_all_columns() -> Result<()> {
     );
 
     // Fill column "a" null values with a value that cannot be cast to Int32.
-    let df_filled = df_filled.fill_null(ScalarValue::Int32(Some(0)), vec![])?;
+    let df_filled = df_filled.fill_null(&ScalarValue::Int32(Some(0)), &[])?;
 
     let results = df_filled.collect().await?;
     assert_snapshot!(
@@ -6526,6 +6687,173 @@ async fn test_fill_null_all_columns() -> Result<()> {
     +---+---------+
     "
     );
+    Ok(())
+}
+
+async fn create_nan_table() -> Result<DataFrame> {
+    // create a DataFrame with a NaN value in a float column "a" and a
+    // non-float column "b" that must stay untouched by fill_nan.
+    //    "+-----+---+",
+    //    "| a   | b |",
+    //    "+-----+---+",
+    //    "| 1.0 | 1 |",
+    //    "| NaN | 2 |",
+    //    "| 3.0 | 3 |",
+    //    "+-----+---+",
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("a", DataType::Float64, true),
+        Field::new("b", DataType::Int32, true),
+    ]));
+    let a_values = Float64Array::from(vec![Some(1.0), Some(f64::NAN), Some(3.0)]);
+    let b_values = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(a_values), Arc::new(b_values)],
+    )?;
+
+    let ctx = SessionContext::new();
+    let table = MemTable::try_new(schema.clone(), vec![vec![batch]])?;
+    ctx.register_table("t_nan", Arc::new(table))?;
+    let df = ctx.table("t_nan").await?;
+    Ok(df)
+}
+
+#[tokio::test]
+async fn test_fill_nan() -> Result<()> {
+    let df = create_nan_table().await?;
+
+    // Fill NaNs in the float column "a" with 0.0.
+    let df_filled = df.fill_nan(&ScalarValue::Float64(Some(0.0)), &["a"])?;
+
+    let results = df_filled.collect().await?;
+    assert_snapshot!(
+        batches_to_sort_string(&results),
+        @r"
+    +-----+---+
+    | a   | b |
+    +-----+---+
+    | 0.0 | 2 |
+    | 1.0 | 1 |
+    | 3.0 | 3 |
+    +-----+---+
+    "
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fill_nan_all_columns() -> Result<()> {
+    let df = create_nan_table().await?;
+
+    // Fill NaNs across all columns. Only the float column "a" is affected;
+    // the non-float column "b" is left unchanged since NaN only exists for
+    // floating-point types.
+    let df_filled = df.fill_nan(&ScalarValue::Float64(Some(0.0)), &[])?;
+
+    let results = df_filled.collect().await?;
+    assert_snapshot!(
+        batches_to_sort_string(&results),
+        @r"
+    +-----+---+
+    | a   | b |
+    +-----+---+
+    | 0.0 | 2 |
+    | 1.0 | 1 |
+    | 3.0 | 3 |
+    +-----+---+
+    "
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fill_nan_non_float_column() -> Result<()> {
+    let df = create_nan_table().await?;
+
+    // Explicitly naming a non-float column is a no-op, not an error: NaN does
+    // not exist for Int32, so column "b" (and the un-targeted "a") are unchanged.
+    let df_filled = df.fill_nan(&ScalarValue::Float64(Some(0.0)), &["b"])?;
+
+    let results = df_filled.collect().await?;
+    assert_snapshot!(
+        batches_to_sort_string(&results),
+        @r"
+    +-----+---+
+    | a   | b |
+    +-----+---+
+    | 1.0 | 1 |
+    | 3.0 | 3 |
+    | NaN | 2 |
+    +-----+---+
+    "
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fill_nan_unknown_column() -> Result<()> {
+    let df = create_nan_table().await?;
+
+    // A column name that is not in the schema is propagated as an error.
+    let err = df
+        .fill_nan(&ScalarValue::Float64(Some(0.0)), &["does_not_exist"])
+        .unwrap_err();
+
+    assert_snapshot!(err.strip_backtrace(), @"Error during planning: Column 'does_not_exist' not found");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fill_nan_casts_fill_value() -> Result<()> {
+    let df = create_nan_table().await?;
+
+    // Int32(0) is not the column's type (Float64) but can be cast to it, so the
+    // NaN is replaced with 0.0. Exercises the cross-type cast path — the other
+    // positive tests pass a Float64 value, which skips the actual cast.
+    let df_filled = df.fill_nan(&ScalarValue::Int32(Some(0)), &["a"])?;
+
+    let results = df_filled.collect().await?;
+    assert_snapshot!(
+        batches_to_sort_string(&results),
+        @r"
+    +-----+---+
+    | a   | b |
+    +-----+---+
+    | 0.0 | 2 |
+    | 1.0 | 1 |
+    | 3.0 | 3 |
+    +-----+---+
+    "
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fill_nan_uncastable_value() -> Result<()> {
+    let df = create_nan_table().await?;
+
+    // The float column "a" is targeted, but "abc" cannot be cast to Float64, so
+    // the fill is skipped and column "a" keeps its original NaN value.
+    let df_filled = df.fill_nan(&ScalarValue::Utf8(Some("abc".to_string())), &["a"])?;
+
+    let results = df_filled.collect().await?;
+    assert_snapshot!(
+        batches_to_sort_string(&results),
+        @r"
+    +-----+---+
+    | a   | b |
+    +-----+---+
+    | 1.0 | 1 |
+    | 3.0 | 3 |
+    | NaN | 2 |
+    +-----+---+
+    "
+    );
+
     Ok(())
 }
 
@@ -6614,24 +6942,80 @@ async fn test_insert_into_casting_support() -> Result<()> {
 
 #[tokio::test]
 async fn test_dataframe_from_columns() -> Result<()> {
-    let a: ArrayRef = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    let b: ArrayRef = Arc::new(BooleanArray::from(vec![true, true, false]));
-    let c: ArrayRef = Arc::new(StringArray::from(vec![Some("foo"), Some("bar"), None]));
-    let df = DataFrame::from_columns(vec![("a", a), ("b", b), ("c", c)])?;
+    let bools: ArrayRef = Arc::new(BooleanArray::from(vec![true, false, true]));
+    let i8s: ArrayRef = Arc::new(Int8Array::from(vec![-1, 0, 1]));
+    let i16s: ArrayRef = Arc::new(Int16Array::from(vec![-1, 0, 1]));
+    let i32s: ArrayRef = Arc::new(Int32Array::from(vec![-1, 0, 1]));
+    let i64s: ArrayRef = Arc::new(Int64Array::from(vec![-1, 0, 1]));
 
-    assert_eq!(df.schema().fields().len(), 3);
+    let u8s: ArrayRef = Arc::new(UInt8Array::from(vec![0, 1, 2]));
+    let u16s: ArrayRef = Arc::new(UInt16Array::from(vec![0, 1, 2]));
+    let u32s: ArrayRef = Arc::new(UInt32Array::from(vec![0, 1, 2]));
+    let u64s: ArrayRef = Arc::new(UInt64Array::from(vec![0, 1, 2]));
+
+    let f16s: ArrayRef = Arc::new(Float16Array::from(vec![
+        half::f16::from_f64(1.0),
+        half::f16::from_f64(2.0),
+        half::f16::from_f64(3.0),
+    ]));
+    let f32s: ArrayRef = Arc::new(Float32Array::from(vec![1.0, 2.0, 3.0]));
+    let f64s: ArrayRef = Arc::new(Float64Array::from(vec![1.0, 2.0, 3.0]));
+
+    let strings: ArrayRef =
+        Arc::new(StringArray::from(vec![Some("foo"), Some("bar"), None]));
+
+    let df = DataFrame::from_columns(vec![
+        ("bool", bools),
+        ("i8", i8s),
+        ("i16", i16s),
+        ("i32", i32s),
+        ("i64", i64s),
+        ("u8", u8s),
+        ("u16", u16s),
+        ("u32", u32s),
+        ("u64", u64s),
+        ("f16", f16s),
+        ("f32", f32s),
+        ("f64", f64s),
+        ("str", strings),
+    ])?;
+
+    assert_eq!(df.schema().fields().len(), 13);
     assert_eq!(df.clone().count().await?, 3);
 
-    let rows = df.sort(vec![col("a").sort(true, true)])?;
+    let expected_types = [
+        ("bool", DataType::Boolean),
+        ("i8", DataType::Int8),
+        ("i16", DataType::Int16),
+        ("i32", DataType::Int32),
+        ("i64", DataType::Int64),
+        ("u8", DataType::UInt8),
+        ("u16", DataType::UInt16),
+        ("u32", DataType::UInt32),
+        ("u64", DataType::UInt64),
+        ("f16", DataType::Float16),
+        ("f32", DataType::Float32),
+        ("f64", DataType::Float64),
+        ("str", DataType::Utf8),
+    ];
+
+    let schema = df.schema();
+
+    for (name, data_type) in expected_types {
+        assert_eq!(schema.field_with_name(None, name)?.data_type(), &data_type);
+    }
+
+    let rows = df.sort(vec![col("i32").sort(true, true)])?;
+
     assert_batches_eq!(
         &[
-            "+---+-------+-----+",
-            "| a | b     | c   |",
-            "+---+-------+-----+",
-            "| 1 | true  | foo |",
-            "| 2 | true  | bar |",
-            "| 3 | false |     |",
-            "+---+-------+-----+",
+            "+-------+----+-----+-----+-----+----+-----+-----+-----+-----+-----+-----+-----+",
+            "| bool  | i8 | i16 | i32 | i64 | u8 | u16 | u32 | u64 | f16 | f32 | f64 | str |",
+            "+-------+----+-----+-----+-----+----+-----+-----+-----+-----+-----+-----+-----+",
+            "| true  | -1 | -1  | -1  | -1  | 0  | 0   | 0   | 0   | 1   | 1.0 | 1.0 | foo |",
+            "| false | 0  | 0   | 0   | 0   | 1  | 1   | 1   | 1   | 2   | 2.0 | 2.0 | bar |",
+            "| true  | 1  | 1   | 1   | 1   | 2  | 2   | 2   | 2   | 3   | 3.0 | 3.0 |     |",
+            "+-------+----+-----+-----+-----+----+-----+-----+-----+-----+-----+-----+-----+",
         ],
         &rows.collect().await?
     );
@@ -6641,25 +7025,86 @@ async fn test_dataframe_from_columns() -> Result<()> {
 
 #[tokio::test]
 async fn test_dataframe_macro() -> Result<()> {
+    let bools = [true, false, true];
+    let i8s = [-1_i8, 0, 1];
+    let i16s = [-1_i16, 0, 1];
+    let i32s = [-1_i32, 0, 1];
+    let i64s = [-1_i64, 0, 1];
+
+    let u8s = [0_u8, 1, 2];
+    let u16s = [0_u16, 1, 2];
+    let u32s = [0_u32, 1, 2];
+    let u64s = [0_u64, 1, 2];
+
+    let f16s = [
+        half::f16::from_f64(1.0),
+        half::f16::from_f64(2.0),
+        half::f16::from_f64(3.0),
+    ];
+    let f32s = [1.0_f32, 2.0, 3.0];
+    let f64s = [1.0_f64, 2.0, 3.0];
+
+    let strings = ["foo", "bar", "baz"];
+
     let df = dataframe!(
-        "a" => [1, 2, 3],
-        "b" => [true, true, false],
-        "c" => [Some("foo"), Some("bar"), None]
+        // Vec<T>
+        "bool" => bools.to_vec(),
+        "i8" => i8s.to_vec(),
+        "i16" => i16s.to_vec(),
+        "i32" => i32s.to_vec(),
+
+        // Vec<Option<T>>
+        "i64" => vec![Some(i64s[0]), None, Some(i64s[2])],
+        "u8" => vec![Some(u8s[0]), None, Some(u8s[2])],
+        "u16" => vec![Some(u16s[0]), None, Some(u16s[2])],
+
+        // &[T]
+        "u32" => &u32s,
+        "u64" => &u64s,
+        "f16" => &f16s,
+
+        // &[Option<T>]
+        "f32" => &[Some(f32s[0]), None, Some(f32s[2])],
+        "f64" => &[Some(f64s[0]), None, Some(f64s[2])],
+        "str" => &[Some(strings[0]), None, Some(strings[2])],
     )?;
 
-    assert_eq!(df.schema().fields().len(), 3);
+    assert_eq!(df.schema().fields().len(), 13);
     assert_eq!(df.clone().count().await?, 3);
 
-    let rows = df.sort(vec![col("a").sort(true, true)])?;
+    let expected_types = [
+        ("bool", DataType::Boolean),
+        ("i8", DataType::Int8),
+        ("i16", DataType::Int16),
+        ("i32", DataType::Int32),
+        ("i64", DataType::Int64),
+        ("u8", DataType::UInt8),
+        ("u16", DataType::UInt16),
+        ("u32", DataType::UInt32),
+        ("u64", DataType::UInt64),
+        ("f16", DataType::Float16),
+        ("f32", DataType::Float32),
+        ("f64", DataType::Float64),
+        ("str", DataType::Utf8),
+    ];
+
+    let schema = df.schema();
+
+    for (name, data_type) in expected_types {
+        assert_eq!(schema.field_with_name(None, name)?.data_type(), &data_type);
+    }
+
+    let rows = df.sort(vec![col("i32").sort(true, true)])?;
+
     assert_batches_eq!(
         &[
-            "+---+-------+-----+",
-            "| a | b     | c   |",
-            "+---+-------+-----+",
-            "| 1 | true  | foo |",
-            "| 2 | true  | bar |",
-            "| 3 | false |     |",
-            "+---+-------+-----+",
+            "+-------+----+-----+-----+-----+----+-----+-----+-----+-----+-----+-----+-----+",
+            "| bool  | i8 | i16 | i32 | i64 | u8 | u16 | u32 | u64 | f16 | f32 | f64 | str |",
+            "+-------+----+-----+-----+-----+----+-----+-----+-----+-----+-----+-----+-----+",
+            "| true  | -1 | -1  | -1  | -1  | 0  | 0   | 0   | 0   | 1   | 1.0 | 1.0 | foo |",
+            "| false | 0  | 0   | 0   |     |    |     | 1   | 1   | 2   |     |     |     |",
+            "| true  | 1  | 1   | 1   | 1   | 2  | 2   | 2   | 2   | 3   | 3.0 | 3.0 | baz |",
+            "+-------+----+-----+-----+-----+----+-----+-----+-----+-----+-----+-----+-----+",
         ],
         &rows.collect().await?
     );
@@ -6748,7 +7193,8 @@ async fn test_copy_to_preserves_order() -> Result<()> {
       DataSinkExec: sink=CsvSink(file_groups=[])
         SortExec: expr=[column1@0 DESC], preserve_partitioning=[false]
           DataSourceExec: partitions=1, partition_sizes=[1]
-      DataSourceExec: partitions=1, partition_sizes=[1]
+      ProjectionExec: expr=[CAST(column1@0 AS UInt64) as count]
+        DataSourceExec: partitions=1, partition_sizes=[1]
     "
     );
     Ok(())

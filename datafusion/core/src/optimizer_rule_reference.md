@@ -73,13 +73,13 @@ in multiple phases.
 | 1     | `OutputRequirements`           | add phase               | Adds helper nodes so output requirements survive later physical rewrites.                                    |
 | 2     | `aggregate_statistics`         | -                       | Uses exact source statistics to answer some aggregates without scanning data.                                |
 | 3     | `join_selection`               | -                       | Chooses join implementation, build side, and partition mode from statistics and stream properties.           |
-| 4     | `LimitedDistinctAggregation`   | -                       | Pushes limit hints into grouped distinct-style aggregations when only a small result is needed.              |
-| 5     | `FilterPushdown`               | pre-optimization phase  | Pushes supported physical filters down toward data sources before distribution and sorting are enforced.     |
-| 6     | `EnforceDistribution`          | -                       | Adds repartitioning only where needed to satisfy physical distribution requirements.                         |
-| 7     | `CombinePartialFinalAggregate` | -                       | Collapses adjacent partial and final aggregates when the distributed shape makes them redundant.             |
-| 8     | `EnforceSorting`               | -                       | Adds or removes local sorts to satisfy required input orderings.                                             |
-| 9     | `OptimizeAggregateOrder`       | -                       | Updates aggregate expressions to use the best ordering once sort requirements are known.                     |
-| 10    | `WindowTopN`                   | -                       | Replaces eligible row-number window and filter patterns with per-partition TopK execution.                   |
+| 4     | `eager_aggregation`            | -                       | Pushes partial aggregations below joins when statistics show the pre-aggregation pays off (off by default).  |
+| 5     | `LimitedDistinctAggregation`   | -                       | Pushes limit hints into grouped distinct-style aggregations when only a small result is needed.              |
+| 6     | `FilterPushdown`               | pre-optimization phase  | Pushes supported physical filters down toward data sources before distribution and sorting are enforced.     |
+| 7     | `WindowTopN`                   | -                       | Replaces eligible row-number window and filter patterns with per-partition TopK execution.                   |
+| 8     | `EnsureRequirements`           | -                       | Enforces both distribution and sorting requirements in a single idempotent rule.                             |
+| 9     | `CombinePartialFinalAggregate` | -                       | Collapses adjacent partial and final aggregates when the distributed shape makes them redundant.             |
+| 10    | `OptimizeAggregateOrder`       | -                       | Updates aggregate expressions to use the best ordering once sort requirements are known.                     |
 | 11    | `ProjectionPushdown`           | early pass              | Pushes projections toward inputs before later physical rewrites add more limit and TopK structure.           |
 | 12    | `OutputRequirements`           | remove phase            | Removes the temporary output-requirement helper nodes after requirement-sensitive planning is done.          |
 | 13    | `LimitAggregation`             | -                       | Passes a limit hint into eligible aggregations so they can keep fewer accumulator buckets.                   |
