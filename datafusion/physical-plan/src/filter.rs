@@ -55,7 +55,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
-use datafusion_common::tree_node::TreeNodeRecursion;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     DataFusionError, Result, ScalarValue, internal_datafusion_err, internal_err,
     plan_err, project_schema,
@@ -64,7 +64,7 @@ use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
 use datafusion_physical_expr::expressions::{
-    BinaryExpr, Column, IsNotNullExpr, Literal, lit,
+    BinaryExpr, Column, InListExpr, IsNotNullExpr, Literal, lit,
 };
 use datafusion_physical_expr::intervals::utils::check_support;
 use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee, collect_columns};
@@ -429,8 +429,28 @@ impl FilterExec {
                 // nearly the whole domain — a worse estimate than the flat default,
                 // not a better one.
                 let mut cs = input_stats.to_inexact().column_statistics;
-                let guarantees = LiteralGuarantee::analyze(predicate);
-                let columns = collect_columns(predicate);
+                // Only an `IN` list or an `OR` admits more than one literal for
+                // a column. Without either, every guarantee `analyze` reports is
+                // an equality column, which the estimate counts on its own, so
+                // the common single-equality filter skips the analysis.
+                let admits_a_set = predicate
+                    .exists(|expr| {
+                        Ok(expr.downcast_ref::<InListExpr>().is_some()
+                            || expr
+                                .downcast_ref::<BinaryExpr>()
+                                .is_some_and(|binary| *binary.op() == Operator::Or))
+                    })
+                    .unwrap_or(true);
+                let guarantees = if admits_a_set {
+                    LiteralGuarantee::analyze(predicate)
+                } else {
+                    vec![]
+                };
+                let columns = if guarantees.is_empty() {
+                    Default::default()
+                } else {
+                    collect_columns(predicate)
+                };
                 let admitted = |guarantee: &LiteralGuarantee| {
                     (guarantee.guarantee == Guarantee::In)
                         .then(|| predicate_index_of(&columns, guarantee.column.name()))
@@ -1575,6 +1595,7 @@ mod tests {
     use crate::empty::EmptyExec;
     use crate::expressions::*;
     use crate::statistics::{StatisticsArgs, StatisticsContext};
+
     use crate::test;
     use crate::test::exec::StatisticsExec;
     use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
