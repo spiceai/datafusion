@@ -339,8 +339,9 @@ impl FilterExec {
     }
 
     /// Calculates `Statistics` for `FilterExec` by applying the filter's
-    /// selectivity (default, or estimated from interval analysis) to the input
-    /// statistics.
+    /// selectivity (default, or estimated from interval analysis or from the
+    /// distinct counts of the columns the predicate restricts to literals) to
+    /// the input statistics.
     ///
     /// The estimated output row count is used to keep the per-column statistics
     /// consistent with it:
@@ -349,6 +350,8 @@ impl FilterExec {
     ///   are an exact zero when the row count is an exact zero;
     /// - a column constrained to a single value (`col = literal`, or an
     ///   interval that collapses to one point) gets a distinct count of 1;
+    /// - a column restricted to n literals (`col IN (..)`, or an `OR` chain of
+    ///   equalities) gets a distinct count of at most n;
     /// - a column in a null-rejecting conjunct gets a null count of 0.
     ///
     /// When interval analysis applies, min/max are also tightened to the
@@ -411,11 +414,11 @@ impl FilterExec {
                 // chain of equalities over one column, and the mixtures of those
                 // the simplifier produces as it rewrites between the spellings
                 // around a list length of three. A `Guarantee::In` is a
-                // *necessary* condition for the row to pass, so a column admitted
-                // n of its NDV values matches at most `n / NDV` of the rows, and an
-                // AND takes the tightest estimate any conjunct proves. The single
-                // equality is the n = 1 case, which is why this subsumes an older
-                // `1 / max(NDV)` pass over the equality columns alone.
+                // *necessary* condition for the row to pass, so with rows spread
+                // evenly over the distinct values a column admitted n of its NDV
+                // values matches `n / NDV` of the rows, and an AND takes the
+                // tightest estimate any conjunct gives. The single equality is the
+                // n = 1 case. A hot key matches more than this estimate.
                 //
                 // Extending interval analysis to cover these would not help, and
                 // is not merely imprecise: `propagate_constraints` refuses a
@@ -433,9 +436,13 @@ impl FilterExec {
                         .flatten()
                         .map(|idx| (idx, guarantee.literals.len()))
                 };
+                // `analyze` drops a column's guarantee when its conjuncts admit
+                // no common value (`k = 1 AND k IN (2, 3)`), so each equality
+                // also bounds the estimate on its own.
                 let selectivity = guarantees
                     .iter()
                     .filter_map(admitted)
+                    .chain(eq_columns.iter().map(|&idx| (idx, 1)))
                     .filter_map(|(idx, values)| {
                         distinct_value_selectivity(values, cs.get(idx)?)
                     })
@@ -1122,9 +1129,10 @@ fn unambiguous_index_of(schema: &SchemaRef, name: &str) -> Option<usize> {
     matching.next().is_none().then_some(index)
 }
 
-/// The fraction of rows a column admitted `values` of its distinct values can
-/// match: at most `values / NDV`. `None` when the column reports no usable
-/// distinct count, which leaves the caller on its default.
+/// The estimated fraction of rows a column admitted `values` of its distinct
+/// values matches: `values / NDV`, assuming rows are spread evenly over the
+/// distinct values. `None` when the column reports no usable distinct count,
+/// which leaves the caller on its default.
 fn distinct_value_selectivity(values: usize, column: &ColumnStatistics) -> Option<f64> {
     let (Precision::Exact(ndv) | Precision::Inexact(ndv)) = column.distinct_count else {
         return None;
@@ -4581,6 +4589,28 @@ mod tests {
                     .num_rows,
                 Precision::Inexact(1_000 * default / 100)
             );
+            Ok(())
+        }
+
+        /// `analyze` drops a column's guarantee when its conjuncts admit no
+        /// common value, so `k = 1 AND k IN (2, 3)` yields no `In` guarantee for
+        /// `k`. The equality still bounds the estimate on its own.
+        #[test]
+        fn an_equality_bounds_the_estimate_when_its_conjuncts_contradict() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                binary(col("k", &schema)?, Operator::Eq, lit(1i64), &schema)?,
+                Operator::And,
+                in_list(
+                    col("k", &schema)?,
+                    vec![lit(2i64), lit(3i64)],
+                    &false,
+                    &schema,
+                )?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(1_000));
             Ok(())
         }
 
