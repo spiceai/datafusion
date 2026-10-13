@@ -26,10 +26,12 @@
 #![deny(clippy::clone_on_ref_ptr)]
 
 pub mod common;
+mod io_wait;
 mod join_set;
 mod trace_utils;
 
 pub use common::SpawnedTask;
+pub use io_wait::{IoWait, IoWaitExt, IoWaitHook, IoWaitHookError, set_io_wait_hook};
 pub use join_set::JoinSet;
 pub use trace_utils::{
     JoinSetTracer, JoinSetTracerError, set_join_set_tracer, trace_block, trace_future,
