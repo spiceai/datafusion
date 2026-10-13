@@ -18,8 +18,8 @@
 use arrow::datatypes::{DataType, Field, Schema};
 
 use datafusion_common::{
-    Column, DFSchema, DFSchemaRef, DataFusionError, Result, TableReference,
-    assert_contains,
+    Column, DFSchema, DFSchemaRef, DataFusionError, NullEquality, Result, TableReference,
+    assert_contains, internal_err,
 };
 use datafusion_expr::expr::{WindowFunction, WindowFunctionParams};
 use datafusion_expr::test::function_stub::{
@@ -7024,7 +7024,82 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
     let sql = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" = "right"."first_name") AND ("left"."order_id" = "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" = "p"."first_name") AND ("left"."order_id" = "o"."order_id"))"#
+        @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" IS NOT DISTINCT FROM "right"."first_name") AND ("left"."order_id" IS NOT DISTINCT FROM "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" IS NOT DISTINCT FROM "p"."first_name") AND ("left"."order_id" IS NOT DISTINCT FROM "o"."order_id"))"#
+    );
+    Ok(())
+}
+
+fn unparse_with_dialect(sql: &str, dialect: &dyn UnparserDialect) -> Result<String> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(sql)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    Ok(Unparser::new(dialect).plan_to_sql(&plan)?.to_string())
+}
+
+/// `INTERSECT` and `EXCEPT` treat two NULLs as the same value, so the
+/// `EXISTS`/`NOT EXISTS` they are unparsed to must correlate with a null-safe
+/// comparison: with `=`, every row with a NULL in a compared column is dropped
+/// from an `INTERSECT` and kept by an `EXCEPT` (spiceai/spiceai#14941).
+#[test]
+fn test_unparse_intersect_except_match_nulls() -> Result<()> {
+    let left = "SELECT j1_string FROM j1";
+    let right = "SELECT j2_string FROM j2";
+
+    assert_snapshot!(
+        unparse_with_dialect(&format!("{left} INTERSECT {right}"), &UnparserPostgreSqlDialect {})?,
+        @r#"SELECT DISTINCT "j1"."j1_string" FROM "j1" WHERE EXISTS (SELECT 1 FROM "j2" WHERE ("j1"."j1_string" IS NOT DISTINCT FROM "j2"."j2_string"))"#
+    );
+    assert_snapshot!(
+        unparse_with_dialect(&format!("{left} EXCEPT {right}"), &UnparserPostgreSqlDialect {})?,
+        @r#"SELECT DISTINCT "j1"."j1_string" FROM "j1" WHERE NOT EXISTS (SELECT 1 FROM "j2" WHERE ("j1"."j1_string" IS NOT DISTINCT FROM "j2"."j2_string"))"#
+    );
+    // MySQL has no `IS NOT DISTINCT FROM`; its null-safe equality is `<=>`.
+    assert_snapshot!(
+        unparse_with_dialect(&format!("{left} INTERSECT {right}"), &UnparserMySqlDialect {})?,
+        @"SELECT DISTINCT `j1`.`j1_string` FROM `j1` WHERE EXISTS (SELECT 1 FROM `j2` WHERE (`j1`.`j1_string` <=> `j2`.`j2_string`))"
+    );
+    Ok(())
+}
+
+/// A join that matches NULL keys is unparsed with a null-safe `ON`, and a
+/// `USING` constraint — which compares with `=` — is rewritten to that `ON`.
+#[test]
+fn test_unparse_join_matching_null_keys() -> Result<()> {
+    use datafusion_expr::JoinType;
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, true),
+        Field::new("v", DataType::Int32, true),
+    ]);
+    let right = table_scan(Some("b"), &schema, None)?.build()?;
+    let unparse = |join_type, using: bool| -> Result<String> {
+        let builder = table_scan(Some("a"), &schema, None)?;
+        let plan = if using {
+            builder.join_using(right.clone(), join_type, vec!["id".into()])?
+        } else {
+            builder.join(right.clone(), join_type, (vec!["a.id"], vec!["b.id"]), None)?
+        }
+        .build()?;
+        let LogicalPlan::Join(mut join) = plan else {
+            return internal_err!("expected a join");
+        };
+        join.null_equality = NullEquality::NullEqualsNull;
+        let plan = LogicalPlanBuilder::from(LogicalPlan::Join(join))
+            .project(vec![col("a.v")])?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+
+    assert_snapshot!(
+        unparse(JoinType::Inner, false)?,
+        @"SELECT a.v FROM a INNER JOIN b ON (a.id IS NOT DISTINCT FROM b.id)"
+    );
+    assert_snapshot!(
+        unparse(JoinType::Left, true)?,
+        @"SELECT a.v FROM a LEFT OUTER JOIN b ON (a.id IS NOT DISTINCT FROM b.id)"
     );
     Ok(())
 }
