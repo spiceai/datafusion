@@ -1065,3 +1065,100 @@ async fn test_optimized_plan_roundtrip_count_distinct() -> Result<()> {
 
     Ok(())
 }
+
+/// Rows a statement returns, each rendered as one line, sorted, so two
+/// answers compare as multisets.
+async fn sorted_lines(ctx: &SessionContext, sql: &str) -> Result<Vec<String>> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let mut lines: Vec<String> = arrow::util::pretty::pretty_format_batches(&batches)?
+        .to_string()
+        .lines()
+        .filter(|line| line.starts_with("| "))
+        .skip(1) // the header row
+        .map(str::to_string)
+        .collect();
+    lines.sort_unstable();
+    Ok(lines)
+}
+
+/// `INTERSECT` and `EXCEPT` treat two NULLs as the same value, and DataFusion
+/// plans them as semi and anti joins that match NULL keys. Unparsing such a
+/// join must keep that: an `EXISTS` correlated with `=` never matches a NULL,
+/// so the unparsed SQL drops every row with a NULL in a compared column from
+/// an `INTERSECT` and keeps it in an `EXCEPT`. Executing the unparsed SQL in
+/// the same context must return the rows the plan itself returns.
+#[tokio::test]
+async fn unparsed_intersect_and_except_match_nulls() -> Result<()> {
+    let ctx = SessionContext::new();
+    for (table, values) in [
+        (
+            "a",
+            "(NULL, 1), (NULL, 1), ('x', 2), ('y', NULL), ('z', 3), (NULL, NULL)",
+        ),
+        ("b", "(NULL, 1), ('x', 2), ('y', NULL), ('w', 4)"),
+        ("c", "(NULL, 1), ('y', NULL), ('x', 5)"),
+    ] {
+        ctx.sql(&format!(
+            "CREATE TABLE {table} (name VARCHAR, day BIGINT) AS VALUES {values}"
+        ))
+        .await?
+        .collect()
+        .await?;
+    }
+
+    let queries = [
+        "SELECT name, day FROM a INTERSECT SELECT name, day FROM b",
+        "SELECT name, day FROM a EXCEPT SELECT name, day FROM b",
+        "SELECT name, day FROM a INTERSECT SELECT name, day FROM b INTERSECT SELECT name, day FROM c",
+        "SELECT name, day FROM a EXCEPT SELECT name, day FROM b EXCEPT SELECT name, day FROM c",
+    ];
+    let mut failures = Vec::new();
+    for query in queries {
+        let expected = sorted_lines(&ctx, query).await?;
+        let df = ctx.sql(query).await?;
+        for (label, plan) in [
+            ("unoptimized", df.clone().into_unoptimized_plan()),
+            ("optimized", df.into_optimized_plan()?),
+        ] {
+            let unparsed = datafusion_sql::unparser::plan_to_sql(&plan)?.to_string();
+            let actual = match sorted_lines(&ctx, &unparsed).await {
+                Ok(actual) => actual,
+                Err(e) => {
+                    failures.push(format!(
+                        "{query}\n  {label} plan unparsed to SQL that fails: {unparsed}\n  error: {e}"
+                    ));
+                    continue;
+                }
+            };
+            if actual != expected {
+                failures.push(format!(
+                    "{query}\n  {label} plan unparsed to: {unparsed}\n  expected: {expected:?}\n  actual:   {actual:?}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+    Ok(())
+}
+
+/// A join written with `IS NOT DISTINCT FROM` is optimized into an equi-join
+/// that matches NULL keys; unparsing it must keep matching them.
+#[tokio::test]
+async fn unparsed_is_not_distinct_from_join_matches_nulls() -> Result<()> {
+    let ctx = SessionContext::new();
+    ctx.sql("CREATE TABLE l (k VARCHAR) AS VALUES (NULL), ('x')")
+        .await?
+        .collect()
+        .await?;
+    ctx.sql("CREATE TABLE r (k VARCHAR) AS VALUES (NULL), ('x')")
+        .await?
+        .collect()
+        .await?;
+    let query = "SELECT count(*) FROM l JOIN r ON l.k IS NOT DISTINCT FROM r.k";
+    let expected = sorted_lines(&ctx, query).await?;
+    let plan = ctx.sql(query).await?.into_optimized_plan()?;
+    let unparsed = datafusion_sql::unparser::plan_to_sql(&plan)?.to_string();
+    let actual = sorted_lines(&ctx, &unparsed).await?;
+    assert_eq!(actual, expected, "unparsed to: {unparsed}");
+    Ok(())
+}

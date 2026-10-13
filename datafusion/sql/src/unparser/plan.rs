@@ -54,7 +54,7 @@ use crate::unparser::{
 use crate::utils::UNNEST_PLACEHOLDER;
 use arrow::datatypes::SchemaRef;
 use datafusion_common::{
-    Column, DFSchema, DataFusionError, Result, ScalarValue, TableReference,
+    Column, DFSchema, DataFusionError, NullEquality, Result, ScalarValue, TableReference,
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion},
     utils::combine_limit,
@@ -3465,6 +3465,7 @@ impl Unparser<'_> {
                 let mut join_constraint = self.join_constraint_to_sql(
                     join.join_constraint,
                     &join.on,
+                    join.null_equality,
                     join_filters.as_ref(),
                 )?;
                 // `USING`/`NATURAL` cannot carry an extra predicate. Normally
@@ -3480,8 +3481,11 @@ impl Unparser<'_> {
                         ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural
                     )
                 {
-                    join_constraint =
-                        self.join_conditions_to_sql_on(&join.on, join_filters.as_ref())?;
+                    join_constraint = self.join_conditions_to_sql_on(
+                        &join.on,
+                        join.null_equality,
+                        join_filters.as_ref(),
+                    )?;
                 }
                 let join_constraint = Self::and_hoisted_into_join_constraint(
                     join_constraint,
@@ -5015,6 +5019,7 @@ impl Unparser<'_> {
         &self,
         constraint: JoinConstraint,
         conditions: &[(Expr, Expr)],
+        null_equality: NullEquality,
         filter: Option<&Expr>,
     ) -> Result<ast::JoinConstraint> {
         match (constraint, conditions, filter) {
@@ -5023,12 +5028,18 @@ impl Unparser<'_> {
                 Ok(ast::JoinConstraint::None)
             }
 
-            (JoinConstraint::Using, conditions, None) => {
+            // `USING` compares with `=`, so it can only carry keys that never
+            // match on NULL.
+            (JoinConstraint::Using, conditions, None)
+                if null_equality == NullEquality::NullEqualsNothing =>
+            {
                 match self.join_using_to_sql(conditions) {
                     Some(using) => Ok(using),
                     // As above, this should not be reachable from parsed SQL,
                     // but a user could create this; we "downgrade" to ON.
-                    None => self.join_conditions_to_sql_on(conditions, None),
+                    None => {
+                        self.join_conditions_to_sql_on(conditions, null_equality, None)
+                    }
                 }
             }
 
@@ -5040,7 +5051,7 @@ impl Unparser<'_> {
             //    be accessible from parsed SQL, but may have been a
             //    custom-built JOIN by a user.)
             (JoinConstraint::On | JoinConstraint::Using, conditions, filter) => {
-                self.join_conditions_to_sql_on(conditions, filter)
+                self.join_conditions_to_sql_on(conditions, null_equality, filter)
             }
         }
     }
@@ -5051,15 +5062,24 @@ impl Unparser<'_> {
     fn join_conditions_to_sql_on(
         &self,
         join_conditions: &[(Expr, Expr)],
+        null_equality: NullEquality,
         filter: Option<&Expr>,
     ) -> Result<ast::JoinConstraint> {
         let mut condition = None;
         // AND the join conditions together to create the overall condition
         for (left, right) in join_conditions {
-            // Parse left and right
-            let l = self.expr_to_sql(left)?;
-            let r = self.expr_to_sql(right)?;
-            let e = self.binary_op_to_sql(l, r, ast::BinaryOperator::Eq);
+            let e = match null_equality {
+                NullEquality::NullEqualsNothing => {
+                    let l = self.expr_to_sql(left)?;
+                    let r = self.expr_to_sql(right)?;
+                    self.binary_op_to_sql(l, r, ast::BinaryOperator::Eq)
+                }
+                // The dialect decides how a null-safe comparison is spelled
+                // (`IS NOT DISTINCT FROM`, or `<=>` for MySQL).
+                NullEquality::NullEqualsNull => {
+                    self.expr_to_sql(&join_key_match(left, right, null_equality))?
+                }
+            };
             condition = match condition {
                 Some(expr) => Some(self.and_op_to_sql(expr, e)),
                 None => Some(e),
@@ -5267,11 +5287,11 @@ impl Unparser<'_> {
 
         // AND the correlated join predicates — the `ON` equalities plus any
         // residual (non-equi) join filter — into the WHERE clause.
-        let predicates = join
-            .filter
-            .iter()
-            .cloned()
-            .chain(join.on.iter().map(|(l, r)| l.clone().eq(r.clone())));
+        let predicates = join.filter.iter().cloned().chain(
+            join.on
+                .iter()
+                .map(|(l, r)| join_key_match(l, r, join.null_equality)),
+        );
         for predicate in predicates {
             let predicate = self.expr_to_sql(&predicate)?;
             select.selection = Some(match select.selection.take() {
@@ -6948,4 +6968,18 @@ enum UnnestInputType {
     OuterReference,
     /// The input is a scalar value. It will be presented like a scalar array or struct.
     Scalar,
+}
+
+/// The predicate one equi-join key pair stands for. A join that matches NULL
+/// keys — such as the semi and anti joins `INTERSECT` and `EXCEPT` plan to —
+/// needs `IS NOT DISTINCT FROM`, since `=` is never true on NULL.
+fn join_key_match(left: &Expr, right: &Expr, null_equality: NullEquality) -> Expr {
+    match null_equality {
+        NullEquality::NullEqualsNothing => left.clone().eq(right.clone()),
+        NullEquality::NullEqualsNull => Expr::BinaryExpr(BinaryExpr::new(
+            Box::new(left.clone()),
+            Operator::IsNotDistinctFrom,
+            Box::new(right.clone()),
+        )),
+    }
 }
