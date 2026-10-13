@@ -430,9 +430,10 @@ impl FilterExec {
                 // not a better one.
                 let mut cs = input_stats.to_inexact().column_statistics;
                 let guarantees = LiteralGuarantee::analyze(predicate);
+                let columns = collect_columns(predicate);
                 let admitted = |guarantee: &LiteralGuarantee| {
                     (guarantee.guarantee == Guarantee::In)
-                        .then(|| unambiguous_index_of(schema, guarantee.column.name()))
+                        .then(|| predicate_index_of(&columns, guarantee.column.name()))
                         .flatten()
                         .map(|idx| (idx, guarantee.literals.len()))
                 };
@@ -1111,21 +1112,21 @@ fn collect_equality_columns(predicate: &Arc<dyn PhysicalExpr>) -> (HashSet<usize
     (eq_values.into_keys().collect(), infeasible)
 }
 
-/// The index of `name` in `schema`, or `None` when the schema has no such field
-/// or has more than one.
+/// The input index of the predicate column a [`LiteralGuarantee`] names, or
+/// `None` when the predicate reads more than one column of that name.
 ///
-/// A physical schema may carry duplicate field names — the output of a join is
-/// the ordinary way to get one — and a [`LiteralGuarantee`] names its column
-/// without an index, so an ambiguous name cannot be resolved to the right
-/// column's statistics. Declining leaves the default estimate in place, where
-/// guessing would silently read another column's distinct count.
-fn unambiguous_index_of(schema: &SchemaRef, name: &str) -> Option<usize> {
-    let mut matching = schema
-        .fields()
-        .iter()
-        .enumerate()
-        .filter(|(_, field)| field.name() == name);
-    let (index, _) = matching.next()?;
+/// A guarantee names its column without an index, while a physical [`Column`]
+/// is resolved by index, and its name need not match the field at that index
+/// or be unique in the schema — a join's output is the ordinary way to repeat
+/// one. The predicate's own columns map the name back to the index it reads.
+/// Two of them sharing a name cannot be told apart, so the estimate declines
+/// rather than read another column's statistics.
+fn predicate_index_of<'a>(
+    columns: impl IntoIterator<Item = &'a Column>,
+    name: &str,
+) -> Option<usize> {
+    let mut matching = columns.into_iter().filter(|column| column.name() == name);
+    let index = matching.next()?.index();
     matching.next().is_none().then_some(index)
 }
 
@@ -4558,37 +4559,92 @@ mod tests {
             Ok(())
         }
 
-        /// A duplicate field name cannot be resolved to one column's statistics,
-        /// and a physical schema gets them from a join. Declining leaves the
-        /// default estimate rather than silently reading another column's NDV.
+        /// `rows` rows over `schema`'s two columns, with the given distinct
+        /// counts, for the cases that must tell one column's statistics from
+        /// the other's.
+        fn two_columns(
+            schema: &Schema,
+            rows: usize,
+            ndvs: [usize; 2],
+        ) -> Arc<StatisticsExec> {
+            let column = |ndv| ColumnStatistics {
+                distinct_count: Precision::Exact(ndv),
+                ..Default::default()
+            };
+            Arc::new(StatisticsExec::new(
+                Statistics {
+                    num_rows: Precision::Exact(rows),
+                    total_byte_size: Precision::Exact(rows * BYTES_PER_ROW),
+                    column_statistics: vec![column(ndvs[0]), column(ndvs[1])],
+                },
+                schema.clone(),
+            ))
+        }
+
+        /// A physical schema repeats a field name after a join. The predicate
+        /// reads one of the two by index, so the estimate uses that column's
+        /// NDV: 2 of 1000 values is 2000 rows, where the other column's NDV
+        /// would give 20000.
         #[test]
-        fn a_duplicate_column_name_falls_back() -> Result<()> {
-            let ambiguous = Schema::new(vec![
+        fn a_repeated_field_name_resolves_to_the_index_the_predicate_reads() -> Result<()>
+        {
+            let repeated = Schema::new(vec![
                 Field::new("k", DataType::Int64, false),
                 Field::new("k", DataType::Int64, false),
             ]);
-            let column = ColumnStatistics {
-                distinct_count: Precision::Exact(1_000),
-                ..Default::default()
-            };
-            let input = Arc::new(StatisticsExec::new(
-                Statistics {
-                    num_rows: Precision::Exact(1_000),
-                    total_byte_size: Precision::Exact(1_000 * BYTES_PER_ROW),
-                    column_statistics: vec![column.clone(), column],
-                },
-                ambiguous.clone(),
-            ));
             let predicate =
-                in_list(Arc::new(Column::new("k", 0)), keys(2), &false, &ambiguous)?;
-            let filter = FilterExec::try_new(predicate, input)?;
-            let default = FILTER_EXEC_DEFAULT_SELECTIVITY as usize;
+                in_list(Arc::new(Column::new("k", 0)), keys(2), &false, &repeated)?;
+            let rows =
+                rows_after(predicate, two_columns(&repeated, 1_000_000, [1_000, 100]))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// A physical `Column` is resolved by index; its name is for display
+        /// and need not match the field at that index. `other@0` filters `k`,
+        /// so the estimate and the narrowed NDV are `k`'s.
+        #[test]
+        fn a_column_named_unlike_its_field_reads_the_field_it_indexes() -> Result<()> {
+            let schema = schema();
+            let predicate =
+                in_list(Arc::new(Column::new("other", 0)), keys(2), &false, &schema)?;
+            let filter = FilterExec::try_new(
+                predicate,
+                two_columns(&schema, 1_000_000, [1_000, 100]),
+            )?;
+            let statistics =
+                StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
+            assert_eq!(statistics.num_rows, Precision::Inexact(2_000));
             assert_eq!(
-                StatisticsContext::new()
-                    .compute(&filter, &StatisticsArgs::new())?
-                    .num_rows,
-                Precision::Inexact(1_000 * default / 100)
+                statistics.column_statistics[0].distinct_count,
+                Precision::Inexact(2)
             );
+            assert_eq!(
+                statistics.column_statistics[1].distinct_count,
+                Precision::Inexact(100)
+            );
+            Ok(())
+        }
+
+        /// `analyze` keys its guarantees by name, so two predicate columns
+        /// sharing one cannot be told apart. Declining leaves the default
+        /// estimate rather than reading either column's NDV for both.
+        #[test]
+        fn two_predicate_columns_sharing_a_name_fall_back() -> Result<()> {
+            let repeated = Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("k", DataType::Int64, false),
+            ]);
+            let predicate = binary(
+                in_list(Arc::new(Column::new("k", 0)), keys(2), &false, &repeated)?,
+                Operator::And,
+                in_list(Arc::new(Column::new("k", 1)), keys(2), &false, &repeated)?,
+                &repeated,
+            )?;
+            let default = FILTER_EXEC_DEFAULT_SELECTIVITY as usize;
+            let rows =
+                rows_after(predicate, two_columns(&repeated, 1_000_000, [1_000, 100]))?;
+            assert_eq!(rows, Precision::Inexact(1_000_000 * default / 100));
             Ok(())
         }
 
