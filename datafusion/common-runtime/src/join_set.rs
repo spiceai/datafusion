@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use crate::io_wait::{carry_block, carry_future};
+use crate::io_wait::{carry_block, carry_future, carry_local_future};
 use crate::trace_utils::{trace_block, trace_future};
 use std::future::Future;
 use std::task::{Context, Poll};
@@ -87,7 +87,7 @@ impl<T: 'static> JoinSet<T> {
         F: Future<Output = T>,
         F: 'static,
     {
-        self.inner.spawn_local(task)
+        self.inner.spawn_local(carry_local_future(task))
     }
 
     /// [JoinSet::spawn_local_on](tokio::task::JoinSet::spawn_local_on) - Spawn a local task on a provided LocalSet.
@@ -96,7 +96,8 @@ impl<T: 'static> JoinSet<T> {
         F: Future<Output = T>,
         F: 'static,
     {
-        self.inner.spawn_local_on(task, local_set)
+        self.inner
+            .spawn_local_on(carry_local_future(task), local_set)
     }
 
     /// [JoinSet::spawn_blocking](tokio::task::JoinSet::spawn_blocking) - Spawn a blocking task.

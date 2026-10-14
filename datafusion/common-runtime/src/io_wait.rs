@@ -26,7 +26,7 @@
 //!
 //! Without a hook, [`IoWaitExt::io_wait`] does nothing.
 
-use futures::future::{BoxFuture, Either};
+use futures::future::{BoxFuture, Either, LocalBoxFuture};
 use futures::{FutureExt, Stream};
 use pin_project_lite::pin_project;
 use std::any::Any;
@@ -61,6 +61,15 @@ pub trait IoWaitHook: Send + Sync + 'static {
         &self,
         fut: BoxFuture<'static, Box<dyn Any + Send>>,
     ) -> BoxFuture<'static, Box<dyn Any + Send>>;
+
+    /// Wraps a future spawned on a [`LocalSet`](tokio::task::LocalSet) by
+    /// [`JoinSet::spawn_local`](crate::JoinSet::spawn_local) or
+    /// [`JoinSet::spawn_local_on`](crate::JoinSet::spawn_local_on), as
+    /// [`carry_future`](Self::carry_future) does for `Send` futures.
+    fn carry_local_future(
+        &self,
+        fut: LocalBoxFuture<'static, Box<dyn Any>>,
+    ) -> LocalBoxFuture<'static, Box<dyn Any>>;
 
     /// Wraps a blocking closure spawned by [`SpawnedTask`](crate::SpawnedTask)
     /// or [`JoinSet`](crate::JoinSet), as [`carry_future`](Self::carry_future)
@@ -122,6 +131,26 @@ where
     // Called now, on the spawning task, so the hook can capture its context.
     let carried = hook.carry_future(Box::pin(async move {
         Box::new(future.await) as Box<dyn Any + Send>
+    }));
+    Either::Right(carried.map(|out| {
+        *out.downcast::<T>()
+            .expect("IoWaitHook must preserve the future's output type!")
+    }))
+}
+
+/// Passes a non-`Send` future about to be spawned through
+/// [`IoWaitHook::carry_local_future`]. Without a hook, the future is returned
+/// as it is.
+pub(crate) fn carry_local_future<T, F>(future: F) -> impl Future<Output = T> + 'static
+where
+    F: Future<Output = T> + 'static,
+    T: 'static,
+{
+    let Some(hook) = get_hook() else {
+        return Either::Left(future);
+    };
+    let carried = hook.carry_local_future(Box::pin(async move {
+        Box::new(future.await) as Box<dyn Any>
     }));
     Either::Right(carried.map(|out| {
         *out.downcast::<T>()
@@ -319,6 +348,19 @@ mod tests {
             }
         }
 
+        fn carry_local_future(
+            &self,
+            fut: LocalBoxFuture<'static, Box<dyn Any>>,
+        ) -> LocalBoxFuture<'static, Box<dyn Any>> {
+            match EVENTS.try_with(Arc::clone) {
+                Ok(e) => {
+                    e.carried_futures.fetch_add(1, Ordering::SeqCst);
+                    EVENTS.scope(e, fut).boxed_local()
+                }
+                Err(_) => fut,
+            }
+        }
+
         fn carry_block(
             &self,
             f: Box<dyn FnOnce() -> Box<dyn Any + Send> + Send>,
@@ -478,6 +520,32 @@ mod tests {
         })
         .await;
         assert_eq!(counts, [2, 2, 2, 0]);
+    }
+
+    #[tokio::test]
+    async fn join_set_local_spawns_carry_the_hook() {
+        LazyLock::force(&INSTALL);
+        let events = Arc::new(Events::default());
+        let local = tokio::task::LocalSet::new();
+        let mut set = JoinSet::new();
+        // Spawned inside the recorder's scope and polled outside it, so only
+        // a carried task reports to the recorder.
+        EVENTS.sync_scope(Arc::clone(&events), || {
+            set.spawn_local_on(remote_call().io_wait(), &local);
+        });
+        local
+            .run_until(async {
+                EVENTS.sync_scope(Arc::clone(&events), || {
+                    set.spawn_local(remote_call().io_wait());
+                });
+                let mut total = 0;
+                while let Some(r) = set.join_next().await {
+                    total += r.expect("joined task");
+                }
+                assert_eq!(total, 14);
+            })
+            .await;
+        assert_eq!(events.counts(), [2, 2, 2, 0]);
     }
 
     #[tokio::test]
