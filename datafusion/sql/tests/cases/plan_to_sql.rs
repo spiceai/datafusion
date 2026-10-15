@@ -16165,3 +16165,27 @@ fn test_nested_union_that_groups_alike_stays_flat() -> Result<()> {
     );
     Ok(())
 }
+
+/// A quantifier that differs anywhere in a nested union's exposed chain, not
+/// only at its top, scopes the input: flat, `a UNION ALL b UNION c UNION ALL d`
+/// would deduplicate `a` too.
+#[test]
+fn test_union_input_with_a_mixed_quantifier_below_its_top_is_scoped() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let scan = |name: &str| table_scan(Some(name), &s, None)?.build();
+    let b_or_c = LogicalPlanBuilder::from(scan("b")?)
+        .union_distinct(scan("c")?)?
+        .build()?;
+    let nested = LogicalPlanBuilder::from(b_or_c)
+        .union(scan("d")?)?
+        .build()?;
+    let plan = LogicalPlan::Union(Union::try_new_with_loose_types(vec![
+        Arc::new(scan("a")?),
+        Arc::new(nested),
+    ])?);
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM (SELECT * FROM b UNION SELECT * FROM c UNION ALL SELECT * FROM d)"
+    );
+    Ok(())
+}

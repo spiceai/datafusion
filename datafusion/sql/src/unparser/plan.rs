@@ -719,11 +719,12 @@ impl Unparser<'_> {
     /// The builder is fresh, quantifier included: a `UNION` nested in an input
     /// takes `DISTINCT` from its own `Distinct`, never from the union around it.
     /// Set operations print without parentheses and group left to right, so a
-    /// nested one is scoped too when it is not the first operand and its
-    /// quantifier differs from the enclosing union's — `a UNION ALL (b UNION c)`
-    /// would otherwise read as `(a UNION ALL b) UNION c`. Where the quantifiers
-    /// agree, or the nested union comes first, the flat form already groups the
-    /// same way and is kept.
+    /// nested one is scoped too when it is not the first operand and any set
+    /// operation it exposes has a quantifier other than the enclosing union's —
+    /// `a UNION ALL (b UNION c)` would otherwise read as `(a UNION ALL b) UNION
+    /// c`, and so would `a UNION ALL ((b UNION c) UNION ALL d)`. Where every
+    /// quantifier agrees, or the nested union comes first, the flat form already
+    /// groups the same way and is kept.
     fn union_input_to_sql(
         &self,
         input: &LogicalPlan,
@@ -739,11 +740,8 @@ impl Unparser<'_> {
             || input_query.bounds_rows()
             || input_query.carries_statement_clauses()
             || (!first
-                && matches!(
-                    &body,
-                    SetExpr::SetOperation { set_quantifier, .. }
-                        if (*set_quantifier == ast::SetQuantifier::All) == distinct_union
-                ));
+                && matches!(body, SetExpr::SetOperation { .. })
+                && !Self::every_set_operation_is(&body, !distinct_union));
         if !needs_own_scope {
             return Ok(body);
         }
@@ -761,6 +759,26 @@ impl Unparser<'_> {
             ast::WildcardAdditionalOptions::default(),
         )];
         Ok(SetExpr::Select(Box::new(select)))
+    }
+
+    /// Whether every set operation `expr` exposes — those that print without
+    /// parentheses, so not one inside a derived table or subquery — is a `UNION`
+    /// with the quantifier `all` names.
+    fn every_set_operation_is(expr: &SetExpr, all: bool) -> bool {
+        match expr {
+            SetExpr::SetOperation {
+                op: ast::SetOperator::Union,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                (*set_quantifier == ast::SetQuantifier::All) == all
+                    && Self::every_set_operation_is(left, all)
+                    && Self::every_set_operation_is(right, all)
+            }
+            SetExpr::SetOperation { .. } => false,
+            _ => true,
+        }
     }
 
     /// One term of a recursive CTE, carrying any clause its builder collected.
