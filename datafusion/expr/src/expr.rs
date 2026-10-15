@@ -2224,12 +2224,29 @@ impl Expr {
     /// Returns transformed expression and flag that is true if expression contains
     /// at least one placeholder.
     pub fn infer_placeholder_types(self, schema: &DFSchema) -> Result<(Expr, bool)> {
+        // Inference only ever rewrites a placeholder, so an expression without
+        // one comes back unchanged: return it before the walk.
+        if !self.exists(|expr| Ok(matches!(expr, Expr::Placeholder(_))))? {
+            return Ok((self, false));
+        }
         let mut has_placeholder = false;
         self.transform(|mut expr| {
-            let expr_type = expr.get_type(schema).ok();
+            // Each arm below looks at the types and fields of its operands only
+            // when one of them is an untyped placeholder, the only expression it
+            // can rewrite. Typing an operand walks its whole subtree, and naming
+            // its field renders that subtree, so doing either at every node is
+            // quadratic over a deep chain such as a disjunction of many
+            // conjunctions.
+            let expr_type = if matches!(expr, Expr::Case(_)) {
+                expr.get_type(schema).ok()
+            } else {
+                None
+            };
             #[expect(deprecated)]
             match &mut expr {
-                Expr::BinaryExpr(BinaryExpr { left, op: _, right }) => {
+                Expr::BinaryExpr(BinaryExpr { left, op: _, right })
+                    if is_untyped_placeholder(left) || is_untyped_placeholder(right) =>
+                {
                     let binary_expr_field = find_first_non_null_field_expr_placeholder(
                         [left.as_ref(), right.as_ref()].into_iter(),
                         schema,
@@ -2244,7 +2261,10 @@ impl Expr {
                     negated: _,
                     low,
                     high,
-                }) => {
+                }) if is_untyped_placeholder(expr)
+                    || is_untyped_placeholder(low)
+                    || is_untyped_placeholder(high) =>
+                {
                     let between_field = find_first_non_null_field_expr_placeholder(
                         [low.as_ref(), high.as_ref(), expr.as_ref()].into_iter(),
                         schema,
@@ -2259,7 +2279,9 @@ impl Expr {
                     expr,
                     list,
                     negated: _,
-                }) => {
+                }) if is_untyped_placeholder(expr)
+                    || list.iter().any(is_untyped_placeholder) =>
+                {
                     let in_list_field = find_first_non_null_field_expr_placeholder(
                         [expr.as_ref()].into_iter().chain(list.iter()),
                         schema,
@@ -2287,7 +2309,9 @@ impl Expr {
                     rewrite_placeholder_from_subquery(expr.as_mut(), subquery)?;
                 }
                 Expr::Like(Like { expr, pattern, .. })
-                | Expr::SimilarTo(Like { expr, pattern, .. }) => {
+                | Expr::SimilarTo(Like { expr, pattern, .. })
+                    if is_untyped_placeholder(expr) || is_untyped_placeholder(pattern) =>
+                {
                     let like_field = find_first_non_null_field_expr_placeholder(
                         [expr.as_ref(), pattern.as_ref()].into_iter(),
                         schema,
@@ -2381,7 +2405,13 @@ impl Expr {
                 | Expr::HigherOrderFunction(_)
                 | Expr::Lambda(_)
                 | Expr::LambdaVariable(_)
-                | Expr::Unnest(_) => {}
+                | Expr::Unnest(_)
+                // Without an untyped placeholder operand there is nothing to infer.
+                | Expr::BinaryExpr(_)
+                | Expr::Between(_)
+                | Expr::InList(_)
+                | Expr::Like(_)
+                | Expr::SimilarTo(_) => {}
             }
             Ok(Transformed::yes(expr))
         })
@@ -3084,6 +3114,15 @@ fn rewrite_placeholder_type(expr: &mut Expr, dt: &DataType) -> Result<()> {
         *field = Some(Field::new("", dt.clone(), true).into());
     };
     Ok(())
+}
+
+/// Whether `expr` is a placeholder whose type is still unknown: the only
+/// expression placeholder inference rewrites.
+fn is_untyped_placeholder(expr: &(impl AsRef<Expr> + ?Sized)) -> bool {
+    matches!(
+        expr.as_ref(),
+        Expr::Placeholder(Placeholder { field: None, .. })
+    )
 }
 
 /// Infer the type of an unresolved placeholder from a sibling `field`, preserving
