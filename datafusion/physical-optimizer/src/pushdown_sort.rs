@@ -73,6 +73,17 @@ use datafusion_physical_plan::{
 };
 use std::sync::Arc;
 
+/// `plan` limited to `fetch` rows, keeping a tighter limit it already has:
+/// `with_fetch` replaces a node's limit rather than tightening it, so passing
+/// `fetch` as is would loosen a source that already stops sooner.
+fn with_fetch_at_most(
+    plan: &Arc<dyn ExecutionPlan>,
+    fetch: usize,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let fetch = plan.fetch().map_or(fetch, |existing| existing.min(fetch));
+    plan.with_fetch(Some(fetch))
+}
+
 /// `plan` with `fetch` pushed down as a bound on its total output, or `None`
 /// where nothing beneath it takes the fetch.
 ///
@@ -86,7 +97,7 @@ fn with_total_fetch(
     plan: &Arc<dyn ExecutionPlan>,
     fetch: usize,
 ) -> Option<Arc<dyn ExecutionPlan>> {
-    if let Some(fetched) = plan.with_fetch(Some(fetch)) {
+    if let Some(fetched) = with_fetch_at_most(plan, fetch) {
         return Some(fetched);
     }
     let children = plan.children();
@@ -164,7 +175,7 @@ impl PhysicalOptimizerRule for PushdownSort {
                             {
                                 with_total_fetch(&inner, fetch)
                             } else {
-                                inner.with_fetch(Some(fetch))
+                                with_fetch_at_most(&inner, fetch)
                             };
                             fetched.unwrap_or_else(|| {
                                 Arc::new(LocalLimitExec::new(inner, fetch))
@@ -226,9 +237,10 @@ impl PhysicalOptimizerRule for PushdownSort {
                     // If the source doesn't support `with_fetch`, fall back to
                     // wrapping with GlobalLimitExec.
                     if let Some(fetch) = sort_exec.fetch() {
-                        let inner = inner.with_fetch(Some(fetch)).unwrap_or_else(|| {
-                            Arc::new(GlobalLimitExec::new(inner, 0, Some(fetch)))
-                        });
+                        let inner =
+                            with_fetch_at_most(&inner, fetch).unwrap_or_else(|| {
+                                Arc::new(GlobalLimitExec::new(inner, 0, Some(fetch)))
+                            });
                         Ok(Transformed::yes(inner))
                     } else {
                         Ok(Transformed::yes(inner))

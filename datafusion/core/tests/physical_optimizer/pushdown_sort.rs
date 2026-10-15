@@ -1294,3 +1294,72 @@ fn test_sort_fetch_stays_above_a_multi_input_repartition() -> Result<()> {
     );
     Ok(())
 }
+
+/// A sorted scan that already returns at most 3 rows.
+fn sorted_scan_limited_to_three(
+    schema: &arrow::datatypes::SchemaRef,
+    ordering: &LexOrdering,
+) -> Arc<dyn datafusion_physical_plan::ExecutionPlan> {
+    use datafusion_physical_plan::ExecutionPlan;
+    parquet_exec_with_sort(Arc::clone(schema), vec![ordering.clone()])
+        .with_fetch(Some(3))
+        .expect("the scan takes a limit")
+}
+
+/// A source that already stops sooner than the eliminated sort's fetch keeps
+/// its own limit: `with_fetch` replaces a scan's limit rather than tightening
+/// it, so pushing the larger fetch as is would let the source return more rows.
+#[test]
+fn test_sort_fetch_keeps_a_tighter_source_limit() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    let scan = "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], limit=3, output_ordering=[a@0 ASC], file_type=parquet";
+    let shapes = [
+        (
+            sort_preserving_merge_exec_with_fetch(
+                ordering.clone(),
+                sort_exec_with_fetch_and_preserve_partitioning(
+                    ordering.clone(),
+                    Some(10),
+                    repartition_exec(sorted_scan_limited_to_three(&schema, &ordering)),
+                ),
+                10,
+            ),
+            vec![
+                "SortPreservingMergeExec: [a@0 ASC], fetch=10".to_string(),
+                "  BufferExec: capacity=1073741824".to_string(),
+                "    RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true".to_string(),
+                format!("      {scan}"),
+            ],
+        ),
+        (
+            sort_preserving_merge_exec_with_fetch(
+                ordering.clone(),
+                sort_exec_with_fetch_and_preserve_partitioning(
+                    ordering.clone(),
+                    Some(10),
+                    sorted_scan_limited_to_three(&schema, &ordering),
+                ),
+                10,
+            ),
+            vec![
+                "SortPreservingMergeExec: [a@0 ASC], fetch=10".to_string(),
+                "  BufferExec: capacity=1073741824".to_string(),
+                format!("    {scan}"),
+            ],
+        ),
+        (
+            sort_exec_with_fetch(
+                ordering.clone(),
+                Some(10),
+                sorted_scan_limited_to_three(&schema, &ordering),
+            ),
+            vec![scan.to_string()],
+        ),
+    ];
+    for (plan, expected) in shapes {
+        let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+        assert_eq!(get_plan_string(&optimized), expected);
+    }
+    Ok(())
+}
