@@ -16219,3 +16219,43 @@ fn test_sort_above_union_names_the_output_column() -> Result<()> {
     }
     Ok(())
 }
+
+/// Unqualifying a sort key above a union drops only the relation: a struct
+/// field read through the column keeps its path, or `s.f + 1` would sort by the
+/// top-level column `f` instead.
+#[test]
+fn test_sort_above_union_keeps_a_struct_field_path() -> Result<()> {
+    let s = Schema::new(vec![
+        Field::new("f", DataType::Int32, false),
+        Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("f", DataType::Int32, false)].into()),
+            false,
+        ),
+    ]);
+    let key = datafusion_functions::core::expr_fn::get_field(col("t.s"), "f") + lit(1);
+    for union_distinct in [false, true] {
+        let left = table_scan(Some("t"), &s, None)?;
+        let right = table_scan(Some("w"), &s, None)?.build()?;
+        let union = if union_distinct {
+            left.union_distinct(right)?
+        } else {
+            left.union(right)?
+        };
+        let sql = plan_to_sql(
+            &union
+                .sort_with_limit(vec![key.clone().sort(true, true)], Some(1))?
+                .build()?,
+        )?
+        .to_string();
+        let quantifier = if union_distinct { "UNION" } else { "UNION ALL" };
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT f, s FROM (SELECT * FROM t {quantifier} SELECT * FROM w \
+                 ORDER BY (s.f + 1) ASC NULLS FIRST LIMIT 1)"
+            )
+        );
+    }
+    Ok(())
+}
