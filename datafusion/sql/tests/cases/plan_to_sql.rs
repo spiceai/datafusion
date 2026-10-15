@@ -15966,3 +15966,143 @@ fn test_sort_above_union_still_bounds_the_union() -> Result<()> {
     );
     Ok(())
 }
+
+/// A union nested in a bounded input takes its quantifier from its own plan,
+/// not from the `DISTINCT` union around it: the bound picks from
+/// `a UNION ALL b`, duplicates included, and only then is the outer union
+/// deduplicated.
+#[test]
+fn test_bounded_union_input_keeps_its_own_quantifier() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let inner = table_scan(Some("a"), &s, None)?
+        .union(table_scan(Some("b"), &s, None)?.build()?)?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(2))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(inner)
+        .union_distinct(table_scan(Some("c"), &s, None)?.build()?)?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM (SELECT * FROM a UNION ALL SELECT * FROM b ORDER BY x ASC NULLS FIRST LIMIT 2) \
+         UNION SELECT * FROM c"
+    );
+    Ok(())
+}
+
+/// A `DISTINCT` union nested in an input deduplicates that input only. It must
+/// not turn the enclosing `UNION ALL` into a `UNION`, and it is scoped so that
+/// SQL's left-to-right grouping of set operations cannot regroup it either.
+#[test]
+fn test_distinct_union_input_does_not_dedupe_its_siblings() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let distinct = table_scan(Some("b"), &s, None)?
+        .union_distinct(table_scan(Some("c"), &s, None)?.build()?)?
+        .build()?;
+    let plan = table_scan(Some("a"), &s, None)?
+        .union(distinct.clone())?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM (SELECT * FROM b UNION SELECT * FROM c)"
+    );
+
+    let bounded = LogicalPlanBuilder::from(distinct)
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(5))?
+        .build()?;
+    let plan = table_scan(Some("a"), &s, None)?.union(bounded)?.build()?;
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM (SELECT * FROM b UNION SELECT * FROM c \
+         ORDER BY x ASC NULLS FIRST LIMIT 5)"
+    );
+    Ok(())
+}
+
+/// An `ORDER BY` with no bound on a union input decides no rows — a union's
+/// output order is unspecified — so it is left out rather than wrapped.
+#[test]
+fn test_unbounded_sort_on_union_input_is_left_out() -> Result<()> {
+    let v_sorted = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .sort(vec![col("v.a").sort(true, true)])?
+        .build()?;
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .union(v_sorted)?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM u UNION ALL SELECT * FROM v"
+    );
+    Ok(())
+}
+
+/// An extension unparser that defines a CTE on the query it is handed and
+/// reads it as its relation.
+struct MockCteWritingUnparser {}
+
+impl UserDefinedLogicalNodeUnparser for MockCteWritingUnparser {
+    fn unparse(
+        &self,
+        node: &dyn UserDefinedLogicalNode,
+        _unparser: &Unparser,
+        query: &mut Option<&mut QueryBuilder>,
+        _select: &mut Option<&mut SelectBuilder>,
+        relation: &mut Option<&mut RelationBuilder>,
+    ) -> Result<UnparseWithinStatementResult> {
+        if node
+            .as_any()
+            .downcast_ref::<MockUserDefinedLogicalPlan>()
+            .is_none()
+        {
+            return Ok(UnparseWithinStatementResult::Unmodified);
+        }
+        let Statement::Query(defining) = Parser::new(&GenericDialect {})
+            .try_with_sql("WITH c AS (SELECT 1 AS j1_id, 'x' AS j1_string) SELECT 1")?
+            .parse_statement()?
+        else {
+            return internal_err!("expected a query");
+        };
+        let Some(with) = defining.with else {
+            return internal_err!("expected a WITH clause");
+        };
+        if let Some(query) = query {
+            for cte in with.cte_tables {
+                query.push_cte(cte, false);
+            }
+        }
+        if let Some(rel) = relation {
+            let mut table = TableRelationBuilder::default();
+            table.name(ObjectName::from(vec![Ident::new("c")]));
+            rel.table(table);
+        }
+        Ok(UnparseWithinStatementResult::Modified)
+    }
+}
+
+/// A CTE an extension puts on a union input's query stays defined: the input
+/// keeps it in a scope of its own instead of losing it with its builder.
+#[test]
+fn test_union_input_keeps_a_cte_its_extension_defines() -> Result<()> {
+    let state = MockSessionState::default();
+    let context = MockContextProvider { state };
+    let sql_to_rel = SqlToRel::new(&context);
+    let j1 = sql_to_rel.sql_statement_to_plan(
+        Parser::new(&GenericDialect {})
+            .try_with_sql("SELECT * FROM j1")?
+            .parse_statement()?,
+    )?;
+    let extension = LogicalPlan::Extension(Extension {
+        node: Arc::new(MockUserDefinedLogicalPlan { input: j1.clone() }),
+    });
+    let plan = LogicalPlanBuilder::from(j1).union(extension)?.build()?;
+
+    let unparser = Unparser::default()
+        .with_extension_unparsers(vec![Arc::new(MockCteWritingUnparser {})]);
+    assert_eq!(
+        unparser.plan_to_sql(&plan)?.to_string(),
+        "SELECT j1.j1_id, j1.j1_string FROM j1 UNION ALL \
+         SELECT * FROM (WITH c AS (SELECT 1 AS j1_id, 'x' AS j1_string) SELECT * FROM c)"
+    );
+    Ok(())
+}

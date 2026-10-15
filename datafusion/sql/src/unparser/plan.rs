@@ -704,41 +704,32 @@ impl Unparser<'_> {
     /// An input can carry its own `ORDER BY` and row bound — `u UNION ALL` the
     /// top row of `v` — and those decide which of *that input's* rows reach the
     /// union. Written on the union's query they would follow the last operand
-    /// and bound the whole union instead, returning only the rows the bound
-    /// keeps from every input. So each input gets a builder of its own, and an
-    /// input that put a clause on it becomes a derived table that keeps them:
+    /// and bound the whole union instead, so each input gets a builder of its
+    /// own, and an input that leaves a row bound or another query-level clause
+    /// (`WITH`, locks, `FOR`) on it becomes a derived table that keeps them:
     /// `SELECT * FROM (SELECT * FROM v ORDER BY … LIMIT 1)`. A derived table
     /// rather than a parenthesized operand, because `SQLite` accepts neither
     /// parentheses around a compound operand nor `ORDER BY`/`LIMIT` on any
     /// operand but the last, and every dialect accepts a derived table.
     ///
-    /// The union's quantifier is shared both ways, as it was when the inputs
-    /// rendered on the union's own builder: a nested union reads it, and a
-    /// `Distinct` inside an input sets it.
-    fn union_input_to_sql(
-        &self,
-        input: &LogicalPlan,
-        union_query: &mut Option<QueryBuilder>,
-    ) -> Result<SetExpr> {
-        let distinct_union = union_query
-            .as_ref()
-            .is_some_and(QueryBuilder::is_distinct_union);
-        let mut input_query = QueryBuilder::default();
-        if distinct_union {
-            input_query.distinct_union();
-        }
-        let mut input_query = Some(input_query);
+    /// An `ORDER BY` with no bound orders nothing a union keeps — a union's
+    /// output order is unspecified — so it is dropped rather than wrapped.
+    ///
+    /// The builder is fresh, quantifier included: a `UNION` nested in an input
+    /// takes `DISTINCT` from its own `Distinct`, never from the union around it,
+    /// and an input that is itself a set operation is wrapped too, since set
+    /// operations print without parentheses and `a UNION ALL b UNION c` would
+    /// otherwise group as `(a UNION ALL b) UNION c`.
+    fn union_input_to_sql(&self, input: &LogicalPlan) -> Result<SetExpr> {
+        let mut input_query = Some(QueryBuilder::default());
         let body = self.select_to_sql_expr(input, &mut input_query)?;
         let Some(mut input_query) = input_query else {
             return internal_err!("a UNION input lost its query builder");
         };
-        if input_query.is_distinct_union()
-            && !distinct_union
-            && let Some(union_query) = union_query.as_mut()
-        {
-            union_query.distinct_union();
-        }
-        if input_query.get_order_by().is_none() && !input_query.bounds_rows() {
+        let needs_own_scope = input_query.bounds_rows()
+            || input_query.carries_statement_clauses()
+            || matches!(body, SetExpr::SetOperation { .. });
+        if !needs_own_scope {
             return Ok(body);
         }
 
@@ -750,22 +741,11 @@ impl Unparser<'_> {
             .dialect
             .requires_derived_table_alias()
             .then(|| self.new_table_alias(DERIVED_UNION_INPUT_ALIAS.to_string(), vec![]));
-        let mut derived = DerivedRelationBuilder::default();
-        derived
-            .lateral(false)
-            .alias(alias)
-            .subquery(Box::new(subquery));
-        let mut relation = RelationBuilder::default();
-        relation.derived(derived);
-        let mut from = TableWithJoinsBuilder::default();
-        from.relation(relation);
-        let mut select = SelectBuilder::default();
-        select
-            .projection(vec![ast::SelectItem::Wildcard(
-                ast::WildcardAdditionalOptions::default(),
-            )])
-            .push_from(from);
-        Ok(SetExpr::Select(Box::new(select.build()?)))
+        let mut select = Self::wrap_query_as_derived_select(subquery, alias)?;
+        select.projection = vec![ast::SelectItem::Wildcard(
+            ast::WildcardAdditionalOptions::default(),
+        )];
+        Ok(SetExpr::Select(Box::new(select)))
     }
 
     /// One term of a recursive CTE, carrying any clause its builder collected.
@@ -3906,7 +3886,7 @@ impl Unparser<'_> {
                 let input_exprs: Vec<SetExpr> = union
                     .inputs
                     .iter()
-                    .map(|input| self.union_input_to_sql(input, query))
+                    .map(|input| self.union_input_to_sql(input))
                     .collect::<Result<Vec<_>>>()?;
 
                 assert_or_internal_err!(

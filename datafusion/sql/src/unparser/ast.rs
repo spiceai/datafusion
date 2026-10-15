@@ -144,6 +144,12 @@ impl QueryBuilder {
             || self.fetch.is_some()
             || !self.limit_by.is_empty()
     }
+    /// Whether the query carries a clause other than its body, `ORDER BY` and
+    /// row bound — a `WITH`, a lock, or a `FOR` clause — which only the query
+    /// that owns it can hold.
+    pub fn carries_statement_clauses(&self) -> bool {
+        self.with.is_some() || !self.locks.is_empty() || self.for_clause.is_some()
+    }
     pub fn build(&self) -> Result<ast::Query, BuilderError> {
         let order_by = self
             .order_by_kind
@@ -1424,6 +1430,7 @@ mod tests {
             DERIVED_PROJECTION_ALIAS,
             DERIVED_SORT_ALIAS,
             DERIVED_UNION_ALIAS,
+            DERIVED_UNION_INPUT_ALIAS,
             DERIVED_UNNEST_ALIAS,
             DERIVED_WINDOW_INPUT_ALIAS,
         ] {
