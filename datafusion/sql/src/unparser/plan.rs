@@ -717,11 +717,19 @@ impl Unparser<'_> {
     /// them.
     ///
     /// The builder is fresh, quantifier included: a `UNION` nested in an input
-    /// takes `DISTINCT` from its own `Distinct`, never from the union around it,
-    /// and an input that is itself a set operation is wrapped too, since set
-    /// operations print without parentheses and `a UNION ALL b UNION c` would
-    /// otherwise group as `(a UNION ALL b) UNION c`.
-    fn union_input_to_sql(&self, input: &LogicalPlan) -> Result<SetExpr> {
+    /// takes `DISTINCT` from its own `Distinct`, never from the union around it.
+    /// Set operations print without parentheses and group left to right, so a
+    /// nested one is scoped too when it is not the first operand and its
+    /// quantifier differs from the enclosing union's — `a UNION ALL (b UNION c)`
+    /// would otherwise read as `(a UNION ALL b) UNION c`. Where the quantifiers
+    /// agree, or the nested union comes first, the flat form already groups the
+    /// same way and is kept.
+    fn union_input_to_sql(
+        &self,
+        input: &LogicalPlan,
+        first: bool,
+        distinct_union: bool,
+    ) -> Result<SetExpr> {
         let mut input_query = Some(QueryBuilder::default());
         let body = self.select_to_sql_expr(input, &mut input_query)?;
         let Some(mut input_query) = input_query else {
@@ -730,7 +738,12 @@ impl Unparser<'_> {
         let needs_own_scope = input_query.get_order_by().is_some()
             || input_query.bounds_rows()
             || input_query.carries_statement_clauses()
-            || matches!(body, SetExpr::SetOperation { .. });
+            || (!first
+                && matches!(
+                    &body,
+                    SetExpr::SetOperation { set_quantifier, .. }
+                        if (*set_quantifier == ast::SetQuantifier::All) == distinct_union
+                ));
         if !needs_own_scope {
             return Ok(body);
         }
@@ -3885,10 +3898,15 @@ impl Unparser<'_> {
                     );
                 }
 
+                let distinct_union =
+                    query.as_ref().is_some_and(QueryBuilder::is_distinct_union);
                 let input_exprs: Vec<SetExpr> = union
                     .inputs
                     .iter()
-                    .map(|input| self.union_input_to_sql(input))
+                    .enumerate()
+                    .map(|(i, input)| {
+                        self.union_input_to_sql(input, i == 0, distinct_union)
+                    })
                     .collect::<Result<Vec<_>>>()?;
 
                 assert_or_internal_err!(
@@ -3896,12 +3914,11 @@ impl Unparser<'_> {
                     "UNION operator requires at least 2 inputs"
                 );
 
-                let set_quantifier =
-                    if query.as_ref().is_some_and(|q| q.is_distinct_union()) {
-                        self.dialect.union_distinct_set_quantifier()
-                    } else {
-                        ast::SetQuantifier::All
-                    };
+                let set_quantifier = if distinct_union {
+                    self.dialect.union_distinct_set_quantifier()
+                } else {
+                    ast::SetQuantifier::All
+                };
 
                 // Build the union expression tree bottom-up by reversing the order
                 // note that we are also swapping left and right inputs because of the rev

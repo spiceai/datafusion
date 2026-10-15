@@ -16134,3 +16134,34 @@ fn test_union_input_keeps_a_cte_its_extension_defines() -> Result<()> {
     );
     Ok(())
 }
+
+/// A nested union whose grouping the flat form already states stays flat: one
+/// that comes first groups left to right anyway, and one with the enclosing
+/// union's own quantifier is associative with it. Scoping either would add a
+/// derived table whose duplicate column names some engines refuse.
+#[test]
+fn test_nested_union_that_groups_alike_stays_flat() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let scan = |name: &str| table_scan(Some(name), &s, None)?.build();
+    let first = LogicalPlanBuilder::from(scan("a")?)
+        .union_distinct(scan("b")?)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(first).union(scan("c")?)?.build()?;
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION SELECT * FROM b UNION ALL SELECT * FROM c"
+    );
+
+    let same = LogicalPlanBuilder::from(scan("b")?)
+        .union(scan("c")?)?
+        .build()?;
+    let plan = LogicalPlan::Union(Union::try_new_with_loose_types(vec![
+        Arc::new(scan("a")?),
+        Arc::new(same),
+    ])?);
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM b UNION ALL SELECT * FROM c"
+    );
+    Ok(())
+}
