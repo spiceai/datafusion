@@ -43,7 +43,8 @@ use crate::physical_optimizer::test_utils::{
     parquet_exec, parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
     repartition_exec, schema, simple_projection_exec, sort_exec, sort_exec_with_fetch,
     sort_exec_with_fetch_and_preserve_partitioning, sort_expr, sort_expr_named,
-    sort_preserving_merge_exec_with_fetch, spr_repartition_exec, test_scan_with_ordering,
+    sort_preserving_merge_exec, sort_preserving_merge_exec_with_fetch,
+    spr_repartition_exec, test_scan_with_ordering,
 };
 use datafusion_physical_plan::get_plan_string;
 
@@ -1360,6 +1361,46 @@ fn test_sort_fetch_keeps_a_tighter_source_limit() -> Result<()> {
     for (plan, expected) in shapes {
         let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
         assert_eq!(get_plan_string(&optimized), expected);
+    }
+    Ok(())
+}
+
+/// The eliminated sort's fetch counts as a bound on the total output only under
+/// a merge that keeps at most that many rows. Without a merge fetch, or under a
+/// larger one, the per-partition `LocalLimitExec` stays above the single-input
+/// repartition and the source is left without a limit.
+#[test]
+fn test_sort_fetch_is_a_total_bound_only_under_a_merge_that_keeps_it() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    for (merge_fetch, merge) in [
+        (None, "SortPreservingMergeExec: [a@0 ASC]"),
+        (Some(3), "SortPreservingMergeExec: [a@0 ASC], fetch=3"),
+    ] {
+        let source = parquet_exec_with_sort(Arc::clone(&schema), vec![ordering.clone()]);
+        let sort = sort_exec_with_fetch_and_preserve_partitioning(
+            ordering.clone(),
+            Some(2),
+            repartition_exec(source),
+        );
+        let plan = match merge_fetch {
+            Some(fetch) => {
+                sort_preserving_merge_exec_with_fetch(ordering.clone(), sort, fetch)
+            }
+            None => sort_preserving_merge_exec(ordering.clone(), sort),
+        };
+        let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+        assert_eq!(
+            get_plan_string(&optimized),
+            [
+                merge,
+                "  BufferExec: capacity=1073741824",
+                "    LocalLimitExec: fetch=2",
+                "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true",
+                "        DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet",
+            ],
+            "merge fetch {merge_fetch:?}"
+        );
     }
     Ok(())
 }
