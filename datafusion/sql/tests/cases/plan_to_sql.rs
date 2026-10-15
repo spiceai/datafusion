@@ -16019,10 +16019,38 @@ fn test_distinct_union_input_does_not_dedupe_its_siblings() -> Result<()> {
     Ok(())
 }
 
-/// An `ORDER BY` with no bound on a union input decides no rows — a union's
-/// output order is unspecified — so it is left out rather than wrapped.
+/// Under `DISTINCT ON` the `ORDER BY` picks which row of each group survives,
+/// so a union input's ordering is kept in that input's scope even with no
+/// bound: emitted on the union it would no longer decide between `(1, 10)` and
+/// `(1, 20)`.
 #[test]
-fn test_unbounded_sort_on_union_input_is_left_out() -> Result<()> {
+fn test_distinct_on_union_input_keeps_its_order_by() -> Result<()> {
+    let s = int32_schema(&["k", "v"]);
+    let latest = table_scan(Some("t"), &s, None)?
+        .distinct_on(
+            vec![col("t.k")],
+            vec![col("t.k"), col("t.v")],
+            Some(vec![
+                col("t.k").sort(true, true),
+                col("t.v").sort(false, true),
+            ]),
+        )?
+        .build()?;
+    let plan = table_scan(Some("u"), &s, None)?.union(latest)?.build()?;
+
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT * FROM "u" UNION ALL SELECT * FROM (SELECT DISTINCT ON ("t"."k") "t"."k", "t"."v" FROM "t" ORDER BY "t"."k" ASC NULLS FIRST, "t"."v" DESC NULLS FIRST) AS "derived_union_input""#
+    );
+    Ok(())
+}
+
+/// An input sorted with no bound keeps its `ORDER BY` in its own scope, like
+/// any other clause it leaves on its query.
+#[test]
+fn test_unbounded_sort_on_union_input_stays_in_its_scope() -> Result<()> {
     let v_sorted = table_scan(Some("v"), &int32_schema(&["a"]), None)?
         .sort(vec![col("v.a").sort(true, true)])?
         .build()?;
@@ -16032,7 +16060,7 @@ fn test_unbounded_sort_on_union_input_is_left_out() -> Result<()> {
 
     assert_eq!(
         plan_to_sql(&plan)?.to_string(),
-        "SELECT * FROM u UNION ALL SELECT * FROM v"
+        "SELECT * FROM u UNION ALL SELECT * FROM (SELECT * FROM v ORDER BY v.a ASC NULLS FIRST)"
     );
     Ok(())
 }

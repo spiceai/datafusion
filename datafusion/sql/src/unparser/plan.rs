@@ -705,15 +705,16 @@ impl Unparser<'_> {
     /// top row of `v` — and those decide which of *that input's* rows reach the
     /// union. Written on the union's query they would follow the last operand
     /// and bound the whole union instead, so each input gets a builder of its
-    /// own, and an input that leaves a row bound or another query-level clause
-    /// (`WITH`, locks, `FOR`) on it becomes a derived table that keeps them:
+    /// own, and an input that leaves an `ORDER BY`, a row bound or another
+    /// query-level clause (`WITH`, locks, `FOR`) on it becomes a derived table that keeps them:
     /// `SELECT * FROM (SELECT * FROM v ORDER BY … LIMIT 1)`. A derived table
     /// rather than a parenthesized operand, because `SQLite` accepts neither
     /// parentheses around a compound operand nor `ORDER BY`/`LIMIT` on any
     /// operand but the last, and every dialect accepts a derived table.
     ///
-    /// An `ORDER BY` with no bound orders nothing a union keeps — a union's
-    /// output order is unspecified — so it is dropped rather than wrapped.
+    /// An `ORDER BY` is kept even with no bound: under `DISTINCT ON` it decides
+    /// which row of each group survives, so it can select rows, not only order
+    /// them.
     ///
     /// The builder is fresh, quantifier included: a `UNION` nested in an input
     /// takes `DISTINCT` from its own `Distinct`, never from the union around it,
@@ -726,7 +727,8 @@ impl Unparser<'_> {
         let Some(mut input_query) = input_query else {
             return internal_err!("a UNION input lost its query builder");
         };
-        let needs_own_scope = input_query.bounds_rows()
+        let needs_own_scope = input_query.get_order_by().is_some()
+            || input_query.bounds_rows()
             || input_query.carries_statement_clauses()
             || matches!(body, SetExpr::SetOperation { .. });
         if !needs_own_scope {
