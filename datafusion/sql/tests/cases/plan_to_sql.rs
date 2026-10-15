@@ -16189,3 +16189,33 @@ fn test_union_input_with_a_mixed_quantifier_below_its_top_is_scoped() -> Result<
     );
     Ok(())
 }
+
+/// A sort above a union orders the union's output, whose columns carry no
+/// relation: a key the plan qualifies with an input's table is written bare,
+/// since `ORDER BY "u"."a"` after a `UNION` names a table out of scope.
+#[test]
+fn test_sort_above_union_names_the_output_column() -> Result<()> {
+    let s = int32_schema(&["a"]);
+    for union_distinct in [false, true] {
+        let left = table_scan(Some("u"), &s, None)?;
+        let right = table_scan(Some("v"), &s, None)?.build()?;
+        let union = if union_distinct {
+            left.union_distinct(right)?
+        } else {
+            left.union(right)?
+        };
+        let plan = union
+            .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+            .build()?;
+        let quantifier = if union_distinct { "UNION" } else { "UNION ALL" };
+        assert_eq!(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+            format!(
+                r#"SELECT "a" FROM (SELECT * FROM "u" {quantifier} SELECT * FROM "v" ORDER BY "a" ASC NULLS FIRST LIMIT 2) AS "derived_sort""#
+            )
+        );
+    }
+    Ok(())
+}

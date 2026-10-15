@@ -3956,6 +3956,16 @@ impl Unparser<'_> {
                         "UNION ALL operator only valid in a statement context"
                     );
                 };
+                // An `ORDER BY` on the union reads the union's output, which has
+                // column names and no relation to qualify them with: `ORDER BY
+                // u.a` after `u UNION v` names a table that is out of scope.
+                query.visit_order_by_mut(|expr| {
+                    if let ast::Expr::CompoundIdentifier(idents) = expr
+                        && let Some(column) = idents.last()
+                    {
+                        *expr = ast::Expr::Identifier(column.clone());
+                    }
+                });
                 query.body(Box::new(union_expr));
 
                 Ok(())
