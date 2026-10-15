@@ -1904,6 +1904,34 @@ impl ExecutionPlan for RepartitionExec {
         Ok(FilterPushdownPropagation::if_all(child_pushdown_result))
     }
 
+    /// With a single input partition, every row of every output partition comes
+    /// from that one stream, in its order. A limit on this node is then a limit
+    /// on its input: limiting the input to `n` rows leaves at most `n` rows in
+    /// the output and, for an ordered input, the same first `n`. Passing it on
+    /// lets an input that takes a fetch, such as a scan that pushes `LIMIT` to
+    /// its source, stop early. With several input partitions, limiting each
+    /// would not limit the output, so the limit stays above this node.
+    fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+        if self.input.output_partitioning().partition_count() != 1 {
+            return None;
+        }
+        let input = self.input.with_fetch(limit)?;
+        let mut repartition =
+            RepartitionExec::try_new(input, self.partitioning().clone()).ok()?;
+        if self.preserve_order {
+            repartition = repartition.with_preserve_order();
+        }
+        Some(Arc::new(repartition))
+    }
+
+    fn fetch(&self) -> Option<usize> {
+        if self.input.output_partitioning().partition_count() == 1 {
+            self.input.fetch()
+        } else {
+            None
+        }
+    }
+
     fn try_pushdown_sort(
         &self,
         order: &[PhysicalSortExpr],
@@ -3204,6 +3232,7 @@ mod tests {
     #[derive(Debug, Clone)]
     struct ExactSortPushdownExec {
         cache: Arc<PlanProperties>,
+        fetch: Option<usize>,
     }
 
     impl ExactSortPushdownExec {
@@ -3216,6 +3245,7 @@ mod tests {
                     EmissionType::Incremental,
                     Boundedness::Bounded,
                 )),
+                fetch: None,
             }
         }
     }
@@ -3280,6 +3310,70 @@ mod tests {
                 inner: Arc::new(self.clone()),
             })
         }
+
+        fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn ExecutionPlan>> {
+            Some(Arc::new(Self {
+                fetch: limit,
+                ..self.clone()
+            }))
+        }
+
+        fn fetch(&self) -> Option<usize> {
+            self.fetch
+        }
+    }
+
+    /// With one input partition every output row comes from that one stream, in
+    /// its order, so a limit passes through to the input; with several input
+    /// partitions, limiting each would not limit the output.
+    #[test]
+    fn repartition_passes_a_fetch_through_a_single_input_partition() -> Result<()> {
+        let schema =
+            Arc::new(Schema::new(vec![Field::new("id", DataType::UInt32, false)]));
+        let ordering = LexOrdering::new([PhysicalSortExpr::new(
+            col("id", &schema)?,
+            SortOptions::default(),
+        )])
+        .expect("ordering must not be empty");
+
+        // The round-robin repartition the planner puts above a single-partition
+        // scan to run the operators over it in parallel.
+        let single = Arc::new(ExactSortPushdownExec::new(
+            Arc::clone(&schema),
+            1,
+            ordering.clone(),
+        ));
+        let repartition =
+            RepartitionExec::try_new(single, Partitioning::RoundRobinBatch(4))?;
+        assert_eq!(repartition.fetch(), None);
+
+        let limited = repartition
+            .with_fetch(Some(3))
+            .expect("a single input partition takes the fetch");
+        let pushed = limited
+            .downcast_ref::<RepartitionExec>()
+            .expect("the fetch stays below a RepartitionExec");
+        assert_eq!(pushed.input().fetch(), Some(3), "the input takes the fetch");
+        assert_eq!(limited.fetch(), Some(3));
+        assert!(matches!(
+            pushed.partitioning(),
+            Partitioning::RoundRobinBatch(4)
+        ));
+        assert!(
+            pushed.maintains_input_order()[0],
+            "the input's order still reaches the output"
+        );
+
+        let several =
+            Arc::new(ExactSortPushdownExec::new(Arc::clone(&schema), 2, ordering));
+        let repartition =
+            RepartitionExec::try_new(several, Partitioning::RoundRobinBatch(4))?;
+        assert!(
+            repartition.with_fetch(Some(3)).is_none(),
+            "limiting each of several inputs would not limit the output"
+        );
+        assert_eq!(repartition.fetch(), None);
+        Ok(())
     }
 
     #[tokio::test]
