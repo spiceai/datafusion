@@ -15903,3 +15903,66 @@ fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
 
     Ok(())
 }
+
+/// A union input's own `ORDER BY` and row bound select that input's rows, so
+/// they must stay inside it. Written on the union's query they bound the whole
+/// `UNION ALL` instead: `u UNION ALL <the top row of v>` returned only that one
+/// row (spiceai/spiceai#14737).
+#[test]
+fn test_union_input_keeps_its_own_sort_and_fetch() -> Result<()> {
+    let v_top = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .sort_with_limit(vec![col("v.a").sort(false, true)], Some(1))?
+        .build()?;
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .union(v_top)?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM u UNION ALL SELECT * FROM (SELECT * FROM v ORDER BY v.a DESC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+/// Each bounded input keeps its own bound, and a dialect that requires a
+/// derived-table alias gets one, so the statement is accepted where an
+/// unaliased subquery is refused.
+#[test]
+fn test_union_inputs_each_keep_their_own_bound() -> Result<()> {
+    let u_first = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .build()?;
+    let v_page = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .limit(1, Some(2))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(u_first).union(v_page)?.build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM (SELECT * FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2) \
+         UNION ALL SELECT * FROM (SELECT * FROM v LIMIT 2 OFFSET 1)"
+    );
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_eq!(
+        unparser.plan_to_sql(&plan)?.to_string(),
+        r#"SELECT * FROM (SELECT * FROM "u" ORDER BY "u"."a" ASC NULLS FIRST LIMIT 2) AS "derived_union_input" UNION ALL SELECT * FROM (SELECT * FROM "v" LIMIT 2 OFFSET 1) AS "derived_union_input""#
+    );
+    Ok(())
+}
+
+/// A sort above the union orders and bounds the union as a whole, so it stays
+/// on the union's own query: only an input's clauses move into that input.
+#[test]
+fn test_sort_above_union_still_bounds_the_union() -> Result<()> {
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .union(table_scan(Some("v"), &int32_schema(&["a"]), None)?.build()?)?
+        .sort_with_limit(vec![col("a").sort(true, true)], Some(3))?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM u UNION ALL SELECT * FROM v ORDER BY a ASC NULLS FIRST LIMIT 3"
+    );
+    Ok(())
+}

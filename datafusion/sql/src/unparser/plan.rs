@@ -20,9 +20,10 @@ use super::{
     ast::{
         BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
         DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_TABLE_ALIASES,
-        DERIVED_UNION_ALIAS, DERIVED_UNNEST_ALIAS, DERIVED_WINDOW_INPUT_ALIAS,
-        DerivedRelationBuilder, QueryBuilder, RelationBuilder, SelectBuilder,
-        TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
+        DERIVED_UNION_ALIAS, DERIVED_UNION_INPUT_ALIAS, DERIVED_UNNEST_ALIAS,
+        DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder, QueryBuilder,
+        RelationBuilder, SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
+        is_numbered_alias,
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
@@ -696,6 +697,75 @@ impl Unparser<'_> {
             closing_paren_token: AttachedToken::empty(),
         };
         Ok((cte, name))
+    }
+
+    /// One input of a `UNION`, rendered in a query of its own.
+    ///
+    /// An input can carry its own `ORDER BY` and row bound — `u UNION ALL` the
+    /// top row of `v` — and those decide which of *that input's* rows reach the
+    /// union. Written on the union's query they would follow the last operand
+    /// and bound the whole union instead, returning only the rows the bound
+    /// keeps from every input. So each input gets a builder of its own, and an
+    /// input that put a clause on it becomes a derived table that keeps them:
+    /// `SELECT * FROM (SELECT * FROM v ORDER BY … LIMIT 1)`. A derived table
+    /// rather than a parenthesized operand, because `SQLite` accepts neither
+    /// parentheses around a compound operand nor `ORDER BY`/`LIMIT` on any
+    /// operand but the last, and every dialect accepts a derived table.
+    ///
+    /// The union's quantifier is shared both ways, as it was when the inputs
+    /// rendered on the union's own builder: a nested union reads it, and a
+    /// `Distinct` inside an input sets it.
+    fn union_input_to_sql(
+        &self,
+        input: &LogicalPlan,
+        union_query: &mut Option<QueryBuilder>,
+    ) -> Result<SetExpr> {
+        let distinct_union = union_query
+            .as_ref()
+            .is_some_and(QueryBuilder::is_distinct_union);
+        let mut input_query = QueryBuilder::default();
+        if distinct_union {
+            input_query.distinct_union();
+        }
+        let mut input_query = Some(input_query);
+        let body = self.select_to_sql_expr(input, &mut input_query)?;
+        let Some(mut input_query) = input_query else {
+            return internal_err!("a UNION input lost its query builder");
+        };
+        if input_query.is_distinct_union()
+            && !distinct_union
+            && let Some(union_query) = union_query.as_mut()
+        {
+            union_query.distinct_union();
+        }
+        if input_query.get_order_by().is_none() && !input_query.bounds_rows() {
+            return Ok(body);
+        }
+
+        let subquery = input_query
+            .body(Box::new(body))
+            .build()
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        let alias = self
+            .dialect
+            .requires_derived_table_alias()
+            .then(|| self.new_table_alias(DERIVED_UNION_INPUT_ALIAS.to_string(), vec![]));
+        let mut derived = DerivedRelationBuilder::default();
+        derived
+            .lateral(false)
+            .alias(alias)
+            .subquery(Box::new(subquery));
+        let mut relation = RelationBuilder::default();
+        relation.derived(derived);
+        let mut from = TableWithJoinsBuilder::default();
+        from.relation(relation);
+        let mut select = SelectBuilder::default();
+        select
+            .projection(vec![ast::SelectItem::Wildcard(
+                ast::WildcardAdditionalOptions::default(),
+            )])
+            .push_from(from);
+        Ok(SetExpr::Select(Box::new(select.build()?)))
     }
 
     /// One term of a recursive CTE, carrying any clause its builder collected.
@@ -3836,7 +3906,7 @@ impl Unparser<'_> {
                 let input_exprs: Vec<SetExpr> = union
                     .inputs
                     .iter()
-                    .map(|input| self.select_to_sql_expr(input, query))
+                    .map(|input| self.union_input_to_sql(input, query))
                     .collect::<Result<Vec<_>>>()?;
 
                 assert_or_internal_err!(

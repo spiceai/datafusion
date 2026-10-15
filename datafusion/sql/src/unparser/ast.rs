@@ -344,6 +344,7 @@ pub(crate) const DERIVED_LIMIT_ALIAS: &str = "derived_limit";
 pub(crate) const DERIVED_PROJECTION_ALIAS: &str = "derived_projection";
 pub(crate) const DERIVED_SORT_ALIAS: &str = "derived_sort";
 pub(crate) const DERIVED_UNION_ALIAS: &str = "derived_union";
+pub(crate) const DERIVED_UNION_INPUT_ALIAS: &str = "derived_union_input";
 pub(crate) const DERIVED_UNNEST_ALIAS: &str = "derived_unnest";
 pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 
@@ -356,12 +357,13 @@ pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 /// out of this list still compiles and still emits, and the guard reading it
 /// simply stops recognising the alias, which is the wrong-rows direction. Adding
 /// one here is the other half of adding one above.
-pub(crate) const DERIVED_TABLE_ALIASES: [&str; 7] = [
+pub(crate) const DERIVED_TABLE_ALIASES: [&str; 8] = [
     DERIVED_DISTINCT_ALIAS,
     DERIVED_LIMIT_ALIAS,
     DERIVED_PROJECTION_ALIAS,
     DERIVED_SORT_ALIAS,
     DERIVED_UNION_ALIAS,
+    DERIVED_UNION_INPUT_ALIAS,
     DERIVED_UNNEST_ALIAS,
     DERIVED_WINDOW_INPUT_ALIAS,
 ];
