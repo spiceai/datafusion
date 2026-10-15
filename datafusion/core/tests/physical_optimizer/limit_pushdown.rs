@@ -834,3 +834,86 @@ fn outer_offset_with_same_sort_key_still_pushes_limit() -> Result<()> {
 
     Ok(())
 }
+
+/// Rows `plan` returns when executed, across all its partitions.
+async fn row_count(plan: Arc<dyn ExecutionPlan>) -> Result<usize> {
+    let batches = datafusion_physical_plan::collect(
+        plan,
+        Arc::new(datafusion_execution::TaskContext::default()),
+    )
+    .await?;
+    Ok(batches.iter().map(|batch| batch.num_rows()).sum())
+}
+
+/// A single-partition in-memory scan of column `a`, one batch per slice.
+fn int_source(batches: &[&[i32]]) -> Result<Arc<dyn ExecutionPlan>> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+    let batches = batches
+        .iter()
+        .map(|values| {
+            arrow::record_batch::RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::Int32Array::from(values.to_vec()))],
+            )
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(
+        datafusion_datasource::memory::MemorySourceConfig::try_new_exec(
+            &[batches],
+            schema,
+            None,
+        )?,
+    )
+}
+
+/// An outer limit tighter than an inner one is kept when a repartition sits
+/// between them: the inner limit's fetch must not stand in for the outer one.
+#[tokio::test]
+async fn nested_limits_separated_by_a_repartition_keep_the_tighter_limit() -> Result<()> {
+    // A `RepartitionExec` runs once, so each execution gets a plan of its own.
+    let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+        let values: Vec<i32> = (0..20).collect();
+        let inner = global_limit_exec(int_source(&[&values])?, 0, Some(10));
+        let repartition = Arc::new(RepartitionExec::try_new(
+            inner,
+            Partitioning::RoundRobinBatch(1),
+        )?);
+        Ok(global_limit_exec(repartition, 0, Some(3)))
+    };
+    assert_eq!(row_count(plan()?).await?, 3, "the unoptimized plan");
+
+    let optimized = LimitPushdown::new().optimize(plan()?, &ConfigOptions::new())?;
+    assert_eq!(
+        row_count(Arc::clone(&optimized)).await?,
+        3,
+        "{}",
+        format_plan(&optimized)
+    );
+    Ok(())
+}
+
+/// A local limit applies to each output partition of a repartition on its
+/// own, so pushing it to the repartition's single input would limit the total.
+#[tokio::test]
+async fn a_local_limit_over_a_round_robin_repartition_limits_each_partition() -> Result<()>
+{
+    // A `RepartitionExec` runs once, so each execution gets a plan of its own.
+    let plan = || -> Result<Arc<dyn ExecutionPlan>> {
+        let source = int_source(&[&[0, 1], &[2, 3]])?;
+        let repartition = Arc::new(RepartitionExec::try_new(
+            source,
+            Partitioning::RoundRobinBatch(2),
+        )?);
+        Ok(local_limit_exec(repartition, 2))
+    };
+    assert_eq!(row_count(plan()?).await?, 4, "the unoptimized plan");
+
+    let optimized = LimitPushdown::new().optimize(plan()?, &ConfigOptions::new())?;
+    assert_eq!(
+        row_count(Arc::clone(&optimized)).await?,
+        4,
+        "{}",
+        format_plan(&optimized)
+    );
+    Ok(())
+}

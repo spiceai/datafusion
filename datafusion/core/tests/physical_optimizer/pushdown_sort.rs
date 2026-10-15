@@ -43,8 +43,9 @@ use crate::physical_optimizer::test_utils::{
     parquet_exec, parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
     repartition_exec, schema, simple_projection_exec, sort_exec, sort_exec_with_fetch,
     sort_exec_with_fetch_and_preserve_partitioning, sort_expr, sort_expr_named,
-    test_scan_with_ordering,
+    sort_preserving_merge_exec_with_fetch, spr_repartition_exec, test_scan_with_ordering,
 };
+use datafusion_physical_plan::get_plan_string;
 
 #[test]
 fn test_sort_pushdown_disabled() {
@@ -1229,4 +1230,67 @@ fn test_sort_pushdown_exact_preserves_fetch_with_source_support() {
           - TestScan: requested_ordering=[a@0 ASC], fetch=10
     "
     );
+}
+
+/// Under a `SortPreservingMergeExec` that keeps `fetch` rows, the fetch of an
+/// eliminated sort bounds the total output. It crosses the round-robin
+/// repartition the planner puts above a single-partition source, whose output
+/// all comes from that one stream, and reaches the source rather than staying
+/// above the repartition as a per-partition limit.
+#[test]
+fn test_sort_fetch_reaches_source_through_single_input_repartition() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    let source = parquet_exec_with_sort(Arc::clone(&schema), vec![ordering.clone()]);
+    let projection = simple_projection_exec(repartition_exec(source), vec![0, 1]);
+    let sort = sort_exec_with_fetch_and_preserve_partitioning(
+        ordering.clone(),
+        Some(10),
+        projection,
+    );
+    let plan = sort_preserving_merge_exec_with_fetch(ordering, sort, 10);
+
+    let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+    assert_eq!(
+        get_plan_string(&optimized),
+        [
+            "SortPreservingMergeExec: [a@0 ASC], fetch=10",
+            "  BufferExec: capacity=1073741824",
+            "    ProjectionExec: expr=[a@0 as a, b@1 as b]",
+            "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true",
+            "        DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], limit=10, output_ordering=[a@0 ASC], file_type=parquet",
+        ]
+    );
+    Ok(())
+}
+
+/// A repartition of several input partitions does not take the fetch: limiting
+/// each input would not bound its output. The fetch stays above it as a
+/// per-partition limit under the merge.
+#[test]
+fn test_sort_fetch_stays_above_a_multi_input_repartition() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    let source = parquet_exec_with_sort(Arc::clone(&schema), vec![ordering.clone()]);
+    let several_inputs = spr_repartition_exec(repartition_exec(source));
+    let sort = sort_exec_with_fetch_and_preserve_partitioning(
+        ordering.clone(),
+        Some(10),
+        several_inputs,
+    );
+    let plan = sort_preserving_merge_exec_with_fetch(ordering, sort, 10);
+
+    let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+    assert_eq!(
+        get_plan_string(&optimized),
+        [
+            "SortPreservingMergeExec: [a@0 ASC], fetch=10",
+            "  BufferExec: capacity=1073741824",
+            "    LocalLimitExec: fetch=10",
+            "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=10, preserve_order=true, sort_exprs=a@0 ASC",
+            "        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet",
+        ]
+    );
+    Ok(())
 }
