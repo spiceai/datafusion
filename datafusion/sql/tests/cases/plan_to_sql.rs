@@ -16164,3 +16164,35 @@ fn test_bare_scans_joined_with_using_keep_both_key_columns() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_a_window_over_a_bare_scan_as_a_join_input_narrows_its_wildcard() -> Result<()> {
+    // The window arm lists `*` and then the window expression; beside another
+    // relation that `*` would read it too, so it is narrowed to the scan's own
+    // relation while the window item is kept.
+    let row_number = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        params: WindowFunctionParams {
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![col("u.a").sort(true, true)],
+            window_frame: WindowFrame::new(Some(false)),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }))
+    .alias("rn");
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .window(vec![row_number])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true"
+    );
+    Ok(())
+}

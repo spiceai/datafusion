@@ -1316,13 +1316,34 @@ impl Unparser<'_> {
         // Nothing, or an unqualified `*`: the input names no column of its own.
         let names_no_column =
             matches!(items.as_slice(), [] | [ast::SelectItem::Wildcard(_)]);
-        if !names_no_column {
+        let has_wildcard = items
+            .iter()
+            .any(|item| matches!(item, ast::SelectItem::Wildcard(_)));
+        if alone_in_from {
+            return Ok(if names_no_column {
+                vec![ast::SelectItem::Wildcard(
+                    ast::WildcardAdditionalOptions::default(),
+                )]
+            } else {
+                items
+            });
+        }
+        if !names_no_column && !has_wildcard {
             return Ok(items);
         }
-        if alone_in_from {
-            return Ok(vec![ast::SelectItem::Wildcard(
-                ast::WildcardAdditionalOptions::default(),
-            )]);
+        // An unqualified `*` inside a longer list (a window over a bare scan
+        // lists `*` and then its window expressions) reads every relation of
+        // the enclosing FROM as well; it is narrowed to this input's relations
+        // in place, and the explicit items around it are kept.
+        if !names_no_column {
+            let relation_items = self.whole_relation_items(input)?;
+            return Ok(items
+                .into_iter()
+                .flat_map(|item| match item {
+                    ast::SelectItem::Wildcard(_) => relation_items.clone(),
+                    other => vec![other],
+                })
+                .collect());
         }
         let mut relations: Vec<&TableReference> = vec![];
         for (qualifier, field) in input.schema().iter() {
@@ -1339,8 +1360,32 @@ impl Unparser<'_> {
                 relations.push(qualifier);
             }
         }
-        Ok(relations
-            .into_iter()
+        Ok(self.qualified_wildcards(&relations))
+    }
+
+    /// One `t.*` per relation the input's qualified outputs read, in the
+    /// plan's order; an unqualified output (a window's, an aggregate's) is
+    /// skipped, since the caller keeps the explicit item that names it.
+    fn whole_relation_items(&self, input: &LogicalPlan) -> Result<Vec<ast::SelectItem>> {
+        let mut relations: Vec<&TableReference> = vec![];
+        for (qualifier, _) in input.schema().iter() {
+            if let Some(qualifier) = qualifier
+                && relations.last() != Some(&qualifier)
+            {
+                relations.push(qualifier);
+            }
+        }
+        if relations.is_empty() {
+            return not_impl_err!(
+                "Unparsing a join input that reads every column with `*` is only supported when the input reads at least one relation"
+            );
+        }
+        Ok(self.qualified_wildcards(&relations))
+    }
+
+    fn qualified_wildcards(&self, relations: &[&TableReference]) -> Vec<ast::SelectItem> {
+        relations
+            .iter()
             .map(|relation| {
                 let name = self
                     .emitted_qualifier(relation)
@@ -1354,7 +1399,7 @@ impl Unparser<'_> {
                     ast::WildcardAdditionalOptions::default(),
                 )
             })
-            .collect())
+            .collect()
     }
 
     // The helpers below keep the join arms' bookkeeping out of
