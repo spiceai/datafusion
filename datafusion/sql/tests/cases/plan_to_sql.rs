@@ -16270,13 +16270,21 @@ fn test_sort_above_union_keeps_a_struct_field_path() -> Result<()> {
 #[test]
 fn test_sort_above_union_drops_a_schema_qualified_relation() -> Result<()> {
     let s = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
-    for union_distinct in [false, true] {
+    // `distinct_twice` stacks a second `Distinct` over the union's own, which
+    // the unparser folds into the same `UNION`.
+    for (union_distinct, distinct_twice) in [(false, false), (true, false), (true, true)]
+    {
         let left = table_scan(Some("public.u"), &s, None)?;
         let right = table_scan(Some("public.v"), &s, None)?.build()?;
         let union = if union_distinct {
             left.union_distinct(right)?
         } else {
             left.union(right)?
+        };
+        let union = if distinct_twice {
+            union.distinct()?
+        } else {
+            union
         };
         let plan = union
             .sort_with_limit(vec![col("public.u.a").sort(true, true)], Some(1))?

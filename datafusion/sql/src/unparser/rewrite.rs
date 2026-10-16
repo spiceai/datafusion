@@ -66,7 +66,7 @@ pub(super) fn normalize_union_schema(plan: &LogicalPlan) -> Result<LogicalPlan> 
         }
         LogicalPlan::Sort(sort) => {
             // Only rewrite Sort expressions that read a UNION's output: a
-            // `UNION ALL`, or a `UNION` (a `Distinct::All` over the union)
+            // `UNION ALL`, or a `UNION` (`Distinct::All` over the union)
             if !is_union_output(&sort.input) {
                 return Ok(Transformed::no(LogicalPlan::Sort(sort)));
             }
@@ -83,13 +83,13 @@ pub(super) fn normalize_union_schema(plan: &LogicalPlan) -> Result<LogicalPlan> 
 }
 
 /// Whether `plan` is a `UNION ALL` or a `UNION`, whose output columns carry no
-/// relation an `ORDER BY` above them could name.
+/// relation an `ORDER BY` above them could name. A `UNION` is any chain of
+/// `Distinct::All` over the union: the unparser folds them all into the one
+/// set operation.
 fn is_union_output(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Union(_) => true,
-        LogicalPlan::Distinct(Distinct::All(input)) => {
-            matches!(input.as_ref(), LogicalPlan::Union(_))
-        }
+        LogicalPlan::Distinct(Distinct::All(input)) => is_union_output(input),
         _ => false,
     }
 }
