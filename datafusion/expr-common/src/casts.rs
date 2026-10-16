@@ -157,6 +157,43 @@ pub fn is_date_narrowing_cast(from_type: &DataType, to_type: &DataType) -> bool 
     matches!((from_type, to_type), (DataType::Date64, DataType::Date32))
 }
 
+/// Returns true when casting a decimal column from `from_type` to `to_type`
+/// drops digits: a decimal with a positive scale cast to an integer, or a
+/// decimal cast to a decimal of smaller scale.
+///
+/// Like [`is_timestamp_precision_narrowing_cast`], this guards comparison cast
+/// unwrapping against a many-to-one column cast. Over a `Decimal128(15, 2)`
+/// column, `CAST(price AS BIGINT) = 173665` matches every `price` in
+/// `[173665, 173666)`, but the rewritten `price = 173665.00` matches one value;
+/// over a `Decimal128(20, 4)` column, `CAST(d AS DECIMAL(20, 2)) = 1.23` matches
+/// every `d` that rounds to `1.23` (apache/datafusion#23095). Range operators
+/// are not exempt: `CAST(price AS BIGINT) <= 16` holds for `16.50`, and
+/// `price <= 16.00` does not.
+///
+/// The widening direction — an integer cast to a decimal, or a decimal cast to
+/// a larger or equal scale — is injective and stays allowed, as does a decimal
+/// of scale zero or less cast to an integer, which only multiplies by a power
+/// of ten.
+pub fn is_decimal_scale_narrowing_cast(from_type: &DataType, to_type: &DataType) -> bool {
+    let Some(from_scale) = decimal_scale(from_type) else {
+        return false;
+    };
+    if to_type.is_integer() {
+        return from_scale > 0;
+    }
+    decimal_scale(to_type).is_some_and(|to_scale| to_scale < from_scale)
+}
+
+fn decimal_scale(data_type: &DataType) -> Option<i8> {
+    match data_type {
+        DataType::Decimal32(_, scale)
+        | DataType::Decimal64(_, scale)
+        | DataType::Decimal128(_, scale)
+        | DataType::Decimal256(_, scale) => Some(*scale),
+        _ => None,
+    }
+}
+
 fn timestamp_unit_scale(unit: &TimeUnit) -> i128 {
     match unit {
         TimeUnit::Second => 1,
@@ -1034,6 +1071,89 @@ mod tests {
             &DataType::Date64
         ));
         assert!(!is_date_narrowing_cast(&DataType::Int64, &DataType::Date32));
+    }
+
+    #[test]
+    fn test_is_decimal_scale_narrowing_cast() {
+        let dec_15_2 = DataType::Decimal128(15, 2);
+        // A decimal with fractional digits cast to any integer width truncates
+        // them (many-to-one).
+        for int_type in [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ] {
+            assert!(
+                is_decimal_scale_narrowing_cast(&dec_15_2, &int_type),
+                "Decimal128(15, 2) -> {int_type} narrows"
+            );
+        }
+        for decimal in [
+            DataType::Decimal32(9, 2),
+            DataType::Decimal64(18, 2),
+            DataType::Decimal256(40, 2),
+        ] {
+            assert!(
+                is_decimal_scale_narrowing_cast(&decimal, &DataType::Int64),
+                "{decimal} -> Int64 narrows"
+            );
+        }
+        // So does a cast to a decimal of smaller scale, whatever the precision.
+        assert!(is_decimal_scale_narrowing_cast(
+            &dec_15_2,
+            &DataType::Decimal128(15, 0)
+        ));
+        assert!(is_decimal_scale_narrowing_cast(
+            &dec_15_2,
+            &DataType::Decimal128(38, 1)
+        ));
+        assert!(is_decimal_scale_narrowing_cast(
+            &DataType::Decimal128(20, 4),
+            &DataType::Decimal128(20, 2)
+        ));
+        assert!(is_decimal_scale_narrowing_cast(
+            &dec_15_2,
+            &DataType::Decimal128(15, -1)
+        ));
+        // Widening is injective: a larger scale, the same scale at another
+        // precision, or an integer cast to a decimal.
+        assert!(!is_decimal_scale_narrowing_cast(
+            &dec_15_2,
+            &DataType::Decimal128(20, 4)
+        ));
+        assert!(!is_decimal_scale_narrowing_cast(
+            &dec_15_2,
+            &DataType::Decimal128(38, 2)
+        ));
+        assert!(!is_decimal_scale_narrowing_cast(&dec_15_2, &dec_15_2));
+        assert!(!is_decimal_scale_narrowing_cast(
+            &DataType::Int32,
+            &DataType::Decimal128(10, 2)
+        ));
+        // A decimal with no fractional digits cast to an integer keeps every
+        // value apart, and a negative scale only multiplies by a power of ten.
+        assert!(!is_decimal_scale_narrowing_cast(
+            &DataType::Decimal128(15, 0),
+            &DataType::Int64
+        ));
+        assert!(!is_decimal_scale_narrowing_cast(
+            &DataType::Decimal128(15, -2),
+            &DataType::Int64
+        ));
+        // Non-decimal sources are never flagged, even to a narrower type.
+        assert!(!is_decimal_scale_narrowing_cast(
+            &DataType::Int64,
+            &DataType::Int32
+        ));
+        assert!(!is_decimal_scale_narrowing_cast(
+            &DataType::Float64,
+            &DataType::Int64
+        ));
     }
 
     #[test]
