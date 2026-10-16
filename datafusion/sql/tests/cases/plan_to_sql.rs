@@ -16425,3 +16425,27 @@ fn test_a_sort_key_reading_a_projected_integer_literal_is_dropped_from_the_fold(
     );
     Ok(())
 }
+
+#[test]
+fn test_a_dropped_alias_whose_column_a_surviving_alias_shadows_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // Dropping `s AS x` would substitute `s` into the key, where the surviving
+    // `0 - s AS s` captures the name; the plan orders by the input's `s`. The
+    // fold is skipped, so the sort stays in the scope that reads it.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a").alias("s"), col("u.c").alias("unused")])?
+        .project(vec![
+            (lit(0) - col("s")).alias("s"),
+            col("s").alias("x"),
+            col("unused"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT (0 - s) AS s, s AS x, unused FROM (SELECT u.a AS s, u.c AS unused FROM u) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}

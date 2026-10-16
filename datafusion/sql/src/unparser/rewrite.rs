@@ -347,6 +347,31 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         if key_reads_unrepeatable {
             return None;
         }
+        // A substituted expression reads the scope below by bare column names.
+        // Where such a name is also the name of a surviving alias (`0 - s AS s`
+        // kept, `s AS x` dropped, the key reading `x`), the substituted `s`
+        // would be bound to the alias by the unprojection that follows, and the
+        // key would order by `0 - s` instead of `s`. The fold is skipped.
+        let kept_aliases: HashSet<&str> = new_exprs
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Alias(alias) => Some(alias.name.as_str()),
+                _ => None,
+            })
+            .collect();
+        let substitution_shadowed = sort.expr.iter().any(|sort_expr| {
+            sort_expr.expr.column_refs().iter().any(|col| {
+                col.relation.is_none()
+                    && dropped_outputs.get(col.name()).is_some_and(|underlying| {
+                        underlying.column_refs().iter().any(|read| {
+                            read.relation.is_none() && kept_aliases.contains(read.name())
+                        })
+                    })
+            })
+        });
+        if substitution_shadowed {
+            return None;
+        }
 
         if !dropped_outputs.is_empty() {
             for sort_expr in &mut sort.expr {
