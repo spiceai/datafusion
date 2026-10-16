@@ -20,9 +20,10 @@ use super::{
     ast::{
         BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
         DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_TABLE_ALIASES,
-        DERIVED_UNION_ALIAS, DERIVED_UNNEST_ALIAS, DERIVED_WINDOW_INPUT_ALIAS,
-        DerivedRelationBuilder, QueryBuilder, RelationBuilder, SelectBuilder,
-        TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
+        DERIVED_UNION_ALIAS, DERIVED_UNION_INPUT_ALIAS, DERIVED_UNNEST_ALIAS,
+        DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder, QueryBuilder,
+        RelationBuilder, SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
+        is_numbered_alias,
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
@@ -696,6 +697,88 @@ impl Unparser<'_> {
             closing_paren_token: AttachedToken::empty(),
         };
         Ok((cte, name))
+    }
+
+    /// One input of a `UNION`, rendered in a query of its own.
+    ///
+    /// An input can carry its own `ORDER BY` and row bound — `u UNION ALL` the
+    /// top row of `v` — and those decide which of *that input's* rows reach the
+    /// union. Written on the union's query they would follow the last operand
+    /// and bound the whole union instead, so each input gets a builder of its
+    /// own, and an input that leaves an `ORDER BY`, a row bound or another
+    /// query-level clause (`WITH`, locks, `FOR`) on it becomes a derived table that keeps them:
+    /// `SELECT * FROM (SELECT * FROM v ORDER BY … LIMIT 1)`. A derived table
+    /// rather than a parenthesized operand, because `SQLite` accepts neither
+    /// parentheses around a compound operand nor `ORDER BY`/`LIMIT` on any
+    /// operand but the last, and every dialect accepts a derived table.
+    ///
+    /// An `ORDER BY` is kept even with no bound: under `DISTINCT ON` it decides
+    /// which row of each group survives, so it can select rows, not only order
+    /// them.
+    ///
+    /// The builder is fresh, quantifier included: a `UNION` nested in an input
+    /// takes `DISTINCT` from its own `Distinct`, never from the union around it.
+    /// Set operations print without parentheses and group left to right, so a
+    /// nested one is scoped too when it is not the first operand and any set
+    /// operation it exposes has a quantifier other than the enclosing union's —
+    /// `a UNION ALL (b UNION c)` would otherwise read as `(a UNION ALL b) UNION
+    /// c`, and so would `a UNION ALL ((b UNION c) UNION ALL d)`. Where every
+    /// quantifier agrees, or the nested union comes first, the flat form already
+    /// groups the same way and is kept.
+    fn union_input_to_sql(
+        &self,
+        input: &LogicalPlan,
+        first: bool,
+        distinct_union: bool,
+    ) -> Result<SetExpr> {
+        let mut input_query = Some(QueryBuilder::default());
+        let body = self.select_to_sql_expr(input, &mut input_query)?;
+        let Some(mut input_query) = input_query else {
+            return internal_err!("a UNION input lost its query builder");
+        };
+        let needs_own_scope = input_query.get_order_by().is_some()
+            || input_query.bounds_rows()
+            || input_query.carries_statement_clauses()
+            || (!first
+                && matches!(body, SetExpr::SetOperation { .. })
+                && !Self::every_set_operation_is(&body, !distinct_union));
+        if !needs_own_scope {
+            return Ok(body);
+        }
+
+        let subquery = input_query
+            .body(Box::new(body))
+            .build()
+            .map_err(|e| internal_datafusion_err!("{e}"))?;
+        let alias = self
+            .dialect
+            .requires_derived_table_alias()
+            .then(|| self.new_table_alias(DERIVED_UNION_INPUT_ALIAS.to_string(), vec![]));
+        let mut select = Self::wrap_query_as_derived_select(subquery, alias)?;
+        select.projection = vec![ast::SelectItem::Wildcard(
+            ast::WildcardAdditionalOptions::default(),
+        )];
+        Ok(SetExpr::Select(Box::new(select)))
+    }
+
+    /// Whether every set operation `expr` exposes — those that print without
+    /// parentheses, so not one inside a derived table or subquery — is a `UNION`
+    /// with the quantifier `all` names.
+    fn every_set_operation_is(expr: &SetExpr, all: bool) -> bool {
+        match expr {
+            SetExpr::SetOperation {
+                op: ast::SetOperator::Union,
+                set_quantifier,
+                left,
+                right,
+            } => {
+                (*set_quantifier == ast::SetQuantifier::All) == all
+                    && Self::every_set_operation_is(left, all)
+                    && Self::every_set_operation_is(right, all)
+            }
+            SetExpr::SetOperation { .. } => false,
+            _ => true,
+        }
     }
 
     /// One term of a recursive CTE, carrying any clause its builder collected.
@@ -3833,10 +3916,15 @@ impl Unparser<'_> {
                     );
                 }
 
+                let distinct_union =
+                    query.as_ref().is_some_and(QueryBuilder::is_distinct_union);
                 let input_exprs: Vec<SetExpr> = union
                     .inputs
                     .iter()
-                    .map(|input| self.select_to_sql_expr(input, query))
+                    .enumerate()
+                    .map(|(i, input)| {
+                        self.union_input_to_sql(input, i == 0, distinct_union)
+                    })
                     .collect::<Result<Vec<_>>>()?;
 
                 assert_or_internal_err!(
@@ -3844,12 +3932,11 @@ impl Unparser<'_> {
                     "UNION operator requires at least 2 inputs"
                 );
 
-                let set_quantifier =
-                    if query.as_ref().is_some_and(|q| q.is_distinct_union()) {
-                        self.dialect.union_distinct_set_quantifier()
-                    } else {
-                        ast::SetQuantifier::All
-                    };
+                let set_quantifier = if distinct_union {
+                    self.dialect.union_distinct_set_quantifier()
+                } else {
+                    ast::SetQuantifier::All
+                };
 
                 // Build the union expression tree bottom-up by reversing the order
                 // note that we are also swapping left and right inputs because of the rev
