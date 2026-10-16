@@ -16412,3 +16412,23 @@ fn test_local_and_correlated_references_sharing_a_qualifier_are_told_apart()
     );
     Ok(())
 }
+
+/// A correlated reference read through an array subscript binds in the enclosing
+/// query, so it keeps its qualifier in the subquery's projection and `ORDER BY`:
+/// `array_col[1]` alone would read the subquery's own row.
+#[test]
+fn test_correlated_array_subscript_keeps_its_qualifier() -> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT o.array_col[1] FROM unnest_table AS i LIMIT 1) FROM unnest_table AS o",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT o.array_col[1] FROM unnest_table AS i LIMIT 1) FROM unnest_table AS o",
+    );
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT i.array_col FROM unnest_table AS i ORDER BY o.array_col[1] LIMIT 1) FROM unnest_table AS o",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT i.array_col FROM unnest_table AS i ORDER BY o.array_col[1] ASC NULLS LAST LIMIT 1) FROM unnest_table AS o",
+    );
+    Ok(())
+}

@@ -683,21 +683,18 @@ pub fn remove_dangling_identifiers(idents: &mut Vec<Ident>, available_idents: &[
     }
 }
 
-/// [`remove_dangling_identifiers`] over an expression: a column reference, or the
-/// column reference a struct field path is rooted at. A reference left with one
-/// part becomes a plain identifier, the only form a planner accepts it in.
+/// [`remove_dangling_identifiers`] over a column reference. A reference left with
+/// one part becomes a plain identifier, the only form a planner accepts it in.
+///
+/// A field access (`t.s.f`, `t.a[1]`) is left alone. Its root can be a correlated
+/// reference, which binds in the enclosing query whatever this `FROM` reads, and
+/// nothing in the finished statement tells it from a local one.
 pub fn remove_dangling_qualifier(expr: &mut ast::Expr, available_idents: &[String]) {
-    match expr {
-        ast::Expr::CompoundIdentifier(idents) => {
-            remove_dangling_identifiers(idents, available_idents);
-            if let [column] = idents.as_slice() {
-                *expr = ast::Expr::Identifier(column.clone());
-            }
+    if let ast::Expr::CompoundIdentifier(idents) = expr {
+        remove_dangling_identifiers(idents, available_idents);
+        if let [column] = idents.as_slice() {
+            *expr = ast::Expr::Identifier(column.clone());
         }
-        ast::Expr::CompoundFieldAccess { root, .. } => {
-            remove_dangling_qualifier(root, available_idents);
-        }
-        _ => {}
     }
 }
 
@@ -759,17 +756,11 @@ mod tests {
         remove_dangling_qualifier(&mut expr, &[]);
         assert_eq!(expr, ast::Expr::Identifier(Ident::new("id")));
 
-        // A field path is judged by the column it is rooted at, and keeps its fields.
-        let mut expr = field_path(column(&["t", "metadata"]));
-        remove_dangling_qualifier(&mut expr, &["t".to_string()]);
-        assert_eq!(expr, field_path(column(&["t", "metadata"])));
-
+        // A field path is not a column reference: it keeps its qualifier whatever
+        // the FROM makes visible, as its root may be a correlated reference.
         let mut expr = field_path(column(&["t", "metadata"]));
         remove_dangling_qualifier(&mut expr, &[]);
-        assert_eq!(
-            expr,
-            field_path(ast::Expr::Identifier(Ident::new("metadata")))
-        );
+        assert_eq!(expr, field_path(column(&["t", "metadata"])));
     }
 
     // this is a regression test: when the outer projection has fewer expressions than
