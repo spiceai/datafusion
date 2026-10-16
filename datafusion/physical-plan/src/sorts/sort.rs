@@ -42,6 +42,7 @@ use crate::metrics::{
 };
 use crate::projection::{ProjectionExec, make_with_child, update_ordering};
 use crate::sorts::IncrementalSortIterator;
+use crate::sorts::batch_compaction::BatchCompaction;
 use crate::sorts::streaming_merge::{SortedSpillFile, StreamingMergeBuilder};
 use crate::spill::get_record_batch_memory_size;
 use crate::spill::in_progress_spill_file::InProgressSpillFile;
@@ -324,11 +325,84 @@ impl ExternalSorter {
         }
 
         self.reserve_memory_for_merge()?;
-        self.reserve_memory_for_batch_and_maybe_spill(&input)
-            .await?;
+        let input = match Self::compaction_worth_making(&input)? {
+            Some(compaction) => self.admit_compacted(input, &compaction).await?,
+            None => {
+                self.reserve_memory_for_batch_and_maybe_spill(&input)
+                    .await?;
+                input
+            }
+        };
 
         self.in_mem_batches.push(input);
         Ok(())
+    }
+
+    /// Returns how to copy `input` into buffers of its own when the buffers it
+    /// shares hold at least twice what the copy would.
+    ///
+    /// A grouped aggregate emits all of its groups as one batch and then hands
+    /// them on as `batch_size` slices of it. Every slice shares the whole
+    /// batch's buffers, and [`get_reserved_bytes_for_record_batch`] charges
+    /// those buffers in full for each slice, so admitting the slices as they
+    /// are charges this sort for the aggregate's output once per slice. A
+    /// sort over a few million groups then needs many times the memory its
+    /// rows occupy, spills long before it has to, and fails outright when the
+    /// first slice's charge alone does not fit.
+    fn compaction_worth_making(input: &RecordBatch) -> Result<Option<BatchCompaction>> {
+        let retained = get_record_batch_memory_size(input);
+        // A copy needs at least the bytes of the rows themselves (for a view
+        // column, its views), so skip planning one, which reads every value of
+        // a view column, unless it could pay off. `get_sliced_size` would not
+        // do here: it counts a view column's shared data buffers in full.
+        let mut own_bytes = 0usize;
+        for column in input.columns() {
+            // Leave a batch Arrow cannot size to the usual admission path.
+            let Ok(bytes) = column.to_data().get_slice_memory_size() else {
+                return Ok(None);
+            };
+            own_bytes = own_bytes.saturating_add(bytes);
+        }
+        if retained / 2 < own_bytes {
+            return Ok(None);
+        }
+        let Some(compaction) = BatchCompaction::try_new(input)? else {
+            return Ok(None);
+        };
+        Ok(
+            (compaction.capacity > 0 && compaction.capacity <= retained / 2)
+                .then_some(compaction),
+        )
+    }
+
+    /// Admits a copy of `input` in place of `input`: reserves the copy and its
+    /// sorting scratch first (spilling if memory is scarce), copies, then
+    /// returns what the copy did not use.
+    ///
+    /// The copy's buffers come to at most `compaction.capacity`, and so do its
+    /// sliced bytes, which are what sorting it adds on top. So twice the
+    /// capacity covers [`get_reserved_bytes_for_record_batch`] of the copy,
+    /// which is what the rest of the sorter expects each buffered batch to hold.
+    /// Because the capacity is at most half of what `input` retains, that is
+    /// never more than admitting `input` itself would have reserved.
+    async fn admit_compacted(
+        &mut self,
+        input: RecordBatch,
+        compaction: &BatchCompaction,
+    ) -> Result<RecordBatch> {
+        let charge = compaction.capacity.checked_mul(2).ok_or_else(|| {
+            internal_datafusion_err!("A sort batch's compacted size overflows usize")
+        })?;
+        self.reserve_bytes_and_maybe_spill(charge).await?;
+        let compact = compaction.copy(&input)?;
+        drop(input);
+        let used = get_reserved_bytes_for_record_batch(&compact)?;
+        assert_or_internal_err!(
+            used <= charge,
+            "A compacted sort batch needs more memory than was reserved for it"
+        );
+        self.reservation.shrink(charge - used);
+        Ok(compact)
     }
 
     fn spilled_before(&self) -> bool {
@@ -801,7 +875,12 @@ impl ExternalSorter {
         input: &RecordBatch,
     ) -> Result<()> {
         let size = get_reserved_bytes_for_record_batch(input)?;
+        self.reserve_bytes_and_maybe_spill(size).await
+    }
 
+    /// Reserves `size` more bytes. If memory is scarce, tries to spill current
+    /// in-memory batches to disk first.
+    async fn reserve_bytes_and_maybe_spill(&mut self, size: usize) -> Result<()> {
         match self.reservation.try_grow(size) {
             Ok(_) => Ok(()),
             Err(e) => {
@@ -3211,6 +3290,150 @@ mod tests {
         // Empty input produces no output batches (0 chunks)
         assert_eq!(result_batches.len(), 0);
 
+        Ok(())
+    }
+
+    /// Inserts `rows` descending `Int64` values into an [`ExternalSorter`] as
+    /// `batch_size` slices of one batch, the way a grouped aggregate hands its
+    /// output on. The sorter's pool holds `pool_size(data)` bytes, where `data`
+    /// is what the values occupy, and it sorts in place below
+    /// `sort_in_place_threshold_bytes`. Returns the sorter after the inserts,
+    /// the pool, and `data`.
+    async fn sorter_fed_slices_of_one_batch(
+        rows: usize,
+        batch_size: usize,
+        pool_size: fn(usize) -> usize,
+        sort_in_place_threshold_bytes: usize,
+    ) -> Result<(ExternalSorter, Arc<dyn MemoryPool>, usize)> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+        let values = Int64Array::from_iter_values((0..rows as i64).rev());
+        let data = values.get_buffer_memory_size();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(values)])?;
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(pool_size(data)));
+        let runtime = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::clone(&pool))
+            .build_arc()?;
+        let metrics = ExecutionPlanMetricsSet::new();
+        let mut sorter = ExternalSorter::new(
+            0,
+            Arc::clone(&schema),
+            [PhysicalSortExpr::new_default(Arc::new(Column::new("x", 0)))].into(),
+            batch_size,
+            0,
+            sort_in_place_threshold_bytes,
+            SpillCompression::Uncompressed,
+            &metrics,
+            runtime,
+        )?;
+        for offset in (0..rows).step_by(batch_size) {
+            sorter
+                .insert_batch(batch.slice(offset, batch_size.min(rows - offset)))
+                .await?;
+        }
+        Ok((sorter, pool, data))
+    }
+
+    /// Sorts what `sorter` holds and checks it is exactly `0..rows`.
+    async fn assert_sorts_to_ascending(
+        mut sorter: ExternalSorter,
+        rows: usize,
+    ) -> Result<()> {
+        let sorted = sorter.sort().await?.try_collect::<Vec<_>>().await?;
+        let mut expected = 0i64;
+        for batch in &sorted {
+            let values = as_primitive_array::<Int64Type>(batch.column(0))?;
+            for value in values.values() {
+                assert_eq!(*value, expected);
+                expected += 1;
+            }
+        }
+        assert_eq!(expected, rows as i64);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_slices_of_one_batch_are_charged_for_their_own_rows() -> Result<()> {
+        let rows = 1 << 20;
+        // Four times the values: room for every row and its sorting scratch,
+        // with half of it to spare. Sorting each buffered batch on its own
+        // splits the reservation per batch, which must match what each holds.
+        let (sorter, pool, data) =
+            sorter_fed_slices_of_one_batch(rows, 8192, |data| 4 * data, 0).await?;
+        assert_eq!(sorter.spill_count(), 0);
+        assert!(
+            sorter.reservation.size() <= 2 * data + 128 * 64,
+            "reserved {} bytes for {data} bytes of values",
+            sorter.reservation.size()
+        );
+        assert_eq!(pool.reserved(), sorter.reservation.size());
+        assert_sorts_to_ascending(sorter, rows).await
+    }
+
+    #[tokio::test]
+    async fn test_slices_of_a_batch_larger_than_the_pool_spill_instead_of_failing()
+    -> Result<()> {
+        let rows = 1 << 20;
+        // Exactly the values: their sorting scratch does not fit, so the sort
+        // has to spill, while one slice's own rows fit many times over.
+        let (sorter, pool, data) =
+            sorter_fed_slices_of_one_batch(rows, 8192, |data| data, usize::MAX).await?;
+        assert!(sorter.spill_count() > 0);
+        assert!(pool.reserved() <= data);
+        assert_sorts_to_ascending(sorter, rows).await
+    }
+
+    #[tokio::test]
+    async fn test_compacted_slice_is_admitted_at_twice_its_copy_and_released_on_drop()
+    -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        let array = Int32Array::from((0..1024).collect::<Vec<_>>());
+        let input = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(array.slice(500, 1))],
+        )?;
+        let compaction = ExternalSorter::compaction_worth_making(&input)?
+            .expect("a one-row slice of 1024 values is worth copying");
+        let charge = 2 * compaction.capacity;
+        for (limit, admitted) in [(charge - 1, false), (charge, true)] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(limit));
+            let runtime = RuntimeEnvBuilder::new()
+                .with_memory_pool(Arc::clone(&pool))
+                .build_arc()?;
+            let metrics = ExecutionPlanMetricsSet::new();
+            let mut sorter = ExternalSorter::new(
+                0,
+                Arc::clone(&schema),
+                [PhysicalSortExpr::new_default(Arc::new(Column::new("x", 0)))].into(),
+                128,
+                0,
+                usize::MAX,
+                SpillCompression::Uncompressed,
+                &metrics,
+                runtime,
+            )?;
+            let result = sorter.insert_batch(input.clone()).await;
+            assert_eq!(result.is_ok(), admitted, "limit {limit}: {result:?}");
+            if admitted {
+                let stored = &sorter.in_mem_batches[0];
+                assert_eq!(stored, &input);
+                assert!(
+                    get_record_batch_memory_size(stored)
+                        < get_record_batch_memory_size(&input)
+                );
+                assert_eq!(
+                    sorter.reservation.size(),
+                    get_reserved_bytes_for_record_batch(stored)?
+                );
+            } else {
+                assert!(matches!(
+                    result.unwrap_err().find_root(),
+                    DataFusionError::ResourcesExhausted(_)
+                ));
+            }
+            assert!(pool.reserved() <= limit);
+            drop(sorter);
+            assert_eq!(pool.reserved(), 0);
+        }
         Ok(())
     }
 
