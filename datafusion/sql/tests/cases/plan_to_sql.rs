@@ -2116,7 +2116,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_subquery_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT left_table.id, left_table."name" FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE (right_table.id = (SELECT max(subquery_table.id) FROM subquery_table))"#
+        @r#"SELECT left_table.id, left_table."name", right_table.* FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE (right_table.id = (SELECT max(subquery_table.id) FROM subquery_table))"#
     );
 
     // Inner join with an IN subquery in table_scan_filters.
@@ -2149,7 +2149,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_in_subquery)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT left_table.id, left_table."name" FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE right_table.id IN (SELECT subquery_table.id FROM subquery_table)"#
+        @r#"SELECT left_table.id, left_table."name", right_table.* FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE right_table.id IN (SELECT subquery_table.id FROM subquery_table)"#
     );
 
     // Inner join with an EXISTS subquery in table_scan_filters.
@@ -2180,7 +2180,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_exists)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT left_table.id, left_table."name" FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE EXISTS (SELECT * FROM subquery_table WHERE (subquery_table.id = right_table.id))"#
+        @r#"SELECT left_table.id, left_table."name", right_table.* FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE EXISTS (SELECT * FROM subquery_table WHERE (subquery_table.id = right_table.id))"#
     );
 
     Ok(())
@@ -15901,5 +15901,158 @@ fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
         "SELECT CAST(`t`.`s` AS DATETIME(0)) FROM `t`"
     );
 
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_scan_on_the_probe_side_of_a_semi_join_lists_its_columns() -> Result<()> {
+    // The probe side sets no SELECT items of its own and is the only relation
+    // of the FROM, so it reads as `*`, the way a scan unparsed on its own does,
+    // rather than as an empty list a dialect such as DuckDB rejects.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE (t.a = u.a))"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_scan_beside_a_projected_join_input_lists_its_columns() -> Result<()> {
+    // The right input's projection is folded into the shared SELECT; the left
+    // scan's columns go in front of it, where the plan's schema has them, and
+    // a bare `*` could not stand for them beside the other relation.
+    let right = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("u.a"), (col("u.a") * lit(2)).alias("d")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.a, (u.a * 2) AS d FROM t INNER JOIN u ON (t.a = u.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_two_bare_scans_in_a_join_read_as_a_bare_wildcard() -> Result<()> {
+    // Neither input lists anything, so between them they read every relation of
+    // the FROM: the `*` a scan unparsed on its own renders as.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Full,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM t FULL JOIN u ON (t.a = u.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_scan_under_a_filter_in_a_join_lists_its_columns() -> Result<()> {
+    // The filter sets a predicate, not a SELECT list; the scan under it still
+    // contributes its columns.
+    let right = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("u.a"), (col("u.a") * lit(2)).alias("d")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .filter(col("t.b").gt(lit(1)))?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.a, (u.a * 2) AS d FROM t INNER JOIN u ON (t.a = u.a) WHERE (t.b > 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_two_aliased_bare_scans_in_a_join_read_as_a_bare_wildcard() -> Result<()> {
+    // Each alias claims every column with a bare `*`; two of them side by side
+    // would read both relations twice, so together they read as one `*`.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .alias("x")?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?
+                .alias("y")?
+                .build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("x.a").eq(col("y.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM t AS x INNER JOIN u AS y ON (x.a = y.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_nested_join_of_bare_scans_reads_each_relation_whole() -> Result<()> {
+    // The nested join reads as `*` on its own; beside the projected input that
+    // `*` would read the projected relation too, so it becomes one `t.*` per
+    // relation the nested join holds.
+    let right = table_scan(Some("w"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("w.a"), (col("w.a") * lit(2)).alias("d")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("w.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, w.a, (w.a * 2) AS d FROM t INNER JOIN u ON (t.a = u.a) INNER JOIN w ON (t.a = w.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_scan_on_the_right_of_an_outer_join_lists_its_columns() -> Result<()> {
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .project(vec![col("t.a"), (col("t.b") + lit(1)).alias("c")])?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Right,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, (t.b + 1) AS c, u.* FROM t RIGHT OUTER JOIN u ON (t.a = u.a)"
+    );
     Ok(())
 }

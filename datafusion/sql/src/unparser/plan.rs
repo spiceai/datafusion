@@ -1280,6 +1280,82 @@ impl Unparser<'_> {
         walked
     }
 
+    /// The `SELECT` items one input of a join contributes to the shared list,
+    /// taken from what its walk set.
+    ///
+    /// An input lists its own columns only where a projection is folded for
+    /// it. A scan with no projection — reached directly, or through a filter —
+    /// sets nothing, and an aliased one claims every column with a bare `*`,
+    /// which beside another relation reads that relation's columns as well.
+    /// Either way the list the join assembles no longer lines up with the
+    /// plan's schema: a consumer reading the result by position gets the
+    /// other input's columns under this one's names, and a dialect that
+    /// rejects an empty list gets a parse error. Such an input contributes
+    /// every column of each relation it reads instead — `t.*`, one per
+    /// relation, in the plan's order — or a bare `*` when it is the only
+    /// relation the `FROM` holds, as a scan unparsed on its own renders
+    /// (spiceai/spiceai#14738).
+    fn join_input_select_items(
+        &self,
+        input: &LogicalPlan,
+        alone_in_from: bool,
+        select: &mut SelectBuilder,
+    ) -> Result<Vec<ast::SelectItem>> {
+        let items = select.pop_projections();
+        let claims_every_column =
+            matches!(items.as_slice(), [ast::SelectItem::Wildcard(_)]);
+        if !(items.is_empty() || claims_every_column)
+            || input.schema().fields().is_empty()
+        {
+            return Ok(items);
+        }
+        if alone_in_from {
+            return Ok(vec![ast::SelectItem::Wildcard(
+                ast::WildcardAdditionalOptions::default(),
+            )]);
+        }
+        let mut relations: Vec<&TableReference> = vec![];
+        for (qualifier, field) in input.schema().iter() {
+            // An output no relation qualifies — an aggregate's, say — is
+            // addressable only by the name its own scope gives it, which the
+            // shared list cannot see from here.
+            let Some(qualifier) = qualifier else {
+                return not_impl_err!(
+                    "Unparsing a join input that lists none of its columns is only supported when every output of the input is qualified by a relation, but '{}' is not",
+                    field.name()
+                );
+            };
+            if relations.last() != Some(&qualifier) {
+                relations.push(qualifier);
+            }
+        }
+        Ok(relations
+            .into_iter()
+            .map(|relation| {
+                let name = self
+                    .emitted_qualifier(relation)
+                    .into_iter()
+                    .map(|part| self.new_ident_quoted_if_needs(part))
+                    .collect::<Vec<_>>();
+                ast::SelectItem::QualifiedWildcard(
+                    ast::SelectItemQualifiedWildcardKind::ObjectName(
+                        ast::ObjectName::from(name),
+                    ),
+                    ast::WildcardAdditionalOptions::default(),
+                )
+            })
+            .collect())
+    }
+
+    /// Whether every item is a relation's `t.*`: the list reads nothing but
+    /// whole relations, in the order the `FROM` holds them.
+    fn only_whole_relations(items: &[ast::SelectItem]) -> bool {
+        !items.is_empty()
+            && items
+                .iter()
+                .all(|item| matches!(item, ast::SelectItem::QualifiedWildcard(..)))
+    }
+
     // The helpers below keep the join arms' bookkeeping out of
     // `select_to_sql_recursively_inner`: every local there takes a slot in the
     // frame each level of the plan walk pays for, so its size bounds how deep a
@@ -3316,13 +3392,6 @@ impl Unparser<'_> {
                     None
                 };
 
-                let left_projection: Option<Vec<ast::SelectItem>> = if !already_projected
-                {
-                    Some(select.pop_projections())
-                } else {
-                    None
-                };
-
                 let is_exists_join = matches!(
                     join.join_type,
                     JoinType::LeftSemi
@@ -3332,6 +3401,17 @@ impl Unparser<'_> {
                         | JoinType::RightAnti
                         | JoinType::RightMark
                 );
+
+                let left_projection: Option<Vec<ast::SelectItem>> = if !already_projected
+                {
+                    Some(self.join_input_select_items(
+                        left_plan.as_ref(),
+                        is_exists_join,
+                        select,
+                    )?)
+                } else {
+                    None
+                };
 
                 // The build (right) side of an EXISTS-style join is emitted as
                 // a self-contained subquery (see `build_exists_subquery`), so
@@ -3495,7 +3575,11 @@ impl Unparser<'_> {
 
                 let right_projection: Option<Vec<ast::SelectItem>> =
                     if !already_projected && !is_exists_join {
-                        Some(select.pop_projections())
+                        Some(self.join_input_select_items(
+                            right_plan.as_ref(),
+                            false,
+                            select,
+                        )?)
                     } else {
                         None
                     };
@@ -3576,10 +3660,23 @@ impl Unparser<'_> {
                                 return internal_err!("Right projection is missing");
                             };
 
-                            let projection = left_projection
-                                .into_iter()
-                                .chain(right_projection)
-                                .collect();
+                            // Two inputs that each read whole relations read,
+                            // between them, every relation of the `FROM` in
+                            // its order: the plain `*` a scan unparsed on its
+                            // own renders as.
+                            let projection =
+                                if Self::only_whole_relations(&left_projection)
+                                    && Self::only_whole_relations(&right_projection)
+                                {
+                                    vec![ast::SelectItem::Wildcard(
+                                        ast::WildcardAdditionalOptions::default(),
+                                    )]
+                                } else {
+                                    left_projection
+                                        .into_iter()
+                                        .chain(right_projection)
+                                        .collect()
+                                };
                             select.projection(projection);
                         }
                     }
