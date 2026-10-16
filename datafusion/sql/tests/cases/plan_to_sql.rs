@@ -16157,3 +16157,55 @@ fn test_a_compound_sort_key_over_a_computed_alias_above_a_derived_aggregate() ->
     );
     Ok(())
 }
+
+#[test]
+fn test_a_compound_sort_key_on_a_group_column_above_a_derived_aggregate() -> Result<()> {
+    // The limit under the sort moves the aggregate into a derived table, which
+    // hides `t`; the passthrough item and the key that name `t.k` bind to the
+    // derived table's output by its bare name instead.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k FROM (SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
+    );
+
+    // The same with the group column passed through under an alias.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k").alias("k")])?
+        .sort_with_limit(vec![(col("k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k AS k FROM (SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_folded_through_two_projections_of_unaliased_expressions() -> Result<()> {
+    // The inner projection's unaliased expression is read by nobody above; the
+    // sorts still hoist through both projections, so the outer key is emitted on
+    // the scan's own column rather than on a relation a derived table would hide.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a") + col("u.b"), col("u.a"), col("u.b")])?
+        .sort(vec![(col("u.b") + lit(1)).sort(true, true)])?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort_with_limit(vec![(col("u.a") + lit(1)).sort(false, true)], Some(1))?
+        .project(vec![col("u.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.b FROM u ORDER BY (u.a + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}

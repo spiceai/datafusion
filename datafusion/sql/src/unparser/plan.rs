@@ -1580,9 +1580,10 @@ impl Unparser<'_> {
         Ok(select.has_selection())
     }
 
-    /// Unparses a `Limit` as a derived table, so the `WHERE` already on the
-    /// enclosing `SELECT` applies to the limited rows rather than to the rows
-    /// feeding the limit.
+    /// Unparses a `Limit`, or a `Sort` carrying a fetch, as a derived table, so a
+    /// clause already on the enclosing query — its `WHERE`, `ORDER BY` or row
+    /// bound — applies to the limited rows rather than to the rows feeding the
+    /// limit.
     ///
     /// The derived table takes the name of the relation it reads, because the
     /// predicate staying outside is still qualified by that name, and its
@@ -2440,7 +2441,7 @@ impl Unparser<'_> {
                 // (spiceai/spiceai#14733).
                 if let Some(query_ref) = query.as_ref() {
                     have_order_by = query_ref.has_order_by();
-                    if query_ref.has_row_limit() {
+                    if query_ref.bounds_rows() {
                         match query_ref.literal_row_bound() {
                             Some((skip, fetch)) => {
                                 combined_skip = skip;
@@ -2666,6 +2667,38 @@ impl Unparser<'_> {
                                 false,
                             )),
                         }));
+                    }
+                }
+
+                // The chain under this projection is about to become a derived
+                // table (see `fully_absorbed`), which hides the relations its
+                // outputs are qualified by. The items reconstructed above and the
+                // clauses this SELECT already carries — an `ORDER BY` from a sort
+                // above, a `WHERE` from a filter above that — name those outputs
+                // the way the plan does, `t.k`; from outside the derived table
+                // only the bare name binds. A clause holding a subquery is left
+                // alone by the visitors and would keep naming the hidden
+                // relation: refused (spiceai/spiceai#14733).
+                if !fully_absorbed && !select.within_join_input() {
+                    let hidden_qualifiers = enclosed_qualifiers(cur.schema());
+                    let mut repoint = |expr: &mut ast::Expr| {
+                        if let ast::Expr::CompoundIdentifier(idents) = expr {
+                            requalify_column_onto_derived_table(
+                                idents,
+                                &hidden_qualifiers,
+                                None,
+                            );
+                        }
+                    };
+                    let mut skipped =
+                        select.visit_expressions_in_clauses_mut(&mut repoint);
+                    if let Some(query_ref) = query.as_mut() {
+                        skipped |= query_ref.visit_order_by_mut(&mut repoint);
+                    }
+                    if skipped {
+                        return not_impl_err!(
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when a clause above the projection holds a subquery"
+                        );
                     }
                 }
 
@@ -2904,9 +2937,8 @@ impl Unparser<'_> {
                 // derived table takes the scan's own name, which is what the
                 // join's `ON` and the select list already call this input
                 // (spiceai/spiceai#14375).
-                if select.within_join_input()
-                    && (limit.fetch.is_some() || limit.skip.is_some())
-                {
+                let bounded = limit.fetch.is_some() || limit.skip.is_some();
+                if select.within_join_input() && bounded {
                     return self.derive_join_input_limit(plan, select, relation);
                 }
                 // Limit can be top-level plan for derived table
@@ -2919,7 +2951,6 @@ impl Unparser<'_> {
                         vec![],
                     );
                 }
-                let bounded = limit.fetch.is_some() || limit.skip.is_some();
                 if bounded && Self::row_limit_needs_own_scope(plan, select)? {
                     return self.derive_row_limited_scope(plan, select, relation, false);
                 }
@@ -2937,24 +2968,20 @@ impl Unparser<'_> {
                         return self
                             .derive_row_limited_scope(plan, select, relation, true);
                     }
-                    if query_ref.has_row_limit() {
-                        let merged =
-                            match (limit.get_skip_type()?, limit.get_fetch_type()?) {
-                                (SkipType::Literal(skip), FetchType::Literal(fetch)) => {
-                                    query_ref.merge_inner_row_bound(skip, fetch)
-                                }
-                                _ => false,
-                            };
-                        if !merged {
-                            return self
-                                .derive_row_limited_scope(plan, select, relation, false);
+                    if query_ref.bounds_rows() {
+                        if let (SkipType::Literal(skip), FetchType::Literal(fetch)) =
+                            (limit.get_skip_type()?, limit.get_fetch_type()?)
+                            && query_ref.merge_inner_row_bound(skip, fetch)
+                        {
+                            return self.select_to_sql_recursively(
+                                limit.input.as_ref(),
+                                query,
+                                select,
+                                relation,
+                            );
                         }
-                        return self.select_to_sql_recursively(
-                            limit.input.as_ref(),
-                            query,
-                            select,
-                            relation,
-                        );
+                        return self
+                            .derive_row_limited_scope(plan, select, relation, false);
                     }
                 }
                 if let Some(fetch) = &limit.fetch {
@@ -3046,11 +3073,13 @@ impl Unparser<'_> {
                         relation,
                     );
                 }
-                // A bound set above this sort reads the rows its fetch leaves:
-                // the two merge as literals, or the sort keeps its own scope.
+                // A bound set above this sort reads the rows its fetch leaves, so
+                // the two merge as literals. When they cannot, the sort is refused:
+                // `scanned_relation` stops at a sort that is not reordered, because
+                // a derived table around it would drop the order the plan returns.
                 if let Some(fetch) = sort.fetch
                     && let Some(query_ref) = query.as_mut()
-                    && query_ref.has_row_limit()
+                    && query_ref.bounds_rows()
                     && !query_ref.merge_inner_row_bound(0, Some(fetch))
                 {
                     return self.derive_row_limited_scope(plan, select, relation, false);
@@ -3063,7 +3092,7 @@ impl Unparser<'_> {
                 };
 
                 if let Some(fetch) = sort.fetch
-                    && !query_ref.has_row_limit()
+                    && !query_ref.bounds_rows()
                 {
                     query_ref.limit(Some(ast::Expr::value(ast::Value::Number(
                         fetch.to_string(),
