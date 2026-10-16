@@ -16302,3 +16302,45 @@ fn test_a_window_with_a_qualified_alias_as_a_join_input_reads_only_its_input_rel
     );
     Ok(())
 }
+
+#[test]
+fn test_a_sorted_or_distinct_window_as_a_join_input_reads_only_its_input_relations()
+-> Result<()> {
+    // A sort or a `DISTINCT` above the window folds into the same SELECT as the
+    // window, so the input's `*` is still narrowed to what lies below the
+    // window: the alias of a derived input, and never the qualifier of the
+    // window's own output.
+    let derived = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .project(vec![col("u.a")])?
+            .window(vec![row_number_over_u_a().alias("rn")])
+    };
+    let qualified = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .window(vec![row_number_over_u_a().alias_qualified(Some("x"), "rn")])
+    };
+    let joined_to_t = |windowed: LogicalPlan| -> Result<String> {
+        let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+
+    assert_snapshot!(
+        joined_to_t(derived()?.sort(vec![col("rn").sort(true, true)])?.build()?)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true ORDER BY rn ASC NULLS FIRST"
+    );
+    assert_snapshot!(
+        joined_to_t(derived()?.distinct()?.build()?)?,
+        @"SELECT DISTINCT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true"
+    );
+    assert_snapshot!(
+        joined_to_t(qualified()?.sort(vec![col("u.a").sort(true, true)])?.build()?)?,
+        @"SELECT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true ORDER BY u.a ASC NULLS FIRST"
+    );
+    assert_snapshot!(
+        joined_to_t(qualified()?.distinct()?.build()?)?,
+        @"SELECT DISTINCT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true"
+    );
+    Ok(())
+}

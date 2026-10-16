@@ -1365,12 +1365,13 @@ impl Unparser<'_> {
 
     /// One `t.*` per relation the `*` of the input's walk reads, in the plan's
     /// order. That `*` stands for the columns of what lies below the input's
-    /// windows and filters, so the relations are read from there: a window's
-    /// own outputs are named by the explicit items the caller keeps, whatever
-    /// qualifier the plan gives them.
+    /// windows and the operators folded into the same SELECT, so the relations
+    /// are read from there: a window's own outputs are named by the explicit
+    /// items the caller keeps, whatever qualifier the plan gives them.
     fn whole_relation_items(&self, input: &LogicalPlan) -> Result<Vec<ast::SelectItem>> {
-        // Windows and the filters above them fold into the one SELECT (a filter
-        // as its WHERE or QUALIFY). A window whose input the window arm derives
+        // Windows and the filters, sorts and `DISTINCT`s above them fold into
+        // the one SELECT (a filter as its WHERE or QUALIFY, a sort as the
+        // statement's ORDER BY). A window whose input the window arm derives
         // (see `window_input_requires_derived_subquery`) reads that derived
         // table under its alias, not the relations the plan's schema still names.
         let mut cur = input;
@@ -1385,6 +1386,10 @@ impl Unparser<'_> {
                     cur = window.input.as_ref();
                 }
                 LogicalPlan::Filter(filter) => cur = filter.input.as_ref(),
+                LogicalPlan::Sort(sort) => cur = sort.input.as_ref(),
+                LogicalPlan::Distinct(Distinct::All(distinct_input)) => {
+                    cur = distinct_input.as_ref()
+                }
                 _ => break,
             }
         }
