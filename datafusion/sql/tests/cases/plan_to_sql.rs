@@ -16245,3 +16245,60 @@ fn test_a_window_over_a_derived_input_as_a_join_input_reads_the_derived_alias()
     );
     Ok(())
 }
+
+fn row_number_over_u_a() -> Expr {
+    Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        params: WindowFunctionParams {
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![col("u.a").sort(true, true)],
+            window_frame: WindowFrame::new(Some(false)),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }))
+}
+
+#[test]
+fn test_a_filtered_window_over_a_derived_input_as_a_join_input_reads_the_derived_alias()
+-> Result<()> {
+    // A filter above the window leaves the window arm deriving its input as
+    // `derived_window_input`; the input's `*` is narrowed to that alias, not to
+    // the relation hidden inside it.
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a")])?
+        .window(vec![row_number_over_u_a().alias("rn")])?
+        .filter(lit(true))?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true QUALIFY true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_window_with_a_qualified_alias_as_a_join_input_reads_only_its_input_relations()
+-> Result<()> {
+    // The window's output qualified as `x.rn` is named by its own item; `x` is
+    // not a relation of the FROM, so the input's `*` reads only the window's
+    // input relations.
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .window(vec![row_number_over_u_a().alias_qualified(Some("x"), "rn")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true"
+    );
+    Ok(())
+}

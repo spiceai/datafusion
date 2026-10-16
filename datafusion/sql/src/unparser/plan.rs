@@ -1363,23 +1363,33 @@ impl Unparser<'_> {
         Ok(self.qualified_wildcards(&relations))
     }
 
-    /// One `t.*` per relation the input's qualified outputs read, in the
-    /// plan's order; an unqualified output (a window's, an aggregate's) is
-    /// skipped, since the caller keeps the explicit item that names it.
+    /// One `t.*` per relation the `*` of the input's walk reads, in the plan's
+    /// order. That `*` stands for the columns of what lies below the input's
+    /// windows and filters, so the relations are read from there: a window's
+    /// own outputs are named by the explicit items the caller keeps, whatever
+    /// qualifier the plan gives them.
     fn whole_relation_items(&self, input: &LogicalPlan) -> Result<Vec<ast::SelectItem>> {
-        // A window whose input the window arm derives (see
-        // `window_input_requires_derived_subquery`) reads that derived table
-        // under its alias, not the relations the plan's schema still names.
+        // Windows and the filters above them fold into the one SELECT (a filter
+        // as its WHERE or QUALIFY). A window whose input the window arm derives
+        // (see `window_input_requires_derived_subquery`) reads that derived
+        // table under its alias, not the relations the plan's schema still names.
         let mut cur = input;
-        while let LogicalPlan::Window(window) = cur {
-            if Self::window_input_requires_derived_subquery(window.input.as_ref()) {
-                let derived = TableReference::bare(DERIVED_WINDOW_INPUT_ALIAS);
-                return Ok(self.qualified_wildcards(&[&derived]));
+        loop {
+            match cur {
+                LogicalPlan::Window(window) => {
+                    if Self::window_input_requires_derived_subquery(window.input.as_ref())
+                    {
+                        let derived = TableReference::bare(DERIVED_WINDOW_INPUT_ALIAS);
+                        return Ok(self.qualified_wildcards(&[&derived]));
+                    }
+                    cur = window.input.as_ref();
+                }
+                LogicalPlan::Filter(filter) => cur = filter.input.as_ref(),
+                _ => break,
             }
-            cur = window.input.as_ref();
         }
         let mut relations: Vec<&TableReference> = vec![];
-        for (qualifier, _) in input.schema().iter() {
+        for (qualifier, _) in cur.schema().iter() {
             if let Some(qualifier) = qualifier
                 && relations.last() != Some(&qualifier)
             {
