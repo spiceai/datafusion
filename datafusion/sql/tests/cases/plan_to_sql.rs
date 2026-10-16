@@ -15903,3 +15903,202 @@ fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
 
     Ok(())
 }
+
+// A `Sort` or `Limit` stacked under one this SELECT already carries: the query
+// builder holds one `ORDER BY` and one row bound, so the inner node must either
+// fold into them faithfully or take a scope of its own, never overwrite them
+// (spiceai/spiceai#14733).
+
+#[test]
+fn test_a_fetched_sort_over_an_unfetched_sort_keeps_the_outer_keys() -> Result<()> {
+    // The outer sort decides both the order and the rows its fetch keeps; the inner
+    // sort is reordered by it, so it is emitted nowhere.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .sort(vec![col("u.b").sort(true, true)])?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_over_a_volatile_sort_keeps_the_outer_keys() -> Result<()> {
+    // Same stack over a volatile output: dropping the inner sort is also what keeps
+    // `random()` from being drawn a second time in an `ORDER BY`.
+    let plan = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, random() AS r FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_under_an_outer_sort_takes_a_scope_of_its_own() -> Result<()> {
+    // The inner fetch selects its rows before the outer sort orders them, so the
+    // inner sort becomes a derived table and the outer `ORDER BY` reads it.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .sort_with_limit(vec![col("u.b").sort(true, true)], Some(2))?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u ORDER BY u.b ASC NULLS FIRST LIMIT 2) AS u ORDER BY u.a ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_an_outer_sort_takes_a_scope_of_its_own() -> Result<()> {
+    // `LIMIT` is applied after `ORDER BY`, while this plan limits first and sorts
+    // the two survivors: the limit moves into a derived table.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u LIMIT 2) AS u ORDER BY u.a ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_a_sort_under_a_limit_keeps_every_bound() -> Result<()> {
+    // The outer `LIMIT 1` and the `ORDER BY` share this SELECT; the inner limit,
+    // applied before the sort, cannot, so it is the derived table's.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .sort(vec![col("u.a").sort(false, true)])?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u LIMIT 2) AS u ORDER BY u.a DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stacked_limits_combine_as_the_optimizer_combines_them() -> Result<()> {
+    // `Limit(skip 1, fetch 2)` over `Limit(skip 2, fetch 5)`: the outer bound reads
+    // the inner's output, so the skips add and the outer fetch is cut to what the
+    // inner leaves past the outer skip.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(2, Some(5))?
+        .limit(1, Some(2))?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT * FROM u LIMIT 2 OFFSET 3");
+
+    // The outer fetch reaches past the inner one: what the inner leaves is the bound.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .limit(0, Some(5))?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT * FROM u LIMIT 2");
+
+    // The outer fetch is the smaller: it wins.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT * FROM u LIMIT 1");
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_a_non_literal_limit_takes_a_scope_of_its_own() -> Result<()> {
+    // An outer bound that is an expression cannot be merged with the inner one, so
+    // the inner limit keeps its own scope and the outer applies above it.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .limit_by_expr(None, Some(cast(lit(7_i64), DataType::Int32)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u LIMIT 2) AS u LIMIT CAST(7 AS INTEGER)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_unfetched_sort_in_a_join_input_leaves_the_order_above_the_join_alone()
+-> Result<()> {
+    // A join leaves its output order unspecified, so an input's own sort orders
+    // nothing the enclosing query can observe — and must not replace the `ORDER BY`
+    // a sort above the join already set, which decides what its `LIMIT` keeps.
+    let inner = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .sort(vec![col("u.a").sort(false, false)])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join_on(
+            inner,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .sort_with_limit(vec![col("t.a").sort(true, true)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, u.a FROM t INNER JOIN u ON (t.a = u.a) ORDER BY t.a ASC NULLS FIRST LIMIT 3"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_in_a_join_input_bounds_that_input_only() -> Result<()> {
+    // The fetch bounds the input's contribution, not the join's output, so the
+    // sorted input becomes a derived table under the scan's own name.
+    let inner = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .sort_with_limit(vec![col("u.a").sort(false, false)], Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join_on(
+            inner,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, u.a FROM t INNER JOIN (SELECT u.a FROM u ORDER BY u.a DESC NULLS LAST LIMIT 2) AS u ON (t.a = u.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_folded_through_two_projections_keeps_the_outer_keys() -> Result<()> {
+    // The inner projection exposes a column nobody above reads; the sort over it is
+    // still hoisted, so the outer sort's order is the result's rather than a derived
+    // table's, which SQL does not carry out.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort(vec![col("u.b").sort(true, true)])?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort(vec![col("u.a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("u.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a FROM u ORDER BY (u.a + 1) ASC NULLS FIRST"
+    );
+    Ok(())
+}

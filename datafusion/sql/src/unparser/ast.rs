@@ -24,6 +24,18 @@ use sqlparser::ast::{
     visit_expressions_mut,
 };
 
+/// The number a `LIMIT` or `OFFSET` expression names, when it is a plain
+/// numeric literal; an expression such as `CAST(7 AS INTEGER)` is `None`.
+fn literal_usize(expr: &ast::Expr) -> Option<usize> {
+    match expr {
+        ast::Expr::Value(ast::ValueWithSpan {
+            value: ast::Value::Number(number, _),
+            ..
+        }) => number.parse().ok(),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub struct QueryBuilder {
     with: Option<ast::With>,
@@ -79,6 +91,42 @@ impl QueryBuilder {
     }
     pub fn get_order_by(&self) -> Option<OrderByKind> {
         self.order_by_kind.clone()
+    }
+    /// Whether this query already carries an `ORDER BY`. A query holds one, so a
+    /// sort unparsed into it after another has set it is reordered by that one
+    /// and cannot be emitted here as well.
+    pub fn has_order_by(&self) -> bool {
+        self.order_by_kind.is_some()
+    }
+    /// Whether this query already carries a `LIMIT` or an `OFFSET`. Both are
+    /// applied once, after the `ORDER BY`, so a row bound unparsed into it after
+    /// another has set one either merges with that one or needs a scope of its own.
+    pub fn has_row_limit(&self) -> bool {
+        self.limit.is_some() || self.offset.is_some()
+    }
+    /// The row bound this query carries as `(skip, fetch)`: an absent `OFFSET` is a
+    /// skip of 0 and an absent `LIMIT` an unbounded fetch. `None` when either is an
+    /// expression rather than a number, which no other bound can be merged with.
+    pub fn literal_row_bound(&self) -> Option<(usize, Option<usize>)> {
+        let fetch = match &self.limit {
+            None => None,
+            Some(limit) => Some(literal_usize(limit)?),
+        };
+        let skip = match &self.offset {
+            None => 0,
+            Some(offset) => literal_usize(&offset.value)?,
+        };
+        Some((skip, fetch))
+    }
+    /// Replaces this query's row bound with the numbers given; a skip of 0 leaves
+    /// the `OFFSET` out, and no fetch leaves the `LIMIT` out.
+    pub fn set_literal_row_bound(&mut self, skip: usize, fetch: Option<usize>) {
+        self.limit = fetch
+            .map(|fetch| ast::Expr::value(ast::Value::Number(fetch.to_string(), false)));
+        self.offset = (skip > 0).then(|| ast::Offset {
+            rows: ast::OffsetRows::None,
+            value: ast::Expr::value(ast::Value::Number(skip.to_string(), false)),
+        });
     }
     /// Applies `f` to every expression in this query's `ORDER BY`, nested ones
     /// included, so a caller that replaces the relation the `SELECT` reads — unparsing

@@ -276,7 +276,11 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
 
     let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
 
-    if outer_collects == inner_collects {
+    // The inner projection may expose outputs that neither the outer projection
+    // nor the sort reads. Dropping them changes nothing above, and leaving the
+    // sort unhoisted over them puts its `ORDER BY` in a derived table, whose
+    // order SQL does not carry out (spiceai/spiceai#14733).
+    if outer_collects.is_subset(&inner_collects) {
         let mut sort = sort.clone();
         let mut inner_p = inner_p.clone();
 

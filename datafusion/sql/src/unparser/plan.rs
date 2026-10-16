@@ -1578,8 +1578,9 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         select: &mut SelectBuilder,
         relation: &mut RelationBuilder,
+        reordered: bool,
     ) -> Result<()> {
-        let Some(table_ref) = Self::scanned_relation_of(plan) else {
+        let Some(table_ref) = Self::scanned_relation(plan, reordered) else {
             return not_impl_err!(
                 "Unparsing a row limit in a scope of its own is only supported when the limited input is a single table scan"
             );
@@ -1632,21 +1633,52 @@ impl Unparser<'_> {
     /// clauses that neither rename nor add columns and neither reorder nor
     /// combine rows from elsewhere.
     ///
-    /// A `Sort` is deliberately not walked through. It is the one such clause
-    /// whose effect does not survive being wrapped: SQL does not carry a
-    /// derived table's row order into the query selecting from it.
-    fn scanned_relation_of(plan: &LogicalPlan) -> Option<TableReference> {
+    /// A `Sort` is the one such clause whose effect does not survive being
+    /// wrapped: SQL does not carry a derived table's row order into the query
+    /// selecting from it. It is walked through only when `reordered`: where
+    /// the enclosing query re-establishes an order with an `ORDER BY` of its
+    /// own, or where the subtree is a join input, whose order the join leaves
+    /// unspecified. Everywhere else a sort under the limit orders what the
+    /// plan returns, and is what keeps the subtree out of a derived table.
+    fn scanned_relation(plan: &LogicalPlan, reordered: bool) -> Option<TableReference> {
         match plan {
             LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
             LogicalPlan::SubqueryAlias(alias) => {
-                Self::scanned_relation_of(alias.input.as_ref())
+                Self::scanned_relation(alias.input.as_ref(), reordered)
                     .map(|_| alias.alias.clone())
             }
-            LogicalPlan::Limit(limit) => Self::scanned_relation_of(limit.input.as_ref()),
+            LogicalPlan::Limit(limit) => {
+                Self::scanned_relation(limit.input.as_ref(), reordered)
+            }
+            LogicalPlan::Sort(sort) if reordered => {
+                Self::scanned_relation(sort.input.as_ref(), reordered)
+            }
             LogicalPlan::Filter(filter) => {
-                Self::scanned_relation_of(filter.input.as_ref())
+                Self::scanned_relation(filter.input.as_ref(), reordered)
             }
             _ => None,
+        }
+    }
+
+    /// Whether the fold below `projection` (the Projection arm's walk over the
+    /// `Sort`/`Limit` chain under it) leaves a row limit in a derived table of its
+    /// own because this `SELECT` already carries an `ORDER BY`: the chain's first
+    /// fetched `Sort` or `Limit` applies before that order, and the aggregate the
+    /// fold would otherwise claim goes into the derived table with it. A sort key
+    /// above such a projection then names the derived table's output rather than
+    /// the aggregate expression inside it.
+    fn projection_chain_derives_under_order(projection: &Projection) -> bool {
+        let mut cur = projection.input.as_ref();
+        loop {
+            match cur {
+                LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+                    cur = sort.input.as_ref();
+                }
+                LogicalPlan::Sort(_) | LogicalPlan::Limit(_) => {
+                    return find_agg_node_within_select(cur, true).is_some();
+                }
+                _ => return false,
+            }
         }
     }
 
@@ -1671,8 +1703,8 @@ impl Unparser<'_> {
         // projection already above the join, the dialect-alias derived table
         // (`SELECT 1 FROM b LIMIT n`) keeps its cardinality, as before.
         let projects_nothing = plan.schema().fields().is_empty();
-        if Self::scanned_relation_of(plan).is_some() && !projects_nothing {
-            return self.derive_row_limited_scope(plan, select, relation);
+        if Self::scanned_relation(plan, true).is_some() && !projects_nothing {
+            return self.derive_row_limited_scope(plan, select, relation, true);
         }
         if select.already_projected() {
             // The derived table hides every relation inside it, so an output
@@ -2397,6 +2429,28 @@ impl Unparser<'_> {
                 let mut have_direct_limit = false;
                 let mut direct_limit: Option<&datafusion_expr::Limit> = None;
                 let mut have_order_by = false;
+                // A `Sort` or `Limit` above this projection has already set this
+                // query's `ORDER BY` or row bound. The walk starts from that
+                // state, so a node below folds in only where it would have
+                // folded under a node the walk absorbed itself: an unfetched sort
+                // under the order is dropped, a bound under the order stops the
+                // walk, and a literal bound merges with the literal one above
+                // (spiceai/spiceai#14733).
+                if let Some(query_ref) = query.as_ref() {
+                    have_order_by = query_ref.has_order_by();
+                    if query_ref.has_row_limit() {
+                        match query_ref.literal_row_bound() {
+                            Some((skip, fetch)) => {
+                                combined_skip = skip;
+                                combined_fetch = fetch;
+                                have_combined_limit = true;
+                            }
+                            // The bound above is an expression, already emitted:
+                            // nothing below can merge with it.
+                            None => have_direct_limit = true,
+                        }
+                    }
+                }
                 loop {
                     match cur {
                         LogicalPlan::Limit(limit) => {
@@ -2863,10 +2917,50 @@ impl Unparser<'_> {
                         vec![],
                     );
                 }
-                if (limit.fetch.is_some() || limit.skip.is_some())
-                    && Self::row_limit_needs_own_scope(plan, select)?
-                {
-                    return self.derive_row_limited_scope(plan, select, relation);
+                let bounded = limit.fetch.is_some() || limit.skip.is_some();
+                if bounded && Self::row_limit_needs_own_scope(plan, select)? {
+                    return self.derive_row_limited_scope(plan, select, relation, false);
+                }
+                // This query carries one `ORDER BY` and one row bound, both set
+                // by a node above this one, and both applied after everything
+                // below them. A limit under an `ORDER BY` selects its rows before
+                // that order, so it needs a scope of its own; a limit under
+                // another limit is read through it, so the two merge the way the
+                // optimizer merges them, or the inner takes a scope when either
+                // is an expression. Emitting this limit over the one above would
+                // keep the inner bound and lose the outer (spiceai/spiceai#14733).
+                if bounded && let Some(query_ref) = query.as_mut() {
+                    if query_ref.has_order_by() {
+                        return self
+                            .derive_row_limited_scope(plan, select, relation, true);
+                    }
+                    if query_ref.has_row_limit() {
+                        let merged = match (
+                            query_ref.literal_row_bound(),
+                            limit.get_skip_type()?,
+                            limit.get_fetch_type()?,
+                        ) {
+                            (
+                                Some((outer_skip, outer_fetch)),
+                                SkipType::Literal(skip),
+                                FetchType::Literal(fetch),
+                            ) => {
+                                Some(combine_limit(outer_skip, outer_fetch, skip, fetch))
+                            }
+                            _ => None,
+                        };
+                        let Some((skip, fetch)) = merged else {
+                            return self
+                                .derive_row_limited_scope(plan, select, relation, false);
+                        };
+                        query_ref.set_literal_row_bound(skip, fetch);
+                        return self.select_to_sql_recursively(
+                            limit.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
                 }
                 if let Some(fetch) = &limit.fetch {
                     let Some(query) = query.as_mut() else {
@@ -2915,11 +3009,65 @@ impl Unparser<'_> {
                 // carry a derived table's row order out to the query selecting
                 // from it. (A sort without a fetch reorders nothing: `ORDER BY`
                 // is evaluated after `WHERE` either way.)
+                // A join leaves its output order unspecified, so a sort on one of
+                // its inputs orders nothing the enclosing query can observe, and
+                // its `ORDER BY` would only displace one a sort above the join
+                // set. A fetched one bounds that input's contribution, not the
+                // join's output, so it takes a scope of its own under the scan's
+                // name, as a join input's `Limit` does (spiceai/spiceai#14733).
+                if select.within_join_input() {
+                    if sort.fetch.is_some() {
+                        return self.derive_join_input_limit(plan, select, relation);
+                    }
+                    return self.select_to_sql_recursively(
+                        sort.input.as_ref(),
+                        query,
+                        select,
+                        relation,
+                    );
+                }
                 if sort.fetch.is_some() && Self::row_limit_needs_own_scope(plan, select)?
                 {
                     return not_impl_err!(
                         "Unparsing a filter applied after a sort's fetch is not supported"
                     );
+                }
+                // A sort above this one has already set this query's `ORDER BY`
+                // and reorders whatever this sort produces: without a fetch this
+                // sort changes nothing it can observe, and with one its rows are
+                // selected before that order, so it takes a scope of its own.
+                // Emitting it here would replace the outer sort's keys under the
+                // outer sort's fetch (spiceai/spiceai#14733).
+                if query.as_ref().is_some_and(QueryBuilder::has_order_by) {
+                    if sort.fetch.is_some() {
+                        return self
+                            .derive_row_limited_scope(plan, select, relation, true);
+                    }
+                    return self.select_to_sql_recursively(
+                        sort.input.as_ref(),
+                        query,
+                        select,
+                        relation,
+                    );
+                }
+                // A bound set above this sort reads the rows its fetch leaves:
+                // the two merge as literals, or the sort keeps its own scope.
+                if let Some(fetch) = sort.fetch
+                    && query.as_ref().is_some_and(QueryBuilder::has_row_limit)
+                {
+                    let merged = query
+                        .as_ref()
+                        .and_then(QueryBuilder::literal_row_bound)
+                        .map(|(outer_skip, outer_fetch)| {
+                            combine_limit(outer_skip, outer_fetch, 0, Some(fetch))
+                        });
+                    let Some((skip, merged_fetch)) = merged else {
+                        return self
+                            .derive_row_limited_scope(plan, select, relation, false);
+                    };
+                    if let Some(query_ref) = query.as_mut() {
+                        query_ref.set_literal_row_bound(skip, merged_fetch);
+                    }
                 }
 
                 let Some(query_ref) = query else {
@@ -2928,7 +3076,9 @@ impl Unparser<'_> {
                     );
                 };
 
-                if let Some(fetch) = sort.fetch {
+                if let Some(fetch) = sort.fetch
+                    && !query_ref.has_row_limit()
+                {
                     query_ref.limit(Some(ast::Expr::value(ast::Value::Number(
                         fetch.to_string(),
                         false,
@@ -2953,19 +3103,33 @@ impl Unparser<'_> {
                 );
                 let windows: Option<Vec<&Window>> =
                     window_nodes.as_deref().map(|ws| ws.to_vec());
+                // The projection below may leave the chain under it in a derived
+                // table because of this sort's `ORDER BY` (see
+                // `projection_chain_derives_under_order`). The aggregate is then
+                // that table's, and the key stays the reference the plan holds
+                // so it names the table's output rather than the aggregate
+                // expression inside it.
+                let keys_name_derived_outputs = matches!(
+                    sort.input.as_ref(),
+                    LogicalPlan::Projection(projection)
+                        if Self::projection_chain_derives_under_order(projection)
+                );
                 // unproject sort expressions
-                let sort_exprs: Vec<SortExpr> = sort
-                    .expr
-                    .iter()
-                    .map(|sort_expr| {
-                        Self::unproject_sort_expr_in_scope(
-                            sort_expr.clone(),
-                            agg,
-                            windows.as_deref(),
-                            sort.input.as_ref(),
-                        )
-                    })
-                    .collect::<Result<Vec<_>>>()?;
+                let sort_exprs: Vec<SortExpr> = if keys_name_derived_outputs {
+                    sort.expr.clone()
+                } else {
+                    sort.expr
+                        .iter()
+                        .map(|sort_expr| {
+                            Self::unproject_sort_expr_in_scope(
+                                sort_expr.clone(),
+                                agg,
+                                windows.as_deref(),
+                                sort.input.as_ref(),
+                            )
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                };
 
                 query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
 
