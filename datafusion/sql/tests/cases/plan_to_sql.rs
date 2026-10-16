@@ -16222,7 +16222,9 @@ fn test_sort_above_union_names_the_output_column() -> Result<()> {
 
 /// Unqualifying a sort key above a union drops only the relation: a struct
 /// field read through the column keeps its path, or `s.f + 1` would sort by the
-/// top-level column `f` instead.
+/// top-level column `f` instead. That holds when the struct column shares its
+/// name with an input table (`s`), so the struct name is never mistaken for a
+/// relation.
 #[test]
 fn test_sort_above_union_keeps_a_struct_field_path() -> Result<()> {
     let s = Schema::new(vec![
@@ -16234,9 +16236,11 @@ fn test_sort_above_union_keeps_a_struct_field_path() -> Result<()> {
         ),
     ]);
     let key = datafusion_functions::core::expr_fn::get_field(col("t.s"), "f") + lit(1);
-    for union_distinct in [false, true] {
+    for (union_distinct, right_table) in
+        [(false, "w"), (true, "w"), (false, "s"), (true, "s")]
+    {
         let left = table_scan(Some("t"), &s, None)?;
-        let right = table_scan(Some("w"), &s, None)?.build()?;
+        let right = table_scan(Some(right_table), &s, None)?.build()?;
         let union = if union_distinct {
             left.union_distinct(right)?
         } else {
@@ -16252,8 +16256,41 @@ fn test_sort_above_union_keeps_a_struct_field_path() -> Result<()> {
         assert_eq!(
             sql,
             format!(
-                "SELECT f, s FROM (SELECT * FROM t {quantifier} SELECT * FROM w \
+                "SELECT f, s FROM (SELECT * FROM t {quantifier} SELECT * FROM {right_table} \
                  ORDER BY (s.f + 1) ASC NULLS FIRST LIMIT 1)"
+            )
+        );
+    }
+    Ok(())
+}
+
+/// A sort key above a `UNION` names the union's output column alone, even when
+/// its relation is schema-qualified: `"u"."a"` would name a table that is out of
+/// scope there, which `PostgreSQL` rejects.
+#[test]
+fn test_sort_above_union_drops_a_schema_qualified_relation() -> Result<()> {
+    let s = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    for union_distinct in [false, true] {
+        let left = table_scan(Some("public.u"), &s, None)?;
+        let right = table_scan(Some("public.v"), &s, None)?.build()?;
+        let union = if union_distinct {
+            left.union_distinct(right)?
+        } else {
+            left.union(right)?
+        };
+        let plan = union
+            .sort_with_limit(vec![col("public.u.a").sort(true, true)], Some(1))?
+            .build()?;
+        let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        let quantifier = if union_distinct { "UNION" } else { "UNION ALL" };
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT \"a\" FROM (SELECT * FROM \"public\".\"u\" {quantifier} \
+                 SELECT * FROM \"public\".\"v\" ORDER BY \"a\" ASC NULLS FIRST LIMIT 1) \
+                 AS \"derived_sort\""
             )
         );
     }

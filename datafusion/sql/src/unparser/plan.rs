@@ -781,26 +781,6 @@ impl Unparser<'_> {
         }
     }
 
-    /// The relation qualifiers a column of a union's inputs can carry, longest
-    /// first so a schema-qualified one is matched before its bare table name.
-    fn union_input_relations(union: &datafusion_expr::Union) -> Vec<Vec<String>> {
-        let mut relations: Vec<Vec<String>> = union
-            .inputs
-            .iter()
-            .map(|input| input.schema())
-            .chain(std::iter::once(&union.schema))
-            .flat_map(|schema| {
-                schema
-                    .iter()
-                    .filter_map(|(qualifier, _)| qualifier.map(TableReference::to_vec))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        relations.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        relations.dedup();
-        relations
-    }
-
     /// One term of a recursive CTE, carrying any clause its builder collected.
     ///
     /// `select_to_sql_expr` returns the term's body and puts `ORDER BY`, `LIMIT`
@@ -3976,29 +3956,6 @@ impl Unparser<'_> {
                         "UNION ALL operator only valid in a statement context"
                     );
                 };
-                // An `ORDER BY` on the union reads the union's output, which has
-                // column names and no relation to qualify them with: `ORDER BY
-                // u.a` after `u UNION v` names a table that is out of scope. Only
-                // a leading part that spells an input's relation is dropped — the
-                // rest of a compound identifier can be a struct field path
-                // (`s.f`), which still has to be read through.
-                let relations = Self::union_input_relations(union);
-                query.visit_order_by_mut(|expr| {
-                    if let ast::Expr::CompoundIdentifier(idents) = expr
-                        && let Some(relation) = relations.iter().find(|relation| {
-                            idents.len() > relation.len()
-                                && idents
-                                    .iter()
-                                    .zip(relation.iter())
-                                    .all(|(ident, part)| ident.value == *part)
-                        })
-                    {
-                        idents.drain(..relation.len());
-                        if let [column] = idents.as_slice() {
-                            *expr = ast::Expr::Identifier(column.clone());
-                        }
-                    }
-                });
                 query.body(Box::new(union_expr));
 
                 Ok(())
