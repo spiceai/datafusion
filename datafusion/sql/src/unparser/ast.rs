@@ -103,12 +103,18 @@ impl QueryBuilder {
     /// applied once, after the `ORDER BY`, so a row bound unparsed into it after
     /// another has set one either merges with that one or needs a scope of its own.
     pub fn has_row_limit(&self) -> bool {
-        self.limit.is_some() || self.offset.is_some()
+        self.limit.is_some()
+            || self.offset.is_some()
+            || self.fetch.is_some()
+            || !self.limit_by.is_empty()
     }
     /// The row bound this query carries as `(skip, fetch)`: an absent `OFFSET` is a
     /// skip of 0 and an absent `LIMIT` an unbounded fetch. `None` when either is an
     /// expression rather than a number, which no other bound can be merged with.
     pub fn literal_row_bound(&self) -> Option<(usize, Option<usize>)> {
+        if self.fetch.is_some() || !self.limit_by.is_empty() {
+            return None;
+        }
         let fetch = match &self.limit {
             None => None,
             Some(limit) => Some(literal_usize(limit)?),

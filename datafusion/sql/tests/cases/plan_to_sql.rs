@@ -16135,3 +16135,25 @@ fn test_a_limit_under_a_sort_over_an_aggregate_is_refused() -> Result<()> {
     assert_contains!(error.to_string(), "limited input is a single table scan");
     Ok(())
 }
+
+#[test]
+fn test_a_compound_sort_key_over_a_computed_alias_above_a_derived_aggregate() -> Result<()>
+{
+    // The limit under the sort moves the aggregate into a derived table, so the
+    // key must not expand `s` to the aggregate expression — but it must still
+    // substitute the projection's own expression for the alias: inside a compound
+    // key `s` binds to the derived table's column, the un-negated sum, and the
+    // rows the fetch keeps would be the wrong ones.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![(lit(0) - col("s")).alias("s")])?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - s) AS s FROM (SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k LIMIT 2) ORDER BY ((0 - s) + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}

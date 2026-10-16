@@ -3071,51 +3071,54 @@ impl Unparser<'_> {
                     ))));
                 };
 
-                // The projection below may be about to move the aggregate into a
-                // scope of its own. The aggregate is then not this SELECT's, and the
-                // sort key has to stay the reference the plan holds so it names that
-                // scope's output rather than the grouping expression inside it.
-                let agg = if self
-                    .projection_scopes_its_aggregate(sort.input.as_ref(), select)
-                {
-                    None
-                } else {
-                    find_agg_node_within_select(plan, select.already_projected())
-                };
-                let window_nodes = find_window_nodes_within_select(
-                    plan,
-                    None,
-                    select.already_projected(),
-                );
-                let windows: Option<Vec<&Window>> =
-                    window_nodes.as_deref().map(|ws| ws.to_vec());
                 // The projection below may leave the chain under it in a derived
                 // table because of this sort's `ORDER BY` (see
-                // `projection_chain_derives_under_order`). The aggregate is then
-                // that table's, and the key stays the reference the plan holds
-                // so it names the table's output rather than the aggregate
-                // expression inside it.
+                // `projection_chain_derives_under_order`). The aggregate and any
+                // window are then that table's: a key reading their outputs
+                // keeps the reference the plan holds, which names the table's
+                // column, while the projection's own expressions are still
+                // substituted — inside a compound key a bare alias binds to the
+                // table's column rather than to the `SELECT` list's.
                 let keys_name_derived_outputs = matches!(
                     sort.input.as_ref(),
                     LogicalPlan::Projection(projection)
                         if Self::projection_chain_derives_under_order(projection)
                 );
-                // unproject sort expressions
-                let sort_exprs: Vec<SortExpr> = if keys_name_derived_outputs {
-                    sort.expr.clone()
+                // The projection below may be about to move the aggregate into a
+                // scope of its own. The aggregate is then not this SELECT's, and the
+                // sort key has to stay the reference the plan holds so it names that
+                // scope's output rather than the grouping expression inside it.
+                let agg = if keys_name_derived_outputs
+                    || self.projection_scopes_its_aggregate(sort.input.as_ref(), select)
+                {
+                    None
                 } else {
-                    sort.expr
-                        .iter()
-                        .map(|sort_expr| {
-                            Self::unproject_sort_expr_in_scope(
-                                sort_expr.clone(),
-                                agg,
-                                windows.as_deref(),
-                                sort.input.as_ref(),
-                            )
-                        })
-                        .collect::<Result<Vec<_>>>()?
+                    find_agg_node_within_select(plan, select.already_projected())
                 };
+                let window_nodes = if keys_name_derived_outputs {
+                    None
+                } else {
+                    find_window_nodes_within_select(
+                        plan,
+                        None,
+                        select.already_projected(),
+                    )
+                };
+                let windows: Option<Vec<&Window>> =
+                    window_nodes.as_deref().map(|ws| ws.to_vec());
+                // unproject sort expressions
+                let sort_exprs: Vec<SortExpr> = sort
+                    .expr
+                    .iter()
+                    .map(|sort_expr| {
+                        Self::unproject_sort_expr_in_scope(
+                            sort_expr.clone(),
+                            agg,
+                            windows.as_deref(),
+                            sort.input.as_ref(),
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?;
 
                 query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
 
