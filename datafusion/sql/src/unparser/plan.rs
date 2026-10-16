@@ -1211,69 +1211,96 @@ impl Unparser<'_> {
     /// derived table's outputs, which are addressed by bare name.
     ///
     /// A reference whose root names an output the derived table exposes
-    /// unqualified (`t.payload AS t`, read as `t.x`) is a struct access on that
-    /// output and is left alone. Otherwise the relation prefix is dropped as
+    /// unqualified (`t.payload AS t`, read as `t.x`) and whose next part is a
+    /// field of that output is a struct access on it and is left alone; one whose
+    /// next part is no such field (`t.k` beside that output) reads a column of the
+    /// hidden `t`. Otherwise the relation prefix is dropped as
     /// [`requalify_column_onto_derived_table`] drops it, and a longer path
     /// (`t.payload.x`) loses only its relation when the hidden schema confirms
     /// that `payload` is a column of the hidden `t`: a reference to a sibling
     /// relation that merely starts the same way (`t.s.a` under full
     /// qualification) does not match a column of `t` and keeps its qualifier.
+    ///
+    /// Returns `true`, leaving the reference unchanged, when it reads both a
+    /// field of such an output and a column of the hidden relation: outside the
+    /// derived table `t.k` can only be the field, so the column reference has no
+    /// spelling there.
     fn repoint_onto_derived_chain(
         idents: &mut Vec<Ident>,
         hidden_schema: &DFSchema,
         hidden_qualifiers: &HashSet<String>,
-    ) {
+    ) -> bool {
         if idents.len() < 2 {
-            return;
+            return false;
         }
-        let root = idents[0].value.as_str();
-        // Only an output with fields to access (a struct or a map, dictionary
-        // encoded or not) can root a field path: a scalar output named like the
-        // hidden relation (`sum(t.v) AS t`) leaves `t.k` a column of `t`.
-        fn has_fields(data_type: &DataType) -> bool {
-            match data_type {
-                DataType::Struct(_) | DataType::Map(..) => true,
-                DataType::Dictionary(_, value) => has_fields(value),
-                _ => false,
-            }
-        }
-        let root_is_unqualified_output =
-            hidden_schema.iter().any(|(qualifier, field)| {
-                qualifier.is_none()
-                    && field.name() == root
-                    && has_fields(field.data_type())
-            });
-        if root_is_unqualified_output {
-            return;
-        }
-        if idents.len() == 2 {
-            requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
-            return;
-        }
-        for prefix_len in (1..idents.len() - 1).rev() {
-            let qualifier = idents[..prefix_len]
-                .iter()
-                .map(|ident| ident.value.clone())
-                .collect::<Vec<String>>()
-                .join(".");
-            if !hidden_qualifiers.contains(&qualifier) {
-                continue;
-            }
-            let column = idents[prefix_len].value.as_str();
-            let names_a_hidden_column =
+        // The longest prefix of `idents` (shorter than `max_len`) naming a
+        // hidden relation that has a column called by the part after it.
+        let hidden_column_prefix = |idents: &[Ident], max_len: usize| {
+            (1..max_len).rev().find(|&prefix_len| {
+                let qualifier = idents[..prefix_len]
+                    .iter()
+                    .map(|ident| ident.value.clone())
+                    .collect::<Vec<String>>()
+                    .join(".");
+                if !hidden_qualifiers.contains(&qualifier) {
+                    return false;
+                }
+                let column = idents[prefix_len].value.as_str();
                 hidden_schema.iter().any(|(field_qualifier, field)| {
                     field.name() == column
                         && field_qualifier.is_some_and(|field_qualifier| {
                             field_qualifier.to_string() == qualifier
                                 || field_qualifier.table() == qualifier
                         })
-                });
-            if names_a_hidden_column {
-                idents.drain(..prefix_len);
-                return;
+                })
+            })
+        };
+        // Whether an output of this type has a field called `name` to access:
+        // only a struct or a map (dictionary encoded or not) has fields, so a
+        // scalar output named like the hidden relation (`sum(t.v) AS t`) leaves
+        // `t.k` a column of `t`. A map's keys are not in its type, so any part
+        // may be one.
+        fn has_field(data_type: &DataType, name: &str) -> bool {
+            match data_type {
+                DataType::Struct(fields) => {
+                    fields.iter().any(|field| field.name() == name)
+                }
+                DataType::Map(..) => true,
+                DataType::Dictionary(_, value) => has_field(value, name),
+                _ => false,
             }
         }
+        let root = idents[0].value.as_str();
+        let accesses_unqualified_output =
+            hidden_schema.iter().any(|(qualifier, field)| {
+                qualifier.is_none()
+                    && field.name() == root
+                    && has_field(field.data_type(), &idents[1].value)
+            });
+        if accesses_unqualified_output {
+            return hidden_column_prefix(idents, idents.len()).is_some();
+        }
+        if idents.len() == 2 {
+            requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+            return false;
+        }
+        if let Some(prefix_len) = hidden_column_prefix(idents, idents.len() - 1) {
+            idents.drain(..prefix_len);
+            return false;
+        }
         requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+        false
+    }
+
+    /// The expressions of `query`'s `ORDER BY` terms, in order; none when it
+    /// has no `ORDER BY` or orders by `ALL`.
+    fn order_by_terms(query: &QueryBuilder) -> Vec<ast::Expr> {
+        match query.get_order_by() {
+            Some(OrderByKind::Expressions(terms)) => {
+                terms.into_iter().map(|term| term.expr).collect()
+            }
+            _ => vec![],
+        }
     }
 
     /// The topmost `Sort` of the `Sort`/`Limit` chain starting at `plan`: the
@@ -2771,6 +2798,24 @@ impl Unparser<'_> {
                 // (`t.k`, `u.k`) would share one bare name: refused as well
                 // (spiceai/spiceai#14733).
                 if !fully_absorbed && !select.within_join_input() {
+                    // The outputs this projection computes under a name of its
+                    // own. A bare key in this query's `ORDER BY` binds to such
+                    // an output before the derived table's column of that name
+                    // (`ORDER BY s` binding to `(0 - s) AS s`). Compared the way
+                    // the engine compares them, so `(0 - s) AS "S"` captures `s`
+                    // where identifiers fold.
+                    let mut computed_aliases = HashSet::new();
+                    for expr in &p.expr {
+                        if let Expr::Alias(alias) = expr
+                            && !matches!(
+                                alias.expr.as_ref(),
+                                Expr::Column(column) if column.name() == alias.name
+                            )
+                        {
+                            computed_aliases
+                                .insert(self.emitted_column_key(&alias.name)?);
+                        }
+                    }
                     // A row bound the enclosing query carries applies to the
                     // derived table's rows in no particular order, while the
                     // plan applies it to the rows the chain's sort produced.
@@ -2783,23 +2828,8 @@ impl Unparser<'_> {
                         && let Some(sort) = Self::chain_sort(cur)
                     {
                         // The re-established keys name the derived table's
-                        // outputs by bare name; a computed alias of the same
-                        // name in this projection's list would capture them
-                        // (`ORDER BY s` binding to `(0 - s) AS s`).
-                        // Compared the way the engine compares them, so
-                        // `(0 - s) AS "S"` captures `s` where identifiers fold.
-                        let mut computed_aliases = HashSet::new();
-                        for expr in &p.expr {
-                            if let Expr::Alias(alias) = expr
-                                && !matches!(
-                                    alias.expr.as_ref(),
-                                    Expr::Column(column) if column.name() == alias.name
-                                )
-                            {
-                                computed_aliases
-                                    .insert(self.emitted_column_key(&alias.name)?);
-                            }
-                        }
+                        // outputs by bare name, which a computed alias of the
+                        // same name in this projection's list would capture.
                         let mut captured = false;
                         for sort_expr in &sort.expr {
                             for column in sort_expr.expr.column_refs() {
@@ -2845,9 +2875,10 @@ impl Unparser<'_> {
                     }
                     let hidden_schema = cur.schema();
                     let hidden_qualifiers = enclosed_qualifiers(hidden_schema);
+                    let mut ambiguous = false;
                     let mut repoint = |expr: &mut ast::Expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
-                            Self::repoint_onto_derived_chain(
+                            ambiguous |= Self::repoint_onto_derived_chain(
                                 idents,
                                 hidden_schema,
                                 &hidden_qualifiers,
@@ -2856,12 +2887,51 @@ impl Unparser<'_> {
                     };
                     let mut skipped =
                         select.visit_expressions_in_clauses_mut(&mut repoint);
+                    // A sort above this projection already set an `ORDER BY`
+                    // whose whole-term key may be a qualified reference the walk
+                    // turns into a bare name. A computed alias of that name in
+                    // this projection's list then captures it — the alias is
+                    // what a bare `ORDER BY` term binds to first — and the order
+                    // reads the computed output rather than the column the plan
+                    // sorts by (`ORDER BY k` binding to `(0 - k) AS "K"`).
+                    let mut captured = false;
                     if let Some(query_ref) = query.as_mut() {
+                        let qualified_terms = Self::order_by_terms(query_ref)
+                            .iter()
+                            .map(|expr| {
+                                matches!(
+                                    expr,
+                                    ast::Expr::CompoundIdentifier(idents) if idents.len() > 1
+                                )
+                            })
+                            .collect::<Vec<_>>();
                         skipped |= query_ref.visit_order_by_mut(&mut repoint);
+                        for (expr, was_qualified) in
+                            Self::order_by_terms(query_ref).iter().zip(qualified_terms)
+                        {
+                            if let ast::Expr::CompoundIdentifier(idents) = expr
+                                && was_qualified
+                                && let [ident] = idents.as_slice()
+                            {
+                                captured |= computed_aliases.contains(
+                                    &self.identifier_comparison_key(&ident.value),
+                                );
+                            }
+                        }
                     }
                     if skipped {
                         return not_impl_err!(
                             "Unparsing a sort or limit between a projection and its aggregate is not supported when a clause above the projection holds a subquery"
+                        );
+                    }
+                    if ambiguous {
+                        return not_impl_err!(
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when a reference above the projection names both a column of the hidden relation and a field of an output named like that relation"
+                        );
+                    }
+                    if captured {
+                        return not_impl_err!(
+                            "Unparsing a sort above a projection and its aggregate is not supported when the projection computes an output named like a key it re-points onto the derived table"
                         );
                     }
                     // The derived table names every output by the logical name

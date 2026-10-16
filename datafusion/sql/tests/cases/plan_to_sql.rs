@@ -16717,3 +16717,88 @@ fn test_an_expression_bound_above_a_computed_alias_named_like_the_key_is_refused
     );
     Ok(())
 }
+
+#[test]
+fn test_a_group_column_key_beside_a_struct_output_named_like_the_hidden_relation_is_repointed()
+-> Result<()> {
+    // The aggregate exposes both the group column `t.k` and the struct output
+    // `t.payload AS t`, whose only field is `x`. The key `t.k` reads the group
+    // column, not a field of the struct output, so it is repointed onto the
+    // derived table's `k` like any other column of the hidden `t`.
+    let payload = DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.k"), col("t.payload").alias("t")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), col("t"), col("s")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k, t, s FROM (SELECT t.k AS k, t.payload AS t, sum(t.v) AS s FROM t GROUP BY t.k, t.payload LIMIT 2) ORDER BY (k + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_group_column_key_that_is_also_a_field_of_a_struct_output_named_like_the_hidden_relation_is_refused()
+-> Result<()> {
+    // The struct output `t` has a field `k` and the hidden `t` a column `k`:
+    // `t.k` outside the derived table could only read the struct's field, so the
+    // key that reads the column cannot be told apart from it.
+    let payload = DataType::Struct(vec![Field::new("k", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.k"), col("t.payload").alias("t")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), col("t"), col("s")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a key naming both a hidden column and a struct output's field cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "names both a column of the hidden relation and a field of an output"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_above_a_computed_alias_named_like_its_repointed_key_in_another_case_is_refused()
+-> Result<()> {
+    // The key `t.k` is repointed onto the derived table's bare `k`, which the
+    // projection's `(0 - t.k) AS "K"` captures wherever identifiers fold case:
+    // the fetch would keep the row the negated output ranks first.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![(lit(0) - col("t.k")).alias("K"), col("t.k")])?
+        .sort_with_limit(vec![col("t.k").sort(true, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a computed alias capturing a repointed key in another case cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like a key it re-points onto the derived table"
+    );
+    Ok(())
+}
