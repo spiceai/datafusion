@@ -17222,3 +17222,189 @@ fn test_a_flattened_field_path_key_takes_the_prefix_whose_type_has_the_path() ->
     );
     Ok(())
 }
+
+#[test]
+fn test_a_flattened_field_path_key_does_not_read_past_a_map_value_that_has_no_field()
+-> Result<()> {
+    // Relations `t` (struct `s` with path `a.b.c`) and `t.s` (map `a` of int
+    // values): the flattened key `get_field(t.s, 'a', 'b', 'c')` renders as
+    // `t.s.a.b.c`. Through the prefix `t.s`, `a['b']` is an int with no field
+    // `c`, so only the prefix `t` leaves the path the key reads, `s.a.b.c`.
+    let t_s = TableReference::partial("t", "s");
+    let leaf = DataType::Struct(vec![Field::new("c", DataType::Int32, false)].into());
+    let inner = DataType::Struct(vec![Field::new("b", leaf, false)].into());
+    let payload = DataType::Struct(vec![Field::new("a", inner, false)].into());
+    let map = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let t = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let ts = table_scan(
+        Some(t_s.clone()),
+        &Schema::new(vec![Field::new("a", map, false)]),
+        None,
+    )?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(t)
+        .cross_join(ts)?
+        .aggregate(
+            vec![col("t.s"), Expr::Column(Column::new(Some(t_s), "a"))],
+            Vec::<Expr>::new(),
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s")])?
+        .sort_with_limit(
+            vec![
+                (get_field_path(col("t.s"), vec![lit("a"), lit("b"), lit("c")]) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT t.s AS s, t.s.a AS a FROM t CROSS JOIN t.s GROUP BY t.s, t.s.a LIMIT 2) ORDER BY (s.a.b.c + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_flattened_field_path_key_two_relation_prefixes_can_read_is_refused()
+-> Result<()> {
+    // Relations `t` (struct `s` with path `a.b`) and `t.s` (struct `a` with
+    // field `b`): the flattened key `get_field(t.s, 'a', 'b')` renders as
+    // `t.s.a.b`, which both prefixes read as a valid path. Stripping either
+    // could read the other relation's output, so the plan is refused.
+    let t_s = TableReference::partial("t", "s");
+    let inner = DataType::Struct(vec![Field::new("b", DataType::Int32, false)].into());
+    let payload = DataType::Struct(vec![Field::new("a", inner.clone(), false)].into());
+    let t = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let ts = table_scan(
+        Some(t_s.clone()),
+        &Schema::new(vec![Field::new("a", inner, false)]),
+        None,
+    )?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(t)
+        .cross_join(ts)?
+        .aggregate(
+            vec![col("t.s"), Expr::Column(Column::new(Some(t_s), "a"))],
+            Vec::<Expr>::new(),
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s")])?
+        .sort_with_limit(
+            vec![
+                (get_field_path(col("t.s"), vec![lit("a"), lit("b")]) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let err = Unparser::new(&dialect).plan_to_sql(&plan).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("names both a column of the hidden relation"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_output_taking_a_dropped_outputs_name_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // The outer list repeats `x` and declares the copies `z` and `y`, so the
+    // folded projection names the second copy `y`, the name of the inner
+    // `t.b + 1` it drops. The key `y + 1` would then read the copy of `t.a + 1`
+    // by that name instead of being substituted. The fold is skipped.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c").alias("unused"),
+        ])?
+        .sort_with_limit(vec![(col("y") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x, x FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y, t.c AS unused FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_output_taking_a_dropped_outputs_name_still_folds_a_key_not_reading_it()
+-> Result<()> {
+    // As above, the second copy of `x` takes the name `y` of the dropped
+    // `t.b + 1`, but the key reads `x`, which that name does not capture, so
+    // the sort is still hoisted out of the derived table.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c").alias("unused"),
+        ])?
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(3))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (t.a + 1) AS x, (t.a + 1) AS x FROM t ORDER BY ((t.a + 1) + 1) ASC NULLS FIRST LIMIT 3"
+    );
+    Ok(())
+}

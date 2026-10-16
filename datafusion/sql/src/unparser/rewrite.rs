@@ -327,20 +327,48 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // name two outputs alike. Fields that still collide leave the plan
         // unfolded: the outer schema names outputs by the outer list's
         // positions, so the inliner would resolve a key against the wrong one.
+        //
+        // A repeat named by an outer field that is the name of another inner
+        // output (`x` repeated and declared `y` over an inner `y`) keeps that
+        // output from being substituted, so a key reading it by that name would
+        // read the repeat instead. Such a key leaves the plan unfolded too.
         let mut read = HashSet::new();
+        let mut borrowed_names = HashSet::new();
         let fields = p
             .expr
             .iter()
             .enumerate()
             .map(|(i, e)| {
-                let (schema, index) = match position.get(&e.to_string()) {
-                    Some(&k) if read.insert(k) => (&inner_p.schema, k),
+                let reads = position.get(&e.to_string()).copied();
+                let (schema, index) = match reads {
+                    Some(k) if read.insert(k) => (&inner_p.schema, k),
                     _ => (&p.schema, i),
                 };
-                let (qualifier, _) = schema.qualified_field(index);
+                let (qualifier, field) = schema.qualified_field(index);
+                if std::ptr::eq(schema, &p.schema)
+                    && inner_p
+                        .schema
+                        .fields()
+                        .iter()
+                        .enumerate()
+                        .any(|(k, inner)| {
+                            inner.name() == field.name() && Some(k) != reads
+                        })
+                {
+                    borrowed_names.insert(field.name().clone());
+                }
                 (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
             })
             .collect::<Vec<_>>();
+        let key_reads_borrowed_name =
+            sort.expr.iter().any(|sort_expr| {
+                sort_expr.expr.column_refs().iter().any(|col| {
+                    col.relation.is_none() && borrowed_names.contains(col.name())
+                })
+            });
+        if key_reads_borrowed_name {
+            return None;
+        }
         let schema = Arc::new(
             DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
                 .ok()?,

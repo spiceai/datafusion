@@ -1306,8 +1306,9 @@ impl Unparser<'_> {
             }
         }
         // Whether `path` names a field of `data_type`, a field of that, and so
-        // on. Past a map every part may be a key, and `get_field` accepts a
-        // NULL base, answering NULL, whatever the path.
+        // on. A map's part may be any key, and the rest of the path has to be a
+        // field path of the map's value type; `get_field` accepts a NULL base,
+        // answering NULL, whatever the path.
         fn has_field_path(data_type: &DataType, path: &[Ident]) -> bool {
             let Some((first, rest)) = path.split_first() else {
                 return true;
@@ -1317,7 +1318,13 @@ impl Unparser<'_> {
                     .iter()
                     .find(|field| field.name() == &first.value)
                     .is_some_and(|field| has_field_path(field.data_type(), rest)),
-                DataType::Map(..) | DataType::Null => true,
+                DataType::Map(entries, _) => match entries.data_type() {
+                    DataType::Struct(fields) => fields
+                        .get(1)
+                        .is_some_and(|value| has_field_path(value.data_type(), rest)),
+                    _ => false,
+                },
+                DataType::Null => true,
                 DataType::Dictionary(_, value) => has_field_path(value, path),
                 _ => false,
             }
@@ -1356,6 +1363,14 @@ impl Unparser<'_> {
             return false;
         }
         if let Some(prefix_len) = field_path_prefix {
+            // A shorter prefix naming another hidden relation whose column has
+            // the rest of the parts as a field path reads the reference as
+            // validly (`t.s.a.b`, both the path `a.b` of `t`'s struct `s` and
+            // the field `b` of `t.s`'s struct `a`): stripping either prefix may
+            // read the other relation's output, so it has no spelling here.
+            if hidden_column_prefix(idents, prefix_len).is_some() {
+                return true;
+            }
             idents.drain(..prefix_len);
             return false;
         }
