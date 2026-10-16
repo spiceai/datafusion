@@ -15301,6 +15301,69 @@ fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_bu
 }
 
 #[test]
+fn test_sort_key_reading_a_volatile_output_below_an_unfolded_exists_projection_is_left_out()
+-> Result<()> {
+    // The build side's own projection, `k, (k + 1) AS b`, computes an expression,
+    // so the sort fold leaves it in place and the sort below it is reached by a
+    // SELECT that is already projected, which unparses it as a derived table with
+    // a builder of its own. The body is still unbounded, so the sort's order
+    // reaches nothing and is left out there as it is everywhere else in an EXISTS
+    // body, rather than scoped (or, on a dialect that cannot take the scope,
+    // refused) as though its order could be observed. The correlation reads `k`,
+    // which the derived table exposes.
+    let schema = int32_schema(&["a"]);
+    let build = || -> Result<LogicalPlan> {
+        table_scan(Some("u"), &schema, Some(vec![0]))?
+            .project(vec![col("u.a").alias("k"), random().alias("r")])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .project(vec![col("k"), col("k").add(lit(1)).alias("b")])?
+            .build()
+    };
+    for (join_type, exists) in [
+        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
+        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
+    ] {
+        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+            .join_on(build()?, join_type, vec![col("t.a").eq(col("k"))])?
+            .build()?;
+        let cases: [(&dyn UnparserDialect, String); 4] = [
+            (
+                &DefaultDialect {},
+                format!(
+                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM (SELECT u.a AS k, random() AS r FROM u) WHERE (t.a = k))"
+                ),
+            ),
+            (
+                &SqliteDialect {},
+                format!(
+                    "SELECT `t`.`a` FROM `t` WHERE {exists} (SELECT 1 FROM (SELECT `u`.`a` AS `k`, random() AS `r` FROM `u`) WHERE (`t`.`a` = `k`))"
+                ),
+            ),
+            (
+                &UnparserMySqlDialect {},
+                format!(
+                    "SELECT `t`.`a` FROM `t` WHERE {exists} (SELECT 1 FROM (SELECT `u`.`a` AS `k`, random() AS `r` FROM `u`) AS `derived_projection` WHERE (`t`.`a` = `k`))"
+                ),
+            ),
+            (
+                &UnparserPostgreSqlDialect {},
+                format!(
+                    r#"SELECT "t"."a" FROM "t" WHERE {exists} (SELECT 1 FROM (SELECT "u"."a" AS "k", random() AS "r" FROM "u") AS "derived_projection" WHERE ("t"."a" = "k"))"#
+                ),
+            ),
+        ];
+        for (dialect, expected) in cases {
+            assert_eq!(
+                Unparser::new(dialect).plan_to_sql(&plan)?.to_string(),
+                expected,
+                "{join_type:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_out() -> Result<()> {
     // A join leaves its output order unspecified, so the order of one of its inputs
     // reaches nothing: not the rows, not their order, and not which rows a LIMIT

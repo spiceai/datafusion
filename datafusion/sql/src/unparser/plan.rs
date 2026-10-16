@@ -3202,6 +3202,24 @@ impl Unparser<'_> {
             LogicalPlan::Sort(sort) => {
                 // Sort can be top-level plan for derived table
                 if select.already_projected() {
+                    // The derived table is unparsed with a builder of its own,
+                    // which no longer knows this SELECT is an EXISTS body or a
+                    // join input, so it would take the sort's order as observable
+                    // and scope a key reading an output that cannot be repeated,
+                    // or refuse it on a dialect that cannot take the scope. Decide
+                    // here, as the scoping below does: where the order reaches
+                    // nothing, the sort is left out.
+                    if sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
+                        .is_some()
+                        && !Self::sort_order_is_observable(sort.fetch, query, select)
+                    {
+                        return self.select_to_sql_recursively(
+                            sort.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
                     return self.derive_with_dialect_alias(
                         DERIVED_SORT_ALIAS,
                         plan,
