@@ -16344,3 +16344,64 @@ fn test_a_sorted_or_distinct_window_as_a_join_input_reads_only_its_input_relatio
     );
     Ok(())
 }
+
+#[test]
+fn test_a_window_under_a_semi_or_anti_join_as_a_join_input_reads_only_its_input_relations()
+-> Result<()> {
+    // A semi or anti join forwards its probe's list, `*` and the window item
+    // included, so the `*` is narrowed to what lies below the probe's window:
+    // the alias of a derived input, and never the qualifier of the window's own
+    // output. The probe is the right input of a RIGHT SEMI or RIGHT ANTI join.
+    let derived = || -> Result<LogicalPlan> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .project(vec![col("u.a")])?
+            .window(vec![row_number_over_u_a().alias("rn")])?
+            .build()
+    };
+    let qualified = || -> Result<LogicalPlan> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .window(vec![row_number_over_u_a().alias_qualified(Some("x"), "rn")])?
+            .build()
+    };
+    let v = || -> Result<LogicalPlan> {
+        table_scan(Some("v"), &int32_schema(&["c"]), None)?.build()
+    };
+    let joined_to_t = |input: LogicalPlan| -> Result<String> {
+        let plan = LogicalPlanBuilder::from(input)
+            .join_on(
+                table_scan(Some("t"), &int32_schema(&["d"]), None)?.build()?,
+                datafusion_expr::JoinType::Inner,
+                vec![lit(true)],
+            )?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+    let semi = |probe: LogicalPlan, join_type| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(probe)
+            .join_on(v()?, join_type, vec![lit(true)])?
+            .build()
+    };
+    let right_semi = |probe: LogicalPlan, join_type| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(v()?)
+            .join_on(probe, join_type, vec![lit(true)])?
+            .build()
+    };
+
+    assert_snapshot!(
+        joined_to_t(semi(derived()?, datafusion_expr::JoinType::LeftSemi)?)?,
+        @"SELECT derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM (SELECT u.a FROM u) AS derived_window_input INNER JOIN t ON true WHERE EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    assert_snapshot!(
+        joined_to_t(semi(qualified()?, datafusion_expr::JoinType::LeftAnti)?)?,
+        @"SELECT u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM u INNER JOIN t ON true WHERE NOT EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    assert_snapshot!(
+        joined_to_t(right_semi(derived()?, datafusion_expr::JoinType::RightAnti)?)?,
+        @"SELECT derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM (SELECT u.a FROM u) AS derived_window_input INNER JOIN t ON true WHERE NOT EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    assert_snapshot!(
+        joined_to_t(right_semi(qualified()?, datafusion_expr::JoinType::RightSemi)?)?,
+        @"SELECT u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM u INNER JOIN t ON true WHERE EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    Ok(())
+}

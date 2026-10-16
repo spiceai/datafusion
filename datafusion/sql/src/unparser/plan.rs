@@ -1369,9 +1369,10 @@ impl Unparser<'_> {
     /// are read from there: a window's own outputs are named by the explicit
     /// items the caller keeps, whatever qualifier the plan gives them.
     fn whole_relation_items(&self, input: &LogicalPlan) -> Result<Vec<ast::SelectItem>> {
-        // Windows and the filters, sorts and `DISTINCT`s above them fold into
-        // the one SELECT (a filter as its WHERE or QUALIFY, a sort as the
-        // statement's ORDER BY). A window whose input the window arm derives
+        // Windows and the filters, sorts, `DISTINCT`s and semi or anti joins
+        // above them fold into the one SELECT (a filter as its WHERE or
+        // QUALIFY, a sort as the statement's ORDER BY, a semi or anti join as an
+        // `EXISTS`). A window whose input the window arm derives
         // (see `window_input_requires_derived_subquery`) reads that derived
         // table under its alias, not the relations the plan's schema still names.
         let mut cur = input;
@@ -1390,6 +1391,15 @@ impl Unparser<'_> {
                 LogicalPlan::Distinct(Distinct::All(distinct_input)) => {
                     cur = distinct_input.as_ref()
                 }
+                // A semi or anti join lists only its probe side, whose list it
+                // forwards as it was set (see `Self::swaps_join_inputs`).
+                LogicalPlan::Join(join) => match join.join_type {
+                    JoinType::LeftSemi | JoinType::LeftAnti => cur = join.left.as_ref(),
+                    JoinType::RightSemi | JoinType::RightAnti => {
+                        cur = join.right.as_ref()
+                    }
+                    _ => break,
+                },
                 _ => break,
             }
         }
