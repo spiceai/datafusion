@@ -16377,3 +16377,51 @@ fn test_a_sort_key_reading_a_dropped_volatile_output_keeps_the_sort_in_its_scope
     );
     Ok(())
 }
+
+#[test]
+fn test_a_dropped_alias_reading_a_same_named_output_below_is_substituted_once()
+-> Result<()> {
+    // `(s + 1) AS s` reads the aggregate's own `s`; the substitution must not
+    // walk into its replacement and substitute that `s` again.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .project(vec![
+            col("t.k"),
+            (col("s") + lit(1)).alias("s"),
+            col("t.k").alias("unused"),
+        ])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(1))?
+        .project(vec![col("t.k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.k FROM t GROUP BY t.k ORDER BY (sum(t.v) + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_key_reading_a_projected_integer_literal_is_dropped_from_the_fold()
+-> Result<()> {
+    // Substituted, the key would be the bare `1`, which `ORDER BY` reads as the
+    // first select item; a constant orders nothing, so the key is dropped and
+    // the remaining key decides.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a"), col("u.b"), lit(1), col("u.c")])?
+        .sort_with_limit(
+            vec![
+                col("Int32(1)").sort(true, true),
+                col("u.b").sort(true, true),
+            ],
+            Some(1),
+        )?
+        .project(vec![col("u.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a FROM u ORDER BY u.b ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}

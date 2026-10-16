@@ -356,10 +356,12 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 }
                 // Substitute nested references too, not just a whole-expression
                 // one: `ORDER BY x + 1` over a dropped `expr AS x` has to become
-                // `ORDER BY expr + 1`.
+                // `ORDER BY expr + 1`. Bottom-up, so the substituted expression
+                // is not walked again: `(s + 1) AS s` reads an `s` of the scope
+                // below, which a top-down walk would substitute without end.
                 sort_expr.expr = expr
                     .clone()
-                    .transform_down(|e| {
+                    .transform_up(|e| {
                         Ok(match &e {
                             // Only an unqualified column can name a projection
                             // output: `t.x` refers to `t`'s own column even when a
@@ -376,6 +378,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                         })
                     })
                     .map_or(expr, |transformed| transformed.data);
+            }
+            // A key that is now a literal orders nothing, and an integer literal
+            // in `ORDER BY` would be read as a column position. Such a key is
+            // dropped; a sort left with no key is not folded.
+            sort.expr
+                .retain(|sort_expr| !matches!(sort_expr.expr, Expr::Literal(..)));
+            if sort.expr.is_empty() {
+                return None;
             }
         }
 
