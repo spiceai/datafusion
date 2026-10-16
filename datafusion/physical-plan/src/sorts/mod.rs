@@ -17,6 +17,7 @@
 
 //! Sort functionalities
 
+mod batch_compaction;
 mod builder;
 mod cursor;
 mod merge;
