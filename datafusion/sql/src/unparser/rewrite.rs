@@ -26,6 +26,7 @@ use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::Ident;
 
+use super::Unparser;
 use super::utils::output_is_repeatable;
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
@@ -378,11 +379,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             .iter()
             .map(|field| field.name().clone())
             .collect::<Vec<_>>();
+        // An unnamed kept expression is read by its declared field, not by the
+        // name its expression spells: a dropped output declared under that
+        // spelling (`t.c + 1` declared `t.a + t.b`) is still dropped.
         let kept_names: HashSet<String> = new_exprs
             .iter()
-            .map(|e| match e {
-                Expr::Alias(alias) => alias.name.clone(),
-                other => other.schema_name().to_string(),
+            .filter_map(|e| match e {
+                Expr::Alias(alias) => Some(alias.name.clone()),
+                _ => None,
             })
             .chain(declared_names.iter().cloned())
             .collect();
@@ -427,7 +431,12 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // captures a substituted `c` the same way; a plain column kept under
         // its own name is the column the substitution reads. An unqualified
         // outer reference renders by its bare name too, so any output the fold
-        // keeps under that name captures it the same way.
+        // keeps under that name captures it the same way. A qualified read is
+        // safe while its relation stays in scope, but an aggregate over a
+        // derived projection renders `t.k` as the bare `k`. A key that is that
+        // bare name alone binds to the kept `(0 - t.k) AS k`; inside a compound
+        // key (`k + 1`) the name reads the input column, so that key folds.
+        let qualifiers_stripped = aggregate_scope_strips_qualifiers(&inner_p.input);
         let kept_aliases: HashSet<&str> = new_exprs
             .iter()
             .zip(&declared_names)
@@ -446,11 +455,17 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             })
             .collect();
         let substitution_shadowed = sort.expr.iter().any(|sort_expr| {
+            let mut key = &sort_expr.expr;
+            while let Expr::Alias(alias) = key {
+                key = &alias.expr;
+            }
+            let bare_key = matches!(key, Expr::Column(_));
             sort_expr.expr.column_refs().iter().any(|col| {
                 col.relation.is_none()
                     && dropped_outputs.get(col.name()).is_some_and(|underlying| {
                         underlying.column_refs().iter().any(|read| {
-                            read.relation.is_none() && kept_aliases.contains(read.name())
+                            (read.relation.is_none() || (qualifiers_stripped && bare_key))
+                                && kept_aliases.contains(read.name())
                         }) || reads_outer_reference_named_in(underlying, &declared_names)
                     })
             })
@@ -511,6 +526,28 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         Some(LogicalPlan::Sort(sort))
     } else {
         None
+    }
+}
+
+/// Whether `plan` renders in the scope of an aggregate whose input is a derived
+/// projection, where the unparser strips the qualifiers of the aggregate's
+/// expressions (see `UnparserAggScope`).
+fn aggregate_scope_strips_qualifiers(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(agg) => {
+            Unparser::contains_projection_before_relation(&agg.input)
+        }
+        LogicalPlan::Projection(_)
+        | LogicalPlan::TableScan(_)
+        | LogicalPlan::Subquery(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::EmptyRelation(_)
+        | LogicalPlan::Values(_) => false,
+        _ => matches!(
+            plan.inputs().as_slice(),
+            [input] if aggregate_scope_strips_qualifiers(input)
+        ),
     }
 }
 

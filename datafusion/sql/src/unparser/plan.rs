@@ -1083,7 +1083,7 @@ impl Unparser<'_> {
         }
     }
 
-    fn contains_projection_before_relation(plan: &LogicalPlan) -> bool {
+    pub(super) fn contains_projection_before_relation(plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::Projection(_) => true,
             LogicalPlan::TableScan(_)

@@ -17408,3 +17408,120 @@ fn test_a_repeated_output_taking_a_dropped_outputs_name_still_folds_a_key_not_re
     );
     Ok(())
 }
+
+#[test]
+fn test_an_unnamed_output_declared_under_another_name_is_substituted_by_its_field()
+-> Result<()> {
+    // The inner projection declares `t.a + t.b` as `x` and `t.c + 1` under the
+    // field name `t.a + t.b`. The key reads the second output by that field
+    // name; the fold keeps only `x`, so the key must be substituted with
+    // `t.c + 1`, not left reading a name the first output's expression spells.
+    let input =
+        table_scan(Some("t"), &int32_schema(&["a", "b", "c", "d"]), None)?.build()?;
+    let inner_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("x", DataType::Int32, false),
+            Field::new("t.a + t.b", DataType::Int32, false),
+            Field::new("unused", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![col("t.a") + col("t.b"), col("t.c") + lit(1), col("t.d")],
+        Arc::new(input),
+        Arc::new(inner_schema),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort_with_limit(
+            vec![Expr::Column(Column::new_unqualified("t.a + t.b")).sort(true, true)],
+            Some(1),
+        )?
+        .project(vec![col("x")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (t.a + t.b) FROM t ORDER BY (t.c + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_unqualified_by_a_derived_aggregate_scope_keeps_the_sort()
+-> Result<()> {
+    // `x` is `t.k` over an aggregate that reads a derived projection, so the
+    // aggregate scope renders the substituted key as the bare `k`, which the
+    // kept `(0 - t.k) AS k` would capture. The fold is skipped.
+    let agg = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(agg)
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+            col("s"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k FROM (SELECT (0 - k) AS k, k AS x, sum(v) AS s FROM (SELECT t.k, t.v FROM t) GROUP BY k ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_over_a_join_still_folds() -> Result<()> {
+    // `x` is `t.k` over a join that keeps `t` in scope, so the substituted
+    // `t.k` keeps its qualifier and the kept `(0 - t.k) AS k` cannot capture
+    // it. The sort is hoisted, and the two same-named `v` columns stay apart.
+    let u = table_scan(Some("u"), &int32_schema(&["v"]), None)?.build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .cross_join(u)?
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+            col("t.v"),
+            col("u.v"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k"), col("t.v"), col("u.v")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - t.k) AS k, t.v, u.v FROM t CROSS JOIN u ORDER BY t.k ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_in_a_compound_key_over_a_derived_aggregate_still_folds()
+-> Result<()> {
+    // As above, but the key is `x + 1`. Inside an expression the bare `k`
+    // reads the input column, not the kept `(0 - t.k) AS k`, so the sort is
+    // still hoisted out of the derived table.
+    let agg = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(agg)
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+            col("s"),
+        ])?
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - k) AS k FROM (SELECT t.k, t.v FROM t) GROUP BY k ORDER BY (k + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
