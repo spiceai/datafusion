@@ -2892,6 +2892,11 @@ impl Unparser<'_> {
                             );
                         }
                         query_ref.order_by(self.sorts_to_sql(&sort.expr)?);
+                        // Its outer references render as bare names too, and
+                        // are checked against the derived outputs below.
+                        query_ref.set_order_by_outer_references(outer_reference_names(
+                            sort.expr.iter().map(|sort_expr| &sort_expr.expr),
+                        )?);
                     }
                     // Names are compared the way the engine compares them, so
                     // `k` and `K` collide where identifiers fold case.
