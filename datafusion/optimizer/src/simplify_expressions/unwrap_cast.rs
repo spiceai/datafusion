@@ -60,8 +60,8 @@ use datafusion_common::{internal_err, tree_node::Transformed};
 use datafusion_expr::{BinaryExpr, lit};
 use datafusion_expr::{Cast, Expr, Operator, TryCast, simplify::SimplifyContext};
 use datafusion_expr_common::casts::{
-    is_date_narrowing_cast, is_supported_type, is_timestamp_precision_narrowing_cast,
-    try_cast_literal_to_type,
+    is_date_narrowing_cast, is_decimal_scale_narrowing_cast, is_supported_type,
+    is_timestamp_precision_narrowing_cast, try_cast_literal_to_type,
 };
 
 pub(super) fn unwrap_cast_in_comparison_for_binary(
@@ -137,6 +137,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
 
             if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
                 || is_date_narrowing_cast(&expr_type, field.data_type())
+                || is_decimal_scale_narrowing_cast(&expr_type, field.data_type())
             {
                 return false;
             }
@@ -182,6 +183,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
 
     if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
         || is_date_narrowing_cast(&expr_type, field.data_type())
+        || is_decimal_scale_narrowing_cast(&expr_type, field.data_type())
     {
         return false;
     }
@@ -429,26 +431,48 @@ mod tests {
     }
 
     #[test]
-    fn test_unwrap_cast_with_decimal_lit_comparison() {
+    fn test_not_unwrap_cast_decimal_scale_narrowing() {
         let schema = expr_test_schema();
-        // integer to decimal
-        // c3 < INT64(16) -> c3 < (CAST(INT64(16) AS DECIMAL(18,2));
+        // c3 is DECIMAL(18, 2). Casting it to an integer truncates its two
+        // fractional digits, so `CAST(c3 AS BIGINT) = 173665` matches every c3
+        // in [173665, 173666) and must not become `c3 = 173665.00`
+        // (apache/datafusion#23095).
+        let expr_eq = cast(col("c3"), DataType::Int64).eq(lit(173665i64));
+        assert_eq!(optimize_test(expr_eq.clone(), &schema), expr_eq);
+
+        let expr_in = cast(col("c3"), DataType::Int64)
+            .in_list(vec![lit(173665i64), lit(173666i64)], false);
+        assert_eq!(optimize_test(expr_in.clone(), &schema), expr_in);
+
+        // Range operators are not exempt: `CAST(c3 AS BIGINT) <= 16` holds for
+        // 16.50 and `c3 <= 16.00` does not, and `< 0` disagrees on -0.50.
+        let expr_lt_eq = cast(col("c3"), DataType::Int64).lt_eq(lit(16i64));
+        assert_eq!(optimize_test(expr_lt_eq.clone(), &schema), expr_lt_eq);
+
+        let expr_lt_zero = cast(col("c3"), DataType::Int64).lt(lit(0i64));
+        assert_eq!(optimize_test(expr_lt_zero.clone(), &schema), expr_lt_zero);
+
         let expr_lt = try_cast(col("c3"), DataType::Int64).lt(lit(16i64));
-        let expected = col("c3").lt(lit_decimal(1600, 18, 2));
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
-        // c3 < INT64(NULL)
-        let c1_lt_lit_null = cast(col("c3"), DataType::Int64).lt(null_i64());
-        let expected = null_bool();
-        assert_eq!(optimize_test(c1_lt_lit_null, &schema), expected);
-
-        // decimal to decimal
-        // c3 < Decimal(123,10,0) -> c3 < CAST(DECIMAL(123,10,0) AS DECIMAL(18,2)) -> c3 < DECIMAL(12300,18,2)
+        // A decimal of smaller scale rounds the same way.
         let expr_lt =
             cast(col("c3"), DataType::Decimal128(10, 0)).lt(lit_decimal(123, 10, 0));
-        let expected = col("c3").lt(lit_decimal(12300, 18, 2));
-        assert_eq!(optimize_test(expr_lt, &schema), expected);
+        assert_eq!(optimize_test(expr_lt.clone(), &schema), expr_lt);
 
+        let expr_eq =
+            cast(col("c3"), DataType::Decimal128(18, 1)).eq(lit_decimal(1236, 18, 1));
+        assert_eq!(optimize_test(expr_eq.clone(), &schema), expr_eq);
+
+        // A NULL literal still folds: the comparison is NULL whatever the cast does.
+        let c3_lt_lit_null = cast(col("c3"), DataType::Int64).lt(null_i64());
+        assert_eq!(optimize_test(c3_lt_lit_null, &schema), null_bool());
+    }
+
+    #[test]
+    fn test_unwrap_cast_with_decimal_lit_comparison() {
+        let schema = expr_test_schema();
+        // decimal to decimal of a larger scale is injective
         // c3 < Decimal(1230,10,3) -> c3 < CAST(DECIMAL(1230,10,3) AS DECIMAL(18,2)) -> c3 < DECIMAL(123,18,2)
         let expr_lt =
             cast(col("c3"), DataType::Decimal128(10, 3)).lt(lit_decimal(1230, 10, 3));

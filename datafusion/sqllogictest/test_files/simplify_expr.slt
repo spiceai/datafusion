@@ -449,3 +449,139 @@ select id from date_unwrap where cast(d64 as date) = DATE '1970-01-01' order by 
 
 statement ok
 drop table date_unwrap;
+
+# ------------------------------------------------------------------------
+# Unwrapping a decimal cast in comparison predicates.
+#
+# A decimal with fractional digits cast to an integer truncates them, and a
+# cast to a decimal of smaller scale rounds them, so both casts map many
+# column values to one target value. `CAST(price AS BIGINT) = 173665` over a
+# `DECIMAL(15, 2)` column matches every price in [173665, 173666) and must NOT
+# be rewritten to `price = 173665.00`, which matches one value
+# (apache/datafusion#23095). Casting to a decimal of larger scale is injective
+# and still folds onto the bare column.
+statement ok
+create table decimal_unwrap(k int, price decimal(15, 2)) as values
+  (1, 173664.94),
+  (2, 173665.29),
+  (3, 173665.47),
+  (4, 173665.73),
+  (5, 173665.91),
+  (6, 173666.04),
+  (7, 205623.50),
+  (8, 193846.25),
+  (9, NULL);
+
+query IRI
+select k, price, cast(price as bigint) as p from decimal_unwrap order by k;
+----
+1 173664.94 173664
+2 173665.29 173665
+3 173665.47 173665
+4 173665.73 173665
+5 173665.91 173665
+6 173666.04 173666
+7 205623.5 205623
+8 193846.25 193846
+9 NULL NULL
+
+# --- Narrowing decimal -> integer: must NOT fold (soundness) ---------------
+query TT
+explain select k from decimal_unwrap where cast(price as bigint) = 173665;
+----
+logical_plan
+01)Projection: decimal_unwrap.k
+02)--Filter: CAST(decimal_unwrap.price AS Int64) = Int64(173665)
+03)----TableScan: decimal_unwrap projection=[k, price]
+physical_plan
+01)FilterExec: CAST(price@1 AS Int64) = 173665, projection=[k@0]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+query I
+select k from decimal_unwrap where cast(price as bigint) = 173665 order by k;
+----
+2
+3
+4
+5
+
+query I
+select k from decimal_unwrap where cast(price as bigint) > 173664 and cast(price as bigint) < 173666 order by k;
+----
+2
+3
+4
+5
+
+# `<=` disagrees with the folded form on 173665.29 .. 173665.91, and `>` on
+# the same rows the other way: `price > 173665.00` would also keep 2 .. 5.
+query I
+select k from decimal_unwrap where cast(price as bigint) <= 173665 order by k;
+----
+1
+2
+3
+4
+5
+
+query I
+select k from decimal_unwrap where cast(price as bigint) > 173665 order by k;
+----
+6
+7
+8
+
+query I
+select k from decimal_unwrap where cast(price as int) in (173665) order by k;
+----
+2
+3
+4
+5
+
+# --- Narrowing decimal -> decimal of smaller scale: must NOT fold ---------
+query TT
+explain select k from decimal_unwrap where cast(price as decimal(15, 0)) = 173665;
+----
+logical_plan
+01)Projection: decimal_unwrap.k
+02)--Filter: CAST(decimal_unwrap.price AS Decimal128(15, 0)) = Decimal128(173665,15,0)
+03)----TableScan: decimal_unwrap projection=[k, price]
+physical_plan
+01)FilterExec: CAST(price@1 AS Decimal128(15, 0)) = 173665, projection=[k@0]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+# Arrow rounds half away from zero when it drops decimal digits, so 173664.94,
+# 173665.29 and 173665.47 round to 173665, and 173665.73 to 173666.
+query I
+select k from decimal_unwrap where cast(price as decimal(15, 0)) = 173665 order by k;
+----
+1
+2
+3
+
+# At scale 1 only 173665.47 rounds to 173665.5; 173665.73 rounds to 173665.7.
+query I
+select k from decimal_unwrap where cast(price as decimal(15, 1)) = cast(173665.5 as decimal(15, 1)) order by k;
+----
+3
+
+# --- Widening decimal -> larger scale: folds onto the bare column ----------
+query TT
+explain select k from decimal_unwrap where cast(price as decimal(20, 4)) = cast(173665.29 as decimal(20, 4));
+----
+logical_plan
+01)Projection: decimal_unwrap.k
+02)--Filter: decimal_unwrap.price = Decimal128(173665.29,15,2)
+03)----TableScan: decimal_unwrap projection=[k, price]
+physical_plan
+01)FilterExec: price@1 = 173665.29, projection=[k@0]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+query I
+select k from decimal_unwrap where cast(price as decimal(20, 4)) = cast(173665.29 as decimal(20, 4)) order by k;
+----
+2
+
+statement ok
+drop table decimal_unwrap;

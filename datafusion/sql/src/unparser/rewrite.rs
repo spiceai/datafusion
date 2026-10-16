@@ -24,7 +24,7 @@ use datafusion_common::{
     tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
-use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
+use datafusion_expr::{Distinct, Expr, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::Ident;
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
@@ -66,8 +66,9 @@ pub(super) fn normalize_union_schema(plan: &LogicalPlan) -> Result<LogicalPlan> 
             Ok(Transformed::yes(LogicalPlan::Union(union)))
         }
         LogicalPlan::Sort(sort) => {
-            // Only rewrite Sort expressions that have a UNION as their input
-            if !matches!(&*sort.input, LogicalPlan::Union(_)) {
+            // Only rewrite Sort expressions that read a UNION's output: a
+            // `UNION ALL`, or a `UNION` (`Distinct::All` over the union)
+            if !is_union_output(&sort.input) {
                 return Ok(Transformed::no(LogicalPlan::Sort(sort)));
             }
 
@@ -80,6 +81,18 @@ pub(super) fn normalize_union_schema(plan: &LogicalPlan) -> Result<LogicalPlan> 
         _ => Ok(Transformed::no(plan)),
     });
     transformed_plan.data()
+}
+
+/// Whether `plan` is a `UNION ALL` or a `UNION`, whose output columns carry no
+/// relation an `ORDER BY` above them could name. A `UNION` is any chain of
+/// `Distinct::All` over the union: the unparser folds them all into the one
+/// set operation.
+fn is_union_output(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Union(_) => true,
+        LogicalPlan::Distinct(Distinct::All(input)) => is_union_output(input),
+        _ => false,
+    }
 }
 
 /// Rewrite sort expressions that have a UNION plan as their input to remove the table reference.
