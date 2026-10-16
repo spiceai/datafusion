@@ -2457,17 +2457,24 @@ impl Unparser<'_> {
                 loop {
                     match cur {
                         LogicalPlan::Limit(limit) => {
+                            // A predicate already on this SELECT came from
+                            // above the limit and must filter what the limit
+                            // produced; folding the limit in here would run
+                            // it after that predicate instead. Checked before
+                            // the order below stops the walk: a grouped
+                            // predicate (`HAVING`) has no scope that applies
+                            // it after the limit, so it is refused here
+                            // rather than left outside the derived table the
+                            // chain then becomes.
+                            let needs_own_scope =
+                                Self::row_limit_needs_own_scope(cur, select)?;
                             if have_order_by {
                                 // Limit-below-Sort: `ORDER BY … LIMIT N`
                                 // would apply the sort first, but the
                                 // logical plan applies the Limit first.
                                 break;
                             }
-                            // A predicate already on this SELECT came from
-                            // above the limit and must filter what the limit
-                            // produced; folding the limit in here would run
-                            // it after that predicate instead.
-                            if Self::row_limit_needs_own_scope(cur, select)? {
+                            if needs_own_scope {
                                 break;
                             }
                             let skip_lit = limit.get_skip_type()?;
@@ -2678,8 +2685,22 @@ impl Unparser<'_> {
                 // the way the plan does, `t.k`; from outside the derived table
                 // only the bare name binds. A clause holding a subquery is left
                 // alone by the visitors and would keep naming the hidden
-                // relation: refused (spiceai/spiceai#14733).
+                // relation: refused. Two outputs that differ only by qualifier
+                // (`t.k`, `u.k`) would share one bare name: refused as well
+                // (spiceai/spiceai#14733).
                 if !fully_absorbed && !select.within_join_input() {
+                    let mut names = HashSet::new();
+                    if let Some(repeated) = cur
+                        .schema()
+                        .fields()
+                        .iter()
+                        .map(|field| field.name())
+                        .find(|name| !names.insert(name.as_str()))
+                    {
+                        return not_impl_err!(
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when two of the aggregate's outputs share the name '{repeated}'"
+                        );
+                    }
                     let hidden_qualifiers = enclosed_qualifiers(cur.schema());
                     let mut repoint = |expr: &mut ast::Expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
@@ -2700,6 +2721,23 @@ impl Unparser<'_> {
                             "Unparsing a sort or limit between a projection and its aggregate is not supported when a clause above the projection holds a subquery"
                         );
                     }
+                    // The derived table names every output by the logical name
+                    // the clauses above read it by: an unaliased aggregate
+                    // (`sum(t.v)`) is otherwise named by the engine (`sum` on
+                    // PostgreSQL) and the reference to it binds to nothing.
+                    let named = name_scope_outputs(cur)?;
+                    let alias = if matches!(cur, LogicalPlan::Sort(_)) {
+                        DERIVED_SORT_ALIAS
+                    } else {
+                        DERIVED_LIMIT_ALIAS
+                    };
+                    return self.derive_with_dialect_alias(
+                        alias,
+                        &named,
+                        relation,
+                        false,
+                        vec![],
+                    );
                 }
 
                 self.select_to_sql_recursively(cur, query, select, relation)

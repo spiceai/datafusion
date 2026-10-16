@@ -16153,7 +16153,7 @@ fn test_a_compound_sort_key_over_a_computed_alias_above_a_derived_aggregate() ->
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT (0 - s) AS s FROM (SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k LIMIT 2) ORDER BY ((0 - s) + 1) ASC NULLS FIRST LIMIT 1"
+        @"SELECT (0 - s) AS s FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY ((0 - s) + 1) ASC NULLS FIRST LIMIT 1"
     );
     Ok(())
 }
@@ -16172,7 +16172,7 @@ fn test_a_compound_sort_key_on_a_group_column_above_a_derived_aggregate() -> Res
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT s, k FROM (SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
+        @"SELECT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
     );
 
     // The same with the group column passed through under an alias.
@@ -16185,7 +16185,7 @@ fn test_a_compound_sort_key_on_a_group_column_above_a_derived_aggregate() -> Res
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT s, k AS k FROM (SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
+        @"SELECT s, k AS k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
     );
     Ok(())
 }
@@ -16206,6 +16206,92 @@ fn test_a_sort_folded_through_two_projections_of_unaliased_expressions() -> Resu
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @"SELECT u.b FROM u ORDER BY (u.a + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_having_above_a_limited_aggregate_under_a_sort_is_refused() -> Result<()> {
+    // The filter on the aggregate's output is a HAVING; the limit under it moves
+    // the aggregate into a derived table, which no HAVING outside can apply to.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .filter(col("s").gt(lit(10)))?
+        .sort(vec![col("t.k").sort(true, true)])?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("a HAVING applied after a row limit cannot be unparsed");
+    assert_contains!(
+        error.to_string(),
+        "HAVING or QUALIFY predicate that is applied after a row limit"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_derived_aggregate_with_two_outputs_of_one_name_is_refused() -> Result<()> {
+    // `t.k` and `u.k` share one bare name once the derived table hides their
+    // qualifiers, so the passthrough items and the key could not be told apart.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["k"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.k").eq(col("u.k"))],
+        )?
+        .aggregate(
+            vec![col("t.k"), col("u.k")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), col("u.k")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("two derived outputs named alike cannot be unparsed");
+    assert_contains!(error.to_string(), "share the name 'k'");
+    Ok(())
+}
+
+#[test]
+fn test_an_unaliased_aggregate_output_above_a_derived_aggregate_is_named() -> Result<()> {
+    // The derived table names every output by the logical name the clauses above
+    // read it by; an engine would otherwise name `sum(t.v)` itself.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v"))])?
+        .limit(0, Some(2))?
+        .project(vec![col("sum(t.v)"), col("t.k")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "sum(t.v)", k FROM (SELECT t.k AS k, sum(t.v) AS "sum(t.v)" FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_folded_through_reordered_and_pruned_computed_aliases() -> Result<()> {
+    // The outer projection reorders `x` and `y` and drops `u.c`; the inner
+    // projection's schema follows the replacement expressions, so the key `x + 1`
+    // still resolves to `u.a + 1` rather than to the expression at `x`'s old index.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("u.a") + lit(1)).alias("x"),
+            (col("u.b") + lit(1)).alias("y"),
+            col("u.c"),
+        ])?
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![col("y"), col("x")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (u.b + 1) AS y, (u.a + 1) AS x FROM u ORDER BY ((u.a + 1) + 1) ASC NULLS FIRST LIMIT 1"
     );
     Ok(())
 }

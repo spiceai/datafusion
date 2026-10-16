@@ -241,6 +241,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         })
         .collect::<Vec<_>>();
 
+    // The inner output each outer expression reads, matched by the spelling the
+    // comparison below uses, so every expression the fold accepts finds its own.
+    let position = inner_exprs
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.to_string(), i))
+        .collect::<HashMap<_, _>>();
+
     // Compare outer collects Expr::to_string with inner collected transformed values
     // alias -> alias column
     // column -> remain
@@ -282,7 +290,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     // order SQL does not carry out (spiceai/spiceai#14733).
     if outer_collects.is_subset(&inner_collects) {
         let mut sort = sort.clone();
-        let mut inner_p = inner_p.clone();
+        let inner_p = inner_p.clone();
 
         let new_exprs = p
             .expr
@@ -349,7 +357,41 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         }
 
-        inner_p.expr.clone_from(&new_exprs);
+        // The inner Projection takes the outer one's expressions, and each is the
+        // inner output the outer list reads, so it keeps that output's field: the
+        // name the sort's keys and the inliner (`unproject_sort_expr` resolves a
+        // key's column by position) look it up by, at the position the expression
+        // takes in the outer list. Carrying the inner schema over unchanged would
+        // name each output after the inner expression at the same index, `ORDER BY
+        // x + 1` emitted over the expression at `x`'s inner index; taking the outer
+        // schema would rename an output the outer list renames, so the key that
+        // reads it by its inner name resolves to nothing. An output the outer list
+        // repeats takes the outer field the second time, since one schema cannot
+        // name two outputs alike, and fields that still collide leave the outer
+        // schema in place rather than the plan unfolded.
+        let mut read = HashSet::new();
+        let fields = p
+            .expr
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let (schema, index) = match position.get(&e.to_string()) {
+                    Some(&k) if read.insert(k) => (&inner_p.schema, k),
+                    _ => (&p.schema, i),
+                };
+                let (qualifier, _) = schema.qualified_field(index);
+                (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
+            })
+            .collect::<Vec<_>>();
+        let schema =
+            DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
+                .map_or_else(|_| Arc::clone(&p.schema), Arc::new);
+        let inner_p = Projection::try_new_with_schema(
+            new_exprs,
+            Arc::clone(&inner_p.input),
+            schema,
+        )
+        .ok()?;
         sort.input = Arc::new(LogicalPlan::Projection(inner_p));
 
         Some(LogicalPlan::Sort(sort))
