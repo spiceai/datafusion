@@ -56,7 +56,7 @@ use crate::common::{MockContextProvider, MockSessionState};
 use datafusion_expr::builder::{
     project, subquery_alias, table_scan_with_filter_and_fetch, table_scan_with_filters,
 };
-use datafusion_functions::core::expr_fn::get_field;
+use datafusion_functions::core::expr_fn::{get_field, get_field_path};
 use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions::unicode::planner::UnicodeFunctionPlanner;
 use datafusion_functions_nested::expr_fn::array_element;
@@ -17115,6 +17115,110 @@ fn test_a_repeated_output_keeps_the_declared_name_the_fold_gives_it_in_the_shado
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @"SELECT c, c FROM (SELECT (a + b) AS c, z AS x FROM (SELECT t.a AS a, t.b AS b, t.z AS z FROM t) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_output_whose_fold_names_collide_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // The outer list repeats `x`, so the folded projection would name the
+    // second copy by the outer field `y`, colliding with the kept `y`. Taking
+    // the outer schema instead would resolve the key `y + 1` by position onto
+    // the second copy of `t.a + 1`. The fold is skipped.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c").alias("unused"),
+        ])?
+        .sort_with_limit(vec![(col("y") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x"), col("y")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x, x, y FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y, t.c AS unused FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_reading_an_outer_reference_a_kept_output_shadows_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // Dropping `outer_ref(s) * u.a AS x` would substitute the outer `s` into
+    // the key, which renders by its bare name and binds to the kept `0 - u.a
+    // AS s` instead of the enclosing query's `s`. The fold is skipped.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (lit(0) - col("u.a")).alias("s"),
+            (out_ref_col(DataType::Int32, "s") * col("u.a")).alias("x"),
+            col("u.c"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT (0 - u.a) AS s, (s * u.a) AS x, u.c FROM u ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_flattened_field_path_key_takes_the_prefix_whose_type_has_the_path() -> Result<()>
+{
+    // Relations `t` (struct `s` with path `a.b`) and `t.s` (scalar `a`): the
+    // flattened key `get_field(t.s, 'a', 'b')` renders as `t.s.a.b`. The
+    // longest relation prefix `t.s` leaves `a.b`, a field of a scalar; the
+    // prefix `t` leaves `s.a.b`, the path the key reads.
+    let t_s = TableReference::partial("t", "s");
+    let inner = DataType::Struct(vec![Field::new("b", DataType::Int32, false)].into());
+    let payload = DataType::Struct(vec![Field::new("a", inner, false)].into());
+    let t = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let ts = table_scan(Some(t_s.clone()), &int32_schema(&["a"]), None)?.build()?;
+    let plan = LogicalPlanBuilder::from(t)
+        .cross_join(ts)?
+        .aggregate(
+            vec![col("t.s"), Expr::Column(Column::new(Some(t_s), "a"))],
+            Vec::<Expr>::new(),
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s")])?
+        .sort_with_limit(
+            vec![
+                (get_field_path(col("t.s"), vec![lit("a"), lit("b")]) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT t.s AS s, t.s.a AS a FROM t CROSS JOIN t.s GROUP BY t.s, t.s.a LIMIT 2) ORDER BY (s.a.b + 1) ASC NULLS FIRST LIMIT 1"
     );
     Ok(())
 }

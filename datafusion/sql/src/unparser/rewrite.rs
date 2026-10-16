@@ -324,8 +324,9 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // schema would rename an output the outer list renames, so the key that
         // reads it by its inner name resolves to nothing. An output the outer list
         // repeats takes the outer field the second time, since one schema cannot
-        // name two outputs alike, and fields that still collide leave the outer
-        // schema in place rather than the plan unfolded.
+        // name two outputs alike. Fields that still collide leave the plan
+        // unfolded: the outer schema names outputs by the outer list's
+        // positions, so the inliner would resolve a key against the wrong one.
         let mut read = HashSet::new();
         let fields = p
             .expr
@@ -340,9 +341,10 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
             })
             .collect::<Vec<_>>();
-        let schema =
+        let schema = Arc::new(
             DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
-                .map_or_else(|_| Arc::clone(&p.schema), Arc::new);
+                .ok()?,
+        );
         let declared_names = schema
             .fields()
             .iter()
@@ -395,7 +397,9 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // key would order by `0 - s` instead of `s`. The fold is skipped. A
         // computed output named by a declared schema (`a + b` declared `c`)
         // captures a substituted `c` the same way; a plain column kept under
-        // its own name is the column the substitution reads.
+        // its own name is the column the substitution reads. An unqualified
+        // outer reference renders by its bare name too, so any output the fold
+        // keeps under that name captures it the same way.
         let kept_aliases: HashSet<&str> = new_exprs
             .iter()
             .zip(&declared_names)
@@ -419,7 +423,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                     && dropped_outputs.get(col.name()).is_some_and(|underlying| {
                         underlying.column_refs().iter().any(|read| {
                             read.relation.is_none() && kept_aliases.contains(read.name())
-                        })
+                        }) || reads_outer_reference_named_in(underlying, &declared_names)
                     })
             })
         });
@@ -480,6 +484,20 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     } else {
         None
     }
+}
+
+/// Whether `expr` holds an unqualified outer reference whose bare name is one of
+/// `names`, so that a scope projecting those names would bind it to its own
+/// output rather than to the enclosing query.
+fn reads_outer_reference_named_in(expr: &Expr, names: &[String]) -> bool {
+    expr.exists(|e| {
+        Ok(matches!(
+            e,
+            Expr::OuterReferenceColumn(_, column)
+                if column.relation.is_none() && names.iter().any(|n| n == column.name())
+        ))
+    })
+    .unwrap_or(true)
 }
 
 /// This logic is to work out the columns and inner query for SubqueryAlias plan for some types of

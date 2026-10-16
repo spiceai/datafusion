@@ -1279,11 +1279,16 @@ impl Unparser<'_> {
                 .map(|(_, field)| field)
         };
         // The longest prefix of `idents` (shorter than `max_len`) naming a
-        // hidden relation that has a column called by the part after it.
+        // hidden relation that has a column called by the part after it, and
+        // whose type has the rest of the parts as a field path: beside `t.s`
+        // with a scalar `a`, `t.s.a.b` is the path `a.b` of `t`'s struct `s`,
+        // not a field of that scalar.
         let hidden_column_prefix = |idents: &[Ident], max_len: usize| {
-            (1..max_len)
-                .rev()
-                .find(|&prefix_len| hidden_column(idents, prefix_len).is_some())
+            (1..max_len).rev().find(|&prefix_len| {
+                hidden_column(idents, prefix_len).is_some_and(|field| {
+                    has_field_path(field.data_type(), &idents[prefix_len + 1..])
+                })
+            })
         };
         // Whether an output of this type has a field called `name` to access:
         // only a struct or a map (dictionary encoded or not) has fields, so a
@@ -1297,6 +1302,23 @@ impl Unparser<'_> {
                 }
                 DataType::Map(..) => true,
                 DataType::Dictionary(_, value) => has_field(value, name),
+                _ => false,
+            }
+        }
+        // Whether `path` names a field of `data_type`, a field of that, and so
+        // on. Past a map every part may be a key, and `get_field` accepts a
+        // NULL base, answering NULL, whatever the path.
+        fn has_field_path(data_type: &DataType, path: &[Ident]) -> bool {
+            let Some((first, rest)) = path.split_first() else {
+                return true;
+            };
+            match data_type {
+                DataType::Struct(fields) => fields
+                    .iter()
+                    .find(|field| field.name() == &first.value)
+                    .is_some_and(|field| has_field_path(field.data_type(), rest)),
+                DataType::Map(..) | DataType::Null => true,
+                DataType::Dictionary(_, value) => has_field_path(value, path),
                 _ => false,
             }
         }
