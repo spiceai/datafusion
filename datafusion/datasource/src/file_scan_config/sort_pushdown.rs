@@ -535,7 +535,7 @@ pub(crate) fn validate_orderings(
 /// file is scanned, the same values for A, B and C can be repeated in
 /// the same sorted stream
 ///
-///```text
+/// ```text
 /// ┏ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━ ━
 ///   ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─ ┐ ┌ ─ ─ ─ ─ ─ ─ ─ ─ ─  ┃
 /// ┃   ┌───────────────┐     ┌──────────────┐ │

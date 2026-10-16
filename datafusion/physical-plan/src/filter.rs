@@ -28,10 +28,9 @@ use super::{
     ColumnStatistics, DisplayAs, ExecutionPlanProperties, PlanProperties,
     RecordBatchStream, SendableRecordBatchStream, Statistics,
 };
-use crate::check_if_same_properties;
 use crate::coalesce::{LimitedBatchCoalescer, PushBatchStatus};
 use crate::common::can_project;
-use crate::execution_plan::CardinalityEffect;
+use crate::execution_plan::{CardinalityEffect, replace_children_if_necessary};
 use crate::filter_pushdown::{
     ChildFilterDescription, ChildPushdownResult, FilterDescription, FilterPushdownPhase,
     FilterPushdownPropagation, FilterRemapper, PushedDown,
@@ -42,7 +41,9 @@ use crate::projection::{
     EmbeddedProjection, ProjectionExec, ProjectionExpr, make_with_child,
     try_embed_projection, update_expr,
 };
+use crate::statistics::{ChildStats, StatisticsArgs, StatisticsContext};
 use crate::stream::EmptyRecordBatchStream;
+use crate::{ChildrenPropertiesMode, ReplaceChildrenOptions, validate_child_count};
 use crate::{
     DisplayFormatType, ExecutionPlan,
     metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RatioMetrics},
@@ -54,6 +55,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion_common::cast::as_boolean_array;
 use datafusion_common::config::ConfigOptions;
 use datafusion_common::stats::Precision;
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     DataFusionError, Result, ScalarValue, internal_datafusion_err, internal_err,
     plan_err, project_schema,
@@ -61,9 +63,11 @@ use datafusion_common::{
 use datafusion_execution::TaskContext;
 use datafusion_expr::Operator;
 use datafusion_physical_expr::equivalence::ProjectionMapping;
-use datafusion_physical_expr::expressions::{BinaryExpr, Column, Literal, lit};
+use datafusion_physical_expr::expressions::{
+    BinaryExpr, Column, InListExpr, IsNotNullExpr, Literal, lit,
+};
 use datafusion_physical_expr::intervals::utils::check_support;
-use datafusion_physical_expr::utils::collect_columns;
+use datafusion_physical_expr::utils::{Guarantee, LiteralGuarantee, collect_columns};
 use datafusion_physical_expr::{
     AcrossPartitions, AnalysisContext, ConstExpr, ExprBoundaries, PhysicalExpr, analyze,
     conjunction, split_conjunction,
@@ -334,11 +338,27 @@ impl FilterExec {
         &self.projection
     }
 
-    /// Calculates `Statistics` for `FilterExec`, by applying selectivity
-    /// (either default, or estimated) to input statistics.
+    /// Calculates `Statistics` for `FilterExec` by applying the filter's
+    /// selectivity (default, or estimated from interval analysis or from the
+    /// distinct counts of the columns the predicate restricts to literals) to
+    /// the input statistics.
     ///
-    /// Equality predicates (`col = literal`) set NDV to `Exact(1)`, or
-    /// `Exact(0)` when the predicate is contradictory (e.g. `a = 1 AND a = 2`).
+    /// The estimated output row count is used to keep the per-column statistics
+    /// consistent with it:
+    /// - null and distinct counts are capped at the estimated row count;
+    /// - byte sizes (per column and total) are scaled by the selectivity, and
+    ///   are an exact zero when the row count is an exact zero;
+    /// - a column constrained to a single value (`col = literal`, or an
+    ///   interval that collapses to one point) gets a distinct count of 1;
+    /// - a column restricted to n literals (`col IN (..)`, or an `OR` chain of
+    ///   equalities) gets a distinct count of at most n;
+    /// - a column in a null-rejecting conjunct gets a null count of 0.
+    ///
+    /// When interval analysis applies, min/max are also tightened to the
+    /// surviving value range.
+    ///
+    /// A contradictory predicate (e.g. `a = 1 AND a = 2`) yields zero rows and
+    /// empty-column statistics.
     pub(crate) fn statistics_helper(
         schema: &SchemaRef,
         input_stats: Statistics,
@@ -351,8 +371,8 @@ impl FilterExec {
         let input_total_byte_size = input_stats.total_byte_size;
 
         let (selectivity, num_rows, column_statistics) = if is_infeasible {
-            // Contradictory predicate: zero rows, and null/min/max are
-            // undefined on an empty column.
+            // Contradictory predicate: no rows survive. Row-bounded counts are
+            // zero; value statistics are undefined on an empty column.
             let mut cs = input_stats.to_inexact().column_statistics;
             for col_stat in &mut cs {
                 col_stat.distinct_count = Precision::Exact(0);
@@ -363,71 +383,133 @@ impl FilterExec {
                 col_stat.byte_size = Precision::Exact(0);
             }
             (0.0, Precision::Exact(0), cs)
-        } else if !check_support(predicate, schema) {
-            // Interval analysis is not applicable (e.g. equality on a `Utf8`
-            // column). Estimate selectivity from the equality columns' distinct
-            // counts. For an AND of `col = literal` predicates the result is a
-            // subset of the rows matching any single one, so the true selectivity
-            // is at most `1/NDV` of the *most selective* column — i.e.
-            // `1 / max(NDV)` is a correlation-agnostic upper bound. It never
-            // under-estimates rows, unlike the independence product `∏ 1/NDV`
-            // (which collapses badly on correlated columns such as a composite
-            // key). `max` over the *known* NDVs stays a valid upper bound
-            // even when some columns' NDV is absent (an extra equality can only
-            // shrink the result), so fall back to the default only when NO column
-            // has a usable NDV. Then pin NDV=1 for every `col = literal` column
-            // (the equality leaves a single value).
-            let mut cs = input_stats.to_inexact().column_statistics;
-            let mut max_ndv: Option<usize> = None;
-            for &idx in &eq_columns {
-                if idx < cs.len()
-                    && let Precision::Exact(n) | Precision::Inexact(n) =
-                        cs[idx].distinct_count
-                    && n > 0
-                {
-                    max_ndv = Some(max_ndv.map_or(n, |m| m.max(n)));
-                }
-            }
-            let selectivity = match max_ndv {
-                Some(n) => 1.0 / n as f64,
-                None => default_selectivity as f64 / 100.0,
-            };
-            for &idx in &eq_columns {
-                if idx < cs.len() && cs[idx].distinct_count != Precision::Exact(0) {
-                    cs[idx].distinct_count = Precision::Exact(1);
-                }
-            }
-            (
-                selectivity,
-                input_num_rows.with_estimated_selectivity(selectivity),
-                cs,
-            )
         } else {
-            // Interval-analysis path. `collect_new_statistics` already sets
-            // distinct_count = Exact(1) when an interval collapses to a single
-            // value, so no post-fix is needed here.
-            let input_analysis_ctx = AnalysisContext::try_from_statistics(
-                schema,
-                &input_stats.column_statistics,
-            )?;
-            let analysis_ctx = analyze(predicate, input_analysis_ctx, schema)?;
-            let selectivity = analysis_ctx.selectivity.unwrap_or(1.0);
-            let filtered_num_rows =
-                input_num_rows.with_estimated_selectivity(selectivity);
-            let cs = collect_new_statistics(
-                schema,
-                &input_stats.column_statistics,
-                analysis_ctx.boundaries,
-                match &filtered_num_rows {
-                    Precision::Absent => None,
-                    p => Some(*p),
-                },
-            );
-            (selectivity, filtered_num_rows, cs)
+            let null_rejecting_columns = collect_null_rejecting_columns(predicate);
+
+            if check_support(predicate, schema) {
+                let input_analysis_ctx = AnalysisContext::try_from_statistics(
+                    schema,
+                    &input_stats.column_statistics,
+                )?;
+                let analysis_ctx = analyze(predicate, input_analysis_ctx, schema)?;
+                let selectivity = analysis_ctx.selectivity.unwrap_or(1.0);
+                let filtered_num_rows =
+                    input_num_rows.with_estimated_selectivity(selectivity);
+                let cs = collect_new_statistics(
+                    schema,
+                    &input_stats.column_statistics,
+                    analysis_ctx.boundaries,
+                    selectivity,
+                    &null_rejecting_columns,
+                    filtered_num_rows,
+                );
+                (selectivity, filtered_num_rows, cs)
+            } else {
+                // Interval analysis is not applicable (e.g. equality on a `Utf8`
+                // column), so estimate from distinctness instead of from range.
+                //
+                // `LiteralGuarantee::analyze` reports, per column, the set of
+                // literals a row must match for the predicate to be true — it
+                // recognizes `col = lit` either way round, `col IN (..)`, an `OR`
+                // chain of equalities over one column, and the mixtures of those
+                // the simplifier produces as it rewrites between the spellings
+                // around a list length of three. A `Guarantee::In` is a
+                // *necessary* condition for the row to pass, so with rows spread
+                // evenly over the distinct values a column admitted n of its NDV
+                // values matches `n / NDV` of the rows, and an AND takes the
+                // tightest estimate any conjunct gives. The single equality is the
+                // n = 1 case. A hot key matches more than this estimate.
+                //
+                // Extending interval analysis to cover these would not help, and
+                // is not merely imprecise: `propagate_constraints` refuses a
+                // disjunction outright ("OR operator cannot yet propagate true
+                // intervals"), so admitting `Or` to `check_support` would turn this
+                // estimate into an error. Even implemented, one interval per column
+                // can only carry the hull, and the hull of scattered keys spans
+                // nearly the whole domain — a worse estimate than the flat default,
+                // not a better one.
+                let mut cs = input_stats.to_inexact().column_statistics;
+                // Only an `IN` list or an `OR` admits more than one literal for
+                // a column. Without either, every guarantee `analyze` reports is
+                // an equality column, which the estimate counts on its own, so
+                // the common single-equality filter skips the analysis.
+                let admits_a_set = predicate
+                    .exists(|expr| {
+                        Ok(expr.downcast_ref::<InListExpr>().is_some()
+                            || expr
+                                .downcast_ref::<BinaryExpr>()
+                                .is_some_and(|binary| *binary.op() == Operator::Or))
+                    })
+                    .unwrap_or(true);
+                let guarantees = if admits_a_set {
+                    LiteralGuarantee::analyze(predicate)
+                } else {
+                    vec![]
+                };
+                let columns = if guarantees.is_empty() {
+                    Default::default()
+                } else {
+                    collect_columns(predicate)
+                };
+                let admitted = |guarantee: &LiteralGuarantee| {
+                    (guarantee.guarantee == Guarantee::In)
+                        .then(|| predicate_index_of(&columns, guarantee.column.name()))
+                        .flatten()
+                        .map(|idx| (idx, guarantee.literals.len()))
+                };
+                // `analyze` drops a column's guarantee when its conjuncts admit
+                // no common value (`k = 1 AND k IN (2, 3)`), so each equality
+                // also bounds the estimate on its own.
+                let selectivity = guarantees
+                    .iter()
+                    .filter_map(admitted)
+                    .chain(eq_columns.iter().map(|&idx| (idx, 1)))
+                    .filter_map(|(idx, values)| {
+                        distinct_value_selectivity(values, cs.get(idx)?)
+                    })
+                    .min_by(f64::total_cmp)
+                    .unwrap_or(default_selectivity as f64 / 100.0);
+                let filtered_num_rows =
+                    input_num_rows.with_estimated_selectivity(selectivity);
+                for (idx, col_stat) in cs.iter_mut().enumerate() {
+                    col_stat.byte_size = scale_byte_size_at_rows(
+                        col_stat.byte_size,
+                        selectivity,
+                        filtered_num_rows,
+                    );
+                    col_stat.null_count = if null_rejecting_columns.contains(&idx) {
+                        Precision::Exact(0)
+                    } else {
+                        cap_at_rows(col_stat.null_count, filtered_num_rows)
+                    };
+                    col_stat.distinct_count = if eq_columns.contains(&idx) {
+                        distinct_count_for_singleton_domain(filtered_num_rows)
+                    } else {
+                        cap_at_rows(col_stat.distinct_count, filtered_num_rows)
+                    };
+                }
+                // A column the filter admits n values of holds at most n distinct
+                // values downstream. Without this the estimate is
+                // self-contradictory — a filter reporting 128 rows but the scan's
+                // whole-table NDV for the column it filtered — and join
+                // cardinality estimation reads the NDV, not the row count.
+                for (idx, values) in guarantees.iter().filter_map(admitted) {
+                    if let Some(column) = cs.get_mut(idx)
+                        && column
+                            .distinct_count
+                            .get_value()
+                            .is_none_or(|&ndv| values < ndv)
+                    {
+                        column.distinct_count =
+                            cap_at_rows(Precision::Inexact(values), filtered_num_rows);
+                    }
+                }
+                (selectivity, filtered_num_rows, cs)
+            }
         };
 
         let total_byte_size =
-            input_total_byte_size.with_estimated_selectivity(selectivity);
+            scale_byte_size_at_rows(input_total_byte_size, selectivity, num_rows);
 
         Ok(Statistics {
             num_rows,
@@ -448,7 +530,10 @@ impl FilterExec {
         let schema = input.schema();
         let stats = Self::statistics_helper(
             &schema,
-            Arc::unwrap_or_clone(input.partition_statistics(None)?),
+            Arc::unwrap_or_clone(
+                StatisticsContext::new()
+                    .compute(input.as_ref(), &StatisticsArgs::new())?,
+            ),
             predicate,
             default_selectivity,
         )?;
@@ -505,17 +590,6 @@ impl FilterExec {
             input.pipeline_behavior(),
             input.boundedness(),
         ))
-    }
-
-    fn with_new_children_and_same_properties(
-        &self,
-        mut children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Self {
-        Self {
-            input: children.swap_remove(0),
-            metrics: ExecutionPlanMetricsSet::new(),
-            ..Self::clone(self)
-        }
     }
 }
 
@@ -578,21 +652,58 @@ impl ExecutionPlan for FilterExec {
         vec![&self.input]
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        crate::apply_expression_roots([&self.predicate], f)
+    }
+
     fn maintains_input_order(&self) -> Vec<bool> {
         // Tell optimizer this operator doesn't reorder its input
         vec![true]
     }
 
-    fn with_new_children(
+    fn replace_children(
         self: Arc<Self>,
         mut children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        check_if_same_properties!(self, children);
-        let new_input = children.swap_remove(0);
-        FilterExecBuilder::from(&*self)
-            .with_input(new_input)
-            .build()
-            .map(|e| Arc::new(e) as _)
+        validate_child_count!(self, children);
+        match options.children_properties {
+            ChildrenPropertiesMode::Keep => Ok(Arc::new(Self {
+                input: children.swap_remove(0),
+                metrics: ExecutionPlanMetricsSet::new(),
+                ..Self::clone(&*self)
+            })),
+            ChildrenPropertiesMode::Recompute => {
+                let new_input = children.swap_remove(0);
+                FilterExecBuilder::from(&*self)
+                    .with_input(new_input)
+                    .build()
+                    .map(|e| Arc::new(e) as _)
+            }
+        }
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )
     }
 
     fn execute(
@@ -625,11 +736,18 @@ impl ExecutionPlan for FilterExec {
         Some(self.metrics.clone_inner())
     }
 
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
     /// The output statistics of a filtering operation can be estimated if the
     /// predicate's selectivity value can be determined for the incoming data.
-    fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let input_stats =
-            Arc::unwrap_or_clone(self.input.partition_statistics(partition)?);
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let input_stats = input_stats[0].as_ref().clone();
         let stats = Self::statistics_helper(
             &self.input.schema(),
             input_stats,
@@ -849,10 +967,104 @@ impl ExecutionPlan for FilterExec {
         self.input
             .with_preserve_order(preserve_order)
             .and_then(|new_input| {
-                Arc::new(self.clone())
-                    .with_new_children(vec![new_input])
+                replace_children_if_necessary(Arc::new(self.clone()), vec![new_input])
                     .ok()
             })
+    }
+
+    #[cfg(feature = "proto")]
+    fn try_to_proto(
+        &self,
+        ctx: &crate::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto_models::protobuf::PhysicalPlanNode>> {
+        use datafusion_proto_models::protobuf;
+        let input = ctx.encode_child(self.input())?;
+        let expr = ctx.encode_expr(self.predicate())?;
+        // Preserve the exact wire format: `None` (full projection) is serialized
+        // as the identity projection `[0, 1, ..., num_fields - 1]` so that it is
+        // distinguishable from an explicit projection on decode.
+        let projection = if let Some(v) = self.projection() {
+            v.iter().map(|x| *x as u32).collect()
+        } else {
+            (0..self.input().schema().fields().len())
+                .map(|i| i as u32)
+                .collect()
+        };
+        Ok(Some(protobuf::PhysicalPlanNode {
+            physical_plan_type: Some(
+                protobuf::physical_plan_node::PhysicalPlanType::Filter(Box::new(
+                    protobuf::FilterExecNode {
+                        input: Some(Box::new(input)),
+                        expr: Some(expr),
+                        default_filter_selectivity: self.default_selectivity() as u32,
+                        projection,
+                        batch_size: self.batch_size() as u32,
+                        fetch: self.fetch().map(|f| f as u32),
+                    },
+                )),
+            ),
+        }))
+    }
+}
+
+#[cfg(feature = "proto")]
+impl FilterExec {
+    /// Reconstruct a [`FilterExec`] from its protobuf representation.
+    ///
+    /// The exact inverse of [`ExecutionPlan::try_to_proto`]: it takes the whole
+    /// [`PhysicalPlanNode`] so every plan's `try_from_proto` shares one signature.
+    ///
+    /// [`PhysicalPlanNode`]: datafusion_proto_models::protobuf::PhysicalPlanNode
+    /// [`ExecutionPlan::try_to_proto`]: crate::ExecutionPlan::try_to_proto
+    pub fn try_from_proto(
+        node: &datafusion_proto_models::protobuf::PhysicalPlanNode,
+        ctx: &crate::proto::ExecutionPlanDecodeCtx<'_>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        use datafusion_proto_models::protobuf;
+        let filter = crate::expect_plan_variant!(
+            node,
+            protobuf::physical_plan_node::PhysicalPlanType::Filter,
+            "FilterExec",
+        );
+        let input =
+            ctx.decode_required_child(filter.input.as_deref(), "FilterExec", "input")?;
+        let predicate = ctx.decode_required_expr(
+            filter.expr.as_ref(),
+            input.schema().as_ref(),
+            "FilterExec",
+            "expr",
+        )?;
+        let filter_selectivity = filter.default_filter_selectivity.try_into();
+
+        // `None` is encoded as the full identity projection. Reconstruct it only
+        // when all input columns are present in order, leaving an empty list as
+        // `Some(vec![])`.
+        let num_fields = input.schema().fields().len();
+        let mut is_full_projection = filter.projection.len() == num_fields;
+        let mut projection_vec: Vec<usize> = Vec::with_capacity(filter.projection.len());
+        for (i, idx) in filter.projection.iter().enumerate() {
+            let idx = *idx as usize;
+            is_full_projection &= idx == i;
+            projection_vec.push(idx);
+        }
+        let projection = if is_full_projection {
+            None
+        } else {
+            Some(projection_vec)
+        };
+        let filter = FilterExecBuilder::new(predicate, input)
+            .apply_projection(projection)?
+            .with_batch_size(filter.batch_size as usize)
+            .with_fetch(filter.fetch.map(|f| f as usize))
+            .build()?;
+        match filter_selectivity {
+            Ok(filter_selectivity) => Ok(Arc::new(
+                filter.with_default_selectivity(filter_selectivity)?,
+            )),
+            Err(_) => Err(datafusion_common::internal_datafusion_err!(
+                "filter_selectivity in PhysicalPlanNode is invalid"
+            )),
+        }
     }
 }
 
@@ -920,6 +1132,35 @@ fn collect_equality_columns(predicate: &Arc<dyn PhysicalExpr>) -> (HashSet<usize
     (eq_values.into_keys().collect(), infeasible)
 }
 
+/// The input index of the predicate column a [`LiteralGuarantee`] names, or
+/// `None` when the predicate reads more than one column of that name.
+///
+/// A guarantee names its column without an index, while a physical [`Column`]
+/// is resolved by index, and its name need not match the field at that index
+/// or be unique in the schema — a join's output is the ordinary way to repeat
+/// one. The predicate's own columns map the name back to the index it reads.
+/// Two of them sharing a name cannot be told apart, so the estimate declines
+/// rather than read another column's statistics.
+fn predicate_index_of<'a>(
+    columns: impl IntoIterator<Item = &'a Column>,
+    name: &str,
+) -> Option<usize> {
+    let mut matching = columns.into_iter().filter(|column| column.name() == name);
+    let index = matching.next()?.index();
+    matching.next().is_none().then_some(index)
+}
+
+/// The estimated fraction of rows a column admitted `values` of its distinct
+/// values matches: `values / NDV`, assuming rows are spread evenly over the
+/// distinct values. `None` when the column reports no usable distinct count,
+/// which leaves the caller on its default.
+fn distinct_value_selectivity(values: usize, column: &ColumnStatistics) -> Option<f64> {
+    let (Precision::Exact(ndv) | Precision::Inexact(ndv)) = column.distinct_count else {
+        return None;
+    };
+    (ndv > 0).then(|| (values as f64 / ndv as f64).min(1.0))
+}
+
 /// Removes exact duplicates from `exprs`, keeping the first occurrence of
 /// each and preserving order.
 ///
@@ -944,6 +1185,48 @@ fn dedup_deterministic_exprs(
     deduped
 }
 
+/// Collects columns that cannot be NULL in any surviving row.
+///
+/// A filter keeps only rows where the predicate is TRUE, so a column is
+/// null-rejecting if some top-level AND conjunct evaluates to NULL or FALSE
+/// whenever that column is NULL. Two such conjuncts are recognized:
+///
+/// - a binary operator that returns NULL on NULL input, applied directly to the
+///   column (e.g. `a = 10`, `a < b`);
+/// - an `IS NOT NULL` check on the column (e.g. `a IS NOT NULL`).
+///
+/// This analysis is conservative; for example, OR clauses are not considered
+/// null-rejecting, and neither are indirect operands like `a + 1 < 10`.
+fn collect_null_rejecting_columns(predicate: &Arc<dyn PhysicalExpr>) -> HashSet<usize> {
+    let mut columns = HashSet::new();
+
+    for expr in split_conjunction(predicate) {
+        // `col IS NOT NULL` keeps only rows where `col` is non-null.
+        if let Some(is_not_null) = expr.downcast_ref::<IsNotNullExpr>() {
+            if let Some(col) = is_not_null.arg().downcast_ref::<Column>() {
+                columns.insert(col.index());
+            }
+            continue;
+        }
+
+        // A binary operator that returns NULL on NULL input rejects rows where
+        // a direct column operand is NULL.
+        if let Some(binary) = expr.downcast_ref::<BinaryExpr>() {
+            if !binary.op().returns_null_on_null() {
+                continue;
+            }
+            if let Some(col) = binary.left().downcast_ref::<Column>() {
+                columns.insert(col.index());
+            }
+            if let Some(col) = binary.right().downcast_ref::<Column>() {
+                columns.insert(col.index());
+            }
+        }
+    }
+
+    columns
+}
+
 /// Converts an interval bound to a [`Precision`] value. NULL bounds (which
 /// represent "unbounded" in the interval type) map to [`Precision::Absent`].
 fn interval_bound_to_precision(
@@ -959,15 +1242,67 @@ fn interval_bound_to_precision(
     }
 }
 
-/// This function ensures that all bounds in the `ExprBoundaries` vector are
-/// converted to closed bounds. If a lower/upper bound is initially open, it
-/// is adjusted by using the next/previous value for its data type to convert
-/// it into a closed bound.
+/// Caps a row-bounded column statistic (a null count or distinct count) at the
+/// filtered row count, since a column cannot have more nulls or distinct values
+/// than it has rows. Known counts are demoted to inexact because a
+/// filter-derived row bound is normally an estimate, the exception being an
+/// exact zero, which proves the column is empty.
+fn cap_at_rows(
+    value: Precision<usize>,
+    filtered_num_rows: Precision<usize>,
+) -> Precision<usize> {
+    match filtered_num_rows {
+        Precision::Absent => value.to_inexact(),
+        Precision::Exact(0) => Precision::Exact(0),
+        rows => value.to_inexact().min(&rows),
+    }
+}
+
+/// Scales a byte size by the filter selectivity. An exact zero row count means
+/// the output is exactly empty, so the byte size is an exact zero too.
+fn scale_byte_size_at_rows(
+    byte_size: Precision<usize>,
+    selectivity: f64,
+    filtered_num_rows: Precision<usize>,
+) -> Precision<usize> {
+    if filtered_num_rows == Precision::Exact(0) {
+        Precision::Exact(0)
+    } else {
+        byte_size.with_estimated_selectivity(selectivity)
+    }
+}
+
+/// Returns the NDV for a column constrained to one non-null value (e.g.
+/// `column = literal` or a singleton interval), derived from the filtered row
+/// estimate: zero rows means zero distinct values, a known positive row count
+/// means exactly one, and an unknown row count means an inexact one (the column
+/// could still be empty).
+///
+/// The caller is responsible for proving the singleton domain.
+fn distinct_count_for_singleton_domain(
+    filtered_num_rows: Precision<usize>,
+) -> Precision<usize> {
+    match filtered_num_rows {
+        Precision::Exact(0) | Precision::Inexact(0) => filtered_num_rows,
+        // The row count is unknown, so the column could still be empty (zero
+        // distinct values); report an inexact one rather than overstating it.
+        Precision::Absent => Precision::Inexact(1),
+        _ => Precision::Exact(1),
+    }
+}
+
+/// Builds output column statistics from interval-analysis boundaries.
+///
+/// The interval bounds become min/max values, singleton intervals become
+/// singleton NDV, and row-bounded counts are kept consistent with the filtered
+/// row estimate.
 fn collect_new_statistics(
     schema: &SchemaRef,
     input_column_stats: &[ColumnStatistics],
     analysis_boundaries: Vec<ExprBoundaries>,
-    filtered_num_rows: Option<Precision<usize>>,
+    selectivity: f64,
+    null_rejecting_columns: &HashSet<usize>,
+    filtered_num_rows: Precision<usize>,
 ) -> Vec<ColumnStatistics> {
     analysis_boundaries
         .into_iter()
@@ -1002,24 +1337,32 @@ fn collect_new_statistics(
                     !lower.is_null() && !upper.is_null() && lower == upper;
                 let min_value = interval_bound_to_precision(lower, is_single_value);
                 let max_value = interval_bound_to_precision(upper, is_single_value);
-                // When the interval collapses to a single value (equality
-                // predicate), the column has exactly 1 distinct value.
-                // Otherwise, cap NDV at the filtered row count.
+
+                // Distinct and null counts cannot exceed the number of rows
+                // that survive the filter. Singleton intervals and
+                // null-rejecting predicates provide tighter bounds.
                 let capped_distinct_count = if is_single_value {
-                    Precision::Exact(1)
+                    distinct_count_for_singleton_domain(filtered_num_rows)
                 } else {
-                    match filtered_num_rows {
-                        Some(rows) => distinct_count.to_inexact().min(&rows),
-                        None => distinct_count.to_inexact(),
-                    }
+                    cap_at_rows(distinct_count, filtered_num_rows)
                 };
+                let capped_null_count = if null_rejecting_columns.contains(&idx) {
+                    Precision::Exact(0)
+                } else {
+                    cap_at_rows(input_column_stats[idx].null_count, filtered_num_rows)
+                };
+                let byte_size = scale_byte_size_at_rows(
+                    input_column_stats[idx].byte_size,
+                    selectivity,
+                    filtered_num_rows,
+                );
                 ColumnStatistics {
-                    null_count: input_column_stats[idx].null_count.to_inexact(),
+                    null_count: capped_null_count,
                     max_value,
                     min_value,
                     sum_value: Precision::Absent,
                     distinct_count: capped_distinct_count,
-                    byte_size: input_column_stats[idx].byte_size,
+                    byte_size,
                 }
             },
         )
@@ -1251,6 +1594,8 @@ mod tests {
     use super::*;
     use crate::empty::EmptyExec;
     use crate::expressions::*;
+    use crate::statistics::{StatisticsArgs, StatisticsContext};
+
     use crate::test;
     use crate::test::exec::StatisticsExec;
     use arrow::datatypes::{Field, Schema, UnionFields, UnionMode};
@@ -1327,7 +1672,8 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(25));
         assert_eq!(
             statistics.total_byte_size,
@@ -1336,6 +1682,8 @@ mod tests {
         assert_eq!(
             statistics.column_statistics,
             vec![ColumnStatistics {
+                // `a <= 25` rejects nulls, so the column has no surviving nulls.
+                null_count: Precision::Exact(0),
                 min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                 max_value: Precision::Inexact(ScalarValue::Int32(Some(25))),
                 ..Default::default()
@@ -1370,7 +1718,8 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // 62 * (1/61) = 1.016, rounded up to 2 — i.e. ~1 row, NOT the ~13 the
         // flat 20% default would give.
         assert_eq!(statistics.num_rows, Precision::Inexact(2));
@@ -1421,7 +1770,8 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // 1000 * (1/max(100,50)) = 10
         assert_eq!(statistics.num_rows, Precision::Inexact(10));
 
@@ -1460,11 +1810,14 @@ mod tests {
             sub_filter,
         )?);
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(16));
         assert_eq!(
             statistics.column_statistics,
             vec![ColumnStatistics {
+                // `a <= 25 AND a >= 10` rejects nulls in `a`.
+                null_count: Precision::Exact(0),
                 min_value: Precision::Inexact(ScalarValue::Int32(Some(10))),
                 max_value: Precision::Inexact(ScalarValue::Int32(Some(25))),
                 ..Default::default()
@@ -1520,7 +1873,8 @@ mod tests {
             binary(col("a", &schema)?, Operator::GtEq, lit(10i32), &schema)?,
             b_gt_5,
         )?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // On a uniform distribution, only fifteen rows will satisfy the
         // filter that 'a' proposed (a >= 10 AND a <= 25) (15/100) and only
         // 5 rows will satisfy the filter that 'b' proposed (b > 45) (5/50).
@@ -1532,11 +1886,16 @@ mod tests {
             statistics.column_statistics,
             vec![
                 ColumnStatistics {
+                    // `a <= 25 AND a >= 10` rejects nulls in `a`.
+                    null_count: Precision::Exact(0),
                     min_value: Precision::Inexact(ScalarValue::Int32(Some(10))),
                     max_value: Precision::Inexact(ScalarValue::Int32(Some(25))),
                     ..Default::default()
                 },
                 ColumnStatistics {
+                    // `b > 45` in the upstream filter zeroes b's nulls; the outer
+                    // filter then caps the (already zero) count, demoting to inexact.
+                    null_count: Precision::Inexact(0),
                     min_value: Precision::Inexact(ScalarValue::Int32(Some(46))),
                     max_value: Precision::Inexact(ScalarValue::Int32(Some(50))),
                     ..Default::default()
@@ -1565,7 +1924,8 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Absent);
 
         Ok(())
@@ -1638,7 +1998,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // 0.5 (from a) * 0.333333... (from b) * 0.798387... (from c) ≈ 0.1330...
         // num_rows after ceil => 133.0... => 134
         // total_byte_size after ceil => 532.0... => 533
@@ -1733,11 +2094,20 @@ mod tests {
                 Arc::new(Column::new("b", 1)),
             )),
         ));
-        // Since filter predicate passes all entries, statistics after filter shouldn't change.
-        let expected = input.partition_statistics(None)?.column_statistics.clone();
+        // The filter predicate passes all (non-null) entries, so min/max/NDV
+        // are unchanged. `a < 200` and `1 <= b` are null-rejecting, though, so
+        // both columns lose any nulls regardless of selectivity.
+        let mut expected = StatisticsContext::new()
+            .compute(input.as_ref(), &StatisticsArgs::new())?
+            .column_statistics
+            .clone();
+        for col in &mut expected {
+            col.null_count = Precision::Exact(0);
+        }
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
         assert_eq!(statistics.num_rows, Precision::Inexact(1000));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(4000));
@@ -1790,7 +2160,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
         assert_eq!(statistics.num_rows, Precision::Inexact(0));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(0));
@@ -1877,7 +2248,8 @@ mod tests {
             Arc::new(FilterExec::try_new(outer_predicate, inner_filter)?);
 
         // Should succeed without error
-        let statistics = outer_filter.partition_statistics(None)?;
+        let statistics = StatisticsContext::new()
+            .compute(outer_filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(0));
 
         Ok(())
@@ -1916,7 +2288,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
         assert_eq!(statistics.num_rows, Precision::Inexact(490));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(1960));
@@ -1924,10 +2297,14 @@ mod tests {
             statistics.column_statistics,
             vec![
                 ColumnStatistics {
+                    // `a < 50` rejects nulls in `a`.
+                    null_count: Precision::Exact(0),
                     min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                     max_value: Precision::Inexact(ScalarValue::Int32(Some(49))),
                     ..Default::default()
                 },
+                // `b` is not referenced by the predicate, so its stats are
+                // unchanged (null count stays unknown).
                 ColumnStatistics {
                     min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                     max_value: Precision::Inexact(ScalarValue::Int32(Some(100))),
@@ -1966,13 +2343,16 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let filter_statistics = filter.partition_statistics(None)?;
+        let filter_statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
 
         let expected_filter_statistics = Statistics {
             num_rows: Precision::Absent,
             total_byte_size: Precision::Absent,
             column_statistics: vec![ColumnStatistics {
-                null_count: Precision::Absent,
+                // `a <= 10` rejects nulls, so `a` has no surviving nulls even
+                // though the input statistics are entirely unknown.
+                null_count: Precision::Exact(0),
                 min_value: Precision::Inexact(ScalarValue::Int32(Some(5))),
                 max_value: Precision::Inexact(ScalarValue::Int32(Some(10))),
                 sum_value: Precision::Absent,
@@ -2001,7 +2381,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let filter_statistics = filter.partition_statistics(None)?;
+        let filter_statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // First column is "a", and it is a column with only one value after the filter.
         assert!(filter_statistics.column_statistics[0].is_singleton());
 
@@ -2048,11 +2429,13 @@ mod tests {
             Arc::new(Literal::new(ScalarValue::Decimal128(Some(10), 10, 10))),
         ));
         let filter = FilterExec::try_new(predicate, input)?;
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(200));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(800));
         let filter = filter.with_default_selectivity(40)?;
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
         assert_eq!(statistics.num_rows, Precision::Inexact(400));
         assert_eq!(statistics.total_byte_size, Precision::Inexact(1600));
         Ok(())
@@ -2087,7 +2470,9 @@ mod tests {
             Arc::new(EmptyExec::new(Arc::clone(&schema))),
         )?;
 
-        exec.partition_statistics(None).unwrap();
+        StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
+            .unwrap();
 
         Ok(())
     }
@@ -2243,8 +2628,10 @@ mod tests {
         assert_eq!(filter1.projection(), filter2.projection());
 
         // Verify statistics are the same
-        let stats1 = filter1.partition_statistics(None)?;
-        let stats2 = filter2.partition_statistics(None)?;
+        let stats1 =
+            StatisticsContext::new().compute(&filter1, &StatisticsArgs::new())?;
+        let stats2 =
+            StatisticsContext::new().compute(&filter2, &StatisticsArgs::new())?;
         assert_eq!(stats1.num_rows, stats2.num_rows);
         assert_eq!(stats1.total_byte_size, stats2.total_byte_size);
 
@@ -2297,7 +2684,8 @@ mod tests {
             .unwrap()
             .build()?;
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
 
         // Verify statistics reflect both filtering and projection
         assert!(matches!(statistics.num_rows, Precision::Inexact(_)));
@@ -2528,7 +2916,8 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         let col_b_stats = &statistics.column_statistics[1];
         assert_eq!(col_b_stats.min_value, Precision::Absent);
         assert_eq!(col_b_stats.max_value, Precision::Absent);
@@ -2607,7 +2996,9 @@ mod tests {
                 vec![Precision::Exact(1)],
             ),
             (
-                "OR preserves original NDV",
+                // A row passes only if `name` is 'a' or 'b', so the column holds
+                // at most two distinct values downstream.
+                "OR narrows NDV to the values it admits",
                 vec![Field::new("name", DataType::Utf8, false)],
                 vec![ColumnStatistics {
                     distinct_count: Precision::Inexact(50),
@@ -2626,7 +3017,7 @@ mod tests {
                         Arc::new(Literal::new(ScalarValue::Utf8(Some("b".to_string())))),
                     )),
                 )),
-                vec![Precision::Inexact(50)],
+                vec![Precision::Inexact(2)],
             ),
             (
                 "AND with mixed types (Utf8 + Int32)",
@@ -2813,7 +3204,8 @@ mod tests {
             ));
             let filter: Arc<dyn ExecutionPlan> =
                 Arc::new(FilterExec::try_new(predicate, input)?);
-            let statistics = filter.partition_statistics(None)?;
+            let statistics = StatisticsContext::new()
+                .compute(filter.as_ref(), &StatisticsArgs::new())?;
 
             for (i, expected) in expected_ndvs.iter().enumerate() {
                 assert_eq!(
@@ -2826,10 +3218,210 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_filter_statistics_preserves_exactly_empty_input() -> Result<()> {
+        // A satisfiable predicate over an exactly empty input: the filter cannot
+        // produce rows, so the whole estimate stays exact. Column `b` is not
+        // mentioned by the predicate, so its null and distinct counts go through
+        // the generic row cap.
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int32, true),
+        ]);
+        let input_stats = Statistics {
+            num_rows: Precision::Exact(0),
+            total_byte_size: Precision::Exact(0),
+            column_statistics: vec![
+                ColumnStatistics {
+                    null_count: Precision::Exact(0),
+                    byte_size: Precision::Exact(0),
+                    ..Default::default()
+                },
+                ColumnStatistics {
+                    null_count: Precision::Exact(3),
+                    distinct_count: Precision::Exact(7),
+                    byte_size: Precision::Exact(0),
+                    ..Default::default()
+                },
+            ],
+        };
+        let predicate = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("a", 0)),
+            Operator::Gt,
+            Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+        ));
+
+        let input = Arc::new(StatisticsExec::new(input_stats, schema.clone()));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
+
+        assert_eq!(statistics.num_rows, Precision::Exact(0));
+        assert_eq!(statistics.total_byte_size, Precision::Exact(0));
+        assert_eq!(
+            statistics.column_statistics[0].byte_size,
+            Precision::Exact(0)
+        );
+        assert_eq!(
+            statistics.column_statistics[1].null_count,
+            Precision::Exact(0)
+        );
+        assert_eq!(
+            statistics.column_statistics[1].distinct_count,
+            Precision::Exact(0)
+        );
+
+        // A contradictory predicate (`a = 1 AND a = 2`) discards all rows, the
+        // output is empty independently of the input.
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(1000),
+                total_byte_size: Precision::Inexact(8000),
+                column_statistics: vec![ColumnStatistics::new_unknown(); 2],
+            },
+            schema,
+        ));
+        let contradiction = Arc::new(BinaryExpr::new(
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(1)))),
+            )),
+            Operator::And,
+            Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 0)),
+                Operator::Eq,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(2)))),
+            )),
+        ));
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(contradiction, input)?);
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
+
+        assert_eq!(statistics.num_rows, Precision::Exact(0));
+        assert_eq!(statistics.total_byte_size, Precision::Exact(0));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_exact_empty_input_zeroes_byte_size() -> Result<()> {
+        let cases = [
+            ("absent", Precision::Absent, Precision::Absent),
+            ("inexact", Precision::Inexact(8000), Precision::Inexact(400)),
+        ];
+
+        for (desc, input_total_byte_size, input_byte_size) in cases {
+            let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
+            let input_stats = Statistics {
+                num_rows: Precision::Exact(0),
+                total_byte_size: input_total_byte_size,
+                column_statistics: vec![ColumnStatistics {
+                    byte_size: input_byte_size,
+                    ..Default::default()
+                }],
+            };
+            let predicate = Arc::new(BinaryExpr::new(
+                Arc::new(Column::new("a", 0)),
+                Operator::Gt,
+                Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+            ));
+
+            let input = Arc::new(StatisticsExec::new(input_stats, schema));
+            let filter: Arc<dyn ExecutionPlan> =
+                Arc::new(FilterExec::try_new(predicate, input)?);
+            let statistics = StatisticsContext::new()
+                .compute(filter.as_ref(), &StatisticsArgs::new())?;
+
+            assert_eq!(
+                statistics.num_rows,
+                Precision::Exact(0),
+                "case '{desc}': num_rows mismatch"
+            );
+            assert_eq!(
+                statistics.total_byte_size,
+                Precision::Exact(0),
+                "case '{desc}': total_byte_size mismatch"
+            );
+            assert_eq!(
+                statistics.column_statistics[0].byte_size,
+                Precision::Exact(0),
+                "case '{desc}': byte_size mismatch"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_empty_input_equality_ndv_zero() -> Result<()> {
+        let cases: Vec<(&str, Schema, Statistics, Arc<dyn PhysicalExpr>)> = vec![
+            (
+                "fallback string equality",
+                Schema::new(vec![Field::new("name", DataType::Utf8, true)]),
+                Statistics {
+                    num_rows: Precision::Exact(0),
+                    total_byte_size: Precision::Exact(0),
+                    column_statistics: vec![ColumnStatistics {
+                        distinct_count: Precision::Exact(0),
+                        null_count: Precision::Exact(0),
+                        byte_size: Precision::Exact(0),
+                        ..Default::default()
+                    }],
+                },
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("name", 0)),
+                    Operator::Eq,
+                    Arc::new(Literal::new(ScalarValue::Utf8(Some("x".to_string())))),
+                )),
+            ),
+            (
+                "interval numeric equality",
+                Schema::new(vec![Field::new("a", DataType::Int32, true)]),
+                Statistics {
+                    num_rows: Precision::Exact(0),
+                    total_byte_size: Precision::Exact(0),
+                    column_statistics: vec![ColumnStatistics {
+                        min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
+                        max_value: Precision::Inexact(ScalarValue::Int32(Some(10))),
+                        distinct_count: Precision::Exact(0),
+                        null_count: Precision::Exact(0),
+                        byte_size: Precision::Exact(0),
+                        ..Default::default()
+                    }],
+                },
+                Arc::new(BinaryExpr::new(
+                    Arc::new(Column::new("a", 0)),
+                    Operator::Eq,
+                    Arc::new(Literal::new(ScalarValue::Int32(Some(5)))),
+                )),
+            ),
+        ];
+
+        for (desc, schema, input_stats, predicate) in cases {
+            let input = Arc::new(StatisticsExec::new(input_stats, schema));
+            let filter: Arc<dyn ExecutionPlan> =
+                Arc::new(FilterExec::try_new(predicate, input)?);
+            let statistics = StatisticsContext::new()
+                .compute(filter.as_ref(), &StatisticsArgs::new())?;
+
+            assert_eq!(
+                statistics.num_rows,
+                Precision::Exact(0),
+                "case '{desc}': row count mismatch"
+            );
+            assert_eq!(
+                statistics.column_statistics[0].distinct_count,
+                Precision::Exact(0),
+                "case '{desc}': NDV should be capped at zero rows"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_filter_statistics_and_equality_ndv() -> Result<()> {
-        // a: min=1, max=100, ndv=80
-        // b: min=1, max=50, ndv=40
-        // c: min=1, max=200, ndv=150
         let schema = Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
@@ -2843,6 +3435,7 @@ mod tests {
                     ColumnStatistics {
                         min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                         max_value: Precision::Inexact(ScalarValue::Int32(Some(100))),
+                        null_count: Precision::Inexact(80),
                         distinct_count: Precision::Inexact(80),
                         ..Default::default()
                     },
@@ -2855,6 +3448,7 @@ mod tests {
                     ColumnStatistics {
                         min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                         max_value: Precision::Inexact(ScalarValue::Int32(Some(200))),
+                        null_count: Precision::Inexact(90),
                         distinct_count: Precision::Inexact(150),
                         ..Default::default()
                     },
@@ -2887,11 +3481,16 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
-        // a = 42 collapses to single value
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
+        // Equality predicates collapse NDV and reject nulls for their columns.
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
             Precision::Exact(1)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Exact(0)
         );
         // b > 10 narrows to [11, 50] but doesn't collapse to a single value.
         // The combined selectivity of a=42 (1/80) and c=7 (1/150) on 100 rows
@@ -2900,10 +3499,13 @@ mod tests {
             statistics.column_statistics[1].distinct_count,
             Precision::Inexact(1)
         );
-        // c = 7 collapses to single value
         assert_eq!(
             statistics.column_statistics[2].distinct_count,
             Precision::Exact(1)
+        );
+        assert_eq!(
+            statistics.column_statistics[2].null_count,
+            Precision::Exact(0)
         );
         Ok(())
     }
@@ -2924,8 +3526,8 @@ mod tests {
             schema.clone(),
         ));
 
-        // a = 42: even without known bounds, interval analysis resolves
-        // the equality to [42, 42], so NDV is correctly set to Exact(1)
+        // Even without input bounds, interval analysis can derive singleton
+        // bounds from the equality itself.
         let predicate = Arc::new(BinaryExpr::new(
             Arc::new(Column::new("a", 0)),
             Operator::Eq,
@@ -2933,7 +3535,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
             Precision::Exact(1)
@@ -2966,7 +3569,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
             Precision::Exact(1)
@@ -2999,7 +3603,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
             Precision::Exact(1)
@@ -3032,7 +3637,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
             Precision::Exact(1)
@@ -3066,7 +3672,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
             Precision::Exact(1)
@@ -3112,7 +3719,8 @@ mod tests {
         ));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         assert_eq!(
             statistics.column_statistics[0].distinct_count,
             Precision::Exact(1)
@@ -3390,16 +3998,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_filter_statistics_ndv_capped_at_row_count() -> Result<()> {
-        // Table: a: min=1, max=100, distinct_count=80, 100 rows
-        let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+        let schema = Schema::new(vec![Field::new("a", DataType::Int32, true)]);
         let input = Arc::new(StatisticsExec::new(
             Statistics {
                 num_rows: Precision::Inexact(100),
-                total_byte_size: Precision::Inexact(400),
+                total_byte_size: Precision::Inexact(1000),
                 column_statistics: vec![ColumnStatistics {
                     min_value: Precision::Inexact(ScalarValue::Int32(Some(1))),
                     max_value: Precision::Inexact(ScalarValue::Int32(Some(100))),
+                    null_count: Precision::Inexact(80),
                     distinct_count: Precision::Inexact(80),
+                    byte_size: Precision::Exact(1000),
                     ..Default::default()
                 }],
             },
@@ -3413,15 +4022,682 @@ mod tests {
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, input)?);
 
-        let statistics = filter.partition_statistics(None)?;
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
         // Filter estimates ~10 rows (selectivity = 10/100)
         assert_eq!(statistics.num_rows, Precision::Inexact(10));
-        // NDV should be capped at the filtered row count (10), not the original 80
         let ndv = &statistics.column_statistics[0].distinct_count;
         assert!(
             ndv.get_value().copied() <= Some(10),
             "Expected NDV <= 10 (filtered row count), got {ndv:?}"
         );
+        // `a <= 10` rejects nulls, so the 80 input nulls drop to exactly zero.
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Exact(0)
+        );
+        // byte_size follows the same 10% selectivity estimate.
+        assert_eq!(
+            statistics.column_statistics[0].byte_size,
+            Precision::Inexact(100)
+        );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_default_selectivity_column_stats() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(100),
+                total_byte_size: Precision::Inexact(1000),
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Inexact(80),
+                    distinct_count: Precision::Inexact(60),
+                    byte_size: Precision::Exact(1000),
+                    ..Default::default()
+                }],
+            },
+            schema.clone(),
+        ));
+
+        // Utf8 interval analysis is unsupported, so this exercises the default
+        // selectivity path. The predicate rejects nulls but does not constrain
+        // the column to one value.
+        let predicate: Arc<dyn PhysicalExpr> =
+            binary(col("name", &schema)?, Operator::Gt, lit("m"), &schema)?;
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(statistics.num_rows, Precision::Inexact(20));
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Exact(0)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].byte_size,
+            Precision::Inexact(200)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].distinct_count,
+            Precision::Inexact(20)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_or_does_not_reject_nulls() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(100),
+                total_byte_size: Precision::Inexact(1000),
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Inexact(80),
+                    distinct_count: Precision::Inexact(60),
+                    byte_size: Precision::Exact(1000),
+                    ..Default::default()
+                }],
+            },
+            schema.clone(),
+        ));
+
+        let predicate: Arc<dyn PhysicalExpr> = binary(
+            binary(col("name", &schema)?, Operator::Gt, lit("m"), &schema)?,
+            Operator::Or,
+            is_null(col("name", &schema)?)?,
+            &schema,
+        )?;
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(statistics.num_rows, Precision::Inexact(20));
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Inexact(20)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].byte_size,
+            Precision::Inexact(200)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].distinct_count,
+            Precision::Inexact(20)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_filter_statistics_is_not_null_rejects_nulls() -> Result<()> {
+        let schema = Schema::new(vec![Field::new("name", DataType::Utf8, true)]);
+        let input = Arc::new(StatisticsExec::new(
+            Statistics {
+                num_rows: Precision::Inexact(100),
+                total_byte_size: Precision::Inexact(1000),
+                column_statistics: vec![ColumnStatistics {
+                    null_count: Precision::Inexact(80),
+                    distinct_count: Precision::Inexact(60),
+                    byte_size: Precision::Exact(1000),
+                    ..Default::default()
+                }],
+            },
+            schema.clone(),
+        ));
+
+        // `name IS NOT NULL` keeps only non-null rows, so the surviving null
+        // count is exactly zero. Utf8 interval analysis is unsupported, so this
+        // also exercises the default-selectivity path.
+        let predicate: Arc<dyn PhysicalExpr> = is_not_null(col("name", &schema)?)?;
+        let filter: Arc<dyn ExecutionPlan> =
+            Arc::new(FilterExec::try_new(predicate, input)?);
+
+        let statistics =
+            StatisticsContext::new().compute(filter.as_ref(), &StatisticsArgs::new())?;
+        assert_eq!(statistics.num_rows, Precision::Inexact(20));
+        assert_eq!(
+            statistics.column_statistics[0].null_count,
+            Precision::Exact(0)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].byte_size,
+            Precision::Inexact(200)
+        );
+        assert_eq!(
+            statistics.column_statistics[0].distinct_count,
+            Precision::Inexact(20)
+        );
+        Ok(())
+    }
+
+    /// `col IN (..)` and `col = k1 OR col = k2` are the same predicate in two
+    /// physical spellings, neither analyzable by interval arithmetic. Without a
+    /// distinctness-based estimate both fall to the flat default selectivity,
+    /// which on a large table over-states the surviving rows by orders of
+    /// magnitude and mis-sizes whatever consumes the estimate — the join build
+    /// side, most damagingly.
+    mod distinct_value_selectivity {
+        use super::*;
+
+        const BYTES_PER_ROW: usize = 8;
+
+        /// One `Int64` column `k` with `rows` rows and `ndv` distinct values,
+        /// plus a second column `other` used by the multi-column cases.
+        fn schema() -> Schema {
+            Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("other", DataType::Int64, false),
+            ])
+        }
+
+        fn input(rows: usize, ndv: Precision<usize>) -> Arc<StatisticsExec> {
+            let column = ColumnStatistics {
+                distinct_count: ndv,
+                ..Default::default()
+            };
+            Arc::new(StatisticsExec::new(
+                Statistics {
+                    num_rows: Precision::Exact(rows),
+                    total_byte_size: Precision::Exact(rows * BYTES_PER_ROW),
+                    column_statistics: vec![column.clone(), column],
+                },
+                schema(),
+            ))
+        }
+
+        fn keys(n: usize) -> Vec<Arc<dyn PhysicalExpr>> {
+            (0..n).map(|i| lit(i as i64)).collect()
+        }
+
+        /// `k IN (0, .., n-1)`, as the planner builds it for n >= 4.
+        fn in_list_predicate(n: usize, negated: bool) -> Arc<dyn PhysicalExpr> {
+            let schema = schema();
+            in_list(col("k", &schema).unwrap(), keys(n), &negated, &schema).unwrap()
+        }
+
+        /// `k = 0 OR .. OR k = n-1`, as the planner builds it for n <= 3.
+        fn or_chain_predicate(n: usize) -> Arc<dyn PhysicalExpr> {
+            let schema = schema();
+            keys(n)
+                .into_iter()
+                .map(|key| {
+                    binary(col("k", &schema).unwrap(), Operator::Eq, key, &schema)
+                        .unwrap()
+                })
+                .reduce(|left, right| binary(left, Operator::Or, right, &schema).unwrap())
+                .expect("at least one key")
+        }
+
+        fn rows_after(
+            predicate: Arc<dyn PhysicalExpr>,
+            input: Arc<StatisticsExec>,
+        ) -> Result<Precision<usize>> {
+            let filter = FilterExec::try_new(predicate, input)?;
+            Ok(StatisticsContext::new()
+                .compute(&filter, &StatisticsArgs::new())?
+                .num_rows)
+        }
+
+        #[test]
+        fn in_list_on_a_unique_column_estimates_the_list_length() -> Result<()> {
+            // 150M rows, every value distinct: 128 keys reach at most 128 rows.
+            // The flat default would have claimed 30M.
+            let rows = rows_after(
+                in_list_predicate(128, false),
+                input(150_000_000, Precision::Exact(150_000_000)),
+            )?;
+            assert_eq!(rows, Precision::Inexact(128));
+            Ok(())
+        }
+
+        #[test]
+        fn or_chain_and_in_list_agree() -> Result<()> {
+            // The optimizer rewrites between these two spellings around a list
+            // length of three, so an estimate that recognized only one of them
+            // would break on the far side of that threshold.
+            let stats = || input(150_000_000, Precision::Exact(150_000_000));
+            for n in [2, 3] {
+                assert_eq!(
+                    rows_after(or_chain_predicate(n), stats())?,
+                    Precision::Inexact(n),
+                    "OR chain of {n} equalities"
+                );
+                assert_eq!(
+                    rows_after(in_list_predicate(n, false), stats())?,
+                    Precision::Inexact(n),
+                    "IN list of {n} keys"
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn a_non_unique_column_scales_by_rows_per_value() -> Result<()> {
+            // 1M rows over 1000 distinct values is 1000 rows per value.
+            let rows = rows_after(
+                in_list_predicate(3, false),
+                input(1_000_000, Precision::Exact(1_000)),
+            )?;
+            assert_eq!(rows, Precision::Inexact(3_000));
+            Ok(())
+        }
+
+        #[test]
+        fn duplicate_literals_collapse() -> Result<()> {
+            let schema = schema();
+            // k IN (7, 7, 7) reaches one value, not three.
+            let predicate = in_list(
+                col("k", &schema)?,
+                vec![lit(7i64), lit(7i64), lit(7i64)],
+                &false,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(1_000));
+            Ok(())
+        }
+
+        #[test]
+        fn a_conjunction_takes_the_tightest_estimate() -> Result<()> {
+            let schema = schema();
+            // k IN (4 of 1000 values) AND other IN (2 of 1000): the result is a
+            // subset of each side, so the tighter of the two bounds it.
+            let predicate = binary(
+                in_list(col("k", &schema)?, keys(4), &false, &schema)?,
+                Operator::And,
+                in_list(col("other", &schema)?, keys(2), &false, &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        #[test]
+        fn an_estimate_never_exceeds_the_input() -> Result<()> {
+            // 50 keys over 10 distinct values would extrapolate past the table.
+            let rows = rows_after(
+                in_list_predicate(50, false),
+                input(100, Precision::Exact(10)),
+            )?;
+            assert_eq!(rows, Precision::Inexact(100));
+            Ok(())
+        }
+
+        #[test]
+        fn the_byte_size_scales_with_the_rows() -> Result<()> {
+            let filter = FilterExec::try_new(
+                in_list_predicate(128, false),
+                input(150_000_000, Precision::Exact(150_000_000)),
+            )?;
+            let statistics =
+                StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
+            assert_eq!(statistics.num_rows, Precision::Inexact(128));
+            // NDV is an estimate, so nothing derived from it may claim Exact.
+            assert_eq!(
+                statistics.total_byte_size,
+                Precision::Inexact(128 * BYTES_PER_ROW)
+            );
+            Ok(())
+        }
+
+        /// Everything below must fall back to the default selectivity: the
+        /// predicate's distinctness says nothing about how many rows survive.
+        fn assert_falls_back_to_default(predicate: Arc<dyn PhysicalExpr>) -> Result<()> {
+            let default = FILTER_EXEC_DEFAULT_SELECTIVITY as usize;
+            let rows = rows_after(predicate, input(1_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(1_000 * default / 100));
+            Ok(())
+        }
+
+        #[test]
+        fn negated_in_list_falls_back() -> Result<()> {
+            // NOT IN excludes n values out of an unknown number.
+            assert_falls_back_to_default(in_list_predicate(5, true))
+        }
+
+        #[test]
+        fn a_disjunction_across_columns_falls_back() -> Result<()> {
+            // k = 1 OR other = 2 is a union of two row sets; neither column's
+            // distinctness limits it.
+            let schema = schema();
+            assert_falls_back_to_default(binary(
+                binary(col("k", &schema)?, Operator::Eq, lit(1i64), &schema)?,
+                Operator::Or,
+                binary(col("other", &schema)?, Operator::Eq, lit(2i64), &schema)?,
+                &schema,
+            )?)
+        }
+
+        #[test]
+        fn a_non_literal_list_element_falls_back() -> Result<()> {
+            // The list's cardinality is not known from the expression alone.
+            let schema = schema();
+            assert_falls_back_to_default(in_list(
+                col("k", &schema)?,
+                vec![lit(1i64), col("other", &schema)?],
+                &false,
+                &schema,
+            )?)
+        }
+
+        /// `a IN (1, 2, 3) OR a = 4` — the two spellings mixed in one predicate.
+        /// The simplifier produces this whenever an `OR` chain is long enough for
+        /// part of it to have been merged into an `InList` but not all of it.
+        #[test]
+        fn a_mixed_in_list_and_equality_disjunction_unions_its_values() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                in_list(col("k", &schema)?, keys(3), &false, &schema)?,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Eq, lit(3i64), &schema)?,
+                &schema,
+            )?;
+            // keys(3) is 0..2, plus the literal 3 => four distinct values.
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(4_000));
+            Ok(())
+        }
+
+        /// A disjunction nests to the left as the parser builds it, so the
+        /// normalizer has to recurse rather than look only one level down.
+        #[test]
+        fn a_nested_disjunction_collects_every_arm() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                binary(
+                    binary(col("k", &schema)?, Operator::Eq, lit(0i64), &schema)?,
+                    Operator::Or,
+                    binary(col("k", &schema)?, Operator::Eq, lit(1i64), &schema)?,
+                    &schema,
+                )?,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Eq, lit(2i64), &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(3_000));
+            Ok(())
+        }
+
+        /// `1 = k` is the same predicate as `k = 1`; the simplifier does not
+        /// always put the column on the left.
+        #[test]
+        fn a_reversed_equality_is_recognized() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                binary(lit(0i64), Operator::Eq, col("k", &schema)?, &schema)?,
+                Operator::Or,
+                binary(lit(1i64), Operator::Eq, col("k", &schema)?, &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// One arm that is not a distinct-value test makes the whole disjunction
+        /// unbounded: `k IN (1, 2) OR k > 5` can match anything `k > 5` matches.
+        #[test]
+        fn a_disjunction_with_a_range_arm_falls_back() -> Result<()> {
+            let schema = schema();
+            assert_falls_back_to_default(binary(
+                in_list(col("k", &schema)?, keys(2), &false, &schema)?,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Gt, lit(5i64), &schema)?,
+                &schema,
+            )?)
+        }
+
+        /// Two conjuncts constraining the SAME column take the tighter one, like
+        /// any other pair: the result is a subset of each.
+        #[test]
+        fn a_conjunction_on_one_column_takes_the_tighter_arm() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                in_list(col("k", &schema)?, keys(8), &false, &schema)?,
+                Operator::And,
+                in_list(col("k", &schema)?, keys(2), &false, &schema)?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// A `NULL` literal matches nothing, so counting it over-states the
+        /// result by one value. That is the safe direction, and it keeps the
+        /// normalizer from having to reason about three-valued logic.
+        #[test]
+        fn a_null_literal_is_counted_rather_than_dropped() -> Result<()> {
+            let schema = schema();
+            let predicate = in_list(
+                col("k", &schema)?,
+                vec![lit(1i64), lit(ScalarValue::Int64(None))],
+                &false,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// The estimate is uniformity-based, which is what NDV supports and no
+        /// more: it divides the rows evenly among the distinct values. On a
+        /// skewed column the true count for a hot key is higher than this, in
+        /// the same way and for the same reason as the `col = literal` estimate
+        /// the branch already computes. Pinned so that the limitation is visible
+        /// and so a histogram-aware estimate has a test to update.
+        #[test]
+        fn the_estimate_divides_rows_evenly_and_does_not_model_skew() -> Result<()> {
+            // 1M rows over two values: the estimate for one of them is 500k,
+            // whatever the real split between them is.
+            let schema = schema();
+            let predicate = binary(col("k", &schema)?, Operator::Eq, lit(0i64), &schema)?;
+            let predicate = binary(
+                predicate,
+                Operator::Or,
+                binary(col("k", &schema)?, Operator::Eq, lit(0i64), &schema)?,
+                &schema,
+            )?;
+            // Both arms name the same value, so the group holds one value.
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(2)))?;
+            assert_eq!(rows, Precision::Inexact(500_000));
+            Ok(())
+        }
+
+        /// Two conjuncts constraining one column intersect rather than each
+        /// standing alone: `k IN (0, 1, 2) AND (k = 2 OR k = 3)` admits only 2.
+        /// Taking the tighter arm alone would say 2 values out of a 1000-value
+        /// column; the intersection says one.
+        #[test]
+        fn conjuncts_on_one_column_intersect() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                in_list(col("k", &schema)?, keys(3), &false, &schema)?,
+                Operator::And,
+                binary(
+                    binary(col("k", &schema)?, Operator::Eq, lit(2i64), &schema)?,
+                    Operator::Or,
+                    binary(col("k", &schema)?, Operator::Eq, lit(3i64), &schema)?,
+                    &schema,
+                )?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(1_000));
+            Ok(())
+        }
+
+        /// A disjunction of conjunctions constrains *both* columns: every row
+        /// passing `(k = 1 AND other = 2) OR (k = 2 AND other = 3)` has k in
+        /// {1, 2}, so the k bound holds even though neither arm alone gives it.
+        #[test]
+        fn a_disjunction_of_conjunctions_bounds_each_column() -> Result<()> {
+            let schema = schema();
+            let arm = |k: i64, other: i64| -> Result<Arc<dyn PhysicalExpr>> {
+                binary(
+                    binary(col("k", &schema)?, Operator::Eq, lit(k), &schema)?,
+                    Operator::And,
+                    binary(col("other", &schema)?, Operator::Eq, lit(other), &schema)?,
+                    &schema,
+                )
+            };
+            let predicate = binary(arm(1, 2)?, Operator::Or, arm(2, 3)?, &schema)?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// The row estimate and the column's distinct count have to agree: a
+        /// filter admitting 3 keys cannot report the scan's whole-table NDV for
+        /// the column it just filtered. Join cardinality estimation reads the
+        /// NDV rather than the row count, so an unnarrowed NDV re-inflates
+        /// downstream what the row estimate just fixed. The column is not
+        /// unique, so capping its NDV at the estimated rows would leave it at
+        /// 1000.
+        #[test]
+        fn the_admitted_column_ndv_narrows_with_the_rows() -> Result<()> {
+            let filter = FilterExec::try_new(
+                in_list_predicate(3, false),
+                input(1_000_000, Precision::Exact(1_000)),
+            )?;
+            let statistics =
+                StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
+            assert_eq!(statistics.num_rows, Precision::Inexact(3_000));
+            assert_eq!(
+                statistics.column_statistics[0].distinct_count,
+                Precision::Inexact(3)
+            );
+            // The untouched column keeps what the scan reported.
+            assert_eq!(
+                statistics.column_statistics[1].distinct_count,
+                Precision::Inexact(1_000)
+            );
+            Ok(())
+        }
+
+        /// `rows` rows over `schema`'s two columns, with the given distinct
+        /// counts, for the cases that must tell one column's statistics from
+        /// the other's.
+        fn two_columns(
+            schema: &Schema,
+            rows: usize,
+            ndvs: [usize; 2],
+        ) -> Arc<StatisticsExec> {
+            let column = |ndv| ColumnStatistics {
+                distinct_count: Precision::Exact(ndv),
+                ..Default::default()
+            };
+            Arc::new(StatisticsExec::new(
+                Statistics {
+                    num_rows: Precision::Exact(rows),
+                    total_byte_size: Precision::Exact(rows * BYTES_PER_ROW),
+                    column_statistics: vec![column(ndvs[0]), column(ndvs[1])],
+                },
+                schema.clone(),
+            ))
+        }
+
+        /// A physical schema repeats a field name after a join. The predicate
+        /// reads one of the two by index, so the estimate uses that column's
+        /// NDV: 2 of 1000 values is 2000 rows, where the other column's NDV
+        /// would give 20000.
+        #[test]
+        fn a_repeated_field_name_resolves_to_the_index_the_predicate_reads() -> Result<()>
+        {
+            let repeated = Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("k", DataType::Int64, false),
+            ]);
+            let predicate =
+                in_list(Arc::new(Column::new("k", 0)), keys(2), &false, &repeated)?;
+            let rows =
+                rows_after(predicate, two_columns(&repeated, 1_000_000, [1_000, 100]))?;
+            assert_eq!(rows, Precision::Inexact(2_000));
+            Ok(())
+        }
+
+        /// A physical `Column` is resolved by index; its name is for display
+        /// and need not match the field at that index. `other@0` filters `k`,
+        /// so the estimate and the narrowed NDV are `k`'s.
+        #[test]
+        fn a_column_named_unlike_its_field_reads_the_field_it_indexes() -> Result<()> {
+            let schema = schema();
+            let predicate =
+                in_list(Arc::new(Column::new("other", 0)), keys(2), &false, &schema)?;
+            let filter = FilterExec::try_new(
+                predicate,
+                two_columns(&schema, 1_000_000, [1_000, 100]),
+            )?;
+            let statistics =
+                StatisticsContext::new().compute(&filter, &StatisticsArgs::new())?;
+            assert_eq!(statistics.num_rows, Precision::Inexact(2_000));
+            assert_eq!(
+                statistics.column_statistics[0].distinct_count,
+                Precision::Inexact(2)
+            );
+            assert_eq!(
+                statistics.column_statistics[1].distinct_count,
+                Precision::Inexact(100)
+            );
+            Ok(())
+        }
+
+        /// `analyze` keys its guarantees by name, so two predicate columns
+        /// sharing one cannot be told apart. Declining leaves the default
+        /// estimate rather than reading either column's NDV for both.
+        #[test]
+        fn two_predicate_columns_sharing_a_name_fall_back() -> Result<()> {
+            let repeated = Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("k", DataType::Int64, false),
+            ]);
+            let predicate = binary(
+                in_list(Arc::new(Column::new("k", 0)), keys(2), &false, &repeated)?,
+                Operator::And,
+                in_list(Arc::new(Column::new("k", 1)), keys(2), &false, &repeated)?,
+                &repeated,
+            )?;
+            let default = FILTER_EXEC_DEFAULT_SELECTIVITY as usize;
+            let rows =
+                rows_after(predicate, two_columns(&repeated, 1_000_000, [1_000, 100]))?;
+            assert_eq!(rows, Precision::Inexact(1_000_000 * default / 100));
+            Ok(())
+        }
+
+        /// `analyze` drops a column's guarantee when its conjuncts admit no
+        /// common value, so `k = 1 AND k IN (2, 3)` yields no `In` guarantee for
+        /// `k`. The equality still bounds the estimate on its own.
+        #[test]
+        fn an_equality_bounds_the_estimate_when_its_conjuncts_contradict() -> Result<()> {
+            let schema = schema();
+            let predicate = binary(
+                binary(col("k", &schema)?, Operator::Eq, lit(1i64), &schema)?,
+                Operator::And,
+                in_list(
+                    col("k", &schema)?,
+                    vec![lit(2i64), lit(3i64)],
+                    &false,
+                    &schema,
+                )?,
+                &schema,
+            )?;
+            let rows = rows_after(predicate, input(1_000_000, Precision::Exact(1_000)))?;
+            assert_eq!(rows, Precision::Inexact(1_000));
+            Ok(())
+        }
+
+        #[test]
+        fn an_absent_ndv_falls_back() -> Result<()> {
+            let rows =
+                rows_after(in_list_predicate(5, false), input(1_000, Precision::Absent))?;
+            let default = FILTER_EXEC_DEFAULT_SELECTIVITY as usize;
+            assert_eq!(rows, Precision::Inexact(1_000 * default / 100));
+            Ok(())
+        }
     }
 }

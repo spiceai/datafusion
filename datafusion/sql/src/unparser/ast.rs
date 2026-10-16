@@ -15,7 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use super::rewrite::VisibleScope;
 use core::fmt;
 use std::ops::ControlFlow;
 
@@ -145,6 +144,12 @@ impl QueryBuilder {
             || self.fetch.is_some()
             || !self.limit_by.is_empty()
     }
+    /// Whether the query carries a clause other than its body, `ORDER BY` and
+    /// row bound — a `WITH`, a lock, or a `FOR` clause — which only the query
+    /// that owns it can hold.
+    pub fn carries_statement_clauses(&self) -> bool {
+        self.with.is_some() || !self.locks.is_empty() || self.for_clause.is_some()
+    }
     pub fn build(&self) -> Result<ast::Query, BuilderError> {
         let order_by = self
             .order_by_kind
@@ -212,7 +217,7 @@ fn visit_unless_subquery(
 }
 
 /// Returns true if `expr` holds a subquery anywhere within it.
-fn contains_subquery(expr: &ast::Expr) -> bool {
+pub(crate) fn contains_subquery(expr: &ast::Expr) -> bool {
     visit_expressions(expr, |expr| {
         if matches!(
             expr,
@@ -265,6 +270,10 @@ pub struct SelectBuilder {
     /// How many join inputs the walk is currently inside. A join walks both of its
     /// inputs with this one builder, so while this is non-zero the relation being
     /// unparsed is not the SELECT's only one — see [`Self::within_join_input`].
+    /// A `Limit` reached there has no clause of this SELECT that bounds one
+    /// input's contribution to the join — `LIMIT` here bounds the join's
+    /// output — so it is derived in a scope of its own whatever else this
+    /// SELECT carries.
     join_inputs_in_progress: usize,
     /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
     /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so
@@ -272,6 +281,24 @@ pub struct SelectBuilder {
     ///
     /// Set with `mark_aggregated()` and read with `already_aggregated()`.
     aggregated: bool,
+    /// How many joins' *right* inputs the walk is currently inside. A join
+    /// reached there cannot append itself to this SELECT's `FROM`, whose
+    /// last entry is the enclosing join's left side: it is a joined table of
+    /// its own, parenthesised on the enclosing join's right.
+    ///
+    /// Entered with `enter_right_join_input()`, left with
+    /// `leave_right_join_input()`, read with `in_right_join_input()`.
+    right_join_inputs: usize,
+    /// How many null-extended join inputs the walk is currently inside — a
+    /// LEFT JOIN's right input, a RIGHT JOIN's left, either of a FULL JOIN's.
+    /// A mark join reached there is refused: the `EXISTS` that would replace
+    /// its mark is never NULL, but the mark is on a row the outer join
+    /// null-extends, so a predicate above reading it would answer differently.
+    ///
+    /// Entered with `enter_null_extended_join_input()`, left with
+    /// `leave_null_extended_join_input()`, read with
+    /// `in_null_extended_join_input()`.
+    null_extended_join_inputs: usize,
     /// Whether the join inputs being walked into this SELECT must keep their
     /// predicates in scopes of their own instead of contributing them to this
     /// SELECT's `WHERE`.
@@ -323,6 +350,7 @@ pub(crate) const DERIVED_LIMIT_ALIAS: &str = "derived_limit";
 pub(crate) const DERIVED_PROJECTION_ALIAS: &str = "derived_projection";
 pub(crate) const DERIVED_SORT_ALIAS: &str = "derived_sort";
 pub(crate) const DERIVED_UNION_ALIAS: &str = "derived_union";
+pub(crate) const DERIVED_UNION_INPUT_ALIAS: &str = "derived_union_input";
 pub(crate) const DERIVED_UNNEST_ALIAS: &str = "derived_unnest";
 pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 
@@ -335,12 +363,13 @@ pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 /// out of this list still compiles and still emits, and the guard reading it
 /// simply stops recognising the alias, which is the wrong-rows direction. Adding
 /// one here is the other half of adding one above.
-pub(crate) const DERIVED_TABLE_ALIASES: [&str; 7] = [
+pub(crate) const DERIVED_TABLE_ALIASES: [&str; 8] = [
     DERIVED_DISTINCT_ALIAS,
     DERIVED_LIMIT_ALIAS,
     DERIVED_PROJECTION_ALIAS,
     DERIVED_SORT_ALIAS,
     DERIVED_UNION_ALIAS,
+    DERIVED_UNION_INPUT_ALIAS,
     DERIVED_UNNEST_ALIAS,
     DERIVED_WINDOW_INPUT_ALIAS,
 ];
@@ -444,6 +473,28 @@ impl SelectBuilder {
     pub fn already_aggregated(&self) -> bool {
         self.aggregated
     }
+    /// Whether the walk is inside some join's right input (see
+    /// `right_join_inputs`).
+    pub fn in_right_join_input(&self) -> bool {
+        self.right_join_inputs > 0
+    }
+    pub fn enter_right_join_input(&mut self) {
+        self.right_join_inputs += 1;
+    }
+    pub fn leave_right_join_input(&mut self) {
+        self.right_join_inputs = self.right_join_inputs.saturating_sub(1);
+    }
+    /// Whether the walk is inside a join input the join null-extends (see
+    /// `null_extended_join_inputs`).
+    pub fn in_null_extended_join_input(&self) -> bool {
+        self.null_extended_join_inputs > 0
+    }
+    pub fn enter_null_extended_join_input(&mut self) {
+        self.null_extended_join_inputs += 1;
+    }
+    pub fn leave_null_extended_join_input(&mut self) {
+        self.null_extended_join_inputs = self.null_extended_join_inputs.saturating_sub(1);
+    }
 
     /// Whether the join inputs walked into this SELECT must keep their
     /// predicates in scopes of their own rather than in this SELECT's `WHERE`.
@@ -530,6 +581,9 @@ impl SelectBuilder {
     pub fn pop_from(&mut self) -> Option<TableWithJoinsBuilder> {
         self.from.pop()
     }
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some()
+    }
     pub fn lateral_views(&mut self, value: Vec<ast::LateralView>) -> &mut Self {
         self.lateral_views = value;
         self
@@ -572,13 +626,6 @@ impl SelectBuilder {
         self.and_selection(value)
     }
 
-    /// Puts back a predicate that `take_selection()` removed. It is combined
-    /// like any other, but not counted by `predicates_added()`: it is the
-    /// predicate that was already there, not a contribution.
-    pub fn restore_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
-        self.and_selection(value)
-    }
-
     /// How many predicates `selection()` has added to this SELECT so far.
     pub fn predicates_added(&self) -> usize {
         self.predicates_added
@@ -610,11 +657,6 @@ impl SelectBuilder {
         self
     }
 
-    /// Whether this `SELECT` already carries a `WHERE` predicate.
-    pub fn has_selection(&self) -> bool {
-        self.selection.is_some()
-    }
-
     /// Whether this `SELECT` already carries a predicate that can only be
     /// stated alongside the grouping or windowing it filters — `HAVING` or
     /// `QUALIFY`.
@@ -631,6 +673,29 @@ impl SelectBuilder {
     /// caller can tell what a sub-plan contributed and re-place it elsewhere.
     pub fn take_selection(&mut self) -> Option<ast::Expr> {
         self.selection.take()
+    }
+
+    /// How many conjuncts the `WHERE` predicate accumulated so far has, counting
+    /// the way `selection()` joins them: a later predicate is `AND`ed onto the
+    /// right, so the first `n` conjuncts are always the ones that were there
+    /// first, whatever a later walk rewrote inside them.
+    pub fn selection_conjunct_count(&self) -> usize {
+        self.selection.as_ref().map_or(0, |selection| {
+            split_selection_conjuncts(selection.clone()).len()
+        })
+    }
+
+    /// Splits off what was `AND`ed onto the `WHERE` predicate after its first
+    /// `kept` conjuncts, leaving those in place — rewritten or not — and returning
+    /// the rest. Unlike `take_selection()` this leaves the predicate a sub-plan
+    /// may rewrite in place (a mark join replaces the mark column it produces
+    /// wherever the predicate reads it) where that sub-plan can reach it.
+    pub fn take_selection_added_after(&mut self, kept: usize) -> Option<ast::Expr> {
+        let selection = self.selection.take()?;
+        let mut conjuncts = split_selection_conjuncts(selection);
+        let added = conjuncts.split_off(kept.min(conjuncts.len()));
+        self.selection = join_selection_conjuncts(conjuncts);
+        join_selection_conjuncts(added)
     }
 
     /// Applies `f` to every expression this SELECT carries: the projection, `WHERE`,
@@ -782,6 +847,8 @@ impl SelectBuilder {
             flatten_table_aliases: Vec::new(),
             join_inputs_in_progress: 0,
             aggregated: false,
+            right_join_inputs: 0,
+            null_extended_join_inputs: 0,
             input_predicates_stay_scoped: false,
             predicates_added: 0,
         }
@@ -847,6 +914,9 @@ pub struct RelationBuilder {
     /// Whether the enclosing scope names this relation's output columns itself,
     /// through a column list on the alias it attaches once the relation is built.
     columns_named_by_alias: bool,
+    /// The alias the enclosing scope attaches to this relation once it is built,
+    /// when that alias names the relation's own output columns.
+    alias_in_scope: Option<String>,
 }
 
 #[derive(Clone)]
@@ -856,6 +926,7 @@ pub struct RelationBuilder {
 enum TableFactorBuilder {
     Table(TableRelationBuilder),
     Derived(DerivedRelationBuilder),
+    NestedJoin(ast::TableWithJoins, Option<ast::TableAlias>),
     Unnest(UnnestRelationBuilder),
     Flatten(FlattenRelationBuilder),
     Empty,
@@ -884,39 +955,21 @@ impl RelationBuilder {
             _ => None,
         }
     }
-    /// Adds what this relation makes visible to the enclosing `SELECT` to `scope`,
-    /// before the `FROM` is built.
-    pub(super) fn add_visible_to(&self, scope: &mut VisibleScope) {
-        match &self.relation {
-            Some(TableFactorBuilder::Table(table)) => match (&table.alias, &table.name) {
-                (Some(alias), _) => scope.add_alias(alias),
-                (None, Some(name)) => scope.add_table_name(name),
-                (None, None) => {}
-            },
-            Some(TableFactorBuilder::Derived(derived)) => {
-                if let Some(alias) = &derived.alias {
-                    scope.add_alias(alias);
-                }
-            }
-            Some(TableFactorBuilder::Unnest(unnest)) => {
-                if let Some(alias) = &unnest.alias {
-                    scope.add_alias(alias);
-                }
-            }
-            Some(TableFactorBuilder::Flatten(flatten)) => {
-                if let Some(alias) = &flatten.alias {
-                    scope.add_alias(alias);
-                }
-            }
-            Some(TableFactorBuilder::Empty) | None => {}
-        }
-    }
     pub fn table(&mut self, value: TableRelationBuilder) -> &mut Self {
         self.relation = Some(TableFactorBuilder::Table(value));
         self
     }
     pub fn derived(&mut self, value: DerivedRelationBuilder) -> &mut Self {
         self.relation = Some(TableFactorBuilder::Derived(value));
+        self
+    }
+
+    pub fn nested_join(
+        &mut self,
+        value: ast::TableWithJoins,
+        alias: Option<ast::TableAlias>,
+    ) -> &mut Self {
+        self.relation = Some(TableFactorBuilder::NestedJoin(value, alias));
         self
     }
 
@@ -943,6 +996,9 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Derived(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
+            Some(TableFactorBuilder::NestedJoin(_, ref mut alias)) => {
+                *alias = value;
+            }
             Some(TableFactorBuilder::Unnest(ref mut rel_builder)) => {
                 rel_builder.alias = value;
             }
@@ -958,6 +1014,12 @@ impl RelationBuilder {
         Ok(match self.relation {
             Some(TableFactorBuilder::Table(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Derived(ref value)) => Some(value.build()?),
+            Some(TableFactorBuilder::NestedJoin(ref table_with_joins, ref alias)) => {
+                Some(ast::TableFactor::NestedJoin {
+                    table_with_joins: Box::new(table_with_joins.clone()),
+                    alias: alias.clone(),
+                })
+            }
             Some(TableFactorBuilder::Unnest(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Flatten(ref value)) => Some(value.build()?),
             Some(TableFactorBuilder::Empty) => None,
@@ -976,13 +1038,53 @@ impl RelationBuilder {
     pub(super) fn has_columns_named_by_alias(&self) -> bool {
         self.columns_named_by_alias
     }
+    /// Declares the alias this relation is given once it has been built, so a
+    /// `SELECT` reading a derived table built in the meantime knows that a
+    /// reference qualified by that alias is in scope.
+    pub(super) fn set_alias_in_scope(&mut self, alias: Option<String>) -> &mut Self {
+        self.alias_in_scope = alias;
+        self
+    }
+    pub(super) fn alias_in_scope(&self) -> Option<&str> {
+        self.alias_in_scope.as_deref()
+    }
     fn create_empty() -> Self {
         Self {
             relation: Default::default(),
             columns_named_by_alias: false,
+            alias_in_scope: None,
         }
     }
 }
+/// The conjuncts of a `WHERE` predicate as `SelectBuilder::selection` builds
+/// it: an `AND` chain, nested to the left, in the order they were added.
+#[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+fn split_selection_conjuncts(selection: ast::Expr) -> Vec<ast::Expr> {
+    match selection {
+        ast::Expr::BinaryOp {
+            left,
+            op: ast::BinaryOperator::And,
+            right,
+        } => {
+            let mut conjuncts = split_selection_conjuncts(*left);
+            conjuncts.extend(split_selection_conjuncts(*right));
+            conjuncts
+        }
+        other => vec![other],
+    }
+}
+
+/// The inverse of [`split_selection_conjuncts`].
+fn join_selection_conjuncts(conjuncts: Vec<ast::Expr>) -> Option<ast::Expr> {
+    conjuncts
+        .into_iter()
+        .reduce(|left, right| ast::Expr::BinaryOp {
+            left: Box::new(left),
+            op: ast::BinaryOperator::And,
+            right: Box::new(right),
+        })
+}
+
 impl Default for RelationBuilder {
     fn default() -> Self {
         Self::create_empty()
@@ -1328,6 +1430,7 @@ mod tests {
             DERIVED_PROJECTION_ALIAS,
             DERIVED_SORT_ALIAS,
             DERIVED_UNION_ALIAS,
+            DERIVED_UNION_INPUT_ALIAS,
             DERIVED_UNNEST_ALIAS,
             DERIVED_WINDOW_INPUT_ALIAS,
         ] {

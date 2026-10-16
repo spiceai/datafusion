@@ -15,5 +15,6 @@
 // specific language governing permissions and limitations
 // under the License.
 
+mod listing_file_filter;
 mod listing_table_metadata_pushdown;
 mod pruned_partition_list;

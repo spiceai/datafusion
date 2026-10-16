@@ -15,16 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use crate::io_wait::{carry_block, carry_future, carry_local_future};
 use crate::trace_utils::{trace_block, trace_future};
 use std::future::Future;
 use std::task::{Context, Poll};
 use tokio::runtime::Handle;
 use tokio::task::{AbortHandle, Id, JoinError, LocalSet};
 
-/// A wrapper around Tokio's JoinSet that forwards all API calls while optionally
+/// A wrapper around [Tokio's `JoinSet`] that forwards all API calls while optionally
 /// instrumenting spawned tasks and blocking closures with custom tracing behavior.
-/// If no tracer is injected via `trace_utils::set_tracer`, tasks and closures are executed
+/// If no tracer is injected via [`set_join_set_tracer`], tasks and closures are executed
 /// without any instrumentation.
+///
+/// [Tokio's `JoinSet`]: tokio::task::JoinSet
+/// [`set_join_set_tracer`]: crate::trace_utils::set_join_set_tracer
 #[derive(Debug)]
 pub struct JoinSet<T> {
     inner: tokio::task::JoinSet<T>,
@@ -63,7 +67,7 @@ impl<T: 'static> JoinSet<T> {
         F: Send + 'static,
         T: Send,
     {
-        self.inner.spawn(trace_future(task))
+        self.inner.spawn(trace_future(carry_future(task)))
     }
 
     /// [JoinSet::spawn_on](tokio::task::JoinSet::spawn_on) - Spawn a task on a provided runtime.
@@ -73,7 +77,8 @@ impl<T: 'static> JoinSet<T> {
         F: Send + 'static,
         T: Send,
     {
-        self.inner.spawn_on(trace_future(task), handle)
+        self.inner
+            .spawn_on(trace_future(carry_future(task)), handle)
     }
 
     /// [JoinSet::spawn_local](tokio::task::JoinSet::spawn_local) - Spawn a local task.
@@ -82,7 +87,7 @@ impl<T: 'static> JoinSet<T> {
         F: Future<Output = T>,
         F: 'static,
     {
-        self.inner.spawn_local(task)
+        self.inner.spawn_local(carry_local_future(task))
     }
 
     /// [JoinSet::spawn_local_on](tokio::task::JoinSet::spawn_local_on) - Spawn a local task on a provided LocalSet.
@@ -91,7 +96,8 @@ impl<T: 'static> JoinSet<T> {
         F: Future<Output = T>,
         F: 'static,
     {
-        self.inner.spawn_local_on(task, local_set)
+        self.inner
+            .spawn_local_on(carry_local_future(task), local_set)
     }
 
     /// [JoinSet::spawn_blocking](tokio::task::JoinSet::spawn_blocking) - Spawn a blocking task.
@@ -101,7 +107,7 @@ impl<T: 'static> JoinSet<T> {
         F: Send + 'static,
         T: Send,
     {
-        self.inner.spawn_blocking(trace_block(f))
+        self.inner.spawn_blocking(trace_block(carry_block(f)))
     }
 
     /// [JoinSet::spawn_blocking_on](tokio::task::JoinSet::spawn_blocking_on) - Spawn a blocking task on a provided runtime.
@@ -111,7 +117,8 @@ impl<T: 'static> JoinSet<T> {
         F: Send + 'static,
         T: Send,
     {
-        self.inner.spawn_blocking_on(trace_block(f), handle)
+        self.inner
+            .spawn_blocking_on(trace_block(carry_block(f)), handle)
     }
 
     /// [JoinSet::join_next](tokio::task::JoinSet::join_next) - Await the next completed task.

@@ -99,6 +99,11 @@ pub trait Dialect: Send + Sync {
         DateFieldExtractStyle::DatePart
     }
 
+    /// The style to use when unparsing DISTINCT FROM style expressions
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
+    }
+
     /// The character length extraction style to use: `CharacterLengthStyle`
     fn character_length_style(&self) -> CharacterLengthStyle {
         CharacterLengthStyle::CharacterLength
@@ -715,6 +720,15 @@ pub(crate) fn convert_timezone_to_ast(input: ast::Expr, tz: &str) -> ast::Expr {
     }
 }
 
+/// `DistinctFromStyle` to use for unparsing `IsDistinctFrom` and `IsNotDistinctFrom` operators
+#[derive(Clone, Copy, PartialEq)]
+pub enum DistinctFromStyle {
+    /// DBMS supports `IS (NOT) DISTINCT FROM`
+    FullText,
+    /// DBMS supports equivalent operations via `<=>` and `NOT <=>`
+    Spaceship,
+}
+
 pub struct DefaultDialect {}
 
 impl Dialect for DefaultDialect {
@@ -767,6 +781,10 @@ impl Dialect for PostgreSqlDialect {
         ast::DataType::SmallInt(None)
     }
 
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
+    }
+
     fn scalar_function_to_sql_overrides(
         &self,
         unparser: &Unparser,
@@ -798,9 +816,11 @@ impl PostgreSqlDialect {
         };
 
         Ok(Some(ast::Expr::AnyOp {
-            left: Box::new(unparser.expr_to_sql(needle)?),
+            // Recurse through the annotated entry point so the stack-growth
+            // protection engages on nested arguments; see issue #23056.
+            left: Box::new(unparser.expr_to_sql_with_nesting(needle)?),
             compare_op: BinaryOperator::Eq,
-            right: Box::new(unparser.expr_to_sql(haystack)?),
+            right: Box::new(unparser.expr_to_sql_with_nesting(haystack)?),
             is_some: false,
         }))
     }
@@ -942,6 +962,10 @@ impl Dialect for DuckDBDialect {
         }
         Some(at_time_zone_to_ast(input, tz))
     }
+
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
+    }
 }
 
 pub struct MySqlDialect {}
@@ -984,6 +1008,10 @@ impl Dialect for MySqlDialect {
         DateFieldExtractStyle::Extract
     }
 
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::Spaceship
+    }
+
     fn int64_cast_dtype(&self) -> ast::DataType {
         ast::DataType::Custom(ObjectName::from(vec![Ident::new("SIGNED")]), vec![])
     }
@@ -992,12 +1020,37 @@ impl Dialect for MySqlDialect {
         ast::DataType::Custom(ObjectName::from(vec![Ident::new("SIGNED")]), vec![])
     }
 
+    /// `DATETIME` with the fractional precision the Arrow unit calls for: none
+    /// for seconds, three digits for milliseconds, and six -- the most MySQL
+    /// holds -- for microseconds and nanoseconds.
+    ///
+    /// A bare `DATETIME` has a fractional-seconds precision of 0, and a cast to it
+    /// truncates: `CAST('1994-06-15 12:30:00.5' AS DATETIME)` is `1994-06-15
+    /// 12:30:00` on MySQL 8 and MariaDB 11. A filter comparing a `DATETIME(6)` or
+    /// `TIMESTAMP(6)` column against a microsecond value cast that way therefore
+    /// sees a value a second coarser than the one written -- an equality on a
+    /// fractional-second value selects no row, and a range bound moves by up to a
+    /// second -- with no error. The precision follows the unit rather than being
+    /// six throughout because a cast *into* `Timestamp(Second)` drops the
+    /// fractional seconds in DataFusion, and `DATETIME(6)` would keep them.
     fn timestamp_cast_dtype(
         &self,
-        _time_unit: &TimeUnit,
+        time_unit: &TimeUnit,
         _tz: &Option<Arc<str>>,
     ) -> ast::DataType {
-        ast::DataType::Datetime(None)
+        let precision = match time_unit {
+            TimeUnit::Second => 0,
+            TimeUnit::Millisecond => 3,
+            TimeUnit::Microsecond | TimeUnit::Nanosecond => 6,
+        };
+        ast::DataType::Datetime(Some(precision))
+    }
+
+    /// MySQL holds six sub-second digits and *rounds* a longer literal to them, so a
+    /// nanosecond value is cut to the six digits the server keeps before it is sent,
+    /// rather than rounded up past the instant it names.
+    fn timestamp_literal_max_subsecond_digits(&self) -> Option<usize> {
+        Some(6)
     }
 
     fn timestamp_at_time_zone_to_sql(
@@ -1005,7 +1058,7 @@ impl Dialect for MySqlDialect {
         _input: ast::Expr,
         _tz: &str,
     ) -> Option<ast::Expr> {
-        // MySQL has no `AT TIME ZONE` operator; keep the legacy DATETIME cast.
+        // MySQL has no `AT TIME ZONE` operator; keep the DATETIME cast.
         None
     }
 
@@ -1056,6 +1109,10 @@ impl Dialect for SqliteDialect {
 
     fn character_length_style(&self) -> CharacterLengthStyle {
         CharacterLengthStyle::Length
+    }
+
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        DistinctFromStyle::FullText
     }
 
     fn supports_column_alias_in_table_alias(&self) -> bool {

@@ -23,6 +23,7 @@ use std::{
 
 use tokio::task::{JoinError, JoinHandle};
 
+use crate::io_wait::{carry_block, carry_future};
 use crate::trace_utils::{trace_block, trace_future};
 
 /// Helper that  provides a simple API to spawn a single task and join it.
@@ -45,7 +46,7 @@ impl<R: 'static> SpawnedTask<R> {
     {
         // Ok to use spawn here as SpawnedTask handles aborting/cancelling the task on Drop
         #[expect(clippy::disallowed_methods)]
-        let inner = tokio::task::spawn(trace_future(task));
+        let inner = tokio::task::spawn(trace_future(carry_future(task)));
         Self { inner }
     }
 
@@ -57,7 +58,7 @@ impl<R: 'static> SpawnedTask<R> {
     {
         // Ok to use spawn_blocking here as SpawnedTask handles aborting/cancelling the task on Drop
         #[expect(clippy::disallowed_methods)]
-        let inner = tokio::task::spawn_blocking(trace_block(task));
+        let inner = tokio::task::spawn_blocking(trace_block(carry_block(task)));
         Self { inner }
     }
 
