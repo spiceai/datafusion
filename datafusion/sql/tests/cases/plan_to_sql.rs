@@ -16449,3 +16449,122 @@ fn test_a_dropped_alias_whose_column_a_surviving_alias_shadows_keeps_the_sort_in
     );
     Ok(())
 }
+
+#[test]
+fn test_an_expression_bound_above_a_sorted_chain_the_query_does_not_order_is_refused()
+-> Result<()> {
+    // The expression bound cannot merge with the fetch, so the sorted chain
+    // becomes a derived table whose order the outer `LIMIT` does not see.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(vec![col("s").sort(false, true)], Some(3))?
+        .project(vec![col("s"), col("t.k")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a bound above a sorted chain the query does not order cannot be unparsed",
+    );
+    assert_contains!(error.to_string(), "row bound applied above a sorted chain");
+    Ok(())
+}
+
+#[test]
+fn test_derived_outputs_whose_names_differ_only_by_case_are_refused() -> Result<()> {
+    // `k` and `K` are one name to an engine that folds identifier case, so the
+    // derived table's two outputs could not be told apart by bare name.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["K"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.k").eq(Expr::Column(Column::new(Some("u"), "K")))],
+        )?
+        .aggregate(
+            vec![col("t.k"), Expr::Column(Column::new(Some("u"), "K"))],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), Expr::Column(Column::new(Some("u"), "K"))])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("two derived outputs named alike up to case cannot be unparsed");
+    assert_contains!(error.to_string(), "share the name 'K'");
+    Ok(())
+}
+
+#[test]
+fn test_a_struct_field_key_above_a_derived_aggregate_is_repointed() -> Result<()> {
+    // The key reads a field of the struct output; the derived table hides `t`,
+    // so the field path keeps everything after the relation.
+    let payload = DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("t.payload")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("t.payload"), col("s")])?
+        .sort_with_limit(
+            vec![(get_field(col("t.payload"), "x") + lit(1)).sort(false, true)],
+            Some(1),
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT payload, s FROM (SELECT t.payload AS payload, sum(t.v) AS s FROM t GROUP BY t.payload LIMIT 2) ORDER BY (payload.x + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_named_like_a_derived_output_is_refused() -> Result<()> {
+    // `outer_ref(s)` renders as the bare `s`, which the derived table's own `s`
+    // would capture.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(1))?
+        .project(vec![
+            Expr::OuterReferenceColumn(
+                Arc::new(Field::new("s", DataType::Int32, false)),
+                Column::from_name("s"),
+            )
+            .alias("wanted"),
+            col("t.k"),
+        ])?
+        .sort_with_limit(vec![col("t.k").sort(true, true)], Some(1))?
+        .project(vec![col("wanted")])?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference a derived output would capture cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer reference named like one of the aggregate's outputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_over_a_distinct_over_a_projection_resolves_its_keys_under_the_distinct()
+-> Result<()> {
+    // The DISTINCT keeps the projection's outputs and names, so the key resolves
+    // against the projection beneath it rather than expanding to the aggregate.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .distinct()?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT DISTINCT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (s + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}

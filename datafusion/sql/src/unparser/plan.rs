@@ -1207,6 +1207,18 @@ impl Unparser<'_> {
         }
     }
 
+    /// Whether the `Sort`/`Limit` chain starting at `plan` holds a `Sort`.
+    fn chain_sorts(plan: &LogicalPlan) -> bool {
+        let mut cur = plan;
+        loop {
+            match cur {
+                LogicalPlan::Sort(_) => return true,
+                LogicalPlan::Limit(limit) => cur = limit.input.as_ref(),
+                _ => return false,
+            }
+        }
+    }
+
     /// Whether `plan`, a `Projection`, is going to move the aggregate below it
     /// into a scope of its own rather than folding it into this SELECT.
     ///
@@ -2689,16 +2701,51 @@ impl Unparser<'_> {
                 // (`t.k`, `u.k`) would share one bare name: refused as well
                 // (spiceai/spiceai#14733).
                 if !fully_absorbed && !select.within_join_input() {
+                    // A row bound the enclosing query carries applies to the
+                    // derived table's rows in no particular order; where the
+                    // chain sorts and nothing above re-establishes that order,
+                    // the bound would keep arbitrary rows.
+                    if query.as_ref().is_some_and(|query_ref| {
+                        query_ref.bounds_rows() && !query_ref.has_order_by()
+                    }) && Self::chain_sorts(cur)
+                    {
+                        return not_impl_err!(
+                            "Unparsing a row bound applied above a sorted chain is not supported when the enclosing query does not order its rows"
+                        );
+                    }
+                    // Names are compared the way the engine compares them, so
+                    // `k` and `K` collide where identifiers fold case.
                     let mut names = HashSet::new();
-                    if let Some(repeated) = cur
+                    for field in cur.schema().fields() {
+                        if !names.insert(self.emitted_column_key(field.name())?) {
+                            return not_impl_err!(
+                                "Unparsing a sort or limit between a projection and its aggregate is not supported when two of the aggregate's outputs share the name '{}'",
+                                field.name()
+                            );
+                        }
+                    }
+                    // An outer reference in the projection renders as a bare
+                    // name, which the derived table's output of that name
+                    // would capture.
+                    let derived_names: HashSet<&str> = cur
                         .schema()
                         .fields()
                         .iter()
-                        .map(|field| field.name())
-                        .find(|name| !names.insert(name.as_str()))
-                    {
+                        .map(|field| field.name().as_str())
+                        .collect();
+                    let captures_outer_reference = p.expr.iter().any(|expr| {
+                        expr.exists(|sub_expr| {
+                            Ok(matches!(
+                                sub_expr,
+                                Expr::OuterReferenceColumn(_, column)
+                                    if derived_names.contains(column.name())
+                            ))
+                        })
+                        .unwrap_or(false)
+                    });
+                    if captures_outer_reference {
                         return not_impl_err!(
-                            "Unparsing a sort or limit between a projection and its aggregate is not supported when two of the aggregate's outputs share the name '{repeated}'"
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when the projection reads an outer reference named like one of the aggregate's outputs"
                         );
                     }
                     let hidden_qualifiers = enclosed_qualifiers(cur.schema());
@@ -3155,6 +3202,11 @@ impl Unparser<'_> {
                     match below {
                         LogicalPlan::Sort(inner) if inner.fetch.is_none() => {
                             below = inner.input.as_ref();
+                        }
+                        // A DISTINCT keeps its input's outputs and names, so the
+                        // keys resolve against what it reads.
+                        LogicalPlan::Distinct(Distinct::All(input)) => {
+                            below = input.as_ref();
                         }
                         _ => break,
                     }
