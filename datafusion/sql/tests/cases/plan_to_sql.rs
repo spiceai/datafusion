@@ -16295,3 +16295,61 @@ fn test_a_sort_folded_through_reordered_and_pruned_computed_aliases() -> Result<
     );
     Ok(())
 }
+
+#[test]
+fn test_a_fetched_sort_on_an_unnamed_computed_output_the_outer_projection_drops()
+-> Result<()> {
+    // The sort reads the unnamed `u.a + u.b` by its schema name; once the fold
+    // drops that output the key is emitted on the expression itself, as it is for
+    // a dropped alias.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            col("u.a").alias("x"),
+            col("u.a") + col("u.b"),
+            col("u.c"),
+        ])?
+        .sort_with_limit(vec![col("u.a + u.b").sort(true, true)], Some(1))?
+        .project(vec![col("x")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a AS x FROM u ORDER BY (u.a + u.b) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_over_an_unfetched_sort_resolves_its_keys_under_the_dropped_sort()
+-> Result<()> {
+    // The inner sort is dropped under the outer order, so the outer keys resolve
+    // against the projection beneath it: `s` names the derived table's output
+    // rather than expanding to the aggregate inside it.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .sort(vec![col("t.k").sort(true, true)])?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (s + 1) DESC NULLS FIRST LIMIT 1"
+    );
+
+    // The projection's own expression is still substituted into the key.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .sort(vec![col("t.k").sort(true, true)])?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - s) AS s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY ((0 - s) + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}

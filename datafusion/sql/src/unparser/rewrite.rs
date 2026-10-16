@@ -298,35 +298,38 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             .map(|e| map.get(e).unwrap_or(e).clone())
             .collect::<Vec<_>>();
 
-        // The inner Projection may define aliases that the Sort references
-        // but the outer Projection does not include.  Since we are about to
-        // replace the inner Projection's expressions with `new_exprs` (which
-        // only contains the outer Projection's columns), those alias
-        // definitions will be lost.  To keep the Sort valid, rewrite any
-        // sort expression that references a dropped alias so that it uses
-        // the alias's underlying expression instead.
-        let projected_aliases: HashSet<&str> = new_exprs
+        // The inner Projection may define outputs that the Sort references but
+        // the outer Projection does not include — an alias, or an unnamed
+        // expression the sort reads by its schema name. Since the inner
+        // Projection's expressions are about to be replaced with `new_exprs`
+        // (which only contains the outer Projection's columns), those outputs
+        // will be lost. To keep the Sort valid, rewrite any sort expression that
+        // references a dropped output so that it uses the underlying expression
+        // instead.
+        let kept_names: HashSet<String> = new_exprs
             .iter()
-            .filter_map(|e| match e {
-                Expr::Alias(alias) => Some(alias.name.as_str()),
-                _ => None,
+            .map(|e| match e {
+                Expr::Alias(alias) => alias.name.clone(),
+                other => other.schema_name().to_string(),
             })
             .collect();
 
-        let dropped_aliases: HashMap<String, Expr> = inner_p
+        let dropped_outputs: HashMap<String, Expr> = inner_p
             .expr
             .iter()
-            .filter_map(|e| match e {
-                Expr::Alias(alias)
-                    if !projected_aliases.contains(alias.name.as_str()) =>
-                {
-                    Some((alias.name.clone(), (*alias.expr).clone()))
-                }
-                _ => None,
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let (name, underlying) = match e {
+                    Expr::Alias(alias) => (alias.name.clone(), (*alias.expr).clone()),
+                    // A plain column keeps its own name wherever it is read.
+                    Expr::Column(_) => return None,
+                    other => (inner_p.schema.field(i).name().clone(), other.clone()),
+                };
+                (!kept_names.contains(&name)).then_some((name, underlying))
             })
             .collect();
 
-        if !dropped_aliases.is_empty() {
+        if !dropped_outputs.is_empty() {
             for sort_expr in &mut sort.expr {
                 let mut expr = sort_expr.expr.clone();
                 while let Expr::Alias(alias) = expr {
@@ -340,10 +343,10 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                     .transform_down(|e| {
                         Ok(match &e {
                             // Only an unqualified column can name a projection
-                            // alias: `t.x` refers to `t`'s own column even when a
-                            // dropped alias happens to share the name.
+                            // output: `t.x` refers to `t`'s own column even when a
+                            // dropped output happens to share the name.
                             Expr::Column(col) if col.relation.is_none() => {
-                                match dropped_aliases.get(col.name()) {
+                                match dropped_outputs.get(col.name()) {
                                     Some(underlying) => {
                                         Transformed::yes(underlying.clone())
                                     }

@@ -3146,8 +3146,21 @@ impl Unparser<'_> {
                 // column, while the projection's own expressions are still
                 // substituted — inside a compound key a bare alias binds to the
                 // table's column rather than to the `SELECT` list's.
+                //
+                // An unfetched sort directly below is reordered by this one and
+                // dropped by the walk (see the `has_order_by` branch above), so
+                // the node this sort's keys resolve against is the one under it.
+                let mut below = sort.input.as_ref();
+                loop {
+                    match below {
+                        LogicalPlan::Sort(inner) if inner.fetch.is_none() => {
+                            below = inner.input.as_ref();
+                        }
+                        _ => break,
+                    }
+                }
                 let keys_name_derived_outputs = matches!(
-                    sort.input.as_ref(),
+                    below,
                     LogicalPlan::Projection(projection)
                         if Self::projection_chain_derives_under_order(projection)
                 );
@@ -3156,7 +3169,7 @@ impl Unparser<'_> {
                 // sort key has to stay the reference the plan holds so it names that
                 // scope's output rather than the grouping expression inside it.
                 let agg = if keys_name_derived_outputs
-                    || self.projection_scopes_its_aggregate(sort.input.as_ref(), select)
+                    || self.projection_scopes_its_aggregate(below, select)
                 {
                     None
                 } else {
@@ -3182,7 +3195,7 @@ impl Unparser<'_> {
                             sort_expr.clone(),
                             agg,
                             windows.as_deref(),
-                            sort.input.as_ref(),
+                            below,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
