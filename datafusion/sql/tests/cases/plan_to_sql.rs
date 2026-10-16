@@ -16405,3 +16405,38 @@ fn test_a_window_under_a_semi_or_anti_join_as_a_join_input_reads_only_its_input_
     );
     Ok(())
 }
+
+#[test]
+fn test_a_derived_window_input_under_a_no_op_limit_or_an_empty_window_reads_the_derived_alias()
+-> Result<()> {
+    // A limit that bounds nothing folds into the window's SELECT, and a window
+    // with no expressions lists a lone `*`; either way that `*` reads the table
+    // the window arm derives, not the relation hidden inside it.
+    let joined_to_t = |windowed: LogicalPlan| -> Result<String> {
+        let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+
+    assert_snapshot!(
+        joined_to_t(
+            table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+                .project(vec![col("u.a")])?
+                .window(vec![row_number_over_u_a().alias("rn")])?
+                .limit(0, None)?
+                .build()?
+        )?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true"
+    );
+    assert_snapshot!(
+        joined_to_t(
+            table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+                .project(vec![col("u.b")])?
+                .window(Vec::<Expr>::new())?
+                .build()?
+        )?,
+        @"SELECT t.*, derived_window_input.* FROM t INNER JOIN (SELECT u.b FROM u) AS derived_window_input ON true"
+    );
+    Ok(())
+}

@@ -1345,6 +1345,11 @@ impl Unparser<'_> {
                 })
                 .collect());
         }
+        // A window that derives its input lists a lone `*` when it has no
+        // expressions of its own; that `*` reads the derived table.
+        if Self::wildcard_source(input).is_none() {
+            return Ok(self.derived_window_input_wildcard());
+        }
         let mut relations: Vec<&TableReference> = vec![];
         for (qualifier, field) in input.schema().iter() {
             // An output no relation qualifies — an aggregate's, say — is
@@ -1366,45 +1371,15 @@ impl Unparser<'_> {
     /// One `t.*` per relation the `*` of the input's walk reads, in the plan's
     /// order. That `*` stands for the columns of what lies below the input's
     /// windows and the operators folded into the same SELECT, so the relations
-    /// are read from there: a window's own outputs are named by the explicit
-    /// items the caller keeps, whatever qualifier the plan gives them.
+    /// are read from there (see [`Self::wildcard_source`]): a window's own
+    /// outputs are named by the explicit items the caller keeps, whatever
+    /// qualifier the plan gives them.
     fn whole_relation_items(&self, input: &LogicalPlan) -> Result<Vec<ast::SelectItem>> {
-        // Windows and the filters, sorts, `DISTINCT`s and semi or anti joins
-        // above them fold into the one SELECT (a filter as its WHERE or
-        // QUALIFY, a sort as the statement's ORDER BY, a semi or anti join as an
-        // `EXISTS`). A window whose input the window arm derives
-        // (see `window_input_requires_derived_subquery`) reads that derived
-        // table under its alias, not the relations the plan's schema still names.
-        let mut cur = input;
-        loop {
-            match cur {
-                LogicalPlan::Window(window) => {
-                    if Self::window_input_requires_derived_subquery(window.input.as_ref())
-                    {
-                        let derived = TableReference::bare(DERIVED_WINDOW_INPUT_ALIAS);
-                        return Ok(self.qualified_wildcards(&[&derived]));
-                    }
-                    cur = window.input.as_ref();
-                }
-                LogicalPlan::Filter(filter) => cur = filter.input.as_ref(),
-                LogicalPlan::Sort(sort) => cur = sort.input.as_ref(),
-                LogicalPlan::Distinct(Distinct::All(distinct_input)) => {
-                    cur = distinct_input.as_ref()
-                }
-                // A semi or anti join lists only its probe side, whose list it
-                // forwards as it was set (see `Self::swaps_join_inputs`).
-                LogicalPlan::Join(join) => match join.join_type {
-                    JoinType::LeftSemi | JoinType::LeftAnti => cur = join.left.as_ref(),
-                    JoinType::RightSemi | JoinType::RightAnti => {
-                        cur = join.right.as_ref()
-                    }
-                    _ => break,
-                },
-                _ => break,
-            }
-        }
+        let Some(source) = Self::wildcard_source(input) else {
+            return Ok(self.derived_window_input_wildcard());
+        };
         let mut relations: Vec<&TableReference> = vec![];
-        for (qualifier, _) in cur.schema().iter() {
+        for (qualifier, _) in source.schema().iter() {
             if let Some(qualifier) = qualifier
                 && relations.last() != Some(&qualifier)
             {
@@ -1417,6 +1392,59 @@ impl Unparser<'_> {
             );
         }
         Ok(self.qualified_wildcards(&relations))
+    }
+
+    /// The plan whose columns the `*` of a join input's walk reads, or `None`
+    /// when that `*` reads the table the window arm derives under
+    /// [`DERIVED_WINDOW_INPUT_ALIAS`].
+    ///
+    /// Windows and the filters, sorts, `DISTINCT`s, limits with neither skip
+    /// nor fetch, and semi or anti joins above them fold into the one SELECT (a
+    /// filter as its WHERE or QUALIFY, a sort as the statement's ORDER BY, a
+    /// semi or anti join as an `EXISTS`), so the walk looks through them. A
+    /// window whose input the window arm derives (see
+    /// `window_input_requires_derived_subquery`) reads that derived table under
+    /// its alias, not the relations the plan's schema still names.
+    fn wildcard_source(input: &LogicalPlan) -> Option<&LogicalPlan> {
+        let mut cur = input;
+        loop {
+            match cur {
+                LogicalPlan::Window(window) => {
+                    if Self::window_input_requires_derived_subquery(window.input.as_ref())
+                    {
+                        return None;
+                    }
+                    cur = window.input.as_ref();
+                }
+                LogicalPlan::Filter(filter) => cur = filter.input.as_ref(),
+                LogicalPlan::Sort(sort) => cur = sort.input.as_ref(),
+                LogicalPlan::Distinct(Distinct::All(distinct_input)) => {
+                    cur = distinct_input.as_ref()
+                }
+                // The Limit arm forwards a limit that bounds nothing; one that
+                // does is derived under the input's own name.
+                LogicalPlan::Limit(limit)
+                    if limit.skip.is_none() && limit.fetch.is_none() =>
+                {
+                    cur = limit.input.as_ref()
+                }
+                // A semi or anti join lists only its probe side, whose list it
+                // forwards as it was set (see `Self::swaps_join_inputs`).
+                LogicalPlan::Join(join) => match join.join_type {
+                    JoinType::LeftSemi | JoinType::LeftAnti => cur = join.left.as_ref(),
+                    JoinType::RightSemi | JoinType::RightAnti => {
+                        cur = join.right.as_ref()
+                    }
+                    _ => return Some(cur),
+                },
+                _ => return Some(cur),
+            }
+        }
+    }
+
+    fn derived_window_input_wildcard(&self) -> Vec<ast::SelectItem> {
+        let derived = TableReference::bare(DERIVED_WINDOW_INPUT_ALIAS);
+        self.qualified_wildcards(&[&derived])
     }
 
     fn qualified_wildcards(&self, relations: &[&TableReference]) -> Vec<ast::SelectItem> {
