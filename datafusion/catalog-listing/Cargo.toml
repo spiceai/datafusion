@@ -47,6 +47,7 @@ itertools = { workspace = true }
 log = { workspace = true }
 object_store = { workspace = true }
 parquet = { workspace = true }
+percent-encoding = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]

@@ -21,14 +21,49 @@ use datafusion_common::plan_err;
 use datafusion_datasource::ListingTableUrl;
 use datafusion_datasource::file_format::FileFormat;
 use datafusion_datasource::metadata::MetadataColumn;
-use datafusion_execution::config::SessionConfig;
-use datafusion_expr::SortExpr;
-use futures::StreamExt;
-use futures::TryStreamExt;
+use datafusion_expr::{Partitioning, SortExpr};
+use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt, future};
+use itertools::AllEqualValueError;
 use itertools::Itertools;
+use object_store::ObjectMeta;
 use parquet::arrow::async_reader::ObjectVersionType;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::sync::Arc;
+
+/// Decides which listed objects are a [`crate::ListingTable`]'s data files,
+/// beyond the [`ListingOptions::file_extension`] suffix (Spice extension).
+///
+/// A suffix cannot describe every layout. A Hive table often stores
+/// extensionless data objects (`000000_0`) next to job markers (`_SUCCESS`,
+/// `.crc`), and no suffix accepts the first without the second. Leaving the
+/// extension empty and deciding here keeps such a table on the regular listing
+/// path, so its scans keep per-file statistics, partition pruning and file
+/// splitting.
+///
+/// The filter sees each listed object that matches the extension, zero-byte
+/// objects included, before the object's partition values are parsed and
+/// before any of its bytes are read. It applies wherever the table lists files:
+/// scans, inserts, and schema and partition inference. An error fails the
+/// listing, for an object that must not be silently left out. A zero-byte
+/// object the filter accepts is still never read.
+pub trait ListingFileFilter: Debug + Send + Sync {
+    /// Returns whether `object` is one of the table's data files.
+    fn is_data_file(&self, object: &ObjectMeta) -> datafusion_common::Result<bool>;
+
+    /// Returns whether the files an insert writes are data files to this
+    /// filter.
+    ///
+    /// An insert names each file it writes `<write id>_<n>.<file_extension>`,
+    /// or `<partition directories>/<write id>.<file_extension>` in a
+    /// partitioned table, where the write id is 16 random alphanumeric
+    /// characters and `file_extension` is the format's
+    /// [`FileFormat::get_ext`]. An insert into a table whose filter does not
+    /// accept those files fails before it writes anything, because no later
+    /// scan would read the inserted rows.
+    fn accepts_inserted_files(&self, file_extension: &str) -> bool;
+}
 
 /// Options for creating a [`crate::ListingTable`]
 #[derive(Clone, Debug)]
@@ -41,13 +76,6 @@ pub struct ListingOptions {
     /// The expected partition column names in the folder structure.
     /// See [Self::with_table_partition_cols] for details
     pub table_partition_cols: Vec<(String, DataType)>,
-    /// Set true to try to guess statistics from the files.
-    /// This can add a lot of overhead as it will usually require files
-    /// to be opened and at least partially parsed.
-    pub collect_stat: bool,
-    /// Group files to avoid that the number of partitions exceeds
-    /// this limit
-    pub target_partitions: usize,
     /// Optional pre-known sort order(s). Must be `SortExpr`s.
     ///
     /// DataFusion may take advantage of this ordering to omit sorts
@@ -64,6 +92,46 @@ pub struct ListingOptions {
     ///       multiple equivalent orderings, the outer `Vec` will have a
     ///       single element.
     pub file_sort_order: Vec<Vec<SortExpr>>,
+    /// Declared output partitioning for scans from this table.
+    ///
+    /// Expressions are logical expressions over the full table schema. When set,
+    /// [`ListingTable`](crate::ListingTable) creates one file group per
+    /// declared output partition. When unset, file grouping uses the scan-time
+    /// [`SessionConfig::target_partitions`](datafusion_execution::config::SessionConfig::target_partitions).
+    ///
+    /// Files are listed in path order, split into whole-file groups across the
+    /// declared partition count, and then padded with trailing empty groups when
+    /// needed. DataFusion does not route files by partition values or validate
+    /// row placement, so callers must ensure file group `i` contains rows for
+    /// partition `i`. Layouts that require explicit file-to-partition assignment
+    /// are not supported.
+    ///
+    /// For example, range partitioning on column `a` with split points
+    /// `[10, 20, 30]` declares four output partitions. With three path-ordered
+    /// files, the trailing partition is preserved as empty:
+    ///
+    /// ```text
+    /// files in path order: f0, f1, f2
+    ///
+    /// file groups:
+    ///   partition 0: [f0]
+    ///   partition 1: [f1]
+    ///   partition 2: [f2]
+    ///   partition 3: []
+    /// ```
+    ///
+    /// With five path-ordered files, a partition can contain multiple files:
+    ///
+    /// ```text
+    /// files in path order: f0, f1, f2, f3, f4
+    ///
+    /// file groups:
+    ///   partition 0: [f0, f1]
+    ///   partition 1: [f2, f3]
+    ///   partition 2: [f4]
+    ///   partition 3: []
+    /// ```
+    pub output_partitioning: Option<Partitioning>,
     /// Metadata columns to include in the output schema (Spice extension).
     ///
     /// These columns provide per-file metadata like location, size, and last
@@ -75,6 +143,11 @@ pub struct ListingOptions {
     /// ensuring that objects listed during planning are consistent with objects
     /// read during execution.
     pub object_versioning_type: Option<ObjectVersionType>,
+    /// Selects the table's data files among the listed objects that match
+    /// [`Self::file_extension`] (Spice extension). `None` accepts every one.
+    ///
+    /// See [`ListingFileFilter`].
+    pub file_filter: Option<Arc<dyn ListingFileFilter>>,
 }
 
 impl ListingOptions {
@@ -82,30 +155,17 @@ impl ListingOptions {
     /// Default values:
     /// - use default file extension filter
     /// - no input partition to discover
-    /// - one target partition
-    /// - do not collect statistics
     pub fn new(format: Arc<dyn FileFormat>) -> Self {
         Self {
             file_extension: format.get_ext(),
             format,
             table_partition_cols: vec![],
-            collect_stat: false,
-            target_partitions: 1,
             file_sort_order: vec![],
+            output_partitioning: None,
             metadata_cols: vec![],
             object_versioning_type: None,
+            file_filter: None,
         }
-    }
-
-    /// Set options from [`SessionConfig`] and returns self.
-    ///
-    /// Currently this sets `target_partitions` and `collect_stat`
-    /// but if more options are added in the future that need to be coordinated
-    /// they will be synchronized through this method.
-    pub fn with_session_config_options(mut self, config: &SessionConfig) -> Self {
-        self = self.with_target_partitions(config.target_partitions());
-        self = self.with_collect_stat(config.collect_statistics());
-        self
     }
 
     /// Set metadata columns on [`ListingOptions`] and returns self.
@@ -154,6 +214,38 @@ impl ListingOptions {
     ) -> Self {
         self.object_versioning_type = object_versioning_type;
         self
+    }
+
+    /// Set the [`ListingFileFilter`] on [`ListingOptions`] and returns self.
+    ///
+    /// Pair it with an empty [`Self::file_extension`] when the filter, not a
+    /// suffix, decides which objects are data files.
+    pub fn with_file_filter(
+        mut self,
+        file_filter: Option<Arc<dyn ListingFileFilter>>,
+    ) -> Self {
+        self.file_filter = file_filter;
+        self
+    }
+
+    /// Drops the listed objects that [`Self::file_filter`] rejects, and fails
+    /// the stream on the first object it errors on.
+    fn data_files<'a>(
+        &'a self,
+        objects: BoxStream<'a, datafusion_common::Result<ObjectMeta>>,
+    ) -> BoxStream<'a, datafusion_common::Result<ObjectMeta>> {
+        let Some(file_filter) = self.file_filter.as_deref() else {
+            return objects;
+        };
+        objects
+            .try_filter_map(move |object| {
+                future::ready(
+                    file_filter
+                        .is_data_file(&object)
+                        .map(|keep| keep.then_some(object)),
+                )
+            })
+            .boxed()
     }
 
     /// Validate that the metadata columns don't conflict with existing schema
@@ -229,6 +321,17 @@ impl ListingOptions {
         self
     }
 
+    /// Set declared output partitioning.
+    ///
+    /// See [`Self::output_partitioning`] for the contract.
+    pub fn with_output_partitioning(
+        mut self,
+        output_partitioning: Option<Partitioning>,
+    ) -> Self {
+        self.output_partitioning = output_partitioning;
+        self
+    }
+
     /// Set `table partition columns` on [`ListingOptions`] and returns self.
     ///
     /// "partition columns," used to support [Hive Partitioning], are
@@ -298,40 +401,6 @@ impl ListingOptions {
         self
     }
 
-    /// Set stat collection on [`ListingOptions`] and returns self.
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use datafusion_catalog_listing::ListingOptions;
-    /// # use datafusion_datasource_parquet::file_format::ParquetFormat;
-    ///
-    /// let listing_options =
-    ///     ListingOptions::new(Arc::new(ParquetFormat::default())).with_collect_stat(true);
-    ///
-    /// assert_eq!(listing_options.collect_stat, true);
-    /// ```
-    pub fn with_collect_stat(mut self, collect_stat: bool) -> Self {
-        self.collect_stat = collect_stat;
-        self
-    }
-
-    /// Set number of target partitions on [`ListingOptions`] and returns self.
-    ///
-    /// ```
-    /// # use std::sync::Arc;
-    /// # use datafusion_catalog_listing::ListingOptions;
-    /// # use datafusion_datasource_parquet::file_format::ParquetFormat;
-    ///
-    /// let listing_options =
-    ///     ListingOptions::new(Arc::new(ParquetFormat::default())).with_target_partitions(8);
-    ///
-    /// assert_eq!(listing_options.target_partitions, 8);
-    /// ```
-    pub fn with_target_partitions(mut self, target_partitions: usize) -> Self {
-        self.target_partitions = target_partitions;
-        self
-    }
-
     /// Set file sort order on [`ListingOptions`] and returns self.
     ///
     /// ```
@@ -376,9 +445,12 @@ impl ListingOptions {
     ) -> datafusion_common::Result<SchemaRef> {
         let store = state.runtime_env().object_store(table_path)?;
 
-        let all_files: Vec<_> = table_path
-            .list_all_files(state, store.as_ref(), &self.file_extension)
-            .await?
+        let all_files: Vec<_> = self
+            .data_files(
+                table_path
+                    .list_all_files(state, store.as_ref(), &self.file_extension)
+                    .await?,
+            )
             .try_collect()
             .await?;
 
@@ -471,9 +543,12 @@ impl ListingOptions {
         // only use 10 files for inference
         // This can fail to detect inconsistent partition keys
         // A DFS traversal approach of the store can help here
-        let files: Vec<_> = table_path
-            .list_all_files(state, store.as_ref(), &self.file_extension)
-            .await?
+        let files: Vec<_> = self
+            .data_files(
+                table_path
+                    .list_all_files(state, store.as_ref(), &self.file_extension)
+                    .await?,
+            )
             .take(10)
             .try_collect()
             .await?;
@@ -502,11 +577,10 @@ impl ListingOptions {
 
         match partition_keys.into_iter().all_equal_value() {
             Ok(v) => Ok(v),
-            Err(None) => Ok(vec![]),
-            Err(Some(diff)) => {
-                let mut sorted_diff = [diff.0, diff.1];
-                sorted_diff.sort();
-                plan_err!("Found mixed partition values on disk {:?}", sorted_diff)
+            Err(AllEqualValueError(None)) => Ok(vec![]),
+            Err(AllEqualValueError(Some(mut diff))) => {
+                diff.sort();
+                plan_err!("Found mixed partition values on disk {:?}", diff)
             }
         }
     }

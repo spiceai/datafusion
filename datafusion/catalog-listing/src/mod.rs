@@ -31,5 +31,5 @@ mod options;
 mod table;
 
 pub use config::{ListingTableConfig, SchemaSource};
-pub use options::ListingOptions;
+pub use options::{ListingFileFilter, ListingOptions};
 pub use table::{ListFilesResult, ListingTable};

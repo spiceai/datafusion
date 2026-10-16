@@ -18,8 +18,8 @@
 use arrow::datatypes::{DataType, Field, Schema};
 
 use datafusion_common::{
-    Column, DFSchema, DFSchemaRef, DataFusionError, Result, TableReference,
-    assert_contains,
+    Column, DFSchema, DFSchemaRef, DataFusionError, NullEquality, Result, TableReference,
+    assert_contains, internal_err,
 };
 use datafusion_expr::expr::{WindowFunction, WindowFunctionParams};
 use datafusion_expr::test::function_stub::{
@@ -315,6 +315,12 @@ macro_rules! roundtrip_statement_with_dialect_helper {
         let state = MockSessionState::default()
             .with_aggregate_function(max_udaf())
             .with_aggregate_function(min_udaf())
+            .with_aggregate_function(
+                datafusion_functions_aggregate::approx_percentile_cont::approx_percentile_cont_udaf(),
+            )
+            .with_aggregate_function(
+                datafusion_functions_aggregate::percentile_cont::percentile_cont_udaf(),
+            )
             .with_expr_planner(Arc::new(CoreFunctionPlanner::default()))
             .with_expr_planner(Arc::new(NestedFunctionPlanner))
             .with_expr_planner(Arc::new(FieldAccessPlanner));
@@ -5323,6 +5329,116 @@ fn test_unparse_inner_join_with_table_scan_projection() -> Result<()> {
     Ok(())
 }
 
+/// Build the three base table scans (`left_table`, `mid_table`, `right_table`)
+/// shared by the nested passthrough-projection join unparsing tests.
+fn nested_passthrough_join_tables() -> Result<(LogicalPlan, LogicalPlan, LogicalPlan)> {
+    let left_schema = Schema::new(vec![
+        Field::new("left_id", DataType::Int32, false),
+        Field::new("mid_id", DataType::Int32, false),
+    ]);
+    let mid_schema = Schema::new(vec![
+        Field::new("mid_id", DataType::Int32, false),
+        Field::new("right_id", DataType::Int32, false),
+    ]);
+    let right_schema = Schema::new(vec![
+        Field::new("right_id", DataType::Int32, false),
+        Field::new("value", DataType::Int32, false),
+    ]);
+
+    let left = table_scan(Some("left_table"), &left_schema, None)?.build()?;
+    let mid = table_scan(Some("mid_table"), &mid_schema, None)?.build()?;
+    let right = table_scan(Some("right_table"), &right_schema, None)?.build()?;
+    Ok((left, mid, right))
+}
+
+#[test]
+fn test_unparse_projected_join_unwraps_right_nested_passthrough_projection() -> Result<()>
+{
+    let (left, mid, right) = nested_passthrough_join_tables()?;
+
+    let nested_right = LogicalPlanBuilder::from(mid)
+        .join(
+            right,
+            datafusion_expr::JoinType::Inner,
+            (vec!["mid_table.right_id"], vec!["right_table.right_id"]),
+            None,
+        )?
+        .project(vec![
+            col("mid_table.mid_id"),
+            col("mid_table.right_id"),
+            col("right_table.value"),
+        ])?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(left)
+        .join(
+            nested_right,
+            datafusion_expr::JoinType::Inner,
+            (vec!["left_table.mid_id"], vec!["mid_table.mid_id"]),
+            None,
+        )?
+        .project(vec![
+            col("left_table.left_id"),
+            col("mid_table.mid_id"),
+            col("right_table.value"),
+        ])?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    assert_snapshot!(
+        sql,
+        @r#"SELECT left_table.left_id, mid_table.mid_id, right_table."value" FROM left_table INNER JOIN (mid_table INNER JOIN right_table ON mid_table.right_id = right_table.right_id) ON left_table.mid_id = mid_table.mid_id"#
+    );
+
+    Ok(())
+}
+
+#[test]
+fn test_unparse_projected_join_unwraps_left_nested_passthrough_projection() -> Result<()>
+{
+    let (left, mid, right) = nested_passthrough_join_tables()?;
+
+    // Left join input is a qualified passthrough `Projection(Join)`, and the
+    // outer join condition (`mid_table.right_id`) references an alias from
+    // inside it. The unparser must not wrap this in a derived table that would
+    // hide `mid_table.right_id` from the outer condition.
+    let nested_left = LogicalPlanBuilder::from(left)
+        .join(
+            mid,
+            datafusion_expr::JoinType::Inner,
+            (vec!["left_table.mid_id"], vec!["mid_table.mid_id"]),
+            None,
+        )?
+        .project(vec![
+            col("left_table.left_id"),
+            col("mid_table.mid_id"),
+            col("mid_table.right_id"),
+        ])?
+        .build()?;
+
+    let plan = LogicalPlanBuilder::from(nested_left)
+        .join(
+            right,
+            datafusion_expr::JoinType::Inner,
+            (vec!["mid_table.right_id"], vec!["right_table.right_id"]),
+            None,
+        )?
+        .project(vec![
+            col("left_table.left_id"),
+            col("mid_table.mid_id"),
+            col("right_table.value"),
+        ])?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?;
+    assert_snapshot!(
+        sql,
+        @r#"SELECT left_table.left_id, mid_table.mid_id, right_table."value" FROM left_table INNER JOIN mid_table ON left_table.mid_id = mid_table.mid_id INNER JOIN right_table ON mid_table.right_id = right_table.right_id"#
+    );
+
+    Ok(())
+}
+
 #[test]
 fn test_unparse_left_semi_join_with_table_scan_projection() -> Result<()> {
     let schema = Schema::new(vec![
@@ -5954,6 +6070,332 @@ fn roundtrip_subquery_aggregate_with_column_alias() -> Result<(), DataFusionErro
     Ok(())
 }
 
+/// Roundtrip: aggregate over a subquery projection with limit.
+#[test]
+fn roundtrip_aggregate_over_subquery() -> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(j1_rename) AS __agg_0, max(j1_rename) AS __agg_1 FROM (SELECT j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#,
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @r#"SELECT __agg_0 AS "min(j1_id)", __agg_1 AS "max(j1_id)" FROM (SELECT min(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 20)"#,
+    );
+    Ok(())
+}
+
+/// Projection → Limit → Aggregate (aliases inlined into Aggregate, no
+/// intermediate Projection). Verifies the Limit is folded into the outer
+/// SELECT rather than creating a spurious derived subquery.
+#[test]
+fn test_unparse_aggregate_over_subquery_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![
+                max(col("bla.j1_rename")).alias("__agg_0"),
+                max(col("bla.j1_rename")).alias("__agg_1"),
+            ],
+        )?
+        .limit(0, Some(20))?
+        .project(vec![
+            col("__agg_0").alias("max1(j1_id)"),
+            col("__agg_1").alias("max2(j1_id)"),
+        ])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)", max(bla.j1_rename) AS "max2(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 20"#);
+    Ok(())
+}
+
+/// Projection → Aggregate (aliases inlined, no rename in outer Projection).
+/// Verifies the aggregate aliases are preserved as output column names.
+#[test]
+fn test_unparse_aggregate_no_outer_rename() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![
+                max(col("bla.j1_rename")).alias("__agg_0"),
+                max(col("bla.j1_rename")).alias("__agg_1"),
+            ],
+        )?
+        .project(vec![col("__agg_0"), col("__agg_1")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @"SELECT max(bla.j1_rename) AS __agg_0, max(bla.j1_rename) AS __agg_1 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla");
+    Ok(())
+}
+
+/// Projection → Sort → Aggregate (aliases inlined into Aggregate).
+/// Verifies the Sort is folded into the outer SELECT rather than creating
+/// a spurious derived subquery.
+#[test]
+fn test_unparse_aggregate_with_sort_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .sort(vec![col("__agg_0").sort(true, true)])?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST"#);
+    Ok(())
+}
+
+/// Projection → Limit → Sort → Aggregate (aliases inlined into Aggregate).
+/// The Projection claims the Aggregate through the stacked Limit/Sort;
+/// both clauses should fold into the outer SELECT instead of wrapping
+/// the Sort in a derived subquery.
+#[test]
+fn test_unparse_aggregate_with_limit_sort_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .sort(vec![col("__agg_0").sort(true, true)])?
+        .limit(0, Some(5))?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST LIMIT 5"#);
+    Ok(())
+}
+
+/// Projection → Sort → Limit → Aggregate (aliases inlined into Aggregate).
+/// The Sort sits above the Limit — the logical plan applies Limit first
+/// and Sort second, which a single `ORDER BY … LIMIT` SELECT cannot
+/// express (SQL applies the sort first). The outer Sort folds into the
+/// outer SELECT using passthrough column references, while the Limit
+/// (and the Aggregate it sits over) goes into a derived subquery.
+#[test]
+fn test_unparse_aggregate_with_sort_over_limit_no_inner_proj() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .limit(0, Some(5))?
+        .sort(vec![col("__agg_0").sort(true, true)])?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT __agg_0 AS "max1(j1_id)" FROM (SELECT max(bla.j1_rename) AS __agg_0 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 5) ORDER BY __agg_0 ASC NULLS FIRST"#);
+    Ok(())
+}
+
+/// Projection → Limit(10) → Limit(5) → Aggregate. Two stacked Limits
+/// merge via `combine_limit` (matching the optimizer's `PushDownLimit`):
+/// outer fetch=10, inner fetch=5 → effective fetch=5.
+#[test]
+fn test_unparse_aggregate_with_repeated_limits_combines() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .limit(0, Some(10))?
+        .limit(0, Some(5))?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 5"#);
+    Ok(())
+}
+
+/// Projection → Limit(skip=2, fetch=10) → Limit(skip=3, fetch=20)
+/// → Aggregate. Two stacked Limits merge via `combine_limit`: combined
+/// skip = 3+2=5, combined fetch = min(10, 20-2) = 10.
+#[test]
+fn test_unparse_aggregate_with_repeated_limits_combines_offset() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .limit(3, Some(20))?
+        .limit(2, Some(10))?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla LIMIT 10 OFFSET 5"#);
+    Ok(())
+}
+
+/// Projection → Sort(DESC) → Sort(ASC) → Aggregate. Two stacked Sorts
+/// fold into a single ORDER BY using the outermost (top) Sort's order;
+/// the inner Sort is reordered by the outer one and is therefore
+/// redundant.
+#[test]
+fn test_unparse_aggregate_with_repeated_sorts_keeps_outermost() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .sort(vec![col("__agg_0").sort(false, false)])?
+        .sort(vec![col("__agg_0").sort(true, true)])?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT max(bla.j1_rename) AS "max1(j1_id)" FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST"#);
+    Ok(())
+}
+
+/// Projection → Sort(ASC) → Limit(10) → Sort(DESC) → Aggregate. The
+/// inner Sort determines which rows the Limit keeps and the outer Sort
+/// re-orders the kept rows — a single SELECT cannot express that, so
+/// the outer Sort folds into the outer SELECT (passthrough refs) and
+/// the Limit + inner Sort + Aggregate go into a derived subquery.
+#[test]
+fn test_unparse_aggregate_with_sort_limit_sort_uses_derived_subquery() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .sort(vec![col("__agg_0").sort(false, false)])?
+        .limit(0, Some(10))?
+        .sort(vec![col("__agg_0").sort(true, true)])?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT __agg_0 AS "max1(j1_id)" FROM (SELECT max(bla.j1_rename) AS __agg_0 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) DESC NULLS LAST LIMIT 10) ORDER BY __agg_0 ASC NULLS FIRST"#);
+    Ok(())
+}
+
+/// Projection -> Limit(non-literal fetch) -> Sort { fetch = 5 } -> Aggregate.
+/// The outer Limit is non-literal so it can't be combined with the inner
+/// Sort's fetch=5. The walk must stop before absorbing the Sort so its
+/// fetch survives as `LIMIT 5` in the derived subquery, while the
+/// non-literal outer Limit applies on the outer SELECT.
+#[test]
+fn test_unparse_aggregate_with_non_literal_limit_over_sort_with_fetch() -> Result<()> {
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let j1_schema = context
+        .get_table_source(TableReference::bare("j1"))?
+        .schema();
+
+    let scan = table_scan(Some("j1"), &j1_schema, None)?.build()?;
+    let plan = LogicalPlanBuilder::from(scan)
+        .project(vec![col("j1.j1_id").alias("j1_rename")])?
+        .alias("bla")?
+        .aggregate(
+            vec![] as Vec<Expr>,
+            vec![max(col("bla.j1_rename")).alias("__agg_0")],
+        )?
+        .sort_with_limit(vec![col("__agg_0").sort(true, true)], Some(5))?
+        .limit_by_expr(None, Some(cast(lit(7_i64), DataType::Int32)))?
+        .project(vec![col("__agg_0").alias("max1(j1_id)")])?
+        .build()?;
+
+    let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
+    insta::assert_snapshot!(sql, @r#"SELECT __agg_0 AS "max1(j1_id)" FROM (SELECT max(bla.j1_rename) AS __agg_0 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST LIMIT 5) LIMIT CAST(7 AS INTEGER)"#);
+    Ok(())
+}
+
 /// Test that unparsing a manually constructed join with a subquery aggregate
 /// preserves the MAX aggregate function.
 ///
@@ -6497,6 +6939,40 @@ fn snowflake_flatten_cross_join_unnest_table_column() -> Result<(), DataFusionEr
 }
 
 #[test]
+fn roundtrip_approx_percentile_cont_within_group() -> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT approx_percentile_cont(0.5) WITHIN GROUP (ORDER BY salary) FROM person",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT approx_percentile_cont(0.5) WITHIN GROUP (ORDER BY person.salary ASC NULLS LAST) FROM person",
+    );
+    Ok(())
+}
+
+#[test]
+fn roundtrip_percentile_cont_within_group() -> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY salary) FROM person",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY person.salary ASC NULLS LAST) FROM person",
+    );
+    Ok(())
+}
+
+#[test]
+fn roundtrip_approx_percentile_cont_within_group_with_centroids()
+-> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT approx_percentile_cont(0.9, 200) WITHIN GROUP (ORDER BY salary * 2 DESC) FROM person",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT approx_percentile_cont(0.9, 200) WITHIN GROUP (ORDER BY (person.salary * 2) DESC NULLS FIRST) FROM person",
+    );
+    Ok(())
+}
+
+#[test]
 fn snowflake_flatten_multiple_unnest_cross_join() -> Result<(), DataFusionError> {
     // Realistic Snowflake pattern:
     //   SELECT a, b
@@ -6548,7 +7024,82 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
     let sql = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" = "right"."first_name") AND ("left"."order_id" = "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" = "p"."first_name") AND ("left"."order_id" = "o"."order_id"))"#
+        @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" IS NOT DISTINCT FROM "right"."first_name") AND ("left"."order_id" IS NOT DISTINCT FROM "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" IS NOT DISTINCT FROM "p"."first_name") AND ("left"."order_id" IS NOT DISTINCT FROM "o"."order_id"))"#
+    );
+    Ok(())
+}
+
+fn unparse_with_dialect(sql: &str, dialect: &dyn UnparserDialect) -> Result<String> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(sql)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    Ok(Unparser::new(dialect).plan_to_sql(&plan)?.to_string())
+}
+
+/// `INTERSECT` and `EXCEPT` treat two NULLs as the same value, so the
+/// `EXISTS`/`NOT EXISTS` they are unparsed to must correlate with a null-safe
+/// comparison: with `=`, every row with a NULL in a compared column is dropped
+/// from an `INTERSECT` and kept by an `EXCEPT` (spiceai/spiceai#14941).
+#[test]
+fn test_unparse_intersect_except_match_nulls() -> Result<()> {
+    let left = "SELECT j1_string FROM j1";
+    let right = "SELECT j2_string FROM j2";
+
+    assert_snapshot!(
+        unparse_with_dialect(&format!("{left} INTERSECT {right}"), &UnparserPostgreSqlDialect {})?,
+        @r#"SELECT DISTINCT "j1"."j1_string" FROM "j1" WHERE EXISTS (SELECT 1 FROM "j2" WHERE ("j1"."j1_string" IS NOT DISTINCT FROM "j2"."j2_string"))"#
+    );
+    assert_snapshot!(
+        unparse_with_dialect(&format!("{left} EXCEPT {right}"), &UnparserPostgreSqlDialect {})?,
+        @r#"SELECT DISTINCT "j1"."j1_string" FROM "j1" WHERE NOT EXISTS (SELECT 1 FROM "j2" WHERE ("j1"."j1_string" IS NOT DISTINCT FROM "j2"."j2_string"))"#
+    );
+    // MySQL has no `IS NOT DISTINCT FROM`; its null-safe equality is `<=>`.
+    assert_snapshot!(
+        unparse_with_dialect(&format!("{left} INTERSECT {right}"), &UnparserMySqlDialect {})?,
+        @"SELECT DISTINCT `j1`.`j1_string` FROM `j1` WHERE EXISTS (SELECT 1 FROM `j2` WHERE (`j1`.`j1_string` <=> `j2`.`j2_string`))"
+    );
+    Ok(())
+}
+
+/// A join that matches NULL keys is unparsed with a null-safe `ON`, and a
+/// `USING` constraint — which compares with `=` — is rewritten to that `ON`.
+#[test]
+fn test_unparse_join_matching_null_keys() -> Result<()> {
+    use datafusion_expr::JoinType;
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Utf8, true),
+        Field::new("v", DataType::Int32, true),
+    ]);
+    let right = table_scan(Some("b"), &schema, None)?.build()?;
+    let unparse = |join_type, using: bool| -> Result<String> {
+        let builder = table_scan(Some("a"), &schema, None)?;
+        let plan = if using {
+            builder.join_using(right.clone(), join_type, vec!["id".into()])?
+        } else {
+            builder.join(right.clone(), join_type, (vec!["a.id"], vec!["b.id"]), None)?
+        }
+        .build()?;
+        let LogicalPlan::Join(mut join) = plan else {
+            return internal_err!("expected a join");
+        };
+        join.null_equality = NullEquality::NullEqualsNull;
+        let plan = LogicalPlanBuilder::from(LogicalPlan::Join(join))
+            .project(vec![col("a.v")])?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+
+    assert_snapshot!(
+        unparse(JoinType::Inner, false)?,
+        @"SELECT a.v FROM a INNER JOIN b ON (a.id IS NOT DISTINCT FROM b.id)"
+    );
+    assert_snapshot!(
+        unparse(JoinType::Left, true)?,
+        @"SELECT a.v FROM a LEFT OUTER JOIN b ON (a.id IS NOT DISTINCT FROM b.id)"
     );
     Ok(())
 }
@@ -7694,8 +8245,8 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
     );
 
     // A filtered scan reached through a row limit rather than a projection,
-    // with no select list taken: nothing lists the scan's columns for a
-    // derived table, so the filters keep the pushdown rewrite and the refusal.
+    // with no select list taken: the limited join input is derived under the
+    // scan's own name, so its filters and its `LIMIT` both stay in that scope.
     let limited = table_scan_with_filters(
         Some("a"),
         &schema,
@@ -7707,10 +8258,9 @@ fn full_join_input_predicate_not_on_a_scan_is_refused() -> Result<()> {
     let plan = LogicalPlanBuilder::from(limited)
         .join(c.clone(), Full, (vec!["a.id"], vec!["c.id"]), None)?
         .build()?;
-    let error = plan_to_sql(&plan).expect_err("the scan's columns are unlisted");
-    assert_contains!(
-        error.to_string(),
-        "predicate on a FULL JOIN input that is not applied by one of its table scans"
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, c.id FROM (SELECT a.id FROM a WHERE (a.id = 'x') LIMIT 1) AS a FULL JOIN c ON a.id = c.id"
     );
 
     // A semi join's EXISTS is a predicate on the enclosing WHERE.
@@ -13975,6 +14525,169 @@ fn test_bigquery_agrees_a_schemaless_comparison_against_a_truncated_date() -> Re
     Ok(())
 }
 
+/// A `Limit` that is a join input is derived unconditionally, under the scan's
+/// own name: the enclosing query has no clause that bounds one input's
+/// contribution to the join (its `LIMIT` bounds the join's output), and the
+/// join's `ON` and the select list go on naming the input by the scan's name.
+/// Neither a `WHERE` nor a projection above the join is what decides it
+/// (spiceai/spiceai#14375).
+#[test]
+fn limit_join_input_is_derived_under_the_scans_name() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, Inner};
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let bare = |join_type| -> Result<LogicalPlan> {
+        let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let limited_c = LogicalPlanBuilder::from(c).limit(0, Some(1))?.build()?;
+        LogicalPlanBuilder::from(b)
+            .join(limited_c, join_type, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()
+    };
+
+    // No projection and no filter above the join: the limit must still be the
+    // input's, not the join's.
+    assert_snapshot!(
+        plan_to_sql(&bare(Full)?)?,
+        @"SELECT b.id, c.id FROM b FULL JOIN (SELECT c.id FROM c LIMIT 1) AS c ON b.id = c.id"
+    );
+    assert_snapshot!(
+        plan_to_sql(&bare(Inner)?)?,
+        @"SELECT b.id, c.id FROM b INNER JOIN (SELECT c.id FROM c LIMIT 1) AS c ON b.id = c.id"
+    );
+
+    // With a projection above the join the derived table was already made,
+    // but carried no alias the references above could bind to.
+    let projected = LogicalPlanBuilder::from(bare(Full)?)
+        .project(vec![col("b.id"), col("c.id")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&projected)?,
+        @"SELECT b.id, c.id FROM b FULL JOIN (SELECT c.id FROM c LIMIT 1) AS c ON b.id = c.id"
+    );
+
+    // The limit on the left input.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let limited_b = LogicalPlanBuilder::from(b).limit(0, Some(1))?.build()?;
+    let plan = LogicalPlanBuilder::from(limited_b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT b.id, c.id FROM (SELECT b.id FROM b LIMIT 1) AS b INNER JOIN c ON b.id = c.id"
+    );
+
+    // A qualified scan on a dialect that spells columns in full is refused,
+    // and the refusal names the row limit, not a filter the plan does not have.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("s.c"), &schema, Some(vec![0]))?
+        .limit(0, Some(1))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let error = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("the alias cannot carry the full path");
+    assert_contains!(
+        error.to_string(),
+        "Unparsing a row limit in a scope of its own is not supported for a qualified table name on a dialect that spells columns in full"
+    );
+    Ok(())
+}
+
+/// A `Limit` over something other than one scan, as a join input with a
+/// projection above, keeps the dialect-alias derived table only while its
+/// output columns are unqualified: a qualified one names a relation inside the
+/// derived table, which the enclosing `ON` and select list cannot reach.
+#[test]
+fn limit_join_input_over_qualified_outputs_is_refused() -> Result<()> {
+    use datafusion_expr::JoinType::Inner;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let scan = |name| table_scan(Some(name), &schema, Some(vec![0]))?.build();
+    let joined_on = |input: LogicalPlan, key: Expr| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(scan("a")?)
+            .join_on(input, Inner, vec![col("a.id").eq(key.clone())])?
+            .project(vec![col("a.id"), key])?
+            .build()
+    };
+
+    // Renamed outputs carry no qualifier, so the enclosing query binds them.
+    let renamed = LogicalPlanBuilder::from(scan("b")?)
+        .project(vec![col("b.id").alias("x")])?
+        .limit(0, Some(1))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&joined_on(renamed, col("x"))?)?,
+        @"SELECT a.id, x FROM a INNER JOIN (SELECT b.id AS x FROM b LIMIT 1) ON (a.id = x)"
+    );
+
+    let grouped = LogicalPlanBuilder::from(scan("b")?)
+        .aggregate(vec![col("b.id")], Vec::<Expr>::new())?
+        .limit(0, Some(1))?
+        .build()?;
+    let joined = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .limit(0, Some(1))?
+        .build()?;
+    for input in [grouped, joined] {
+        let error = plan_to_sql(&joined_on(input, col("b.id"))?)
+            .expect_err("`b` is not addressable outside the derived table");
+        assert_contains!(
+            error.to_string(),
+            "Unparsing a row limit on a join input whose columns are qualified is not supported unless the input is a single table scan"
+        );
+    }
+    Ok(())
+}
+
+/// A `Limit` with neither `fetch` nor `skip` bounds nothing, so as a join
+/// input it takes no scope of its own.
+#[test]
+fn no_op_limit_join_input_is_passed_through() -> Result<()> {
+    use datafusion_expr::JoinType::Inner;
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?
+        .limit(0, None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT b.id, c.id FROM b INNER JOIN c ON b.id = c.id"
+    );
+    Ok(())
+}
+
+/// A limited scan that projects no columns, as a join input under a count:
+/// it keeps the dialect-alias derived table it had, `SELECT 1 FROM b LIMIT n`,
+/// which preserves the cardinality the count needs and names nothing.
+#[test]
+fn limit_join_input_projecting_no_columns_keeps_its_count_scope() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![]))?
+        .limit(0, Some(3))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .cross_join(b)?
+        .aggregate(
+            Vec::<Expr>::new(),
+            vec![datafusion_functions_aggregate::count::count(lit(1))],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT count(1) FROM a CROSS JOIN (SELECT 1 FROM b LIMIT 3)"
+    );
+    Ok(())
+}
+
 /// A `FULL JOIN` input whose filtered scan sits under a plain alias keeps its
 /// filters in a derived table of its own, exactly as an unaliased scan does.
 /// The alias is not a reason to refuse: the pushdown rewrite would put the
@@ -16434,5 +17147,627 @@ fn test_filter_scope_refuses_two_outputs_the_dialect_emits_under_one_name() -> R
             .to_string(),
         "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when two outputs the derived table exposes are both emitted as x_42"
     );
+    Ok(())
+}
+
+/// `p` and `c` both expose a column `name`, so a projection over their join
+/// that passes both through has two outputs no name tells apart.
+fn same_named_join_columns() -> Result<LogicalPlanBuilder> {
+    let products = Schema::new(vec![
+        Field::new("category_id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+        Field::new("price", DataType::Int32, false),
+    ]);
+    let categories = Schema::new(vec![
+        Field::new("category_id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, false),
+    ]);
+    let p = table_scan(Some("products"), &products, None)?
+        .alias("p")?
+        .build()?;
+    let c = table_scan(Some("categories"), &categories, None)?
+        .alias("c")?
+        .build()?;
+    LogicalPlanBuilder::from(p).join(
+        c,
+        datafusion_expr::JoinType::Left,
+        (vec!["p.category_id"], vec!["c.category_id"]),
+        None,
+    )
+}
+
+// regression test for apache/datafusion#22961: common subexpression
+// elimination leaves a projection over another projection that passes two
+// same-named columns through. The inner projection is a derived table, so the
+// outer one's `p.name`/`c.name` would name relations out of its scope, and no
+// bare name addresses either column; the projections are merged instead.
+#[test]
+fn test_projection_over_projection_merges_same_named_columns() -> Result<()> {
+    let plan = same_named_join_columns()?
+        .project(vec![
+            (col("p.price") + lit(1)).alias("__common_expr_1"),
+            col("p.name"),
+            col("c.name"),
+        ])?
+        .project(vec![
+            col("p.name").alias("product_name"),
+            col("c.name").alias("category_name"),
+            (col("__common_expr_1") * lit(2)).alias("doubled"),
+            col("__common_expr_1"),
+        ])?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert_eq!(
+        sql,
+        r#"SELECT p."name" AS product_name, c."name" AS category_name, ((p.price + 1) * 2) AS doubled, (p.price + 1) AS __common_expr_1 FROM products AS p LEFT OUTER JOIN categories AS c ON p.category_id = c.category_id"#
+    );
+    Ok(())
+}
+
+// A projection over another projection whose outputs are unique reads them by
+// name: the inner projection's qualifier is out of scope in the outer SELECT,
+// including under an alias, which the outer SELECT used to keep qualified.
+#[test]
+fn test_projection_over_projection_reads_unique_columns_by_name() -> Result<()> {
+    let plan = same_named_join_columns()?
+        .project(vec![
+            (col("p.price") + lit(1)).alias("__common_expr_1"),
+            col("p.name"),
+        ])?
+        .project(vec![
+            col("p.name").alias("product_name"),
+            col("__common_expr_1"),
+        ])?
+        .build()?;
+
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert_eq!(
+        sql,
+        r#"SELECT "name" AS product_name, __common_expr_1 FROM (SELECT (p.price + 1) AS __common_expr_1, p."name" FROM products AS p LEFT OUTER JOIN categories AS c ON p.category_id = c.category_id)"#
+    );
+    Ok(())
+}
+
+// Merging would evaluate a volatile inner output once per use rather than once
+// per row, so a same-named pair over one is refused rather than emitted with a
+// reference that binds to nothing, or to the wrong column.
+#[test]
+fn test_projection_over_projection_same_named_columns_over_volatile_is_refused()
+-> Result<()> {
+    let plan = same_named_join_columns()?
+        .project(vec![random().alias("r"), col("p.name"), col("c.name")])?
+        .project(vec![
+            col("p.name").alias("product_name"),
+            col("c.name").alias("category_name"),
+            col("r"),
+        ])?
+        .build()?;
+
+    let err = plan_to_sql(&plan).expect_err("a volatile merge must be refused");
+    assert!(
+        matches!(err, DataFusionError::NotImplemented(_)),
+        "expected NotImplemented, got {err:?}"
+    );
+    Ok(())
+}
+
+/// A join that is the right input of another join keeps its own shape: it is
+/// a parenthesised joined table on the right of the outer join, with its own
+/// `ON`, and `b` is in scope where the outer `ON` names it. Linearising it
+/// into the outer `FROM` put the nested join's right side before the relation
+/// it joins to (`FROM a INNER JOIN c ON b.id = c.id FULL JOIN b …`), which
+/// `PostgreSQL` and `DuckDB` reject as an unbound `b` (spiceai/spiceai#14373).
+#[test]
+fn right_nested_join_keeps_its_shape_on_the_right() -> Result<()> {
+    use datafusion_expr::JoinType::{Full, Inner};
+    let schema = Schema::new(vec![Field::new("id", DataType::Utf8, false)]);
+    let nested = |join_type| -> Result<LogicalPlan> {
+        let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+        let b = table_scan_with_filters(
+            Some("b"),
+            &schema,
+            Some(vec![0]),
+            vec![col("b.id").eq(lit("x"))],
+        )?
+        .build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let inner = LogicalPlanBuilder::from(b)
+            .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()?;
+        LogicalPlanBuilder::from(a)
+            .join(inner, join_type, (vec!["a.id"], vec!["b.id"]), None)?
+            .build()
+    };
+
+    assert_snapshot!(
+        plan_to_sql(&nested(Inner)?)?,
+        @"SELECT a.id, b.id, c.id FROM a INNER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id WHERE (b.id = 'x')"
+    );
+
+    // The same right-nested shape under a FULL JOIN, without a scan filter (a
+    // FULL JOIN input's filters have their own scoping, out of scope here).
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let inner = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .join(inner, Full, (vec!["a.id"], vec!["b.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, b.id, c.id FROM a FULL JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id"
+    );
+
+    // A nested join's scan filter must not reach the shared `WHERE` when the
+    // outer join null-extends that input: under a LEFT JOIN it folds into the
+    // outer `ON`; under a RIGHT JOIN the right input is preserved and `WHERE`
+    // is right; under a FULL JOIN neither clause serves, so the filtered scan
+    // keeps its filter in a derived table of its own.
+    use datafusion_expr::JoinType::{Left, Right};
+    assert_snapshot!(
+        plan_to_sql(&nested(Left)?)?,
+        @"SELECT a.id, b.id, c.id FROM a LEFT OUTER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id AND (b.id = 'x')"
+    );
+    assert_snapshot!(
+        plan_to_sql(&nested(Right)?)?,
+        @"SELECT a.id, b.id, c.id FROM a RIGHT OUTER JOIN (b INNER JOIN c ON b.id = c.id) ON a.id = b.id WHERE (b.id = 'x')"
+    );
+    assert_snapshot!(
+        plan_to_sql(&nested(Full)?)?,
+        @"SELECT a.id, b.id, c.id FROM a FULL JOIN ((SELECT b.id FROM b WHERE (b.id = 'x')) AS b INNER JOIN c ON b.id = c.id) ON a.id = b.id"
+    );
+    // The same on the FULL JOIN's left, at the top and nested on a LEFT JOIN's
+    // right: neither lets the filter escape to the enclosing `WHERE` or `ON`.
+    let filtered_join_on_the_left = |outer: Option<LogicalPlan>| -> Result<LogicalPlan> {
+        let b = table_scan_with_filters(
+            Some("b"),
+            &schema,
+            Some(vec![0]),
+            vec![col("b.id").eq(lit("x"))],
+        )?
+        .build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        let d = table_scan(Some("d"), &schema, Some(vec![0]))?.build()?;
+        let inner = LogicalPlanBuilder::from(b)
+            .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()?;
+        let full = LogicalPlanBuilder::from(inner)
+            .join(d, Full, (vec!["b.id"], vec!["d.id"]), None)?
+            .build()?;
+        match outer {
+            None => Ok(full),
+            Some(a) => LogicalPlanBuilder::from(a)
+                .join(full, Left, (vec!["a.id"], vec!["d.id"]), None)?
+                .build(),
+        }
+    };
+    assert_snapshot!(
+        plan_to_sql(&filtered_join_on_the_left(None)?)?,
+        @"SELECT b.id, c.id, d.id FROM (SELECT b.id FROM b WHERE (b.id = 'x')) AS b INNER JOIN c ON b.id = c.id FULL JOIN d ON b.id = d.id"
+    );
+    assert_snapshot!(
+        plan_to_sql(&filtered_join_on_the_left(Some(
+            table_scan(Some("a"), &schema, Some(vec![0]))?.build()?
+        ))?)?,
+        @"SELECT a.id, b.id, c.id, d.id FROM a LEFT OUTER JOIN (((SELECT b.id FROM b WHERE (b.id = 'x')) AS b INNER JOIN c ON b.id = c.id) FULL JOIN d ON b.id = d.id) ON a.id = d.id"
+    );
+
+    // A nested join whose scan filter holds a subquery contributes a conjunct
+    // that some dialects refuse in `ON`, and `WHERE` is not this join's to
+    // use for its right input: refused.
+    let a = table_scan(Some("a"), &schema, Some(vec![0]))?.build()?;
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let b = table_scan_with_filters(
+        Some("b"),
+        &schema,
+        Some(vec![0]),
+        vec![exists(Arc::new(allowed))],
+    )?
+    .build()?;
+    let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+    let inner = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(a)
+        .join(inner, Left, (vec!["a.id"], vec!["b.id"]), None)?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a subquery conjunct from a nested right input has no clause under a LEFT JOIN",
+    );
+    assert_contains!(
+        error.to_string(),
+        "LEFT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+    );
+    // The mirror image: a semi join on a RIGHT JOIN's null-extended left
+    // contributes its `EXISTS`, which the left hoist would fold into `ON`.
+    use datafusion_expr::JoinType::LeftSemi;
+    let semi =
+        LogicalPlanBuilder::from(table_scan(Some("b"), &schema, Some(vec![0]))?.build()?)
+            .join(
+                table_scan(Some("c"), &schema, Some(vec![0]))?.build()?,
+                LeftSemi,
+                (vec!["b.id"], vec!["c.id"]),
+                None,
+            )?
+            .build()?;
+    let plan = LogicalPlanBuilder::from(semi)
+        .join(
+            table_scan(Some("a"), &schema, Some(vec![0]))?.build()?,
+            Right,
+            (vec!["b.id"], vec!["a.id"]),
+            None,
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a subquery conjunct from a nested left input has no clause under a RIGHT JOIN",
+    );
+    assert_contains!(
+        error.to_string(),
+        "RIGHT JOIN input that is a join with a subquery predicate on its own inputs is not supported"
+    );
+
+    // A mark join on an input an outer join null-extends is refused: the
+    // `EXISTS` that replaces its mark is never NULL, but the mark is on a row
+    // the outer join adds, so `NOT c.mark` or `c.mark IS NULL` above would
+    // answer differently from the plan. On a preserved input the mark join
+    // rewrites the mark in place, which the walk keeps possible.
+    use datafusion_expr::JoinType::LeftMark;
+    let marked = || -> Result<LogicalPlan> {
+        let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+        let c = table_scan(Some("c"), &schema, Some(vec![0]))?.build()?;
+        LogicalPlanBuilder::from(b)
+            .join(c, LeftMark, (vec!["b.id"], vec!["c.id"]), None)?
+            .build()
+    };
+    let scan = |name| table_scan(Some(name), &schema, Some(vec![0]))?.build();
+    // A FULL JOIN input is refused by the FULL JOIN's own rule, which also
+    // covers semi and anti joins there.
+    let refused: Vec<(&str, &str, LogicalPlan)> = vec![
+        (
+            "a LEFT JOIN (b MARK c)",
+            "mark join as an input an outer join null-extends is not supported",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Left, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a FULL JOIN (b MARK c)",
+            "semi, anti or mark join as a FULL JOIN input is not supported",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Full, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+        (
+            "(b MARK c) RIGHT JOIN a",
+            "mark join as an input an outer join null-extends is not supported",
+            LogicalPlanBuilder::from(marked()?)
+                .join(scan("a")?, Right, (vec!["b.id"], vec!["a.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a LEFT JOIN ((b MARK c) RIGHT JOIN d)",
+            "mark join as an input an outer join null-extends is not supported",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(
+                    LogicalPlanBuilder::from(marked()?)
+                        .join(scan("d")?, Right, (vec!["b.id"], vec!["d.id"]), None)?
+                        .build()?,
+                    Left,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )?
+                .build()?,
+        ),
+    ];
+    for (shape, expected, joined) in refused {
+        let plan = LogicalPlanBuilder::from(joined)
+            .filter(!col("c.mark"))?
+            .project(vec![col("a.id")])?
+            .build()?;
+        let error = plan_to_sql(&plan).expect_err(shape);
+        assert_contains!(error.to_string(), expected);
+    }
+    let preserved: Vec<(&str, LogicalPlan)> = vec![
+        (
+            "(b MARK c) LEFT JOIN a",
+            LogicalPlanBuilder::from(marked()?)
+                .join(scan("a")?, Left, (vec!["b.id"], vec!["a.id"]), None)?
+                .build()?,
+        ),
+        (
+            "a RIGHT JOIN (b MARK c)",
+            LogicalPlanBuilder::from(scan("a")?)
+                .join(marked()?, Right, (vec!["a.id"], vec!["b.id"]), None)?
+                .build()?,
+        ),
+    ];
+    for (shape, joined) in preserved {
+        let plan = LogicalPlanBuilder::from(joined)
+            .filter(col("c.mark"))?
+            .project(vec![col("a.id")])?
+            .build()?;
+        let sql = plan_to_sql(&plan)?.to_string();
+        assert!(
+            sql.contains("WHERE EXISTS (SELECT 1 FROM c WHERE (b.id = c.id))")
+                && !sql.contains("mark"),
+            "the mark read above {shape} must be replaced in place: {sql}"
+        );
+    }
+
+    // An aliased join as the right input is a scope of its own, so its scan
+    // filter stays inside the derived table the alias names, and the outer
+    // join addresses the alias.
+    let c_schema = Schema::new(vec![Field::new("cid", DataType::Utf8, false)]);
+    let b = table_scan_with_filters(
+        Some("b"),
+        &schema,
+        Some(vec![0]),
+        vec![col("b.id").eq(lit("x"))],
+    )?
+    .build()?;
+    let c = table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?;
+    let aliased = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.cid"]), None)?
+        .alias("j")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(aliased, Left, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, j.id, j.cid FROM a LEFT OUTER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid WHERE (b.id = 'x')) AS j ON a.id = j.id"
+    );
+
+    // An aliased join under a filter is a joined input still: derived under
+    // the alias, with the filter inside.
+    let b = table_scan(Some("b"), &schema, Some(vec![0]))?.build()?;
+    let c = table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?;
+    let aliased = LogicalPlanBuilder::from(b)
+        .join(c, Inner, (vec!["b.id"], vec!["c.cid"]), None)?
+        .filter(col("b.id").eq(lit("x")))?
+        .alias("j")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(aliased, Left, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id, j.id, j.cid FROM a LEFT OUTER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid WHERE (b.id = 'x')) AS j ON a.id = j.id"
+    );
+
+    // A subquery conjunct the outer join's `ON` would scope onto a joined right
+    // input has no single name for the derived table it needs: refused.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let inner = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(
+            inner,
+            Left,
+            (vec!["a.id"], vec!["b.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a scoped subquery conjunct on a joined input has no name to bind to",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
+    // The same joined input under a projection that only picks its columns.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let projected = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .project(vec![col("b.id"), col("c.id")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(
+            projected,
+            Left,
+            (vec!["a.id"], vec!["b.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error =
+        plan_to_sql(&plan).expect_err("a projected joined input is a joined input still");
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
+    // The mirror image: a RIGHT JOIN scopes the conjunct onto its left input.
+    let allowed = table_scan(Some("allowed"), &schema, Some(vec![0]))?
+        .filter(col("allowed.id").eq(col("b.id")))?
+        .build()?;
+    let inner = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(inner)
+        .join(
+            scan("a")?,
+            Right,
+            (vec!["b.id"], vec!["a.id"]),
+            Some(exists(Arc::new(allowed))),
+        )?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "a scoped subquery conjunct on a joined left input has no name to bind to",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer join's subquery predicate scoped onto a joined input is not supported"
+    );
+
+    // An aliased join behind a filter and a second alias is a joined input
+    // still: the outer alias derives all of it, so the inner alias's filter
+    // stays inside rather than naming `i` where only `o` is in scope.
+    let nested_aliases = LogicalPlanBuilder::from(scan("b")?)
+        .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+        .alias("i")?
+        .filter(col("i.id").eq(lit("x")))?
+        .alias("o")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(nested_aliases, Left, (vec!["a.id"], vec!["o.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a.id, o.id, o."id:1" FROM a LEFT OUTER JOIN (SELECT * FROM (SELECT b.id, c.id AS "id:1" FROM b INNER JOIN c ON b.id = c.id) AS i WHERE (i.id = 'x')) AS o ON a.id = o.id"#
+    );
+
+    // An aliased join on the right of a join inside an EXISTS build side is
+    // derived there too, so the correlation on its primary output binds
+    // inside the subquery. A key on another of its outputs is still refused by
+    // the correlation check, which models the alias as renaming only its
+    // primary relation.
+    use datafusion_expr::JoinType::LeftSemi as Semi;
+    let build_side = || -> Result<LogicalPlan> {
+        let j = LogicalPlanBuilder::from(scan("b")?)
+            .join(
+                table_scan(Some("c"), &c_schema, Some(vec![0]))?.build()?,
+                Inner,
+                (vec!["b.id"], vec!["c.cid"]),
+                None,
+            )?
+            .alias("j")?
+            .build()?;
+        LogicalPlanBuilder::from(scan("d")?)
+            .join(j, Inner, (vec!["d.id"], vec!["j.id"]), None)?
+            .build()
+    };
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(build_side()?, Semi, (vec!["a.id"], vec!["j.id"]), None)?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a.id FROM a WHERE EXISTS (SELECT 1 FROM d INNER JOIN (SELECT b.id, c.cid FROM b INNER JOIN c ON b.id = c.cid) AS j ON d.id = j.id WHERE (a.id = j.id))"
+    );
+    let plan = LogicalPlanBuilder::from(scan("a")?)
+        .join(build_side()?, Semi, (vec!["a.id"], vec!["j.cid"]), None)?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err("the correlation check refuses it");
+    assert_contains!(
+        error.to_string(),
+        "a build-side join key names an output only the build side's projection binds"
+    );
+
+    // An aliased joined input that renames its columns takes the dialect's
+    // column-alias fallback: a dialect that refuses `AS j (x, y)` gets the
+    // names inside the derived table instead.
+    let renamed = || -> Result<LogicalPlan> {
+        let joined = LogicalPlanBuilder::from(scan("b")?)
+            .join(scan("c")?, Inner, (vec!["b.id"], vec!["c.id"]), None)?
+            .project(vec![col("b.id"), col("c.id")])?
+            .build()?;
+        let renamed = LogicalPlanBuilder::from(joined)
+            .project(vec![col("b.id").alias("x"), col("c.id").alias("y")])?
+            .alias("j")?
+            .build()?;
+        LogicalPlanBuilder::from(scan("a")?)
+            .join(renamed, Left, (vec!["a.id"], vec!["j.x"]), None)?
+            .build()
+    };
+    assert_snapshot!(
+        plan_to_sql(&renamed()?)?,
+        @"SELECT a.id, j.x, j.y FROM a LEFT OUTER JOIN (SELECT b.id, c.id FROM b INNER JOIN c ON b.id = c.id) AS j (x, y) ON a.id = j.x"
+    );
+    assert_snapshot!(
+        Unparser::new(&SqliteDialect {}).plan_to_sql(&renamed()?)?,
+        @"SELECT `a`.`id`, `j`.`x`, `j`.`y` FROM `a` LEFT OUTER JOIN (SELECT `b`.`id` AS `x`, `c`.`id` AS `y` FROM `b` INNER JOIN `c` ON `b`.`id` = `c`.`id`) AS `j` ON `a`.`id` = `j`.`x`"
+    );
+    Ok(())
+}
+
+/// MySQL's bare `DATETIME` has a fractional-seconds precision of 0, so
+/// `CAST('1994-06-15 12:30:00.5' AS DATETIME)` is `1994-06-15 12:30:00` (MySQL 8,
+/// MariaDB 11): an equality on a `TIMESTAMP(6)` column pushed down that way selects
+/// no row, and a range bound lands up to a second away from the one the query
+/// wrote. The cast must name `DATETIME(6)`, the widest precision MySQL holds, and
+/// a literal carrying more than six sub-second digits is truncated to six before
+/// it is sent, because the server would otherwise round it.
+#[test]
+fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
+    let unparser = Unparser::new(&UnparserMySqlDialect {});
+
+    // 1994-06-15 12:30:00.500 UTC, as the planner types a `TIMESTAMP '...'` literal.
+    let half_second = lit(datafusion_common::ScalarValue::TimestampNanosecond(
+        Some(771_683_400_500_000_000),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&half_second)?.to_string(),
+        "CAST('1994-06-15 12:30:00.500' AS DATETIME(6))"
+    );
+
+    // Nine sub-second digits: cut to the six MySQL stores, never rounded up.
+    let nanos = lit(datafusion_common::ScalarValue::TimestampNanosecond(
+        Some(771_683_400_123_456_789),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&nanos)?.to_string(),
+        "CAST('1994-06-15 12:30:00.123456' AS DATETIME(6))"
+    );
+
+    // The precision follows the unit: a second-precision value takes none, a
+    // millisecond one three, so a cast into a coarser unit still drops the
+    // digits DataFusion would drop.
+    let whole = lit(datafusion_common::ScalarValue::TimestampSecond(
+        Some(771_683_400),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&whole)?.to_string(),
+        "CAST('1994-06-15 12:30:00' AS DATETIME(0))"
+    );
+    let millis = lit(datafusion_common::ScalarValue::TimestampMillisecond(
+        Some(771_683_400_500),
+        None,
+    ));
+    assert_eq!(
+        unparser.expr_to_sql(&millis)?.to_string(),
+        "CAST('1994-06-15 12:30:00.500' AS DATETIME(3))"
+    );
+
+    // A cast of a column keeps its fractional seconds too.
+    let schema = Schema::new(vec![Field::new("s", DataType::Utf8, true)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .filter(
+            cast(
+                col("t.s"),
+                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
+            )
+            .gt(half_second),
+        )?
+        .build()?;
+    let sql = unparser.plan_to_sql(&plan)?.to_string();
+    assert_eq!(
+        sql,
+        "SELECT * FROM `t` WHERE (CAST(`t`.`s` AS DATETIME(6)) > CAST('1994-06-15 12:30:00.500' AS DATETIME(6)))"
+    );
+
+    // A cast into `Timestamp(Second)` drops fractional seconds in DataFusion, so
+    // its rendering must not keep them: `DATETIME(0)`, not `DATETIME(6)`.
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![cast(
+            col("t.s"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+        )])?
+        .build()?;
+    assert_eq!(
+        unparser.plan_to_sql(&plan)?.to_string(),
+        "SELECT CAST(`t`.`s` AS DATETIME(0)) FROM `t`"
+    );
+
     Ok(())
 }

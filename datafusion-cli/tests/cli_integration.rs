@@ -20,16 +20,22 @@ use std::process::Command;
 use rstest::rstest;
 
 use async_trait::async_trait;
+use futures::TryStreamExt;
 use insta::internals::SettingsBindDropGuard;
 use insta::{Settings, glob};
 use insta_cmd::{assert_cmd_snapshot, get_cargo_bin};
+use object_store::{
+    ObjectStore, ObjectStoreExt, aws::AmazonS3Builder, local::LocalFileSystem,
+};
 use std::path::PathBuf;
+use std::time::Duration;
 use std::{env, fs};
-use testcontainers_modules::minio;
-use testcontainers_modules::testcontainers::core::{CmdWaitFor, ExecCommand, Mount};
+use testcontainers_modules::testcontainers::core::{
+    CmdWaitFor, ExecCommand, IntoContainerPort,
+};
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::{
-    ContainerAsync, ImageExt, TestcontainersError,
+    ContainerAsync, GenericImage, ImageExt, TestcontainersError,
 };
 
 fn cli() -> Command {
@@ -45,79 +51,241 @@ fn make_settings() -> Settings {
     settings
 }
 
-async fn setup_minio_container() -> Result<ContainerAsync<minio::MinIO>, String> {
-    const MINIO_ROOT_USER: &str = "TEST-DataFusionLogin";
-    const MINIO_ROOT_PASSWORD: &str = "TEST-DataFusionPassword";
+const RUSTFS_ACCESS_KEY: &str = "TEST-DataFusionLogin";
+const RUSTFS_SECRET_KEY: &str = "TEST-DataFusionPassword";
 
-    let data_path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datafusion/core/tests/data");
+/// Pinned RustFS image, also pulled by the CLI CI job.
+const RUSTFS_IMAGE_NAME: &str = "docker.io/rustfs/rustfs";
+const RUSTFS_IMAGE_TAG: &str = "1.0.0";
 
-    let absolute_data_path = data_path
-        .canonicalize()
-        .expect("Failed to get absolute path for test data");
+/// How many times to try bringing up the RustFS container before failing.
+///
+/// Image pulls and fixture uploads can fail with transient errors such as
+/// `bytes remaining on stream`. Retry these failures before failing the test.
+const RUSTFS_SETUP_ATTEMPTS: u32 = 3;
 
-    let container = minio::MinIO::default()
-        .with_env_var("MINIO_ROOT_USER", MINIO_ROOT_USER)
-        .with_env_var("MINIO_ROOT_PASSWORD", MINIO_ROOT_PASSWORD)
-        .with_mount(Mount::bind_mount(
-            absolute_data_path.to_str().unwrap(),
-            "/source",
-        ))
-        .start()
-        .await;
+/// Delay before the first retry of the RustFS setup, doubled on each attempt.
+const RUSTFS_SETUP_RETRY_DELAY: Duration = Duration::from_secs(5);
 
-    match container {
-        Ok(container) => {
-            // We wait for MinIO to be healthy and prepare test files. We do it via CLI to avoid s3 dependency
-            let commands = [
-                ExecCommand::new(["/usr/bin/mc", "ready", "local"]),
-                ExecCommand::new([
-                    "/usr/bin/mc",
-                    "alias",
-                    "set",
-                    "localminio",
-                    "http://localhost:9000",
-                    MINIO_ROOT_USER,
-                    MINIO_ROOT_PASSWORD,
-                ]),
-                ExecCommand::new(["/usr/bin/mc", "mb", "localminio/data"]),
-                ExecCommand::new([
-                    "/usr/bin/mc",
-                    "cp",
-                    "-r",
-                    "/source/",
-                    "localminio/data/",
-                ]),
-            ];
+/// Time budget for a single RustFS setup attempt. A stalled image pull or `curl`
+/// invocation is retried instead of hanging the whole test run.
+const RUSTFS_SETUP_TIMEOUT: Duration = Duration::from_mins(3);
 
-            for command in commands {
-                let command =
-                    command.with_cmd_ready_condition(CmdWaitFor::Exit { code: Some(0) });
+/// Starts a RustFS container preloaded with the test data, retrying transient
+/// Docker failures.
+///
+/// Returns `None` when the test should be skipped, that is when
+/// `TEST_STORAGE_INTEGRATION` is unset or the registry is rate limiting the
+/// image pull. Panics if the container cannot be started for any other reason.
+async fn start_rustfs_or_skip() -> Option<ContainerAsync<GenericImage>> {
+    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
+        eprintln!("Skipping external storages integration tests");
+        return None;
+    }
 
-                let cmd_ref = format!("{command:?}");
+    match setup_rustfs_container().await {
+        Ok(container) => Some(container),
+        Err(e) if is_docker_pull_rate_limit(&e) => {
+            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
+            None
+        }
+        Err(e) => panic!("{e}"),
+    }
+}
 
-                if let Err(e) = container.exec(command).await {
-                    let stdout = container.stdout_to_vec().await.unwrap_or_default();
-                    let stderr = container.stderr_to_vec().await.unwrap_or_default();
+/// A registry pull rate limit does not clear up within a test run, so the
+/// affected tests are skipped rather than retried.
+fn is_docker_pull_rate_limit(error: &str) -> bool {
+    error.contains("toomanyrequests")
+}
 
-                    return Err(format!(
-                        "Failed to execute command: {}\nError: {}\nStdout: {:?}\nStderr: {:?}",
-                        cmd_ref,
-                        e,
-                        String::from_utf8_lossy(&stdout),
-                        String::from_utf8_lossy(&stderr)
-                    ));
-                }
-            }
+/// Retrying only pays off for transient failures. An exhausted pull quota or a
+/// Docker daemon that cannot be reached at all stays broken for the whole run.
+fn is_retryable(error: &str) -> bool {
+    !is_docker_pull_rate_limit(error)
+        && !error.contains("failed to initialize a docker client")
+}
 
-            Ok(container)
+async fn setup_rustfs_container() -> Result<ContainerAsync<GenericImage>, String> {
+    let mut delay = RUSTFS_SETUP_RETRY_DELAY;
+    let mut last_error = String::from("RustFS container setup was not attempted at all");
+
+    for attempt in 1..=RUSTFS_SETUP_ATTEMPTS {
+        last_error = match tokio::time::timeout(
+            RUSTFS_SETUP_TIMEOUT,
+            try_setup_rustfs_container(),
+        )
+        .await
+        {
+            Ok(Ok(container)) => return Ok(container),
+            Ok(Err(e)) => e,
+            Err(_) => format!(
+                "Timed out after {RUSTFS_SETUP_TIMEOUT:?} while starting the RustFS container"
+            ),
+        };
+
+        if attempt == RUSTFS_SETUP_ATTEMPTS || !is_retryable(&last_error) {
+            break;
         }
 
-        Err(TestcontainersError::Client(e)) => Err(format!(
-            "Failed to start MinIO container. Ensure Docker is running and accessible: {e}"
-        )),
-        Err(e) => Err(format!("Failed to start MinIO container: {e}")),
+        eprintln!(
+            "RustFS container setup failed (attempt {attempt}/{RUSTFS_SETUP_ATTEMPTS}), \
+             retrying in {delay:?}: {last_error}"
+        );
+        tokio::time::sleep(delay).await;
+        delay *= 2;
     }
+
+    Err(last_error)
+}
+
+/// A single attempt at starting and provisioning a RustFS container.
+///
+/// The container is removed again if provisioning fails, so that the next
+/// attempt starts from a clean state.
+async fn try_setup_rustfs_container() -> Result<ContainerAsync<GenericImage>, String> {
+    let container = start_rustfs_container().await?;
+
+    match provision_rustfs_container(&container).await {
+        Ok(()) => Ok(container),
+        Err(e) => {
+            if let Err(rm_error) = container.rm().await {
+                eprintln!("Failed to remove the RustFS container: {rm_error}");
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn start_rustfs_container() -> Result<ContainerAsync<GenericImage>, String> {
+    GenericImage::new(RUSTFS_IMAGE_NAME, RUSTFS_IMAGE_TAG)
+        .with_exposed_port(9000.tcp())
+        .with_env_var("RUSTFS_ACCESS_KEY", RUSTFS_ACCESS_KEY)
+        .with_env_var("RUSTFS_SECRET_KEY", RUSTFS_SECRET_KEY)
+        .with_env_var("RUSTFS_CONSOLE_ENABLE", "false")
+        .start()
+        .await
+        .map_err(|e| match e {
+            TestcontainersError::Client(e) => format!(
+                "Failed to start RustFS container. Ensure Docker is running and accessible: {e}"
+            ),
+            e => format!("Failed to start RustFS container: {e}"),
+        })
+}
+
+/// Waits for RustFS to be healthy and uploads the test files.
+///
+/// Use the image's `curl` to check readiness and create the bucket, then upload
+/// the fixtures through `object_store`.
+async fn provision_rustfs_container(
+    container: &ContainerAsync<GenericImage>,
+) -> Result<(), String> {
+    let credentials = format!("{RUSTFS_ACCESS_KEY}:{RUSTFS_SECRET_KEY}");
+    let commands = [
+        ExecCommand::new([
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--retry",
+            "60",
+            "--retry-delay",
+            "1",
+            "--retry-all-errors",
+            "--max-time",
+            "5",
+            "http://localhost:9000/health/ready",
+        ]),
+        ExecCommand::new([
+            "curl",
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--aws-sigv4",
+            "aws:amz:us-east-1:s3",
+            "--user",
+            &credentials,
+            "--request",
+            "PUT",
+            "http://localhost:9000/data",
+        ]),
+    ];
+
+    for command in commands {
+        let command =
+            command.with_cmd_ready_condition(CmdWaitFor::Exit { code: Some(0) });
+
+        let cmd_ref = format!("{command:?}");
+
+        if let Err(e) = container.exec(command).await {
+            let stdout = container.stdout_to_vec().await.unwrap_or_default();
+            let stderr = container.stderr_to_vec().await.unwrap_or_default();
+
+            return Err(format!(
+                "Failed to execute command: {}\nError: {}\nStdout: {:?}\nStderr: {:?}",
+                cmd_ref,
+                e,
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            ));
+        }
+    }
+
+    let port = container
+        .get_host_port_ipv4(9000)
+        .await
+        .map_err(|e| e.to_string())?;
+    let store = AmazonS3Builder::new()
+        .with_bucket_name("data")
+        .with_region("us-east-1")
+        .with_access_key_id(RUSTFS_ACCESS_KEY)
+        .with_secret_access_key(RUSTFS_SECRET_KEY)
+        .with_endpoint(format!("http://localhost:{port}"))
+        .with_allow_http(true)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let data_path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../datafusion/core/tests/data");
+    let source =
+        LocalFileSystem::new_with_prefix(data_path).map_err(|e| e.to_string())?;
+    let mut files = source.list(None);
+    while let Some(file) = files.try_next().await.map_err(|e| e.to_string())? {
+        let data = source
+            .get(&file.location)
+            .await
+            .map_err(|e| e.to_string())?
+            .bytes()
+            .await
+            .map_err(|e| e.to_string())?;
+        store
+            .put(&file.location, data.into())
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    Ok(())
+}
+
+/// CI pre-pulls the RustFS image so that the storage integration tests do not
+/// have to pull it themselves. Keep the CI image and the test image in sync.
+#[test]
+fn rustfs_image_matches_ci_prepull() {
+    let workflow =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.github/workflows/rust.yml");
+
+    // The workflow is not shipped with the published crate.
+    let Ok(contents) = fs::read_to_string(&workflow) else {
+        return;
+    };
+
+    let image_ref = format!("{RUSTFS_IMAGE_NAME}:{RUSTFS_IMAGE_TAG}");
+
+    assert!(
+        contents.contains(&format!("RUSTFS_IMAGE: {image_ref}")),
+        "{} does not pre-pull `{image_ref}`. Update RUSTFS_IMAGE in the \
+         `Pre-pull RustFS image` step to match the image used by the tests.",
+        workflow.display()
+    );
 }
 
 #[cfg(test)]
@@ -171,6 +339,222 @@ fn cli_quick_test<'a>(
     cmd.args(args);
 
     assert_cmd_snapshot!(cmd);
+}
+
+/// Read data piped into the CLI via the `/dev/stdin` pseudo-path.
+///
+/// Unix-only: `/dev/stdin` does not exist on Windows. This drives the real
+/// binary through an actual pipe, exercising the stdin read that the in-process
+/// unit tests cannot.
+#[cfg(unix)]
+#[test]
+fn test_cli_read_from_stdin() {
+    let stdout = run_cli_with_stdin(
+        "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/dev/stdin' \
+         OPTIONS ('format.has_header' 'true'); \
+         SELECT b, count(*) AS c FROM t GROUP BY b ORDER BY b;",
+        b"a,b\n1,foo\n2,bar\n3,foo\n",
+    );
+
+    assert!(
+        stdout.contains("| foo | 2 |") && stdout.contains("| bar | 1 |"),
+        "unexpected output:\n{stdout}"
+    );
+}
+
+/// stdin is a one-shot stream, so a second `/dev/stdin` table in the same
+/// session must reuse the buffered input rather than re-reading (now-empty)
+/// stdin and silently emptying the first table.
+#[cfg(unix)]
+#[test]
+fn test_cli_read_from_stdin_twice_reuses_buffer() {
+    let stdout = run_cli_with_stdin(
+        "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/dev/stdin' \
+         OPTIONS ('format.has_header' 'true'); \
+         CREATE EXTERNAL TABLE t2 STORED AS CSV LOCATION '/dev/stdin' \
+         OPTIONS ('format.has_header' 'true'); \
+         SELECT count(*) AS t_count FROM t; \
+         SELECT count(*) AS t2_count FROM t2;",
+        b"a,b\n1,foo\n2,bar\n",
+    );
+
+    // Both tables must still see the two buffered rows.
+    let counts: Vec<&str> = stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with("| 2 "))
+        .collect();
+    assert_eq!(
+        counts.len(),
+        2,
+        "expected both stdin tables to report 2 rows, got:\n{stdout}"
+    );
+}
+
+/// A later `/dev/stdin` table declaring a different `STORED AS` format must be
+/// rejected with a clear error: stdin is one-shot, its bytes were already
+/// buffered under the first table's format, and silently reading them as
+/// another format would be wrong.
+#[cfg(unix)]
+#[test]
+fn test_cli_read_from_stdin_mixed_formats_rejected() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = cli()
+        .args([
+            "-q",
+            "--command",
+            "CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/dev/stdin' \
+             OPTIONS ('format.has_header' 'true'); \
+             CREATE EXTERNAL TABLE t2 STORED AS JSON LOCATION '/dev/stdin';",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn datafusion-cli");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"a,b\n1,foo\n2,bar\n")
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    // Fatal errors in `--command` mode are reported on stdout.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        !output.status.success(),
+        "expected the mismatched format to fail, stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("must declare the same STORED AS format"),
+        "expected a clear mismatch error, got:\n{stdout}"
+    );
+}
+
+/// When the SQL itself arrives on stdin (the piped REPL, e.g. `cat script.sql
+/// | datafusion-cli`), stdin cannot double as a data source: the statement
+/// must fail with a clear error instead of silently consuming the rest of the
+/// script as table data, and the remaining statements must still run.
+#[cfg(unix)]
+#[test]
+fn test_cli_stdin_location_rejected_when_sql_comes_from_stdin() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = cli()
+        .arg("-q")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn datafusion-cli");
+
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(
+            b"CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/dev/stdin';\n\
+              SELECT 123 + 456;\n",
+        )
+        .unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("SQL commands"),
+        "expected a clear error about stdin carrying SQL.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The statement after the failed CREATE must still execute rather than
+    // being consumed as table data.
+    assert!(
+        stdout.contains("579"),
+        "expected the following statement to still run.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// `-f /dev/stdin` reads the SQL script from stdin, exactly like the piped
+/// REPL, so stdin still cannot double as a `LOCATION '/dev/stdin'` data source.
+/// The offending statement must fail with the same clear error, and later
+/// statements in the script must still run.
+///
+/// `/dev/stdin` only passes the `-f` file check when stdin is a redirected
+/// regular file (a pipe is not `is_file()`), so the binary is driven with a
+/// temp script file as its stdin rather than a pipe.
+#[cfg(unix)]
+#[test]
+fn test_cli_dash_f_stdin_location_rejected() {
+    use std::process::Stdio;
+
+    let script = env::temp_dir().join(format!(
+        "datafusion_cli_dash_f_stdin_{}.sql",
+        std::process::id()
+    ));
+    fs::write(
+        &script,
+        b"CREATE EXTERNAL TABLE t STORED AS CSV LOCATION '/dev/stdin';\n\
+          SELECT 123 + 456;\n",
+    )
+    .unwrap();
+    let stdin = fs::File::open(&script).unwrap();
+
+    let output = cli()
+        .args(["-q", "-f", "/dev/stdin"])
+        .stdin(Stdio::from(stdin))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to spawn datafusion-cli");
+
+    let _ = fs::remove_file(&script);
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        stderr.contains("SQL commands"),
+        "expected a clear error about stdin carrying SQL.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    // The statement after the failed CREATE must still execute rather than
+    // being consumed as table data.
+    assert!(
+        stdout.contains("579"),
+        "expected the following statement to still run.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+}
+
+/// Spawns the real `datafusion-cli` binary, pipes `stdin` into it, and returns
+/// its stdout after asserting a successful exit.
+#[cfg(unix)]
+fn run_cli_with_stdin(command: &str, stdin: &[u8]) -> String {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = cli()
+        .args(["-q", "--command", command])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn datafusion-cli");
+
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        output.status.success(),
+        "datafusion-cli failed.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    stdout
 }
 
 #[test]
@@ -306,18 +690,8 @@ fn test_cli_wide_result_set_no_crash() {
 
 #[tokio::test]
 async fn test_cli() {
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
 
     let settings = make_settings();
@@ -330,8 +704,8 @@ async fn test_cli() {
         assert_cmd_snapshot!(
             cli()
                 .env_clear()
-                .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
-                .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
+                .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
+                .env("AWS_SECRET_ACCESS_KEY", RUSTFS_SECRET_KEY)
                 .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
                 .env("AWS_ALLOW_HTTP", "true")
                 .pass_stdin(input)
@@ -343,22 +717,13 @@ async fn test_cli() {
 async fn test_aws_options() {
     // Separate test is needed to pass aws as options in sql and not via env
 
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
+    };
 
     let settings = make_settings();
     let _bound = settings.bind_to_scope();
 
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
-    };
     let port = container.get_host_port_ipv4(9000).await.unwrap();
 
     let input = format!(
@@ -366,8 +731,8 @@ async fn test_aws_options() {
 STORED AS CSV
 LOCATION 's3://data/cars.csv'
 OPTIONS(
-    'aws.access_key_id' 'TEST-DataFusionLogin',
-    'aws.secret_access_key' 'TEST-DataFusionPassword',
+    'aws.access_key_id' '{RUSTFS_ACCESS_KEY}',
+    'aws.secret_access_key' '{RUSTFS_SECRET_KEY}',
     'aws.endpoint' 'http://localhost:{port}',
     'aws.allow_http' 'true'
 );
@@ -442,18 +807,8 @@ fn test_backtrace_output(#[case] query: &str) {
 
 #[tokio::test]
 async fn test_s3_url_fallback() {
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
 
     let mut settings = make_settings();
@@ -473,25 +828,16 @@ OPTIONS (
 SELECT * FROM partitioned_data ORDER BY column_1, column_2 LIMIT 5;
 "#;
 
-    assert_cmd_snapshot!(cli().with_minio(&container).await.pass_stdin(input));
+    assert_cmd_snapshot!(cli().with_rustfs(&container).await.pass_stdin(input));
 }
 
 /// Validate object store profiling output
 #[tokio::test]
 async fn test_object_store_profiling() {
-    if env::var("TEST_STORAGE_INTEGRATION").is_err() {
-        eprintln!("Skipping external storages integration tests");
+    let Some(container) = start_rustfs_or_skip().await else {
         return;
-    }
-
-    let container = match setup_minio_container().await {
-        Ok(c) => c,
-        Err(e) if e.contains("toomanyrequests") => {
-            eprintln!("Skipping test: Docker pull rate limit reached: {e}");
-            return;
-        }
-        e @ Err(_) => e.unwrap(),
     };
+
     let mut settings = make_settings();
 
     // as the object store profiling contains timestamps and durations, we must
@@ -534,27 +880,29 @@ SELECT * from CARS LIMIT 1;
 SELECT * from CARS LIMIT 1;
 "#;
 
-    assert_cmd_snapshot!(cli().with_minio(&container).await.pass_stdin(input));
+    assert_cmd_snapshot!(cli().with_rustfs(&container).await.pass_stdin(input));
 }
 
-/// Extension trait to Add the minio connection information to a Command
+/// Add the RustFS connection information to a Command.
 #[async_trait]
-trait MinioCommandExt {
-    async fn with_minio(&mut self, container: &ContainerAsync<minio::MinIO>)
-    -> &mut Self;
-}
-
-#[async_trait]
-impl MinioCommandExt for Command {
-    async fn with_minio(
+trait RustfsCommandExt {
+    async fn with_rustfs(
         &mut self,
-        container: &ContainerAsync<minio::MinIO>,
+        container: &ContainerAsync<GenericImage>,
+    ) -> &mut Self;
+}
+
+#[async_trait]
+impl RustfsCommandExt for Command {
+    async fn with_rustfs(
+        &mut self,
+        container: &ContainerAsync<GenericImage>,
     ) -> &mut Self {
         let port = container.get_host_port_ipv4(9000).await.unwrap();
 
         self.env_clear()
-            .env("AWS_ACCESS_KEY_ID", "TEST-DataFusionLogin")
-            .env("AWS_SECRET_ACCESS_KEY", "TEST-DataFusionPassword")
+            .env("AWS_ACCESS_KEY_ID", RUSTFS_ACCESS_KEY)
+            .env("AWS_SECRET_ACCESS_KEY", RUSTFS_SECRET_KEY)
             .env("AWS_ENDPOINT", format!("http://localhost:{port}"))
             .env("AWS_ALLOW_HTTP", "true")
     }

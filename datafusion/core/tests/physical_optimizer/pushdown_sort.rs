@@ -24,19 +24,29 @@
 //! 4. Early termination is enabled for TopK queries
 //! 5. Prefix matching works correctly
 
+use arrow::array::{ArrayRef, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use datafusion::prelude::SessionContext;
+use datafusion_common::config::ConfigOptions;
+use datafusion_common::{Result, assert_batches_eq};
 use datafusion_physical_expr::expressions;
 use datafusion_physical_expr_common::physical_expr::PhysicalExpr;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
 use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::pushdown_sort::PushdownSort;
+use datafusion_physical_plan::collect;
 use std::sync::Arc;
 
 use crate::physical_optimizer::test_utils::{
-    OptimizationTest, TestScan, coalesce_partitions_exec, parquet_exec,
-    parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
+    OptimizationTest, TestScan, coalesce_partitions_exec, inexact_memory_exec,
+    parquet_exec, parquet_exec_with_sort, projection_exec, projection_exec_with_alias,
     repartition_exec, schema, simple_projection_exec, sort_exec, sort_exec_with_fetch,
-    sort_expr, sort_expr_named, test_scan_with_ordering,
+    sort_exec_with_fetch_and_preserve_partitioning, sort_expr, sort_expr_named,
+    sort_preserving_merge_exec, sort_preserving_merge_exec_with_fetch,
+    spr_repartition_exec, test_scan_with_ordering,
 };
+use datafusion_physical_plan::get_plan_string;
 
 #[test]
 fn test_sort_pushdown_disabled() {
@@ -117,6 +127,91 @@ fn test_sort_with_limit_phase1() {
           -   DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], file_type=parquet, sort_order_for_reorder=[a@0 DESC NULLS LAST], reverse_row_groups=true
     "
     );
+}
+
+#[test]
+fn test_standalone_inexact_partitioned_topk_adds_global_merge() {
+    // Inexact pushdown keeps the SortExec. If that SortExec is a
+    // partition-preserving TopK, it still needs a final merge across partitions
+    // to preserve the global ORDER BY ... LIMIT semantics.
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source = Arc::new(TestScan::new(schema.clone(), vec![]).with_partition_count(2));
+
+    let ordering = LexOrdering::new(vec![a]).unwrap();
+    let plan = sort_exec_with_fetch_and_preserve_partitioning(ordering, Some(10), source);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[true]
+        -   TestScan
+      output:
+        Ok:
+          - SortPreservingMergeExec: [a@0 ASC], fetch=10
+          -   SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[true]
+          -     TestScan: requested_ordering=[a@0 ASC]
+    "
+    );
+}
+
+#[test]
+fn test_standalone_inexact_single_partition_topk_no_global_merge() {
+    let schema = schema();
+    let a = sort_expr("a", &schema);
+    let source = Arc::new(TestScan::new(schema.clone(), vec![]).with_partition_count(1));
+
+    let ordering = LexOrdering::new(vec![a]).unwrap();
+    let plan = sort_exec_with_fetch_and_preserve_partitioning(ordering, Some(10), source);
+
+    insta::assert_snapshot!(
+        OptimizationTest::new(plan, PushdownSort::new(), true),
+        @r"
+    OptimizationTest:
+      input:
+        - SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[true]
+        -   TestScan
+      output:
+        Ok:
+          - SortExec: TopK(fetch=10), expr=[a@0 ASC], preserve_partitioning=[true]
+          -   TestScan: requested_ordering=[a@0 ASC]
+    "
+    );
+}
+
+#[tokio::test]
+async fn test_standalone_inexact_partitioned_topk_returns_global_limit() -> Result<()> {
+    let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
+    let partition_0 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![1, 100])) as ArrayRef],
+    )?;
+    let partition_1 = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![Arc::new(Int64Array::from(vec![2, 3])) as ArrayRef],
+    )?;
+    let source = inexact_memory_exec(
+        &[vec![partition_0], vec![partition_1]],
+        Arc::clone(&schema),
+    )?;
+
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    let plan = sort_exec_with_fetch_and_preserve_partitioning(ordering, Some(3), source);
+
+    let mut config = ConfigOptions::new();
+    config.optimizer.enable_sort_pushdown = true;
+    let optimized = PushdownSort::new().optimize(plan, &config)?;
+
+    let ctx = SessionContext::new();
+    let batches = collect(optimized, ctx.task_ctx()).await?;
+
+    let expected = [
+        "+---+", "| a |", "+---+", "| 1 |", "| 2 |", "| 3 |", "+---+",
+    ];
+    assert_batches_eq!(expected, &batches);
+    Ok(())
 }
 
 #[test]
@@ -1136,4 +1231,176 @@ fn test_sort_pushdown_exact_preserves_fetch_with_source_support() {
           - TestScan: requested_ordering=[a@0 ASC], fetch=10
     "
     );
+}
+
+/// Under a `SortPreservingMergeExec` that keeps `fetch` rows, the fetch of an
+/// eliminated sort bounds the total output. It crosses the round-robin
+/// repartition the planner puts above a single-partition source, whose output
+/// all comes from that one stream, and reaches the source rather than staying
+/// above the repartition as a per-partition limit.
+#[test]
+fn test_sort_fetch_reaches_source_through_single_input_repartition() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    let source = parquet_exec_with_sort(Arc::clone(&schema), vec![ordering.clone()]);
+    let projection = simple_projection_exec(repartition_exec(source), vec![0, 1]);
+    let sort = sort_exec_with_fetch_and_preserve_partitioning(
+        ordering.clone(),
+        Some(10),
+        projection,
+    );
+    let plan = sort_preserving_merge_exec_with_fetch(ordering, sort, 10);
+
+    let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+    assert_eq!(
+        get_plan_string(&optimized),
+        [
+            "SortPreservingMergeExec: [a@0 ASC], fetch=10",
+            "  BufferExec: capacity=1073741824",
+            "    ProjectionExec: expr=[a@0 as a, b@1 as b]",
+            "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true",
+            "        DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], limit=10, output_ordering=[a@0 ASC], file_type=parquet",
+        ]
+    );
+    Ok(())
+}
+
+/// A repartition of several input partitions does not take the fetch: limiting
+/// each input would not bound its output. The fetch stays above it as a
+/// per-partition limit under the merge.
+#[test]
+fn test_sort_fetch_stays_above_a_multi_input_repartition() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    let source = parquet_exec_with_sort(Arc::clone(&schema), vec![ordering.clone()]);
+    let several_inputs = spr_repartition_exec(repartition_exec(source));
+    let sort = sort_exec_with_fetch_and_preserve_partitioning(
+        ordering.clone(),
+        Some(10),
+        several_inputs,
+    );
+    let plan = sort_preserving_merge_exec_with_fetch(ordering, sort, 10);
+
+    let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+    assert_eq!(
+        get_plan_string(&optimized),
+        [
+            "SortPreservingMergeExec: [a@0 ASC], fetch=10",
+            "  BufferExec: capacity=1073741824",
+            "    LocalLimitExec: fetch=10",
+            "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=10, preserve_order=true, sort_exprs=a@0 ASC",
+            "        RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true",
+            "          DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet",
+        ]
+    );
+    Ok(())
+}
+
+/// A sorted scan that already returns at most 3 rows.
+fn sorted_scan_limited_to_three(
+    schema: &arrow::datatypes::SchemaRef,
+    ordering: &LexOrdering,
+) -> Arc<dyn datafusion_physical_plan::ExecutionPlan> {
+    use datafusion_physical_plan::ExecutionPlan;
+    parquet_exec_with_sort(Arc::clone(schema), vec![ordering.clone()])
+        .with_fetch(Some(3))
+        .expect("the scan takes a limit")
+}
+
+/// A source that already stops sooner than the eliminated sort's fetch keeps
+/// its own limit: `with_fetch` replaces a scan's limit rather than tightening
+/// it, so pushing the larger fetch as is would let the source return more rows.
+#[test]
+fn test_sort_fetch_keeps_a_tighter_source_limit() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    let scan = "DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], limit=3, output_ordering=[a@0 ASC], file_type=parquet";
+    let shapes = [
+        (
+            sort_preserving_merge_exec_with_fetch(
+                ordering.clone(),
+                sort_exec_with_fetch_and_preserve_partitioning(
+                    ordering.clone(),
+                    Some(10),
+                    repartition_exec(sorted_scan_limited_to_three(&schema, &ordering)),
+                ),
+                10,
+            ),
+            vec![
+                "SortPreservingMergeExec: [a@0 ASC], fetch=10".to_string(),
+                "  BufferExec: capacity=1073741824".to_string(),
+                "    RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true".to_string(),
+                format!("      {scan}"),
+            ],
+        ),
+        (
+            sort_preserving_merge_exec_with_fetch(
+                ordering.clone(),
+                sort_exec_with_fetch_and_preserve_partitioning(
+                    ordering.clone(),
+                    Some(10),
+                    sorted_scan_limited_to_three(&schema, &ordering),
+                ),
+                10,
+            ),
+            vec![
+                "SortPreservingMergeExec: [a@0 ASC], fetch=10".to_string(),
+                "  BufferExec: capacity=1073741824".to_string(),
+                format!("    {scan}"),
+            ],
+        ),
+        (
+            sort_exec_with_fetch(
+                ordering.clone(),
+                Some(10),
+                sorted_scan_limited_to_three(&schema, &ordering),
+            ),
+            vec![scan.to_string()],
+        ),
+    ];
+    for (plan, expected) in shapes {
+        let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+        assert_eq!(get_plan_string(&optimized), expected);
+    }
+    Ok(())
+}
+
+/// The eliminated sort's fetch counts as a bound on the total output only under
+/// a merge that keeps at most that many rows. Without a merge fetch, or under a
+/// larger one, the per-partition `LocalLimitExec` stays above the single-input
+/// repartition and the source is left without a limit.
+#[test]
+fn test_sort_fetch_is_a_total_bound_only_under_a_merge_that_keeps_it() -> Result<()> {
+    let schema = schema();
+    let ordering = LexOrdering::new(vec![sort_expr("a", &schema)]).unwrap();
+    for (merge_fetch, merge) in [
+        (None, "SortPreservingMergeExec: [a@0 ASC]"),
+        (Some(3), "SortPreservingMergeExec: [a@0 ASC], fetch=3"),
+    ] {
+        let source = parquet_exec_with_sort(Arc::clone(&schema), vec![ordering.clone()]);
+        let sort = sort_exec_with_fetch_and_preserve_partitioning(
+            ordering.clone(),
+            Some(2),
+            repartition_exec(source),
+        );
+        let plan = match merge_fetch {
+            Some(fetch) => {
+                sort_preserving_merge_exec_with_fetch(ordering.clone(), sort, fetch)
+            }
+            None => sort_preserving_merge_exec(ordering.clone(), sort),
+        };
+        let optimized = PushdownSort::new().optimize(plan, &ConfigOptions::default())?;
+        assert_eq!(
+            get_plan_string(&optimized),
+            [
+                merge,
+                "  BufferExec: capacity=1073741824",
+                "    LocalLimitExec: fetch=2",
+                "      RepartitionExec: partitioning=RoundRobinBatch(10), input_partitions=1, maintains_sort_order=true",
+                "        DataSourceExec: file_groups={1 group: [[x]]}, projection=[a, b, c, d, e], output_ordering=[a@0 ASC], file_type=parquet",
+            ],
+            "merge fetch {merge_fetch:?}"
+        );
+    }
+    Ok(())
 }

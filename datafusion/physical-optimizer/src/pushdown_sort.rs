@@ -57,14 +57,74 @@
 use crate::PhysicalOptimizerRule;
 use datafusion_common::Result;
 use datafusion_common::config::ConfigOptions;
-use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
-use datafusion_physical_plan::ExecutionPlan;
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
+};
 use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::buffer::BufferExec;
+use datafusion_physical_plan::execution_plan::CardinalityEffect;
 use datafusion_physical_plan::limit::{GlobalLimitExec, LocalLimitExec};
+use datafusion_physical_plan::repartition::RepartitionExec;
 use datafusion_physical_plan::sorts::sort::SortExec;
 use datafusion_physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion_physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ExecutionPlanProperties,
+    ReplaceChildrenOptions,
+};
 use std::sync::Arc;
+
+/// `plan` limited to `fetch` rows, keeping a tighter limit it already has:
+/// `with_fetch` replaces a node's limit rather than tightening it, so passing
+/// `fetch` as is would loosen a source that already stops sooner.
+fn with_fetch_at_most(
+    plan: &Arc<dyn ExecutionPlan>,
+    fetch: usize,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    let fetch = plan.fetch().map_or(fetch, |existing| existing.min(fetch));
+    plan.with_fetch(Some(fetch))
+}
+
+/// `plan` with `fetch` pushed down as a bound on its total output, or `None`
+/// where nothing beneath it takes the fetch.
+///
+/// `with_fetch` on a plan with several output partitions limits each partition
+/// separately. Where the caller already keeps at most `fetch` rows of the total,
+/// as a `SortPreservingMergeExec` with that fetch does, the bound can also cross
+/// a [`RepartitionExec`] whose input is a single partition: every output row
+/// comes from that one stream, so its first `fetch` rows are enough. The descent
+/// passes only through nodes that keep every row in their input's order.
+fn with_total_fetch(
+    plan: &Arc<dyn ExecutionPlan>,
+    fetch: usize,
+) -> Option<Arc<dyn ExecutionPlan>> {
+    if let Some(fetched) = with_fetch_at_most(plan, fetch) {
+        return Some(fetched);
+    }
+    let children = plan.children();
+    let [child] = children.as_slice() else {
+        return None;
+    };
+    let passes_rows_through = match plan.downcast_ref::<RepartitionExec>() {
+        Some(repartition) => {
+            repartition.input().output_partitioning().partition_count() == 1
+        }
+        None => {
+            plan.supports_limit_pushdown()
+                && matches!(plan.cardinality_effect(), CardinalityEffect::Equal)
+                && plan.maintains_input_order().first() == Some(&true)
+        }
+    };
+    if !passes_rows_through {
+        return None;
+    }
+    let child = with_total_fetch(child, fetch)?;
+    Arc::clone(plan)
+        .replace_children(
+            vec![child],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+        .ok()
+}
 
 /// A PhysicalOptimizerRule that attempts to push down sort requirements to data sources.
 ///
@@ -108,7 +168,16 @@ impl PhysicalOptimizerRule for PushdownSort {
                         // Preserve fetch (LIMIT) from the eliminated SortExec.
                         // Use LocalLimitExec (not Global) since input is multi-partition.
                         let inner = if let Some(fetch) = sort_child.fetch() {
-                            inner.with_fetch(Some(fetch)).unwrap_or_else(|| {
+                            // When the merge keeps at most `fetch` rows, the
+                            // fetch bounds the total output of `inner`, not
+                            // just each partition, and can be pushed further.
+                            let fetched = if spm.fetch().is_some_and(|keep| keep <= fetch)
+                            {
+                                with_total_fetch(&inner, fetch)
+                            } else {
+                                with_fetch_at_most(&inner, fetch)
+                            };
+                            fetched.unwrap_or_else(|| {
                                 Arc::new(LocalLimitExec::new(inner, fetch))
                             })
                         } else {
@@ -133,7 +202,15 @@ impl PhysicalOptimizerRule for PushdownSort {
                             Arc::new(new_sort),
                         )
                         .with_fetch(spm.fetch());
-                        return Ok(Transformed::yes(Arc::new(new_spm)));
+                        // The replacement already has the required
+                        // `SortPreservingMergeExec` parent. Do not descend
+                        // into its `SortExec` child and treat it as a
+                        // standalone TopK.
+                        return Ok(Transformed::new(
+                            Arc::new(new_spm),
+                            true,
+                            TreeNodeRecursion::Jump,
+                        ));
                     }
                     SortOrderPushdownResult::Unsupported => {
                         return Ok(Transformed::no(plan));
@@ -160,9 +237,10 @@ impl PhysicalOptimizerRule for PushdownSort {
                     // If the source doesn't support `with_fetch`, fall back to
                     // wrapping with GlobalLimitExec.
                     if let Some(fetch) = sort_exec.fetch() {
-                        let inner = inner.with_fetch(Some(fetch)).unwrap_or_else(|| {
-                            Arc::new(GlobalLimitExec::new(inner, 0, Some(fetch)))
-                        });
+                        let inner =
+                            with_fetch_at_most(&inner, fetch).unwrap_or_else(|| {
+                                Arc::new(GlobalLimitExec::new(inner, 0, Some(fetch)))
+                            });
                         Ok(Transformed::yes(inner))
                     } else {
                         Ok(Transformed::yes(inner))
@@ -172,13 +250,35 @@ impl PhysicalOptimizerRule for PushdownSort {
                     // Data source is optimized for the ordering but not perfectly sorted
                     // Keep the Sort operator but use the optimized input
                     // Benefits: TopK queries can terminate early, better cache locality
-                    Ok(Transformed::yes(Arc::new(
+                    // A standalone multi-partition TopK still needs a global
+                    // merge; otherwise a later coalesce can concatenate
+                    // locally sorted partitions.
+                    let preserve_partitioning = sort_exec.preserve_partitioning();
+                    let needs_global_topk =
+                        preserve_partitioning && sort_exec.fetch().is_some();
+                    let input_partitions = inner.output_partitioning().partition_count();
+                    let new_sort: Arc<dyn ExecutionPlan> = Arc::new(
                         SortExec::new(required_ordering.clone(), inner)
                             .with_fetch(sort_exec.fetch())
-                            .with_preserve_partitioning(
-                                sort_exec.preserve_partitioning(),
-                            ),
-                    )))
+                            .with_preserve_partitioning(preserve_partitioning),
+                    );
+                    if needs_global_topk && input_partitions > 1 {
+                        let new_spm = SortPreservingMergeExec::new(
+                            required_ordering.clone(),
+                            new_sort,
+                        )
+                        .with_fetch(sort_exec.fetch());
+                        // Do not descend into the newly inserted
+                        // `SortExec`, or this standalone branch will wrap it
+                        // in another `SortPreservingMergeExec`.
+                        Ok(Transformed::new(
+                            Arc::new(new_spm),
+                            true,
+                            TreeNodeRecursion::Jump,
+                        ))
+                    } else {
+                        Ok(Transformed::yes(new_sort))
+                    }
                 }
                 SortOrderPushdownResult::Unsupported => {
                     // Cannot optimize for this ordering - no change
