@@ -229,6 +229,23 @@ fn plan_reads_an_outer_row(plan: &LogicalPlan) -> Result<bool> {
     Ok(correlated)
 }
 
+/// The names of the outer references `exprs` read, outside any subquery they
+/// hold. Each renders as its bare name.
+fn outer_reference_names<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+) -> Result<Vec<String>> {
+    let mut names = vec![];
+    for expr in exprs {
+        expr.apply(|sub_expr| {
+            if let Expr::OuterReferenceColumn(_, column) = sub_expr {
+                names.push(column.name().to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    Ok(names)
+}
+
 /// Whether `plan` holds the definition of a recursive CTE called `name`.
 fn subtree_defines_recursive_cte(plan: &LogicalPlan, name: &str) -> bool {
     let mut found = false;
@@ -1221,10 +1238,15 @@ impl Unparser<'_> {
     /// relation that merely starts the same way (`t.s.a` under full
     /// qualification) does not match a column of `t` and keeps its qualifier.
     ///
+    /// A reference whose whole qualifier names a hidden relation (`t.s.a`, a
+    /// column of `t.s`) reads that column even when a shorter prefix names
+    /// another hidden relation (`t`, with a column `s`).
+    ///
     /// Returns `true`, leaving the reference unchanged, when it reads both a
     /// field of such an output and a column of the hidden relation: outside the
     /// derived table `t.k` can only be the field, so the column reference has no
-    /// spelling there.
+    /// spelling there. Likewise when `t.s.a` reads both the column `a` of `t.s`
+    /// and the field `a` of `t`'s struct column `s`.
     fn repoint_onto_derived_chain(
         idents: &mut Vec<Ident>,
         hidden_schema: &DFSchema,
@@ -1233,27 +1255,35 @@ impl Unparser<'_> {
         if idents.len() < 2 {
             return false;
         }
-        // The longest prefix of `idents` (shorter than `max_len`) naming a
-        // hidden relation that has a column called by the part after it.
-        let hidden_column_prefix = |idents: &[Ident], max_len: usize| {
-            (1..max_len).rev().find(|&prefix_len| {
-                let qualifier = idents[..prefix_len]
-                    .iter()
-                    .map(|ident| ident.value.clone())
-                    .collect::<Vec<String>>()
-                    .join(".");
-                if !hidden_qualifiers.contains(&qualifier) {
-                    return false;
-                }
-                let column = idents[prefix_len].value.as_str();
-                hidden_schema.iter().any(|(field_qualifier, field)| {
+        // The hidden column `idents[prefix_len]` reads when the parts before it
+        // name a hidden relation.
+        let hidden_column = |idents: &[Ident], prefix_len: usize| {
+            let qualifier = idents[..prefix_len]
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<String>>()
+                .join(".");
+            if !hidden_qualifiers.contains(&qualifier) {
+                return None;
+            }
+            let column = idents[prefix_len].value.as_str();
+            hidden_schema
+                .iter()
+                .find(|(field_qualifier, field)| {
                     field.name() == column
                         && field_qualifier.is_some_and(|field_qualifier| {
                             field_qualifier.to_string() == qualifier
                                 || field_qualifier.table() == qualifier
                         })
                 })
-            })
+                .map(|(_, field)| field)
+        };
+        // The longest prefix of `idents` (shorter than `max_len`) naming a
+        // hidden relation that has a column called by the part after it.
+        let hidden_column_prefix = |idents: &[Ident], max_len: usize| {
+            (1..max_len)
+                .rev()
+                .find(|&prefix_len| hidden_column(idents, prefix_len).is_some())
         };
         // Whether an output of this type has a field called `name` to access:
         // only a struct or a map (dictionary encoded or not) has fields, so a
@@ -1284,7 +1314,26 @@ impl Unparser<'_> {
             requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
             return false;
         }
-        if let Some(prefix_len) = hidden_column_prefix(idents, idents.len() - 1) {
+        // Under full qualification the whole qualifier may name a hidden
+        // relation (`t.s.a`, column `a` of `t.s`) while a shorter one names
+        // another (`t`, with a column `s`): the reference reads the column,
+        // which the derived table exposes by its bare name. Where that shorter
+        // column is a struct with a field of the next part's name, `t.s.a` is as
+        // well a field access on it, and the two have no common spelling
+        // outside the derived table.
+        let field_path_prefix = hidden_column_prefix(idents, idents.len() - 1);
+        if hidden_column(idents, idents.len() - 1).is_some() {
+            if let Some(prefix_len) = field_path_prefix
+                && hidden_column(idents, prefix_len).is_some_and(|field| {
+                    has_field(field.data_type(), &idents[prefix_len + 1].value)
+                })
+            {
+                return true;
+            }
+            idents.drain(..idents.len() - 1);
+            return false;
+        }
+        if let Some(prefix_len) = field_path_prefix {
             idents.drain(..prefix_len);
             return false;
         }
@@ -2857,16 +2906,25 @@ impl Unparser<'_> {
                     }
                     // An outer reference in the projection renders as a bare
                     // name, which the derived table's output of that name
-                    // would capture — compared by the same folded key.
+                    // would capture — compared by the same folded key. So does
+                    // one in the keys of a sort this SELECT orders by: a sort
+                    // above, whose `ORDER BY` is already set, or the chain's
+                    // own sort absorbed into this SELECT.
+                    let mut read_outer_references = outer_reference_names(&p.expr)?;
+                    if let Some(query_ref) = query.as_ref() {
+                        read_outer_references.extend(
+                            query_ref.order_by_outer_references().iter().cloned(),
+                        );
+                    }
+                    if let Some(sort) = absorbed_sort {
+                        read_outer_references.extend(outer_reference_names(
+                            sort.expr.iter().map(|sort_expr| &sort_expr.expr),
+                        )?);
+                    }
                     let mut captures_outer_reference = false;
-                    for expr in &p.expr {
-                        captures_outer_reference |= expr.exists(|sub_expr| {
-                            Ok(match sub_expr {
-                                Expr::OuterReferenceColumn(_, column) => names
-                                    .contains(&self.emitted_column_key(column.name())?),
-                                _ => false,
-                            })
-                        })?;
+                    for name in &read_outer_references {
+                        captures_outer_reference |=
+                            names.contains(&self.emitted_column_key(name)?);
                     }
                     if captures_outer_reference {
                         return not_impl_err!(
@@ -2926,7 +2984,7 @@ impl Unparser<'_> {
                     }
                     if ambiguous {
                         return not_impl_err!(
-                            "Unparsing a sort or limit between a projection and its aggregate is not supported when a reference above the projection names both a column of the hidden relation and a field of an output named like that relation"
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when a reference above the projection names both a column of the hidden relation and a field of an output of the derived table"
                         );
                     }
                     if captured {
@@ -3419,6 +3477,9 @@ impl Unparser<'_> {
                     .collect::<Result<Vec<_>>>()?;
 
                 query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                query_ref.set_order_by_outer_references(outer_reference_names(
+                    sort_exprs.iter().map(|sort_expr| &sort_expr.expr),
+                )?);
 
                 self.select_to_sql_recursively(
                     sort.input.as_ref(),

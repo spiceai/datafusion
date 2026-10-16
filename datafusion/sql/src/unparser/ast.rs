@@ -50,6 +50,9 @@ pub struct QueryBuilder {
     for_clause: Option<ast::ForClause>,
     // If true, we need to unparse LogicalPlan::Union as a SQL `UNION` rather than a `UNION ALL`.
     distinct_union: bool,
+    // The names of the outer references the `ORDER BY` reads, which render as
+    // bare names a derived table's output of the same name would capture.
+    order_by_outer_references: Vec<String>,
 }
 
 impl QueryBuilder {
@@ -92,6 +95,17 @@ impl QueryBuilder {
     }
     pub fn get_order_by(&self) -> Option<OrderByKind> {
         self.order_by_kind.clone()
+    }
+    /// Records the names of the outer references a sort's keys read, set
+    /// together with the `ORDER BY` those keys become: once rendered they are
+    /// bare names, no longer told apart from the columns beside them.
+    pub fn set_order_by_outer_references(&mut self, names: Vec<String>) -> &mut Self {
+        self.order_by_outer_references = names;
+        self
+    }
+    /// The names of the outer references this query's `ORDER BY` reads.
+    pub fn order_by_outer_references(&self) -> &[String] {
+        &self.order_by_outer_references
     }
     /// Whether this query already carries an `ORDER BY`. A query holds one, so a
     /// sort unparsed into it after another has set it is reordered by that one
@@ -245,6 +259,7 @@ impl QueryBuilder {
             locks: Default::default(),
             for_clause: Default::default(),
             distinct_union: false,
+            order_by_outer_references: vec![],
         }
     }
 }

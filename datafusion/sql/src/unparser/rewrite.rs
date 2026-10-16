@@ -308,12 +308,27 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // will be lost. To keep the Sort valid, rewrite any sort expression that
         // references a dropped output so that it uses the underlying expression
         // instead.
+        //
+        // A projection built with a declared schema (`Projection::try_new_with_schema`)
+        // names an output by its field rather than by its expression (`a + b`
+        // declared `c`), and the kept output keeps that field, so the name it
+        // is read by above is the declared one.
+        let declared_names = p
+            .expr
+            .iter()
+            .enumerate()
+            .map(|(i, e)| match position.get(&e.to_string()) {
+                Some(&k) => inner_p.schema.field(k).name().clone(),
+                None => p.schema.field(i).name().clone(),
+            })
+            .collect::<Vec<_>>();
         let kept_names: HashSet<String> = new_exprs
             .iter()
             .map(|e| match e {
                 Expr::Alias(alias) => alias.name.clone(),
                 other => other.schema_name().to_string(),
             })
+            .chain(declared_names.iter().cloned())
             .collect();
 
         let dropped_outputs: HashMap<String, Expr> = inner_p
@@ -351,12 +366,25 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // Where such a name is also the name of a surviving alias (`0 - s AS s`
         // kept, `s AS x` dropped, the key reading `x`), the substituted `s`
         // would be bound to the alias by the unprojection that follows, and the
-        // key would order by `0 - s` instead of `s`. The fold is skipped.
+        // key would order by `0 - s` instead of `s`. The fold is skipped. A
+        // computed output named by a declared schema (`a + b` declared `c`)
+        // captures a substituted `c` the same way; a plain column kept under
+        // its own name is the column the substitution reads.
         let kept_aliases: HashSet<&str> = new_exprs
             .iter()
-            .filter_map(|e| match e {
-                Expr::Alias(alias) => Some(alias.name.as_str()),
-                _ => None,
+            .zip(&declared_names)
+            .flat_map(|(e, declared)| {
+                let alias = match e {
+                    Expr::Alias(alias) => Some(alias.name.as_str()),
+                    _ => None,
+                };
+                let computed = !matches!(
+                    e,
+                    Expr::Column(column) if column.name() == declared.as_str()
+                );
+                alias
+                    .into_iter()
+                    .chain(computed.then_some(declared.as_str()))
             })
             .collect();
         let substitution_shadowed = sort.expr.iter().any(|sort_expr| {
