@@ -952,6 +952,19 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Derived(ref value)) => {
                 value.alias.as_ref().map(|a| a.name.to_string())
             }
+            Some(TableFactorBuilder::Unnest(ref value)) => {
+                value.alias.as_ref().map(|a| a.name.to_string())
+            }
+            Some(TableFactorBuilder::Flatten(ref value)) => {
+                value.alias.as_ref().map(|a| a.name.to_string())
+            }
+            _ => None,
+        }
+    }
+    /// The name of the bare table this relation reads, if it is one.
+    pub(super) fn table_name(&self) -> Option<&ast::ObjectName> {
+        match self.relation {
+            Some(TableFactorBuilder::Table(ref value)) => value.name.as_ref(),
             _ => None,
         }
     }

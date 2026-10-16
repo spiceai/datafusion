@@ -27,7 +27,7 @@ use super::{
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_identifiers, requalify_column_onto_derived_table,
+        remove_dangling_qualifier, requalify_column_onto_derived_table,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
@@ -290,7 +290,8 @@ fn relations_capturable_by(plan: &LogicalPlan, hoisted: &str) -> Result<HashSet<
 /// joined relations.
 ///
 /// An unaliased nested join (`a JOIN (b JOIN c ON …) ON …`) does not hide the
-/// relations inside it, so their names stay in scope.
+/// relations inside it, so their names stay in scope. An `UNNEST(…) AS u` or a
+/// `LATERAL FLATTEN(…) AS u` is in scope by its alias like a derived table.
 #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
 fn collect_relation_idents(relation: &ast::TableFactor, idents: &mut Vec<String>) {
     match relation {
@@ -298,13 +299,19 @@ fn collect_relation_idents(relation: &ast::TableFactor, idents: &mut Vec<String>
             if let Some(alias) = alias {
                 idents.push(alias.name.to_string());
             } else {
-                idents.push(name.to_string());
+                collect_table_name_idents(name, idents);
             }
         }
         ast::TableFactor::Derived {
             alias: Some(alias), ..
         }
         | ast::TableFactor::NestedJoin {
+            alias: Some(alias), ..
+        }
+        | ast::TableFactor::UNNEST {
+            alias: Some(alias), ..
+        }
+        | ast::TableFactor::Function {
             alias: Some(alias), ..
         } => {
             idents.push(alias.name.to_string());
@@ -319,6 +326,18 @@ fn collect_relation_idents(relation: &ast::TableFactor, idents: &mut Vec<String>
             }
         }
         _ => {}
+    }
+}
+
+/// Names a `SELECT` can qualify a column with through the bare table `name`: its
+/// full name, and, for a multi-part name, its last part, which is how a column
+/// over it is qualified unless the dialect writes every part.
+fn collect_table_name_idents(name: &ast::ObjectName, idents: &mut Vec<String>) {
+    idents.push(name.to_string());
+    if name.0.len() > 1
+        && let Some(last) = name.0.last()
+    {
+        idents.push(last.to_string());
     }
 }
 
@@ -929,8 +948,8 @@ impl Unparser<'_> {
         let mut all_idents = Vec::new();
         if let Some(source_alias) = relation_builder.get_alias() {
             all_idents.push(source_alias);
-        } else if let Some(source_name) = relation_builder.get_name() {
-            all_idents.push(source_name);
+        } else if let Some(source_name) = relation_builder.table_name() {
+            collect_table_name_idents(source_name, &mut all_idents);
         }
 
         let mut twj = select_builder.pop_from().unwrap();
@@ -944,10 +963,8 @@ impl Unparser<'_> {
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
         projection.iter_mut().for_each(|select_item| {
-            if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) =
-                select_item
-            {
-                remove_dangling_identifiers(idents, &all_idents);
+            if let ast::SelectItem::UnnamedExpr(expr) = select_item {
+                remove_dangling_qualifier(expr, &all_idents);
             }
         });
 
@@ -956,9 +973,7 @@ impl Unparser<'_> {
             && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
         {
             order_by.iter_mut().for_each(|sort_item| {
-                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                    remove_dangling_identifiers(idents, &all_idents);
-                }
+                remove_dangling_qualifier(&mut sort_item.expr, &all_idents);
             });
 
             query.order_by(OrderByKind::Expressions(order_by));
@@ -967,9 +982,7 @@ impl Unparser<'_> {
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
         sort.iter_mut().for_each(|sort_item| {
-            if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                remove_dangling_identifiers(idents, &all_idents);
-            }
+            remove_dangling_qualifier(&mut sort_item.expr, &all_idents);
         });
 
         select_builder.projection(projection);

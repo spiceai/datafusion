@@ -24,7 +24,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Distinct, Expr, LogicalPlan, Projection, Sort, SortExpr};
-use sqlparser::ast::Ident;
+use sqlparser::ast::{self, Ident};
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -683,6 +683,24 @@ pub fn remove_dangling_identifiers(idents: &mut Vec<Ident>, available_idents: &[
     }
 }
 
+/// [`remove_dangling_identifiers`] over an expression: a column reference, or the
+/// column reference a struct field path is rooted at. A reference left with one
+/// part becomes a plain identifier, the only form a planner accepts it in.
+pub fn remove_dangling_qualifier(expr: &mut ast::Expr, available_idents: &[String]) {
+    match expr {
+        ast::Expr::CompoundIdentifier(idents) => {
+            remove_dangling_identifiers(idents, available_idents);
+            if let [column] = idents.as_slice() {
+                *expr = ast::Expr::Identifier(column.clone());
+            }
+        }
+        ast::Expr::CompoundFieldAccess { root, .. } => {
+            remove_dangling_qualifier(root, available_idents);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +738,38 @@ mod tests {
             remove_dangling_identifiers(&mut idents, &test_in);
             assert_eq!(idents, test_out);
         }
+    }
+
+    #[test]
+    fn test_remove_dangling_qualifier() {
+        let column = |parts: &[&str]| {
+            ast::Expr::CompoundIdentifier(
+                parts.iter().map(|part| Ident::new(*part)).collect(),
+            )
+        };
+        let field_path = |root: ast::Expr| ast::Expr::CompoundFieldAccess {
+            root: Box::new(root),
+            access_chain: vec![ast::AccessExpr::Dot(ast::Expr::Identifier(Ident::new(
+                "product",
+            )))],
+        };
+
+        // A dangling qualifier leaves a plain identifier, not a one-part compound one.
+        let mut expr = column(&["t", "id"]);
+        remove_dangling_qualifier(&mut expr, &[]);
+        assert_eq!(expr, ast::Expr::Identifier(Ident::new("id")));
+
+        // A field path is judged by the column it is rooted at, and keeps its fields.
+        let mut expr = field_path(column(&["t", "metadata"]));
+        remove_dangling_qualifier(&mut expr, &["t".to_string()]);
+        assert_eq!(expr, field_path(column(&["t", "metadata"])));
+
+        let mut expr = field_path(column(&["t", "metadata"]));
+        remove_dangling_qualifier(&mut expr, &[]);
+        assert_eq!(
+            expr,
+            field_path(ast::Expr::Identifier(Ident::new("metadata")))
+        );
     }
 
     // this is a regression test: when the outer projection has fewer expressions than
