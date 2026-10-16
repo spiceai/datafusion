@@ -2014,7 +2014,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_with_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
     );
 
     let join_plan_no_filter = LogicalPlanBuilder::from(left_plan.clone())
@@ -2029,7 +2029,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_no_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
     );
 
     let right_plan_with_filter = table_scan_with_filters(
@@ -2054,7 +2054,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_multiple_filters)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE ("left"."name" = 'after_join_filter_val') AND "left"."name" LIKE 'some_name' AND (right_table."name" = 'before_join_filter_val') AND (age > 10)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE ("left"."name" = 'after_join_filter_val') AND "left"."name" LIKE 'some_name' AND (right_table."name" = 'before_join_filter_val') AND (age > 10)"#
     );
 
     let right_plan_with_filter_schema = table_scan_with_filters(
@@ -2084,7 +2084,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_duplicated_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (right_table.age > 10) AND (right_table.age < 11)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (right_table.age > 10) AND (right_table.age < 11)"#
     );
 
     // Inner join with a scalar subquery in table_scan_filters. The subquery filter should appear in WHERE, not in JOIN ON,
@@ -15949,9 +15949,8 @@ fn test_a_bare_scan_beside_a_projected_join_input_lists_its_columns() -> Result<
 }
 
 #[test]
-fn test_two_bare_scans_in_a_join_read_as_a_bare_wildcard() -> Result<()> {
-    // Neither input lists anything, so between them they read every relation of
-    // the FROM: the `*` a scan unparsed on its own renders as.
+fn test_two_bare_scans_in_a_join_read_each_relation_whole() -> Result<()> {
+    // Neither input lists anything, so each contributes its relation whole.
     let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
         .join_on(
             table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
@@ -15962,7 +15961,7 @@ fn test_two_bare_scans_in_a_join_read_as_a_bare_wildcard() -> Result<()> {
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT * FROM t FULL JOIN u ON (t.a = u.a)"
+        @"SELECT t.*, u.* FROM t FULL JOIN u ON (t.a = u.a)"
     );
     Ok(())
 }
@@ -15991,9 +15990,9 @@ fn test_a_bare_scan_under_a_filter_in_a_join_lists_its_columns() -> Result<()> {
 }
 
 #[test]
-fn test_two_aliased_bare_scans_in_a_join_read_as_a_bare_wildcard() -> Result<()> {
-    // Each alias claims every column with a bare `*`; two of them side by side
-    // would read both relations twice, so together they read as one `*`.
+fn test_two_aliased_bare_scans_in_a_join_read_each_alias_whole() -> Result<()> {
+    // Each alias claims every column with a bare `*`; side by side each would
+    // read both relations, so each is narrowed to its own alias.
     let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
         .alias("x")?
         .join_on(
@@ -16007,16 +16006,15 @@ fn test_two_aliased_bare_scans_in_a_join_read_as_a_bare_wildcard() -> Result<()>
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT * FROM t AS x INNER JOIN u AS y ON (x.a = y.a)"
+        @"SELECT x.*, y.* FROM t AS x INNER JOIN u AS y ON (x.a = y.a)"
     );
     Ok(())
 }
 
 #[test]
 fn test_a_nested_join_of_bare_scans_reads_each_relation_whole() -> Result<()> {
-    // The nested join reads as `*` on its own; beside the projected input that
-    // `*` would read the projected relation too, so it becomes one `t.*` per
-    // relation the nested join holds.
+    // The nested join contributes one `t.*` per relation it holds, in the
+    // plan's order, ahead of the projected input's items.
     let right = table_scan(Some("w"), &int32_schema(&["a"]), Some(vec![0]))?
         .project(vec![col("w.a"), (col("w.a") * lit(2)).alias("d")])?
         .build()?;
@@ -16073,7 +16071,7 @@ fn test_an_aggregate_with_no_projection_lists_group_keys_before_aggregates() -> 
     );
 
     // Aliased and joined to a bare scan, the derived table's columns are read
-    // whole, in the order the plan's schema has them.
+    // whole through its alias, in the order the plan's schema has them.
     let grouped = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
         .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
         .alias("g")?
@@ -16088,7 +16086,7 @@ fn test_an_aggregate_with_no_projection_lists_group_keys_before_aggregates() -> 
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT * FROM u INNER JOIN (SELECT t.a, sum(t.b) FROM t GROUP BY t.a) AS g ON (u.a = g.a)"
+        @"SELECT u.*, g.* FROM u INNER JOIN (SELECT t.a, sum(t.b) FROM t GROUP BY t.a) AS g ON (u.a = g.a)"
     );
     Ok(())
 }
@@ -16119,5 +16117,50 @@ fn test_a_join_input_with_no_columns_contributes_nothing_beside_another() -> Res
         .build()?;
 
     assert_snapshot!(plan_to_sql(&plan)?, @"SELECT 1 FROM u INNER JOIN t ON true");
+    Ok(())
+}
+
+#[test]
+fn test_a_nested_join_holding_a_column_less_input_keeps_qualified_wildcards() -> Result<()>
+{
+    // The nested join's FROM holds `t`, projected to no columns; a bare `*` for
+    // the outer list would read `t`'s columns too, so each relation with columns
+    // is read through its own `t.*`.
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .join_on(
+            table_scan(Some("w"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("u.a").eq(col("w.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.*, w.* FROM u INNER JOIN t ON true INNER JOIN w ON (u.a = w.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bare_scans_joined_with_using_keep_both_key_columns() -> Result<()> {
+    // `USING` merges the key column under a bare `*`, while the plan keeps `t.a`
+    // and `u.a` apart; each relation read whole keeps its own.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .join_using(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![Column::from("a")],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.* FROM t INNER JOIN u USING(a)"
+    );
     Ok(())
 }

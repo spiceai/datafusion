@@ -1292,7 +1292,10 @@ impl Unparser<'_> {
     /// and a dialect that rejects an empty list gets a parse error. Such an
     /// input contributes every column of each relation it reads — `t.*`, one
     /// per relation, in the plan's order — or a bare `*` when it is the only
-    /// relation the `FROM` holds, as a scan unparsed on its own renders. An
+    /// relation the `FROM` holds, as a scan unparsed on its own renders. The
+    /// `t.*` form stays even when every input reads whole relations: a bare
+    /// `*` would also read a column-less input's hidden columns, and under
+    /// `USING` would merge the key columns the plan keeps apart. An
     /// input that already lists its own columns is returned as it was set,
     /// and one with no columns contributes nothing beside another relation
     /// (spiceai/spiceai#14738).
@@ -1352,15 +1355,6 @@ impl Unparser<'_> {
                 )
             })
             .collect())
-    }
-
-    /// Whether `items` is non-empty and every item is a relation's `t.*`, so
-    /// the list reads nothing but whole relations.
-    fn only_whole_relations(items: &[ast::SelectItem]) -> bool {
-        !items.is_empty()
-            && items
-                .iter()
-                .all(|item| matches!(item, ast::SelectItem::QualifiedWildcard(..)))
     }
 
     // The helpers below keep the join arms' bookkeeping out of
@@ -3670,33 +3664,27 @@ impl Unparser<'_> {
                                 return internal_err!("Right projection is missing");
                             };
 
-                            // Two inputs that each read whole relations read,
-                            // between them, every relation of the `FROM` in
-                            // its order: the plain `*` a scan unparsed on its
-                            // own renders as.
-                            let projection =
-                                if Self::only_whole_relations(&left_projection)
-                                    && Self::only_whole_relations(&right_projection)
-                                {
-                                    vec![ast::SelectItem::Wildcard(
-                                        ast::WildcardAdditionalOptions::default(),
-                                    )]
-                                } else if left_projection.is_empty()
-                                    && right_projection.is_empty()
-                                {
-                                    // Neither input has a column, so neither contributed
-                                    // one: the join's output has none either, and takes
-                                    // the same placeholder a projection of nothing does.
-                                    self.empty_projection_fallback()
-                                        .iter()
-                                        .map(|e| self.select_item_to_sql(e))
-                                        .collect::<Result<Vec<_>>>()?
-                                } else {
-                                    left_projection
-                                        .into_iter()
-                                        .chain(right_projection)
-                                        .collect()
-                                };
+                            // Each input's items are kept as they are, qualified
+                            // wildcards included: a bare `*` would also read a
+                            // column-less input's hidden columns, and under
+                            // `USING` would merge the key columns the plan keeps
+                            // apart.
+                            let projection = if left_projection.is_empty()
+                                && right_projection.is_empty()
+                            {
+                                // Neither input has a column, so neither contributed
+                                // one: the join's output has none either, and takes
+                                // the same placeholder a projection of nothing does.
+                                self.empty_projection_fallback()
+                                    .iter()
+                                    .map(|e| self.select_item_to_sql(e))
+                                    .collect::<Result<Vec<_>>>()?
+                            } else {
+                                left_projection
+                                    .into_iter()
+                                    .chain(right_projection)
+                                    .collect()
+                            };
                             select.projection(projection);
                         }
                     }
