@@ -1207,6 +1207,62 @@ impl Unparser<'_> {
         }
     }
 
+    /// Re-points a reference the clauses above a derived chain make onto the
+    /// derived table's outputs, which are addressed by bare name.
+    ///
+    /// A reference whose root names an output the derived table exposes
+    /// unqualified (`t.payload AS t`, read as `t.x`) is a struct access on that
+    /// output and is left alone. Otherwise the relation prefix is dropped as
+    /// [`requalify_column_onto_derived_table`] drops it, and a longer path
+    /// (`t.payload.x`) loses only its relation when the hidden schema confirms
+    /// that `payload` is a column of the hidden `t`: a reference to a sibling
+    /// relation that merely starts the same way (`t.s.a` under full
+    /// qualification) does not match a column of `t` and keeps its qualifier.
+    fn repoint_onto_derived_chain(
+        idents: &mut Vec<Ident>,
+        hidden_schema: &DFSchema,
+        hidden_qualifiers: &HashSet<String>,
+    ) {
+        if idents.len() < 2 {
+            return;
+        }
+        let root = idents[0].value.as_str();
+        let root_is_unqualified_output = hidden_schema
+            .iter()
+            .any(|(qualifier, field)| qualifier.is_none() && field.name() == root);
+        if root_is_unqualified_output {
+            return;
+        }
+        if idents.len() == 2 {
+            requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+            return;
+        }
+        for prefix_len in (1..idents.len() - 1).rev() {
+            let qualifier = idents[..prefix_len]
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<String>>()
+                .join(".");
+            if !hidden_qualifiers.contains(&qualifier) {
+                continue;
+            }
+            let column = idents[prefix_len].value.as_str();
+            let names_a_hidden_column =
+                hidden_schema.iter().any(|(field_qualifier, field)| {
+                    field.name() == column
+                        && field_qualifier.is_some_and(|field_qualifier| {
+                            field_qualifier.to_string() == qualifier
+                                || field_qualifier.table() == qualifier
+                        })
+                });
+            if names_a_hidden_column {
+                idents.drain(..prefix_len);
+                return;
+            }
+        }
+        requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+    }
+
     /// The topmost `Sort` of the `Sort`/`Limit` chain starting at `plan`: the
     /// one that decides the order of the rows the chain produces.
     fn chain_sort(plan: &LogicalPlan) -> Option<&Sort> {
@@ -2750,13 +2806,14 @@ impl Unparser<'_> {
                             "Unparsing a sort or limit between a projection and its aggregate is not supported when the projection reads an outer reference named like one of the aggregate's outputs"
                         );
                     }
-                    let hidden_qualifiers = enclosed_qualifiers(cur.schema());
+                    let hidden_schema = cur.schema();
+                    let hidden_qualifiers = enclosed_qualifiers(hidden_schema);
                     let mut repoint = |expr: &mut ast::Expr| {
                         if let ast::Expr::CompoundIdentifier(idents) = expr {
-                            requalify_column_onto_derived_table(
+                            Self::repoint_onto_derived_chain(
                                 idents,
+                                hidden_schema,
                                 &hidden_qualifiers,
-                                None,
                             );
                         }
                     };

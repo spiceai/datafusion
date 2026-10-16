@@ -16570,3 +16570,32 @@ fn test_a_sort_over_a_distinct_over_a_projection_resolves_its_keys_under_the_dis
     );
     Ok(())
 }
+
+#[test]
+fn test_a_struct_output_named_like_the_hidden_relation_keeps_its_root() -> Result<()> {
+    // The aggregate exposes `t.payload AS t`; a key reading `t.x` reads that
+    // struct output, not a column of the hidden relation `t`, so its root stays.
+    let payload = DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.payload").alias("t")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t"), col("s")])?
+        .sort_with_limit(
+            vec![(get_field(col("t"), "x") + lit(1)).sort(false, true)],
+            Some(1),
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t, s FROM (SELECT t.payload AS t, sum(t.v) AS s FROM t GROUP BY t.payload LIMIT 2) ORDER BY (t.x + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}

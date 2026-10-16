@@ -730,22 +730,24 @@ pub fn requalify_column_onto_derived_table(
     derived_qualifiers: &HashSet<String>,
     alias: Option<&Ident>,
 ) {
-    // The qualifier may be followed by more than the column: a struct field
-    // path (`t.payload.x`) keeps everything after the relation.
-    let Some(prefix_len) = (1..idents.len()).rev().find(|&prefix_len| {
-        let qualifier = idents[..prefix_len]
-            .iter()
-            .map(|ident| ident.value.clone())
-            .collect::<Vec<String>>()
-            .join(".");
-        derived_qualifiers.contains(&qualifier)
-    }) else {
+    let Some((last, qualifier)) = idents.split_last() else {
         return;
     };
-    let rest = idents[prefix_len..].to_vec();
+    if qualifier.is_empty() {
+        return;
+    }
+    let qualifier = qualifier
+        .iter()
+        .map(|ident| ident.value.clone())
+        .collect::<Vec<String>>()
+        .join(".");
+    if !derived_qualifiers.contains(&qualifier) {
+        return;
+    }
+    let last = last.clone();
     *idents = match alias {
-        Some(alias) => std::iter::once(alias.clone()).chain(rest).collect(),
-        None => rest,
+        Some(alias) => vec![alias.clone(), last],
+        None => vec![last],
     };
 }
 
