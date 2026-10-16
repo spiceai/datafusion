@@ -1207,14 +1207,15 @@ impl Unparser<'_> {
         }
     }
 
-    /// Whether the `Sort`/`Limit` chain starting at `plan` holds a `Sort`.
-    fn chain_sorts(plan: &LogicalPlan) -> bool {
+    /// The topmost `Sort` of the `Sort`/`Limit` chain starting at `plan`: the
+    /// one that decides the order of the rows the chain produces.
+    fn chain_sort(plan: &LogicalPlan) -> Option<&Sort> {
         let mut cur = plan;
         loop {
             match cur {
-                LogicalPlan::Sort(_) => return true,
+                LogicalPlan::Sort(sort) => return Some(sort),
                 LogicalPlan::Limit(limit) => cur = limit.input.as_ref(),
-                _ => return false,
+                _ => return None,
             }
         }
     }
@@ -2702,16 +2703,17 @@ impl Unparser<'_> {
                 // (spiceai/spiceai#14733).
                 if !fully_absorbed && !select.within_join_input() {
                     // A row bound the enclosing query carries applies to the
-                    // derived table's rows in no particular order; where the
-                    // chain sorts and nothing above re-establishes that order,
-                    // the bound would keep arbitrary rows.
-                    if query.as_ref().is_some_and(|query_ref| {
-                        query_ref.bounds_rows() && !query_ref.has_order_by()
-                    }) && Self::chain_sorts(cur)
+                    // derived table's rows in no particular order, while the
+                    // plan applies it to the rows the chain's sort produced.
+                    // The enclosing query re-establishes that order: the sort's
+                    // keys read the chain's outputs, which the derived table
+                    // exposes under the same names.
+                    if let Some(query_ref) = query.as_mut()
+                        && query_ref.bounds_rows()
+                        && !query_ref.has_order_by()
+                        && let Some(sort) = Self::chain_sort(cur)
                     {
-                        return not_impl_err!(
-                            "Unparsing a row bound applied above a sorted chain is not supported when the enclosing query does not order its rows"
-                        );
+                        query_ref.order_by(self.sorts_to_sql(&sort.expr)?);
                     }
                     // Names are compared the way the engine compares them, so
                     // `k` and `K` collide where identifiers fold case.

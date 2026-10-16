@@ -56,6 +56,7 @@ use crate::common::{MockContextProvider, MockSessionState};
 use datafusion_expr::builder::{
     project, subquery_alias, table_scan_with_filter_and_fetch, table_scan_with_filters,
 };
+use datafusion_functions::core::expr_fn::get_field;
 use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions::unicode::planner::UnicodeFunctionPlanner;
 use datafusion_functions_nested::expr_fn::array_element;
@@ -6392,7 +6393,7 @@ fn test_unparse_aggregate_with_non_literal_limit_over_sort_with_fetch() -> Resul
         .build()?;
 
     let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
-    insta::assert_snapshot!(sql, @r#"SELECT __agg_0 AS "max1(j1_id)" FROM (SELECT max(bla.j1_rename) AS __agg_0 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST LIMIT 5) LIMIT CAST(7 AS INTEGER)"#);
+    insta::assert_snapshot!(sql, @r#"SELECT __agg_0 AS "max1(j1_id)" FROM (SELECT max(bla.j1_rename) AS __agg_0 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST LIMIT 5) ORDER BY __agg_0 ASC NULLS FIRST LIMIT CAST(7 AS INTEGER)"#);
     Ok(())
 }
 
@@ -16451,10 +16452,11 @@ fn test_a_dropped_alias_whose_column_a_surviving_alias_shadows_keeps_the_sort_in
 }
 
 #[test]
-fn test_an_expression_bound_above_a_sorted_chain_the_query_does_not_order_is_refused()
--> Result<()> {
+fn test_an_expression_bound_above_a_sorted_chain_re_establishes_the_order() -> Result<()>
+{
     // The expression bound cannot merge with the fetch, so the sorted chain
-    // becomes a derived table whose order the outer `LIMIT` does not see.
+    // becomes a derived table whose order the outer `LIMIT` would not see; the
+    // outer query orders by the same key, which the derived table exposes.
     let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
         .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
         .sort_with_limit(vec![col("s").sort(false, true)], Some(3))?
@@ -16462,10 +16464,10 @@ fn test_an_expression_bound_above_a_sorted_chain_the_query_does_not_order_is_ref
         .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
         .build()?;
 
-    let error = plan_to_sql(&plan).expect_err(
-        "a bound above a sorted chain the query does not order cannot be unparsed",
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k ORDER BY sum(t.v) DESC NULLS FIRST LIMIT 3) ORDER BY s DESC NULLS FIRST LIMIT CAST(1 AS INTEGER)"
     );
-    assert_contains!(error.to_string(), "row bound applied above a sorted chain");
     Ok(())
 }
 
