@@ -16552,6 +16552,101 @@ fn test_an_outer_reference_named_like_a_derived_output_is_refused() -> Result<()
 }
 
 #[test]
+fn test_a_scalar_output_named_like_the_hidden_relation_does_not_keep_its_qualifier()
+-> Result<()> {
+    // The aggregate's scalar `t` shares its name with the relation the derived
+    // table hides, but `t.k` is no field access on it: the key is repointed
+    // onto the derived table's `k` like any other column of `t`.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("t")])?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), Expr::Column(Column::from_name("t"))])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k, t FROM (SELECT t.k AS k, sum(t.v) AS t FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_expression_bound_above_a_computed_alias_named_like_the_key_in_another_case_is_refused()
+-> Result<()> {
+    // `(0 - s) AS "S"` captures the re-established `ORDER BY s` wherever
+    // identifiers fold case, as `(0 - s) AS s` does everywhere.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(3))?
+        .project(vec![(lit(0) - col("s")).alias("S"), col("t.k")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a computed alias named like the re-established key in another case cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like one of the sort's keys"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_named_like_a_derived_output_in_another_case_is_refused()
+-> Result<()> {
+    // `outer_ref(S)` renders as `"S"`, which the derived table's own `s` would
+    // capture wherever identifiers fold case.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(1))?
+        .project(vec![
+            Expr::OuterReferenceColumn(
+                Arc::new(Field::new("S", DataType::Int32, false)),
+                Column::from_name("S"),
+            )
+            .alias("wanted"),
+            col("t.k"),
+        ])?
+        .sort_with_limit(vec![col("t.k").sort(true, true)], Some(1))?
+        .project(vec![col("wanted")])?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference a derived output would capture in another case cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer reference named like one of the aggregate's outputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_whose_column_a_surviving_alias_in_another_case_shadows_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // The surviving `(0 - s) AS "S"` captures a substituted `s` wherever
+    // identifiers fold case, so the fold is skipped as it is for `AS s`.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a").alias("s"), col("u.c").alias("unused")])?
+        .project(vec![
+            (lit(0) - col("s")).alias("S"),
+            col("s").alias("x"),
+            col("unused"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![Expr::Column(Column::from_name("S"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT \"S\" FROM (SELECT (0 - s) AS \"S\", s AS x, unused FROM (SELECT u.a AS s, u.c AS unused FROM u) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_a_sort_over_a_distinct_over_a_projection_resolves_its_keys_under_the_distinct()
 -> Result<()> {
     // The DISTINCT keeps the projection's outputs and names, so the key resolves

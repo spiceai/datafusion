@@ -52,7 +52,7 @@ use crate::unparser::{
     ast::FlattenRelationBuilder, ast::UnnestRelationBuilder, rewrite::rewrite_qualify,
 };
 use crate::utils::UNNEST_PLACEHOLDER;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::{
     Column, DFSchema, DataFusionError, NullEquality, Result, ScalarValue, TableReference,
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
@@ -1227,9 +1227,22 @@ impl Unparser<'_> {
             return;
         }
         let root = idents[0].value.as_str();
-        let root_is_unqualified_output = hidden_schema
-            .iter()
-            .any(|(qualifier, field)| qualifier.is_none() && field.name() == root);
+        // Only an output with fields to access (a struct or a map, dictionary
+        // encoded or not) can root a field path: a scalar output named like the
+        // hidden relation (`sum(t.v) AS t`) leaves `t.k` a column of `t`.
+        fn has_fields(data_type: &DataType) -> bool {
+            match data_type {
+                DataType::Struct(_) | DataType::Map(..) => true,
+                DataType::Dictionary(_, value) => has_fields(value),
+                _ => false,
+            }
+        }
+        let root_is_unqualified_output =
+            hidden_schema.iter().any(|(qualifier, field)| {
+                qualifier.is_none()
+                    && field.name() == root
+                    && has_fields(field.data_type())
+            });
         if root_is_unqualified_output {
             return;
         }
@@ -2773,27 +2786,27 @@ impl Unparser<'_> {
                         // outputs by bare name; a computed alias of the same
                         // name in this projection's list would capture them
                         // (`ORDER BY s` binding to `(0 - s) AS s`).
-                        let computed_aliases: HashSet<&str> = p
-                            .expr
-                            .iter()
-                            .filter_map(|expr| match expr {
-                                Expr::Alias(alias)
-                                    if !matches!(
-                                        alias.expr.as_ref(),
-                                        Expr::Column(column) if column.name() == alias.name
-                                    ) =>
-                                {
-                                    Some(alias.name.as_str())
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        let captured =
-                            sort.expr.iter().any(|sort_expr| {
-                                sort_expr.expr.column_refs().iter().any(|column| {
-                                    computed_aliases.contains(column.name())
-                                })
-                            });
+                        // Compared the way the engine compares them, so
+                        // `(0 - s) AS "S"` captures `s` where identifiers fold.
+                        let mut computed_aliases = HashSet::new();
+                        for expr in &p.expr {
+                            if let Expr::Alias(alias) = expr
+                                && !matches!(
+                                    alias.expr.as_ref(),
+                                    Expr::Column(column) if column.name() == alias.name
+                                )
+                            {
+                                computed_aliases
+                                    .insert(self.emitted_column_key(&alias.name)?);
+                            }
+                        }
+                        let mut captured = false;
+                        for sort_expr in &sort.expr {
+                            for column in sort_expr.expr.column_refs() {
+                                captured |= computed_aliases
+                                    .contains(&self.emitted_column_key(column.name())?);
+                            }
+                        }
                         if captured {
                             return not_impl_err!(
                                 "Unparsing a row bound applied above a sorted chain is not supported when the projection computes an output named like one of the sort's keys"
@@ -2814,23 +2827,17 @@ impl Unparser<'_> {
                     }
                     // An outer reference in the projection renders as a bare
                     // name, which the derived table's output of that name
-                    // would capture.
-                    let derived_names: HashSet<&str> = cur
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|field| field.name().as_str())
-                        .collect();
-                    let captures_outer_reference = p.expr.iter().any(|expr| {
-                        expr.exists(|sub_expr| {
-                            Ok(matches!(
-                                sub_expr,
-                                Expr::OuterReferenceColumn(_, column)
-                                    if derived_names.contains(column.name())
-                            ))
-                        })
-                        .unwrap_or(false)
-                    });
+                    // would capture — compared by the same folded key.
+                    let mut captures_outer_reference = false;
+                    for expr in &p.expr {
+                        captures_outer_reference |= expr.exists(|sub_expr| {
+                            Ok(match sub_expr {
+                                Expr::OuterReferenceColumn(_, column) => names
+                                    .contains(&self.emitted_column_key(column.name())?),
+                                _ => false,
+                            })
+                        })?;
+                    }
                     if captures_outer_reference {
                         return not_impl_err!(
                             "Unparsing a sort or limit between a projection and its aggregate is not supported when the projection reads an outer reference named like one of the aggregate's outputs"
