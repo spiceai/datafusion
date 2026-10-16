@@ -16599,3 +16599,26 @@ fn test_a_struct_output_named_like_the_hidden_relation_keeps_its_root() -> Resul
     );
     Ok(())
 }
+
+#[test]
+fn test_an_expression_bound_above_a_computed_alias_named_like_the_key_is_refused()
+-> Result<()> {
+    // The re-established `ORDER BY s` would bind to the projection's
+    // `(0 - s) AS s` rather than to the derived table's `s`, and the bound would
+    // keep the row the negated output ranks first.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(3))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a computed alias named like the re-established key cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like one of the sort's keys"
+    );
+    Ok(())
+}

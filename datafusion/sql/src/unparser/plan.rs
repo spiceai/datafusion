@@ -2769,6 +2769,36 @@ impl Unparser<'_> {
                         && !query_ref.has_order_by()
                         && let Some(sort) = Self::chain_sort(cur)
                     {
+                        // The re-established keys name the derived table's
+                        // outputs by bare name; a computed alias of the same
+                        // name in this projection's list would capture them
+                        // (`ORDER BY s` binding to `(0 - s) AS s`).
+                        let computed_aliases: HashSet<&str> = p
+                            .expr
+                            .iter()
+                            .filter_map(|expr| match expr {
+                                Expr::Alias(alias)
+                                    if !matches!(
+                                        alias.expr.as_ref(),
+                                        Expr::Column(column) if column.name() == alias.name
+                                    ) =>
+                                {
+                                    Some(alias.name.as_str())
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        let captured =
+                            sort.expr.iter().any(|sort_expr| {
+                                sort_expr.expr.column_refs().iter().any(|column| {
+                                    computed_aliases.contains(column.name())
+                                })
+                            });
+                        if captured {
+                            return not_impl_err!(
+                                "Unparsing a row bound applied above a sorted chain is not supported when the projection computes an output named like one of the sort's keys"
+                            );
+                        }
                         query_ref.order_by(self.sorts_to_sql(&sort.expr)?);
                     }
                     // Names are compared the way the engine compares them, so
