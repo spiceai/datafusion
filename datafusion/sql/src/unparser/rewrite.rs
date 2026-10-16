@@ -208,6 +208,7 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// hoist to be valid -- it only has to be computable from them, as `age + 1` is from
 /// `age`.
 pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
+    unparser: &Unparser,
     p: &Projection,
 ) -> Option<LogicalPlan> {
     let LogicalPlan::Sort(sort) = p.input.as_ref() else {
@@ -290,8 +291,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     // The inner projection may expose outputs that neither the outer projection
     // nor the sort reads. Dropping them changes nothing above, and leaving the
     // sort unhoisted over them puts its `ORDER BY` in a derived table, whose
-    // order SQL does not carry out (spiceai/spiceai#14733).
-    if outer_collects.is_subset(&inner_collects) {
+    // order SQL does not carry out (spiceai/spiceai#14733). That widening of the
+    // fold (a strict subset, where the fold has always required equal sets) is
+    // taken only where it is safe by construction: see `widened_fold_is_safe`.
+    // Anything else keeps the sort in its own scope, as it did before.
+    if outer_collects.is_subset(&inner_collects)
+        && (outer_collects == inner_collects
+            || widened_fold_is_safe(p, inner_p, &position, &outer_collects))
+    {
         let mut sort = sort.clone();
         let inner_p = inner_p.clone();
 
@@ -333,34 +340,33 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // output (`x` repeated and declared `y` over an inner `y`) keeps that
         // output from being substituted, so a key reading it by that name would
         // read the repeat instead. Such a key leaves the plan unfolded too.
+        //
+        // A repeat of an output that cannot be repeated (`random() AS r` read
+        // twice) would compute it once per copy, two draws where the plan copies
+        // one value. That leaves the plan unfolded as well.
         let mut read = HashSet::new();
         let mut borrowed_names = HashSet::new();
-        let fields = p
-            .expr
-            .iter()
-            .enumerate()
-            .map(|(i, e)| {
-                let reads = position.get(&e.to_string()).copied();
-                let (schema, index) = match reads {
-                    Some(k) if read.insert(k) => (&inner_p.schema, k),
-                    _ => (&p.schema, i),
-                };
-                let (qualifier, field) = schema.qualified_field(index);
-                if std::ptr::eq(schema, &p.schema)
-                    && inner_p
-                        .schema
-                        .fields()
-                        .iter()
-                        .enumerate()
-                        .any(|(k, inner)| {
-                            inner.name() == field.name() && Some(k) != reads
-                        })
-                {
-                    borrowed_names.insert(field.name().clone());
-                }
-                (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
-            })
-            .collect::<Vec<_>>();
+        let mut fields = Vec::with_capacity(p.expr.len());
+        for (i, e) in p.expr.iter().enumerate() {
+            let reads = position.get(&e.to_string()).copied();
+            let (schema, index) = match reads {
+                Some(k) if read.insert(k) => (&inner_p.schema, k),
+                Some(k) if !output_is_repeatable(&inner_p.expr[k]) => return None,
+                _ => (&p.schema, i),
+            };
+            let (qualifier, field) = schema.qualified_field(index);
+            if std::ptr::eq(schema, &p.schema)
+                && inner_p
+                    .schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .any(|(k, inner)| inner.name() == field.name() && Some(k) != reads)
+            {
+                borrowed_names.insert(field.name().clone());
+            }
+            fields.push((qualifier.cloned(), Arc::clone(&schema.fields()[index])));
+        }
         let key_reads_borrowed_name =
             sort.expr.iter().any(|sort_expr| {
                 sort_expr.expr.column_refs().iter().any(|col| {
@@ -433,27 +439,26 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // outer reference renders by its bare name too, so any output the fold
         // keeps under that name captures it the same way. A qualified read is
         // safe while its relation stays in scope, but an aggregate over a
-        // derived projection renders `t.k` as the bare `k`. A key that is that
-        // bare name alone binds to the kept `(0 - t.k) AS k`; inside a compound
-        // key (`k + 1`) the name reads the input column, so that key folds.
-        let qualifiers_stripped = aggregate_scope_strips_qualifiers(&inner_p.input);
-        let kept_aliases: HashSet<&str> = new_exprs
+        // derived projection, or a projection over one, renders `t.k` as the
+        // bare `k`. A key that is that bare name alone binds to the kept
+        // `(0 - t.k) AS k`; inside a compound key (`k + 1`) the name reads the
+        // input column, so that key folds. Names are compared the way the
+        // engine binds them: `t."K"` and `outer_ref(S)` render as `"K"` and
+        // `"S"`, which `k` and `s` capture wherever identifiers fold case.
+        let qualifiers_stripped = scope_strips_qualifiers(&inner_p.input);
+        let mut kept_aliases = HashSet::new();
+        for (e, declared) in new_exprs.iter().zip(&declared_names) {
+            if let Expr::Alias(alias) = e {
+                kept_aliases.insert(unparser.emitted_column_key(&alias.name).ok()?);
+            }
+            if !matches!(e, Expr::Column(column) if column.name() == declared.as_str()) {
+                kept_aliases.insert(unparser.emitted_column_key(declared).ok()?);
+            }
+        }
+        let kept_keys = declared_names
             .iter()
-            .zip(&declared_names)
-            .flat_map(|(e, declared)| {
-                let alias = match e {
-                    Expr::Alias(alias) => Some(alias.name.as_str()),
-                    _ => None,
-                };
-                let computed = !matches!(
-                    e,
-                    Expr::Column(column) if column.name() == declared.as_str()
-                );
-                alias
-                    .into_iter()
-                    .chain(computed.then_some(declared.as_str()))
-            })
-            .collect();
+            .map(|name| unparser.emitted_column_key(name).ok())
+            .collect::<Option<HashSet<_>>>()?;
         let substitution_shadowed = sort.expr.iter().any(|sort_expr| {
             let mut key = &sort_expr.expr;
             while let Expr::Alias(alias) = key {
@@ -465,8 +470,13 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                     && dropped_outputs.get(col.name()).is_some_and(|underlying| {
                         underlying.column_refs().iter().any(|read| {
                             (read.relation.is_none() || (qualifiers_stripped && bare_key))
-                                && kept_aliases.contains(read.name())
-                        }) || reads_outer_reference_named_in(underlying, &declared_names)
+                                && unparser
+                                    .emitted_column_key(read.name())
+                                    .ok()
+                                    .is_none_or(|key| kept_aliases.contains(&key))
+                        }) || reads_outer_reference_named_in(
+                            unparser, underlying, &kept_keys,
+                        )
                     })
             })
         });
@@ -529,16 +539,65 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     }
 }
 
-/// Whether `plan` renders in the scope of an aggregate whose input is a derived
-/// projection, where the unparser strips the qualifiers of the aggregate's
-/// expressions (see `UnparserAggScope`).
-fn aggregate_scope_strips_qualifiers(plan: &LogicalPlan) -> bool {
+/// Whether the fold may drop inner outputs nobody above reads, which the fold
+/// did not do before spiceai/spiceai#14733. It is taken only in a subset that
+/// is safe by construction, rather than guarded shape by shape:
+///
+/// - every output the outer list keeps is a plain column named by that column,
+///   in the inner schema and in the outer one, so the folded `SELECT` list
+///   introduces no alias that a bare `ORDER BY` name, a substituted expression
+///   or an outer reference could bind to, and the result keeps the plan's names;
+/// - no plain column the inner projection renames is read above: a name read
+///   above is matched against a plain column by the column's own name, while
+///   the output it reads is the one the schema gives that name;
+/// - the outer list reads each kept output once;
+/// - no inner output is volatile or holds a subquery, so substituting a dropped
+///   output into a key evaluates nothing the plan evaluates once.
+///
+/// Outside it the sort keeps its own scope, as it did before the widening.
+fn widened_fold_is_safe(
+    p: &Projection,
+    inner_p: &Projection,
+    position: &HashMap<String, usize>,
+    read_above: &HashSet<String>,
+) -> bool {
+    let named_by_own_column = |schema: &DFSchema, i: usize, column: &Column| {
+        let (qualifier, field) = schema.qualified_field(i);
+        field.name() == &column.name && qualifier == column.relation.as_ref()
+    };
+    let renamed_column_read_above =
+        inner_p.expr.iter().enumerate().any(|(i, e)| match e {
+            Expr::Column(column) => {
+                !named_by_own_column(&inner_p.schema, i, column)
+                    && read_above.contains(&e.to_string())
+            }
+            _ => false,
+        });
+    if renamed_column_read_above || !inner_p.expr.iter().all(output_is_repeatable) {
+        return false;
+    }
+    let mut kept = HashSet::new();
+    p.expr.iter().enumerate().all(|(j, e)| {
+        position.get(&e.to_string()).is_some_and(|&i| {
+            matches!(&inner_p.expr[i], Expr::Column(column)
+                if named_by_own_column(&inner_p.schema, i, column)
+                    && named_by_own_column(&p.schema, j, column))
+                && kept.insert(i)
+        })
+    })
+}
+
+/// Whether `plan` renders in a scope that hides the relations its input
+/// columns are qualified by, where the unparser strips their qualifiers: a
+/// derived projection, or an aggregate whose input is one (see
+/// `UnparserAggScope`).
+fn scope_strips_qualifiers(plan: &LogicalPlan) -> bool {
     match plan {
         LogicalPlan::Aggregate(agg) => {
             Unparser::contains_projection_before_relation(&agg.input)
         }
-        LogicalPlan::Projection(_)
-        | LogicalPlan::TableScan(_)
+        LogicalPlan::Projection(_) => true,
+        LogicalPlan::TableScan(_)
         | LogicalPlan::Subquery(_)
         | LogicalPlan::SubqueryAlias(_)
         | LogicalPlan::Join(_)
@@ -546,21 +605,30 @@ fn aggregate_scope_strips_qualifiers(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Values(_) => false,
         _ => matches!(
             plan.inputs().as_slice(),
-            [input] if aggregate_scope_strips_qualifiers(input)
+            [input] if scope_strips_qualifiers(input)
         ),
     }
 }
 
-/// Whether `expr` holds an unqualified outer reference whose bare name is one of
-/// `names`, so that a scope projecting those names would bind it to its own
-/// output rather than to the enclosing query.
-fn reads_outer_reference_named_in(expr: &Expr, names: &[String]) -> bool {
+/// Whether `expr` holds an unqualified outer reference whose bare name folds to
+/// one of `names` (keys from [`Unparser::emitted_column_key`]), so that a scope
+/// projecting those names would bind it to its own output rather than to the
+/// enclosing query.
+fn reads_outer_reference_named_in(
+    unparser: &Unparser,
+    expr: &Expr,
+    names: &HashSet<String>,
+) -> bool {
     expr.exists(|e| {
-        Ok(matches!(
-            e,
-            Expr::OuterReferenceColumn(_, column)
-                if column.relation.is_none() && names.iter().any(|n| n == column.name())
-        ))
+        Ok(match e {
+            Expr::OuterReferenceColumn(_, column) if column.relation.is_none() => {
+                unparser
+                    .emitted_column_key(column.name())
+                    .ok()
+                    .is_none_or(|key| names.contains(&key))
+            }
+            _ => false,
+        })
     })
     .unwrap_or(true)
 }

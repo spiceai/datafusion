@@ -34,10 +34,10 @@ use super::{
         enclosed_qualifiers, expr_contains_subquery, filters_scope_their_projection,
         find_agg_node_within_select, find_unnest_node_within_select,
         find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
-        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
-        predicate_reads_unrepeatable_output, projection_below_filters,
-        scope_filters_over_projection, select_list_wraps_a_grouping_expr,
-        stacked_filters_read_unrepeatable_output,
+        name_derived_scope_outputs, name_scope_outputs, output_is_repeatable,
+        partition_subquery_filters, predicate_reads_unrepeatable_output,
+        projection_below_filters, scope_filters_over_projection,
+        select_list_wraps_a_grouping_expr, stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -2468,7 +2468,9 @@ impl Unparser<'_> {
                 Ok(())
             }
             LogicalPlan::Projection(p) => {
-                if let Some(new_plan) = rewrite_plan_for_sort_on_non_projected_fields(p) {
+                if let Some(new_plan) =
+                    rewrite_plan_for_sort_on_non_projected_fields(self, p)
+                {
                     return self
                         .select_to_sql_recursively(&new_plan, query, select, relation);
                 }
@@ -2889,8 +2891,12 @@ impl Unparser<'_> {
                     // an output before the derived table's column of that name
                     // (`ORDER BY s` binding to `(0 - s) AS s`). Compared the way
                     // the engine compares them, so `(0 - s) AS "S"` captures `s`
-                    // where identifiers fold.
-                    let mut computed_aliases = HashSet::new();
+                    // where identifiers fold. Each folded name keeps the
+                    // spellings that fold to it, for a key the plan spells bare.
+                    let mut computed_aliases: std::collections::HashMap<
+                        String,
+                        Vec<String>,
+                    > = std::collections::HashMap::new();
                     for expr in &p.expr {
                         if let Expr::Alias(alias) = expr
                             && !matches!(
@@ -2899,7 +2905,9 @@ impl Unparser<'_> {
                             )
                         {
                             computed_aliases
-                                .insert(self.emitted_column_key(&alias.name)?);
+                                .entry(self.emitted_column_key(&alias.name)?)
+                                .or_default()
+                                .push(self.emitted_column_name(&alias.name)?);
                         }
                     }
                     // A row bound the enclosing query carries applies to the
@@ -2913,14 +2921,28 @@ impl Unparser<'_> {
                         && !query_ref.has_order_by()
                         && let Some(sort) = Self::chain_sort(cur)
                     {
+                        // A key that cannot be evaluated a second time
+                        // (`random()`) would rank the derived table's rows
+                        // afresh, so the bound would keep the rows that second
+                        // ranking puts first, not those the chain's sort ranked.
+                        if sort
+                            .expr
+                            .iter()
+                            .any(|sort_expr| !output_is_repeatable(&sort_expr.expr))
+                        {
+                            return not_impl_err!(
+                                "Unparsing a row bound applied above a sorted chain is not supported when it orders by a sort key that cannot be evaluated a second time"
+                            );
+                        }
                         // The re-established keys name the derived table's
                         // outputs by bare name, which a computed alias of the
                         // same name in this projection's list would capture.
                         let mut captured = false;
                         for sort_expr in &sort.expr {
                             for column in sort_expr.expr.column_refs() {
-                                captured |= computed_aliases
-                                    .contains(&self.emitted_column_key(column.name())?);
+                                captured |= computed_aliases.contains_key(
+                                    &self.emitted_column_key(column.name())?,
+                                );
                             }
                         }
                         if captured {
@@ -2994,7 +3016,14 @@ impl Unparser<'_> {
                     // what a bare `ORDER BY` term binds to first — and the order
                     // reads the computed output rather than the column the plan
                     // sorts by (`ORDER BY k` binding to `(0 - k) AS "K"`).
+                    //
+                    // A key the plan already spells bare (`ORDER BY s`) binds the
+                    // same way: to a computed alias whose name folds to its own
+                    // (`(0 - s) AS "S"`) rather than to the output it reads. It
+                    // is left alone only where it names that one alias, spelled
+                    // as the key spells it: the output the key does read.
                     let mut captured = false;
+                    let mut captured_bare = false;
                     if let Some(query_ref) = query.as_mut() {
                         let qualified_terms = Self::order_by_terms(query_ref)
                             .iter()
@@ -3009,13 +3038,27 @@ impl Unparser<'_> {
                         for (expr, was_qualified) in
                             Self::order_by_terms(query_ref).iter().zip(qualified_terms)
                         {
-                            if let ast::Expr::CompoundIdentifier(idents) = expr
-                                && was_qualified
-                                && let [ident] = idents.as_slice()
-                            {
-                                captured |= computed_aliases.contains(
-                                    &self.identifier_comparison_key(&ident.value),
-                                );
+                            match expr {
+                                ast::Expr::CompoundIdentifier(idents)
+                                    if was_qualified =>
+                                {
+                                    if let [ident] = idents.as_slice() {
+                                        captured |= computed_aliases.contains_key(
+                                            &self.identifier_comparison_key(&ident.value),
+                                        );
+                                    }
+                                }
+                                ast::Expr::Identifier(ident) => {
+                                    if let Some(spellings) = computed_aliases.get(
+                                        &self.identifier_comparison_key(&ident.value),
+                                    ) {
+                                        captured_bare |= !matches!(
+                                            spellings.as_slice(),
+                                            [only] if *only == ident.value
+                                        );
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
@@ -3032,6 +3075,11 @@ impl Unparser<'_> {
                     if captured {
                         return not_impl_err!(
                             "Unparsing a sort above a projection and its aggregate is not supported when the projection computes an output named like a key it re-points onto the derived table"
+                        );
+                    }
+                    if captured_bare {
+                        return not_impl_err!(
+                            "Unparsing a sort above a projection and its aggregate is not supported when the projection computes an output whose name folds to that of a bare key reading another output"
                         );
                     }
                     // The derived table names every output by the logical name
