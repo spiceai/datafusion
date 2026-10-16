@@ -1407,9 +1407,11 @@ impl Unparser<'_> {
         true
     }
 
-    /// Refuses, with `refuse`, a scope whose `exprs` hold an outer reference the
-    /// derived table would capture, so that it read the scope instead of the
-    /// enclosing query:
+    /// Refuses, with `refuse`, a scope whose `exprs`, or the clauses `select`
+    /// already carries ([`SelectBuilder::clause_outer_references`]), which are
+    /// re-pointed onto the derived table, hold an outer reference the derived
+    /// table would capture, so that it read the scope instead of the enclosing
+    /// query:
     ///
     /// - an unqualified one named like an output the derived table exposes, the
     ///   fields of `scope`, on any dialect;
@@ -1421,12 +1423,13 @@ impl Unparser<'_> {
     fn ensure_scope_captures_no_outer_reference<'a>(
         &self,
         exprs: impl IntoIterator<Item = &'a Expr>,
+        select: &'a SelectBuilder,
         scope: &DFSchema,
         refuse: fn(&str) -> Result<()>,
     ) -> Result<()> {
         let names_derived_table = self.dialect.requires_derived_table_alias();
         let outputs = self.scope_output_keys(scope, refuse)?;
-        for expr in exprs {
+        for expr in exprs.into_iter().chain(select.clause_outer_references()) {
             let mut captured = None;
             expr.apply(|node| {
                 if let Expr::OuterReferenceColumn(_, column) = node {
@@ -2913,6 +2916,9 @@ impl Unparser<'_> {
                         sort.expr.clone()
                     };
                     query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                    for sort_expr in &sort_exprs {
+                        select.note_clause_outer_references(&sort_expr.expr);
+                    }
                 }
                 if let Some(limit) = direct_limit {
                     let Some(query_ref) = query.as_mut() else {
@@ -3078,6 +3084,7 @@ impl Unparser<'_> {
                                         .into_iter()
                                         .map(|filter| &filter.predicate),
                                 ),
+                                select,
                                 sorted.schema(),
                                 unrepeatable_sort_key_refusal,
                             )?;
@@ -3188,6 +3195,7 @@ impl Unparser<'_> {
                                     .0
                                     .into_iter()
                                     .map(|filter| &filter.predicate),
+                                select,
                                 &filtered.projection.schema,
                                 unrepeatable_output_refusal,
                             )?;
@@ -3216,6 +3224,7 @@ impl Unparser<'_> {
                         None => filter.predicate.clone(),
                     };
                     let filter_expr = self.expr_to_sql(&predicate)?;
+                    select.note_clause_outer_references(&predicate);
                     select.selection(Some(filter_expr));
                 }
 
@@ -3358,6 +3367,7 @@ impl Unparser<'_> {
                     let (scoped, derived) = scope_sort_over_projection(sort, projection)?;
                     self.ensure_scope_captures_no_outer_reference(
                         sort.expr.iter().map(|key| &key.expr),
+                        select,
                         &derived,
                         unrepeatable_sort_key_refusal,
                     )?;
@@ -3412,6 +3422,9 @@ impl Unparser<'_> {
                     .collect::<Result<Vec<_>>>()?;
 
                 query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                for sort_expr in &sort_exprs {
+                    select.note_clause_outer_references(&sort_expr.expr);
+                }
 
                 self.select_to_sql_recursively(
                     sort.input.as_ref(),
@@ -3563,6 +3576,9 @@ impl Unparser<'_> {
                         if let Some(sort_expr) = &on.sort_expr {
                             if let Some(query_ref) = query {
                                 query_ref.order_by(self.sorts_to_sql(sort_expr)?);
+                                for sort_expr in sort_expr {
+                                    select.note_clause_outer_references(&sort_expr.expr);
+                                }
                             } else {
                                 return internal_err!(
                                     "Sort operator only valid in a statement context."

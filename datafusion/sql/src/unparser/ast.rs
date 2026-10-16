@@ -18,6 +18,8 @@
 use core::fmt;
 use std::ops::ControlFlow;
 
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_expr::Expr;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     self, LimitClause, OrderByKind, SelectFlavor, visit_expressions,
@@ -323,6 +325,15 @@ pub struct SelectBuilder {
     /// the predicate already there in place — taking it out would change
     /// what the walk sees.
     predicates_added: usize,
+    /// The outer references read by the clauses already on this SELECT — a
+    /// `WHERE` from a filter above, an `ORDER BY` from a sort above. Emitted,
+    /// an unqualified outer reference is a bare identifier like a local one, so
+    /// a derived table built later under those clauses reads them from here to
+    /// tell whether it would capture one.
+    ///
+    /// Added to with `note_clause_outer_references()` and read with
+    /// `clause_outer_references()`.
+    clause_outer_references: Vec<Expr>,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -648,6 +659,25 @@ impl SelectBuilder {
         self.predicates_added
     }
 
+    /// Records the outer references `expr` reads, for a clause it is emitted into
+    /// on this SELECT. A subquery in `expr` is not entered: its outer references
+    /// are resolved inside it.
+    pub fn note_clause_outer_references(&mut self, expr: &Expr) {
+        // The visitor never fails, so there is no error to keep.
+        let _ = expr.apply(|node| {
+            if matches!(node, Expr::OuterReferenceColumn(..)) {
+                self.clause_outer_references.push(node.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+
+    /// The outer references the clauses already on this SELECT read — see
+    /// [`Self::note_clause_outer_references`].
+    pub fn clause_outer_references(&self) -> &[Expr] {
+        &self.clause_outer_references
+    }
+
     fn and_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
         // With filter pushdown optimization, the LogicalPlan can have filters defined as part of `TableScan` and `Filter` nodes.
         // To avoid overwriting one of the filters, we combine the existing filter with the additional filter.
@@ -869,6 +899,7 @@ impl SelectBuilder {
             null_extended_join_inputs: 0,
             input_predicates_stay_scoped: false,
             predicates_added: 0,
+            clause_outer_references: Vec::new(),
         }
     }
 }

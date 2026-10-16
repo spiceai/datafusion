@@ -17135,6 +17135,61 @@ fn test_scope_refuses_an_outer_reference_named_like_a_column_it_carries() -> Res
 }
 
 #[test]
+fn test_scope_refuses_an_outer_reference_a_where_above_it_reads() -> Result<()> {
+    // The filter above the sort reads only the outer reference `r`, so it is not
+    // lowered into the scope: it is emitted first, as `WHERE (r > 0)`, and the
+    // clauses above the scope are re-pointed onto the derived table. That table
+    // exposes the projection's `r`, and the bare `r` in the WHERE would bind to it
+    // rather than to the enclosing query's `r`: on DuckDB the subquery then returns
+    // a row where the plan says it returns none. Refused, as the same reference in
+    // a sort key is. The second plan reaches the filter scope instead, below a
+    // fetched sort whose `ORDER BY (u.a + r)` reads the outer `r` and is re-pointed
+    // the same way.
+    let outer_r = || out_ref_col(DataType::Int64, "r");
+    let correlated = |inner: LogicalPlan| -> Result<LogicalPlan> {
+        table_scan(Some("o"), &int32_schema(&["a"]), None)?
+            .project(vec![(col("o.a") - lit(5i64)).alias("r")])?
+            .project(vec![
+                col("r"),
+                Expr::ScalarSubquery(datafusion_expr::Subquery {
+                    subquery: Arc::new(inner),
+                    outer_ref_columns: vec![outer_r()],
+                    spans: datafusion_common::Spans::new(),
+                })
+                .alias("pick"),
+            ])?
+            .build()
+    };
+    let sort_scope = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .sort(vec![(col("r") + lit(1.0)).sort(true, true)])?
+        .filter(outer_r().gt(lit(0i64)))?
+        .limit(0, Some(1))?
+        .project(vec![col("r")])?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&correlated(sort_scope)?)
+            .expect_err("the sort scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when the outer reference r carries the name of an output the derived table exposes"
+    );
+
+    let filter_scope = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .filter(col("r").gt(lit(0.5)))?
+        .sort_with_limit(vec![(col("u.a") + outer_r()).sort(true, true)], Some(1))?
+        .project(vec![col("r")])?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&correlated(filter_scope)?)
+            .expect_err("the filter scope must refuse")
+            .to_string(),
+        "This feature is not implemented: Unparsing a filter on a projection output that cannot be repeated is not supported when the outer reference r carries the name of an output the derived table exposes"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_struct_field_filter_re_pointed_onto_a_scope_reads_the_emitted_column_name()
 -> Result<()> {
     // BigQuery emits the struct column `payload*` as `payload_42`. The WHERE above
