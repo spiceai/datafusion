@@ -1283,18 +1283,18 @@ impl Unparser<'_> {
     /// The `SELECT` items one input of a join contributes to the shared list,
     /// taken from what its walk set.
     ///
-    /// An input lists its own columns only where a projection is folded for
-    /// it. A scan with no projection — reached directly, or through a filter —
-    /// sets nothing, and an aliased one claims every column with a bare `*`,
-    /// which beside another relation reads that relation's columns as well.
-    /// Either way the list the join assembles no longer lines up with the
-    /// plan's schema: a consumer reading the result by position gets the
-    /// other input's columns under this one's names, and a dialect that
-    /// rejects an empty list gets a parse error. Such an input contributes
-    /// every column of each relation it reads instead — `t.*`, one per
-    /// relation, in the plan's order — or a bare `*` when it is the only
-    /// relation the `FROM` holds, as a scan unparsed on its own renders
-    /// (spiceai/spiceai#14738).
+    /// An input whose walk set nothing (a scan with no projection, reached
+    /// directly or through a filter) or only an unqualified `*` (an aliased
+    /// scan) names no column of its own, and beside another relation neither
+    /// form stands for exactly its columns: the list the join assembles would
+    /// not line up with the plan's schema, so a consumer reading the result
+    /// by position gets the other input's columns under this one's names,
+    /// and a dialect that rejects an empty list gets a parse error. Such an
+    /// input contributes every column of each relation it reads — `t.*`, one
+    /// per relation, in the plan's order — or a bare `*` when it is the only
+    /// relation the `FROM` holds, as a scan unparsed on its own renders. An
+    /// input with no columns, and one that already lists its own, is returned
+    /// as it was set (spiceai/spiceai#14738).
     fn join_input_select_items(
         &self,
         input: &LogicalPlan,
@@ -1302,11 +1302,10 @@ impl Unparser<'_> {
         select: &mut SelectBuilder,
     ) -> Result<Vec<ast::SelectItem>> {
         let items = select.pop_projections();
-        let claims_every_column =
-            matches!(items.as_slice(), [ast::SelectItem::Wildcard(_)]);
-        if !(items.is_empty() || claims_every_column)
-            || input.schema().fields().is_empty()
-        {
+        // Nothing, or an unqualified `*`: the input names no column of its own.
+        let names_no_column =
+            matches!(items.as_slice(), [] | [ast::SelectItem::Wildcard(_)]);
+        if !names_no_column || input.schema().fields().is_empty() {
             return Ok(items);
         }
         if alone_in_from {
@@ -1347,8 +1346,8 @@ impl Unparser<'_> {
             .collect())
     }
 
-    /// Whether every item is a relation's `t.*`: the list reads nothing but
-    /// whole relations, in the order the `FROM` holds them.
+    /// Whether `items` is non-empty and every item is a relation's `t.*`, so
+    /// the list reads nothing but whole relations.
     fn only_whole_relations(items: &[ast::SelectItem]) -> bool {
         !items.is_empty()
             && items

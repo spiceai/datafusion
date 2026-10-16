@@ -15905,7 +15905,8 @@ fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
 }
 
 #[test]
-fn test_a_bare_scan_on_the_probe_side_of_a_semi_join_lists_its_columns() -> Result<()> {
+fn test_a_bare_scan_on_the_probe_side_of_a_semi_join_reads_as_a_bare_wildcard()
+-> Result<()> {
     // The probe side sets no SELECT items of its own and is the only relation
     // of the FROM, so it reads as `*`, the way a scan unparsed on its own does,
     // rather than as an empty list a dialect such as DuckDB rejects.
