@@ -16353,3 +16353,27 @@ fn test_a_fetched_sort_over_an_unfetched_sort_resolves_its_keys_under_the_droppe
     );
     Ok(())
 }
+
+#[test]
+fn test_a_sort_key_reading_a_dropped_volatile_output_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // Folding the sort would substitute `random()` at both references of `r`,
+    // turning the key `(r - r) * 100 + a`, which is `a`, into a difference of two
+    // draws. The fold is skipped, so the sort stays in the scope that computes
+    // `r`. The repetition of `random()` inside that scope's own key is
+    // spiceai/spiceai#14109's, fixed by spiceai/datafusion#247.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a"), random().alias("r"), col("u.c")])?
+        .sort_with_limit(
+            vec![((col("r") - col("r")) * lit(100.0) + col("u.a")).sort(true, true)],
+            Some(1),
+        )?
+        .project(vec![col("u.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a FROM (SELECT u.a, random() AS r, u.c FROM u ORDER BY (((random() - random()) * 100.0) + u.a) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}

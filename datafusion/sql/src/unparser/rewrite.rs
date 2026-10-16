@@ -26,6 +26,8 @@ use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Expr, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::Ident;
 
+use super::utils::output_is_repeatable;
+
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
 /// DataFusion will return an error if two columns in the schema have the same name with no table qualifiers.
@@ -328,6 +330,23 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 (!kept_names.contains(&name)).then_some((name, underlying))
             })
             .collect();
+
+        // A dropped output that cannot be repeated — a volatile expression, or
+        // one holding a subquery — must not be substituted at every reference
+        // the key makes to it: `(r - r)` over `random() AS r` is 0 drawn once
+        // and a difference of two draws when repeated. The fold is skipped,
+        // and the sort keeps the scope it has, where the output is computed once.
+        let key_reads_unrepeatable = sort.expr.iter().any(|sort_expr| {
+            sort_expr.expr.column_refs().iter().any(|col| {
+                col.relation.is_none()
+                    && dropped_outputs
+                        .get(col.name())
+                        .is_some_and(|underlying| !output_is_repeatable(underlying))
+            })
+        });
+        if key_reads_unrepeatable {
+            return None;
+        }
 
         if !dropped_outputs.is_empty() {
             for sort_expr in &mut sort.expr {
