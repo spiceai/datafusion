@@ -1142,7 +1142,7 @@ fn test_aggregation_without_projection() -> Result<()> {
     let statement = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
         statement,
-        @r#"SELECT sum(users.age), users."name" FROM users GROUP BY users."name""#
+        @r#"SELECT users."name", sum(users.age) FROM users GROUP BY users."name""#
     );
 
     Ok(())
@@ -5579,7 +5579,7 @@ fn test_unparse_window_over_aggregate_without_projection() -> Result<()> {
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT sum(gas."value") AS sum_n, gas."time", row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time""#
+        @r#"SELECT gas."time", sum(gas."value") AS sum_n, row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time""#
     );
 
     Ok(())
@@ -5613,7 +5613,7 @@ fn test_unparse_filter_on_window_over_aggregate_without_projection() -> Result<(
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT sum(gas."value") AS sum_n, gas."time", row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) = 0)"#
+        @r#"SELECT gas."time", sum(gas."value") AS sum_n, row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) = 0)"#
     );
 
     Ok(())
@@ -5648,7 +5648,7 @@ fn test_unparse_filter_on_aggregate_output_above_window_without_projection() -> 
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT sum(gas."value") AS sum_n, gas."time", row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (sum(gas."value") = 0.0)"#
+        @r#"SELECT gas."time", sum(gas."value") AS sum_n, row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (sum(gas."value") = 0.0)"#
     );
 
     Ok(())
@@ -5862,7 +5862,7 @@ fn test_unparse_window_over_derived_aggregate_without_projection() -> Result<()>
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT *, row_number() OVER (ORDER BY agg.sum_n ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM (SELECT sum(gas."value") AS sum_n, gas."time" FROM gas GROUP BY gas."time") AS agg"#
+        @r#"SELECT *, row_number() OVER (ORDER BY agg.sum_n ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM (SELECT gas."time", sum(gas."value") AS sum_n FROM gas GROUP BY gas."time") AS agg"#
     );
 
     Ok(())
@@ -7202,7 +7202,7 @@ fn stacked_aggregate_is_unparsed_as_a_derived_table() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(test.b), test.a FROM test GROUP BY test.a"
+        @"SELECT test.a, COUNT(test.b) FROM test GROUP BY test.a"
     );
 
     Ok(())
@@ -7231,7 +7231,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"
     );
 
     // A qualifier nested inside a grouping expression is reached too — the projection and
@@ -7241,7 +7241,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), (derived_aggregate_1.a + 1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY (derived_aggregate_1.a + 1)"
+        @"SELECT (derived_aggregate_1.a + 1), COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY (derived_aggregate_1.a + 1)"
     );
 
     // HAVING is built from a Filter above the aggregate and was never swept.
@@ -7251,7 +7251,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
     );
 
     // A query-level ORDER BY is reached by the existing dangling-identifier sweep, which
@@ -7263,7 +7263,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a ORDER BY a ASC NULLS LAST"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a ORDER BY a ASC NULLS LAST"
     );
 
     Ok(())
@@ -7299,7 +7299,7 @@ fn stacked_aggregate_requalifies_onto_a_required_derived_table_alias() -> Result
     let unparser = Unparser::new(&AliasedDerivedTableDialect {});
     assert_snapshot!(
         unparser.plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
     );
 
     Ok(())
@@ -7342,7 +7342,7 @@ fn stacked_aggregate_under_a_join_leaves_the_other_side_qualified() -> Result<()
     // here keeps the gap visible rather than silent.
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(derived_aggregate_1.a), "other".a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
+        @r#"SELECT "other".a, COUNT(derived_aggregate_1.a) FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
     );
 
     Ok(())
@@ -7385,7 +7385,7 @@ fn stacked_aggregates_on_both_join_sides_get_distinct_aliases() -> Result<()> {
     // as spiceai/spiceai#12695 and is pinned here rather than left silent.
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(derived_aggregate_1.a), derived_aggregate_2.a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN (SELECT "other".a FROM "other" GROUP BY "other".a) AS derived_aggregate_2 ON (test.a = "other".a) GROUP BY derived_aggregate_2.a"#
+        @r#"SELECT derived_aggregate_2.a, COUNT(derived_aggregate_1.a) FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN (SELECT "other".a FROM "other" GROUP BY "other".a) AS derived_aggregate_2 ON (test.a = "other".a) GROUP BY derived_aggregate_2.a"#
     );
 
     Ok(())
@@ -7432,7 +7432,7 @@ fn stacked_aggregate_leaves_a_correlated_outer_reference_alone() -> Result<()> {
     // clauses that hold no subquery.
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
+        @r#"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
     );
 
     Ok(())
@@ -7598,7 +7598,7 @@ fn test_having_above_limit_is_refused() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(t.id), t."name" FROM t GROUP BY t."name" HAVING (COUNT(t.id) > 1) LIMIT 5"#
+        @r#"SELECT t."name", COUNT(t.id) FROM t GROUP BY t."name" HAVING (COUNT(t.id) > 1) LIMIT 5"#
     );
 
     Ok(())
@@ -16055,5 +16055,69 @@ fn test_a_bare_scan_on_the_right_of_an_outer_join_lists_its_columns() -> Result<
         plan_to_sql(&plan)?,
         @"SELECT t.a, (t.b + 1) AS c, u.* FROM t RIGHT OUTER JOIN u ON (t.a = u.a)"
     );
+    Ok(())
+}
+
+#[test]
+fn test_an_aggregate_with_no_projection_lists_group_keys_before_aggregates() -> Result<()>
+{
+    // The plan's schema has the group keys first; a consumer reading by position,
+    // and a `g.*` over this SELECT as a derived table, depend on that order.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, sum(t.b) FROM t GROUP BY t.a"
+    );
+
+    // Aliased and joined to a bare scan, the derived table's columns are read
+    // whole, in the order the plan's schema has them.
+    let grouped = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .alias("g")?
+        .build()?;
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .join_on(
+            grouped,
+            datafusion_expr::JoinType::Inner,
+            vec![col("u.a").eq(col("g.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM u INNER JOIN (SELECT t.a, sum(t.b) FROM t GROUP BY t.a) AS g ON (u.a = g.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_join_input_with_no_columns_contributes_nothing_beside_another() -> Result<()> {
+    // A scan projected to no columns gets the `SELECT 1` placeholder on its own;
+    // beside a relation with columns that placeholder would be a column the plan
+    // does not have.
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT u.* FROM u INNER JOIN t ON true");
+
+    // Two inputs with no columns keep the placeholder, as a projection of
+    // nothing does.
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![]))?
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT 1 FROM u INNER JOIN t ON true");
     Ok(())
 }

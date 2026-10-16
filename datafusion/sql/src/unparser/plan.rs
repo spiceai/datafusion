@@ -1293,8 +1293,9 @@ impl Unparser<'_> {
     /// input contributes every column of each relation it reads — `t.*`, one
     /// per relation, in the plan's order — or a bare `*` when it is the only
     /// relation the `FROM` holds, as a scan unparsed on its own renders. An
-    /// input with no columns, and one that already lists its own, is returned
-    /// as it was set (spiceai/spiceai#14738).
+    /// input that already lists its own columns is returned as it was set,
+    /// and one with no columns contributes nothing beside another relation
+    /// (spiceai/spiceai#14738).
     fn join_input_select_items(
         &self,
         input: &LogicalPlan,
@@ -1302,10 +1303,17 @@ impl Unparser<'_> {
         select: &mut SelectBuilder,
     ) -> Result<Vec<ast::SelectItem>> {
         let items = select.pop_projections();
+        if input.schema().fields().is_empty() {
+            // The input has no columns, so its items are the placeholder a dialect
+            // that rejects an empty list needs (`SELECT 1`). Beside another relation
+            // the placeholder would be a column the plan does not have; alone, it is
+            // the whole list.
+            return Ok(if alone_in_from { items } else { vec![] });
+        }
         // Nothing, or an unqualified `*`: the input names no column of its own.
         let names_no_column =
             matches!(items.as_slice(), [] | [ast::SelectItem::Wildcard(_)]);
-        if !names_no_column || input.schema().fields().is_empty() {
+        if !names_no_column {
             return Ok(items);
         }
         if alone_in_from {
@@ -3102,12 +3110,15 @@ impl Unparser<'_> {
                 // Aggregation can be already handled in the projection case
                 if !select.already_projected() {
                     let unparser_agg_scope = UnparserAggScope::new(agg);
-                    // The query returns aggregate and group expressions. If that weren't the case,
-                    // the aggregate would have been placed inside a projection, making the check above^ false
+                    // The query returns the group and aggregate expressions themselves
+                    // (a projection above would have taken the list), in the order the
+                    // plan's schema has them: group keys first, then aggregates. A
+                    // consumer reading the result by position, and a `g.*` over this
+                    // SELECT as a derived table, depend on that order.
                     let exprs: Vec<_> = agg
-                        .aggr_expr
+                        .group_expr
                         .iter()
-                        .chain(agg.group_expr.iter())
+                        .chain(agg.aggr_expr.iter())
                         .cloned()
                         .map(|expr| {
                             self.select_item_to_sql(&unparser_agg_scope.normalize(expr)?)
@@ -3670,6 +3681,16 @@ impl Unparser<'_> {
                                     vec![ast::SelectItem::Wildcard(
                                         ast::WildcardAdditionalOptions::default(),
                                     )]
+                                } else if left_projection.is_empty()
+                                    && right_projection.is_empty()
+                                {
+                                    // Neither input has a column, so neither contributed
+                                    // one: the join's output has none either, and takes
+                                    // the same placeholder a projection of nothing does.
+                                    self.empty_projection_fallback()
+                                        .iter()
+                                        .map(|e| self.select_item_to_sql(e))
+                                        .collect::<Result<Vec<_>>>()?
                                 } else {
                                     left_projection
                                         .into_iter()
