@@ -1367,6 +1367,17 @@ impl Unparser<'_> {
     /// plan's order; an unqualified output (a window's, an aggregate's) is
     /// skipped, since the caller keeps the explicit item that names it.
     fn whole_relation_items(&self, input: &LogicalPlan) -> Result<Vec<ast::SelectItem>> {
+        // A window whose input the window arm derives (see
+        // `window_input_requires_derived_subquery`) reads that derived table
+        // under its alias, not the relations the plan's schema still names.
+        let mut cur = input;
+        while let LogicalPlan::Window(window) = cur {
+            if Self::window_input_requires_derived_subquery(window.input.as_ref()) {
+                let derived = TableReference::bare(DERIVED_WINDOW_INPUT_ALIAS);
+                return Ok(self.qualified_wildcards(&[&derived]));
+            }
+            cur = window.input.as_ref();
+        }
         let mut relations: Vec<&TableReference> = vec![];
         for (qualifier, _) in input.schema().iter() {
             if let Some(qualifier) = qualifier

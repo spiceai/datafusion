@@ -16196,3 +16196,52 @@ fn test_a_window_over_a_bare_scan_as_a_join_input_narrows_its_wildcard() -> Resu
     );
     Ok(())
 }
+
+#[test]
+fn test_a_window_over_a_derived_input_as_a_join_input_reads_the_derived_alias()
+-> Result<()> {
+    // The window arm derives a projection or a limit under it as
+    // `derived_window_input`; the input's `*` beside another relation is
+    // narrowed to that alias, since the plan's own relation is hidden inside.
+    fn row_number_over_a() -> Expr {
+        Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+            params: WindowFunctionParams {
+                args: vec![],
+                partition_by: vec![],
+                order_by: vec![col("u.a").sort(true, true)],
+                window_frame: WindowFrame::new(Some(false)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("rn")
+    }
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a")])?
+        .window(vec![row_number_over_a()])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true"
+    );
+
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(10))?
+        .window(vec![row_number_over_a()])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT * FROM u LIMIT 10) AS derived_window_input ON true"
+    );
+    Ok(())
+}
