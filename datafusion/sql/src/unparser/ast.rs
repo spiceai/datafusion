@@ -18,6 +18,7 @@
 use core::fmt;
 use std::ops::ControlFlow;
 
+use datafusion_common::utils::combine_limit;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     self, LimitClause, OrderByKind, SelectFlavor, visit_expressions,
@@ -118,9 +119,21 @@ impl QueryBuilder {
         };
         Some((skip, fetch))
     }
+    /// Merges a literal bound applied below this query's bound into it, the way the
+    /// optimizer merges stacked limits: the bound here reads the rows the one below
+    /// leaves. Returns `false`, leaving the bound unchanged, when the bound here is
+    /// an expression and so cannot absorb another.
+    pub fn merge_inner_row_bound(&mut self, skip: usize, fetch: Option<usize>) -> bool {
+        let Some((outer_skip, outer_fetch)) = self.literal_row_bound() else {
+            return false;
+        };
+        let (skip, fetch) = combine_limit(outer_skip, outer_fetch, skip, fetch);
+        self.set_literal_row_bound(skip, fetch);
+        true
+    }
     /// Replaces this query's row bound with the numbers given; a skip of 0 leaves
     /// the `OFFSET` out, and no fetch leaves the `LIMIT` out.
-    pub fn set_literal_row_bound(&mut self, skip: usize, fetch: Option<usize>) {
+    fn set_literal_row_bound(&mut self, skip: usize, fetch: Option<usize>) {
         self.limit = fetch
             .map(|fetch| ast::Expr::value(ast::Value::Number(fetch.to_string(), false)));
         self.offset = (skip > 0).then(|| ast::Offset {

@@ -16102,3 +16102,36 @@ fn test_a_sort_folded_through_two_projections_keeps_the_outer_keys() -> Result<(
     );
     Ok(())
 }
+
+#[test]
+fn test_a_fetched_sort_under_a_non_literal_limit_is_refused() -> Result<()> {
+    // The outer bound is an expression, so it cannot merge with the fetch, and a
+    // derived table around the sort would drop the order the plan returns its
+    // rows in. Refused rather than emitted with one bound in place of the other.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .limit_by_expr(None, Some(cast(lit(7_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("a fetched sort under an expression bound cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_a_sort_over_an_aggregate_is_refused() -> Result<()> {
+    // The limit selects its groups before the sort orders them, and an aggregate
+    // is not a scan a derived table can take the name of. Refused rather than
+    // emitted as `ORDER BY … LIMIT`, which would sort first.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .aggregate(vec![col("u.b")], vec![max(col("u.a")).alias("m")])?
+        .limit(0, Some(1))?
+        .sort(vec![col("m").sort(true, true)])?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("a limit under a sort over an aggregate cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+    Ok(())
+}
