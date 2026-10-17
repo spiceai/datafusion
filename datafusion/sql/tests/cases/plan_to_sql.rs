@@ -17933,3 +17933,39 @@ fn test_a_bare_key_a_computed_alias_in_another_case_would_capture_above_a_derive
     );
     Ok(())
 }
+
+#[test]
+fn test_an_absorbed_sort_key_a_computed_alias_of_its_name_would_capture_is_refused()
+-> Result<()> {
+    // The sort sits below the projection, so its key `s` reads the derived
+    // table's `sum(t.v)`. Absorbed into the projection's SELECT, the bare
+    // `ORDER BY s` binds to `(0 - s) AS s` instead, reversing the ranking the
+    // fetch keeps, even though the alias is spelled exactly as the key is.
+    let derived = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+            .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+            .limit(0, Some(2))
+    };
+    let plan = derived()?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(1))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "an absorbed bare key a computed alias of its name captures is refused",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output whose name folds to that of a bare key reading another output"
+    );
+
+    // Inside a compound key the name reads the input column: still unparsed.
+    let plan = derived()?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - s) AS s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (s + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}

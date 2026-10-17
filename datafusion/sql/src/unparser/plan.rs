@@ -3019,9 +3019,12 @@ impl Unparser<'_> {
                     //
                     // A key the plan already spells bare (`ORDER BY s`) binds the
                     // same way: to a computed alias whose name folds to its own
-                    // (`(0 - s) AS "S"`) rather than to the output it reads. It
-                    // is left alone only where it names that one alias, spelled
-                    // as the key spells it: the output the key does read.
+                    // (`(0 - s) AS "S"`) rather than to the output it reads. A
+                    // sort above this projection reads its outputs, so its key
+                    // is left alone where it names that one alias, spelled as
+                    // the key spells it: the output the key does read. A sort
+                    // absorbed from below reads the derived table instead, so
+                    // any such alias captures its key, `(0 - s) AS s` included.
                     let mut captured = false;
                     let mut captured_bare = false;
                     if let Some(query_ref) = query.as_mut() {
@@ -3052,10 +3055,11 @@ impl Unparser<'_> {
                                     if let Some(spellings) = computed_aliases.get(
                                         &self.identifier_comparison_key(&ident.value),
                                     ) {
-                                        captured_bare |= !matches!(
-                                            spellings.as_slice(),
-                                            [only] if *only == ident.value
-                                        );
+                                        captured_bare |= absorbed_sort.is_some()
+                                            || !matches!(
+                                                spellings.as_slice(),
+                                                [only] if *only == ident.value
+                                            );
                                     }
                                 }
                                 _ => {}
