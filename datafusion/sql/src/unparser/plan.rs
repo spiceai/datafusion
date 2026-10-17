@@ -35,10 +35,10 @@ use super::{
         enclosed_qualifiers, expr_contains_subquery, filters_scope_their_projection,
         find_agg_node_within_select, find_unnest_node_within_select,
         find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
-        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
-        predicate_reads_unrepeatable_output, projection_below_filters,
-        scope_filters_over_projection, select_list_wraps_a_grouping_expr,
-        stacked_filters_read_unrepeatable_output,
+        name_derived_scope_outputs, name_scope_outputs, output_is_repeatable,
+        partition_subquery_filters, predicate_reads_unrepeatable_output,
+        projection_below_filters, scope_filters_over_projection,
+        select_list_wraps_a_grouping_expr, stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -53,7 +53,7 @@ use crate::unparser::{
     ast::FlattenRelationBuilder, ast::UnnestRelationBuilder, rewrite::rewrite_qualify,
 };
 use crate::utils::UNNEST_PLACEHOLDER;
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::{
     Column, DFSchema, DataFusionError, NullEquality, Result, ScalarValue, TableReference,
     assert_or_internal_err, internal_datafusion_err, internal_err, not_impl_err,
@@ -69,7 +69,11 @@ use datafusion_expr::{
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::{collections::HashSet, sync::Arc, vec};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    vec,
+};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -129,7 +133,7 @@ fn merged_without_conflict(have: &DFSchema, add: &DFSchema) -> Option<DFSchema> 
             Err(_) => {
                 let addition = DFSchema::new_with_metadata(
                     vec![(qualifier.cloned(), Arc::clone(field))],
-                    std::collections::HashMap::new(),
+                    HashMap::new(),
                 )
                 .ok()?;
                 merged = merged.join(&addition).ok()?;
@@ -228,6 +232,23 @@ fn plan_reads_an_outer_row(plan: &LogicalPlan) -> Result<bool> {
         })
     })?;
     Ok(correlated)
+}
+
+/// The names of the outer references `exprs` read, outside any subquery they
+/// hold. Each renders as its bare name.
+fn outer_reference_names<'a>(
+    exprs: impl IntoIterator<Item = &'a Expr>,
+) -> Result<Vec<String>> {
+    let mut names = vec![];
+    for expr in exprs {
+        expr.apply(|sub_expr| {
+            if let Expr::OuterReferenceColumn(_, column) = sub_expr {
+                names.push(column.name().to_string());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+    }
+    Ok(names)
 }
 
 /// Whether `plan` holds the definition of a recursive CTE called `name`.
@@ -1149,7 +1170,7 @@ impl Unparser<'_> {
         }
     }
 
-    fn contains_projection_before_relation(plan: &LogicalPlan) -> bool {
+    pub(super) fn contains_projection_before_relation(plan: &LogicalPlan) -> bool {
         match plan {
             LogicalPlan::Projection(_) => true,
             LogicalPlan::TableScan(_)
@@ -1264,6 +1285,208 @@ impl Unparser<'_> {
         });
 
         Ok(())
+    }
+
+    /// Whether `projection`, unparsed into a `SELECT` that already carries an
+    /// `ORDER BY`, leaves the `Sort`/`Limit` chain under it in a derived table
+    /// together with the aggregate below that chain.
+    ///
+    /// The Projection arm's fold drops an unfetched `Sort` under an existing order
+    /// and stops at the first fetched `Sort` or `Limit`, which applies before that
+    /// order; an aggregate under the stopping node goes into the derived table
+    /// with it. A sort key above such a projection then names the derived table's
+    /// output rather than the aggregate expression inside it.
+    fn projection_chain_derives_under_order(projection: &Projection) -> bool {
+        let mut cur = projection.input.as_ref();
+        loop {
+            match cur {
+                LogicalPlan::Sort(sort) if sort.fetch.is_none() => {
+                    cur = sort.input.as_ref();
+                }
+                LogicalPlan::Sort(_) | LogicalPlan::Limit(_) => {
+                    return find_agg_node_within_select(cur, true).is_some();
+                }
+                _ => return false,
+            }
+        }
+    }
+
+    /// Re-points a reference the clauses above a derived chain make onto the
+    /// derived table's outputs, which are addressed by bare name.
+    ///
+    /// A reference whose root names an output the derived table exposes
+    /// unqualified (`t.payload AS t`, read as `t.x`) and whose next part is a
+    /// field of that output is a struct access on it and is left alone; one whose
+    /// next part is no such field (`t.k` beside that output) reads a column of the
+    /// hidden `t`. Otherwise the relation prefix is dropped as
+    /// [`requalify_column_onto_derived_table`] drops it, and a longer path
+    /// (`t.payload.x`) loses only its relation when the hidden schema confirms
+    /// that `payload` is a column of the hidden `t`: a reference to a sibling
+    /// relation that merely starts the same way (`t.s.a` under full
+    /// qualification) does not match a column of `t` and keeps its qualifier.
+    ///
+    /// A reference whose whole qualifier names a hidden relation (`t.s.a`, a
+    /// column of `t.s`) reads that column even when a shorter prefix names
+    /// another hidden relation (`t`, with a column `s`).
+    ///
+    /// Returns `true`, leaving the reference unchanged, when it reads both a
+    /// field of such an output and a column of the hidden relation: outside the
+    /// derived table `t.k` can only be the field, so the column reference has no
+    /// spelling there. Likewise when `t.s.a` reads both the column `a` of `t.s`
+    /// and the field `a` of `t`'s struct column `s`.
+    fn repoint_onto_derived_chain(
+        idents: &mut Vec<Ident>,
+        hidden_schema: &DFSchema,
+        hidden_qualifiers: &HashSet<String>,
+    ) -> bool {
+        if idents.len() < 2 {
+            return false;
+        }
+        // The hidden column `idents[prefix_len]` reads when the parts before it
+        // name a hidden relation.
+        let hidden_column = |idents: &[Ident], prefix_len: usize| {
+            let qualifier = idents[..prefix_len]
+                .iter()
+                .map(|ident| ident.value.clone())
+                .collect::<Vec<String>>()
+                .join(".");
+            if !hidden_qualifiers.contains(&qualifier) {
+                return None;
+            }
+            let column = idents[prefix_len].value.as_str();
+            hidden_schema
+                .iter()
+                .find(|(field_qualifier, field)| {
+                    field.name() == column
+                        && field_qualifier.is_some_and(|field_qualifier| {
+                            field_qualifier.to_string() == qualifier
+                                || field_qualifier.table() == qualifier
+                        })
+                })
+                .map(|(_, field)| field)
+        };
+        // The longest prefix of `idents` (shorter than `max_len`) naming a
+        // hidden relation that has a column called by the part after it, and
+        // whose type has the rest of the parts as a field path: beside `t.s`
+        // with a scalar `a`, `t.s.a.b` is the path `a.b` of `t`'s struct `s`,
+        // not a field of that scalar.
+        let hidden_column_prefix = |idents: &[Ident], max_len: usize| {
+            (1..max_len).rev().find(|&prefix_len| {
+                hidden_column(idents, prefix_len).is_some_and(|field| {
+                    has_field_path(field.data_type(), &idents[prefix_len + 1..])
+                })
+            })
+        };
+        // Whether an output of this type has a field called `name` to access:
+        // only a struct or a map (dictionary encoded or not) has fields, so a
+        // scalar output named like the hidden relation (`sum(t.v) AS t`) leaves
+        // `t.k` a column of `t`. A map's keys are not in its type, so any part
+        // may be one.
+        fn has_field(data_type: &DataType, name: &str) -> bool {
+            match data_type {
+                DataType::Struct(fields) => {
+                    fields.iter().any(|field| field.name() == name)
+                }
+                DataType::Map(..) => true,
+                DataType::Dictionary(_, value) => has_field(value, name),
+                _ => false,
+            }
+        }
+        // Whether `path` names a field of `data_type`, a field of that, and so
+        // on. A map's part may be any key, and the rest of the path has to be a
+        // field path of the map's value type; `get_field` accepts a NULL base,
+        // answering NULL, whatever the path.
+        fn has_field_path(data_type: &DataType, path: &[Ident]) -> bool {
+            let Some((first, rest)) = path.split_first() else {
+                return true;
+            };
+            match data_type {
+                DataType::Struct(fields) => fields
+                    .iter()
+                    .find(|field| field.name() == &first.value)
+                    .is_some_and(|field| has_field_path(field.data_type(), rest)),
+                DataType::Map(entries, _) => match entries.data_type() {
+                    DataType::Struct(fields) => fields
+                        .get(1)
+                        .is_some_and(|value| has_field_path(value.data_type(), rest)),
+                    _ => false,
+                },
+                DataType::Null => true,
+                DataType::Dictionary(_, value) => has_field_path(value, path),
+                _ => false,
+            }
+        }
+        let root = idents[0].value.as_str();
+        let accesses_unqualified_output =
+            hidden_schema.iter().any(|(qualifier, field)| {
+                qualifier.is_none()
+                    && field.name() == root
+                    && has_field(field.data_type(), &idents[1].value)
+            });
+        if accesses_unqualified_output {
+            return hidden_column_prefix(idents, idents.len()).is_some();
+        }
+        if idents.len() == 2 {
+            requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+            return false;
+        }
+        // Under full qualification the whole qualifier may name a hidden
+        // relation (`t.s.a`, column `a` of `t.s`) while a shorter one names
+        // another (`t`, with a column `s`): the reference reads the column,
+        // which the derived table exposes by its bare name. Where that shorter
+        // column is a struct with a field of the next part's name, `t.s.a` is as
+        // well a field access on it, and the two have no common spelling
+        // outside the derived table.
+        let field_path_prefix = hidden_column_prefix(idents, idents.len() - 1);
+        if hidden_column(idents, idents.len() - 1).is_some() {
+            if let Some(prefix_len) = field_path_prefix
+                && hidden_column(idents, prefix_len).is_some_and(|field| {
+                    has_field(field.data_type(), &idents[prefix_len + 1].value)
+                })
+            {
+                return true;
+            }
+            idents.drain(..idents.len() - 1);
+            return false;
+        }
+        if let Some(prefix_len) = field_path_prefix {
+            // A shorter prefix naming another hidden relation whose column has
+            // the rest of the parts as a field path reads the reference as
+            // validly (`t.s.a.b`, both the path `a.b` of `t`'s struct `s` and
+            // the field `b` of `t.s`'s struct `a`): stripping either prefix may
+            // read the other relation's output, so it has no spelling here.
+            if hidden_column_prefix(idents, prefix_len).is_some() {
+                return true;
+            }
+            idents.drain(..prefix_len);
+            return false;
+        }
+        requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+        false
+    }
+
+    /// The expressions of `query`'s `ORDER BY` terms, in order; none when it
+    /// has no `ORDER BY` or orders by `ALL`.
+    fn order_by_terms(query: &QueryBuilder) -> Vec<ast::Expr> {
+        match query.get_order_by() {
+            Some(OrderByKind::Expressions(terms)) => {
+                terms.into_iter().map(|term| term.expr).collect()
+            }
+            _ => vec![],
+        }
+    }
+
+    /// The topmost `Sort` of the `Sort`/`Limit` chain starting at `plan`: the
+    /// one that decides the order of the rows the chain produces.
+    fn chain_sort(plan: &LogicalPlan) -> Option<&Sort> {
+        let mut cur = plan;
+        loop {
+            match cur {
+                LogicalPlan::Sort(sort) => return Some(sort),
+                LogicalPlan::Limit(limit) => cur = limit.input.as_ref(),
+                _ => return None,
+            }
+        }
     }
 
     /// Whether `plan`, a `Projection`, is going to move the aggregate below it
@@ -1639,9 +1862,10 @@ impl Unparser<'_> {
         Ok(select.has_selection())
     }
 
-    /// Unparses a `Limit` as a derived table, so the `WHERE` already on the
-    /// enclosing `SELECT` applies to the limited rows rather than to the rows
-    /// feeding the limit.
+    /// Unparses a `Limit`, or a `Sort` carrying a fetch, as a derived table, so a
+    /// clause already on the enclosing query — its `WHERE`, `ORDER BY` or row
+    /// bound — applies to the limited rows rather than to the rows feeding the
+    /// limit.
     ///
     /// The derived table takes the name of the relation it reads, because the
     /// predicate staying outside is still qualified by that name, and its
@@ -1661,8 +1885,9 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         select: &mut SelectBuilder,
         relation: &mut RelationBuilder,
+        reordered: bool,
     ) -> Result<()> {
-        let Some(table_ref) = Self::scanned_relation_of(plan) else {
+        let Some(table_ref) = Self::scanned_relation(plan, reordered) else {
             return not_impl_err!(
                 "Unparsing a row limit in a scope of its own is only supported when the limited input is a single table scan"
             );
@@ -1715,19 +1940,28 @@ impl Unparser<'_> {
     /// clauses that neither rename nor add columns and neither reorder nor
     /// combine rows from elsewhere.
     ///
-    /// A `Sort` is deliberately not walked through. It is the one such clause
-    /// whose effect does not survive being wrapped: SQL does not carry a
-    /// derived table's row order into the query selecting from it.
-    fn scanned_relation_of(plan: &LogicalPlan) -> Option<TableReference> {
+    /// A `Sort` is the one such clause whose effect does not survive being
+    /// wrapped: SQL does not carry a derived table's row order into the query
+    /// selecting from it. It is walked through only when `reordered`: where
+    /// the enclosing query re-establishes an order with an `ORDER BY` of its
+    /// own, or where the subtree is a join input, whose order the join leaves
+    /// unspecified. Everywhere else a sort under the limit orders what the
+    /// plan returns, and is what keeps the subtree out of a derived table.
+    fn scanned_relation(plan: &LogicalPlan, reordered: bool) -> Option<TableReference> {
         match plan {
             LogicalPlan::TableScan(scan) => Some(scan.table_name.clone()),
             LogicalPlan::SubqueryAlias(alias) => {
-                Self::scanned_relation_of(alias.input.as_ref())
+                Self::scanned_relation(alias.input.as_ref(), reordered)
                     .map(|_| alias.alias.clone())
             }
-            LogicalPlan::Limit(limit) => Self::scanned_relation_of(limit.input.as_ref()),
+            LogicalPlan::Limit(limit) => {
+                Self::scanned_relation(limit.input.as_ref(), reordered)
+            }
+            LogicalPlan::Sort(sort) if reordered => {
+                Self::scanned_relation(sort.input.as_ref(), reordered)
+            }
             LogicalPlan::Filter(filter) => {
-                Self::scanned_relation_of(filter.input.as_ref())
+                Self::scanned_relation(filter.input.as_ref(), reordered)
             }
             _ => None,
         }
@@ -1754,8 +1988,8 @@ impl Unparser<'_> {
         // projection already above the join, the dialect-alias derived table
         // (`SELECT 1 FROM b LIMIT n`) keeps its cardinality, as before.
         let projects_nothing = plan.schema().fields().is_empty();
-        if Self::scanned_relation_of(plan).is_some() && !projects_nothing {
-            return self.derive_row_limited_scope(plan, select, relation);
+        if Self::scanned_relation(plan, true).is_some() && !projects_nothing {
+            return self.derive_row_limited_scope(plan, select, relation, true);
         }
         if select.already_projected() {
             // The derived table hides every relation inside it, so an output
@@ -2321,7 +2555,9 @@ impl Unparser<'_> {
                 Ok(())
             }
             LogicalPlan::Projection(p) => {
-                if let Some(new_plan) = rewrite_plan_for_sort_on_non_projected_fields(p) {
+                if let Some(new_plan) =
+                    rewrite_plan_for_sort_on_non_projected_fields(self, p)
+                {
                     return self
                         .select_to_sql_recursively(&new_plan, query, select, relation);
                 }
@@ -2480,20 +2716,49 @@ impl Unparser<'_> {
                 let mut have_direct_limit = false;
                 let mut direct_limit: Option<&datafusion_expr::Limit> = None;
                 let mut have_order_by = false;
+                // A `Sort` or `Limit` above this projection may already have set
+                // this query's `ORDER BY` or row bound. The walk starts from that
+                // state, so a node below folds in only where it would have
+                // folded under a node the walk absorbed itself: an unfetched sort
+                // under the order is dropped, a bound under the order stops the
+                // walk, and a literal bound merges with the literal one above
+                // (spiceai/spiceai#14733).
+                if let Some(query_ref) = query.as_ref() {
+                    have_order_by = query_ref.has_order_by();
+                    if query_ref.bounds_rows() {
+                        match query_ref.literal_row_bound() {
+                            Some((skip, fetch)) => {
+                                combined_skip = skip;
+                                combined_fetch = fetch;
+                                have_combined_limit = true;
+                            }
+                            // The bound above is an expression, already emitted:
+                            // nothing below can merge with it.
+                            None => have_direct_limit = true,
+                        }
+                    }
+                }
                 loop {
                     match cur {
                         LogicalPlan::Limit(limit) => {
+                            // A predicate already on this SELECT came from
+                            // above the limit and must filter what the limit
+                            // produced; folding the limit in here would run
+                            // it after that predicate instead. Checked before
+                            // the order below stops the walk: a grouped
+                            // predicate (`HAVING`) has no scope that applies
+                            // it after the limit, so it is refused here
+                            // rather than left outside the derived table the
+                            // chain then becomes.
+                            let needs_own_scope =
+                                Self::row_limit_needs_own_scope(cur, select)?;
                             if have_order_by {
                                 // Limit-below-Sort: `ORDER BY … LIMIT N`
                                 // would apply the sort first, but the
                                 // logical plan applies the Limit first.
                                 break;
                             }
-                            // A predicate already on this SELECT came from
-                            // above the limit and must filter what the limit
-                            // produced; folding the limit in here would run
-                            // it after that predicate instead.
-                            if Self::row_limit_needs_own_scope(cur, select)? {
+                            if needs_own_scope {
                                 break;
                             }
                             let skip_lit = limit.get_skip_type()?;
@@ -2694,6 +2959,243 @@ impl Unparser<'_> {
                             )),
                         }));
                     }
+                }
+
+                // The chain under this projection is about to become a derived
+                // table (see `fully_absorbed`), which hides the relations its
+                // outputs are qualified by. The items reconstructed above and the
+                // clauses this SELECT already carries — an `ORDER BY` from a sort
+                // above, a `WHERE` from a filter above that — name those outputs
+                // the way the plan does, `t.k`; from outside the derived table
+                // only the bare name binds. A clause holding a subquery is left
+                // alone by the visitors and would keep naming the hidden
+                // relation: refused. Two outputs that differ only by qualifier
+                // (`t.k`, `u.k`) would share one bare name: refused as well
+                // (spiceai/spiceai#14733).
+                if !fully_absorbed && !select.within_join_input() {
+                    // The outputs this projection computes under a name of its
+                    // own. A bare key in this query's `ORDER BY` binds to such
+                    // an output before the derived table's column of that name
+                    // (`ORDER BY s` binding to `(0 - s) AS s`). Compared the way
+                    // the engine compares them, so `(0 - s) AS "S"` captures `s`
+                    // where identifiers fold. Each folded name keeps the
+                    // spellings that fold to it, for a key the plan spells bare.
+                    let mut computed_aliases: HashMap<String, Vec<String>> =
+                        HashMap::new();
+                    for expr in &p.expr {
+                        if let Expr::Alias(alias) = expr
+                            && !matches!(
+                                alias.expr.as_ref(),
+                                Expr::Column(column) if column.name() == alias.name
+                            )
+                        {
+                            let name = self.emitted_column_name(&alias.name)?;
+                            computed_aliases
+                                .entry(self.identifier_comparison_key(&name))
+                                .or_default()
+                                .push(name);
+                        }
+                    }
+                    // A row bound the enclosing query carries applies to the
+                    // derived table's rows in no particular order, while the
+                    // plan applies it to the rows the chain's sort produced.
+                    // The enclosing query re-establishes that order: the sort's
+                    // keys read the chain's outputs, which the derived table
+                    // exposes under the same names.
+                    if let Some(query_ref) = query.as_mut()
+                        && query_ref.bounds_rows()
+                        && !query_ref.has_order_by()
+                        && let Some(sort) = Self::chain_sort(cur)
+                    {
+                        // A key that cannot be evaluated a second time
+                        // (`random()`) would rank the derived table's rows
+                        // afresh, so the bound would keep the rows that second
+                        // ranking puts first, not those the chain's sort ranked.
+                        if sort
+                            .expr
+                            .iter()
+                            .any(|sort_expr| !output_is_repeatable(&sort_expr.expr))
+                        {
+                            return not_impl_err!(
+                                "Unparsing a row bound applied above a sorted chain is not supported when it orders by a sort key that cannot be evaluated a second time"
+                            );
+                        }
+                        // The re-established keys name the derived table's
+                        // outputs by bare name, which a computed alias of the
+                        // same name in this projection's list would capture.
+                        // Their outer references render as bare names too.
+                        let mut captured = false;
+                        for sort_expr in &sort.expr {
+                            for column in sort_expr.expr.column_refs() {
+                                captured |= computed_aliases.contains_key(
+                                    &self.emitted_column_key(column.name())?,
+                                );
+                            }
+                        }
+                        for name in outer_reference_names(
+                            sort.expr.iter().map(|sort_expr| &sort_expr.expr),
+                        )? {
+                            captured |= computed_aliases
+                                .contains_key(&self.emitted_column_key(&name)?);
+                        }
+                        if captured {
+                            return not_impl_err!(
+                                "Unparsing a row bound applied above a sorted chain is not supported when the projection computes an output named like one of the sort's keys"
+                            );
+                        }
+                        query_ref.order_by(self.sorts_to_sql(&sort.expr)?);
+                        // Its outer references render as bare names too, and
+                        // are checked against the derived outputs below.
+                        query_ref.set_order_by_outer_references(outer_reference_names(
+                            sort.expr.iter().map(|sort_expr| &sort_expr.expr),
+                        )?);
+                    }
+                    // Names are compared the way the engine compares them, so
+                    // `k` and `K` collide where identifiers fold case.
+                    let mut names = HashSet::new();
+                    for field in cur.schema().fields() {
+                        if !names.insert(self.emitted_column_key(field.name())?) {
+                            return not_impl_err!(
+                                "Unparsing a sort or limit between a projection and its aggregate is not supported when two of the aggregate's outputs share the name '{}'",
+                                field.name()
+                            );
+                        }
+                    }
+                    // An outer reference in the projection renders as a bare
+                    // name, which the derived table's output of that name
+                    // would capture — compared by the same folded key. So does
+                    // one in the keys of a sort this SELECT orders by: a sort
+                    // above, whose `ORDER BY` is already set, or the chain's
+                    // own sort absorbed into this SELECT.
+                    let mut read_outer_references = outer_reference_names(&p.expr)?;
+                    if let Some(query_ref) = query.as_ref() {
+                        read_outer_references.extend(
+                            query_ref.order_by_outer_references().iter().cloned(),
+                        );
+                    }
+                    if let Some(sort) = absorbed_sort {
+                        read_outer_references.extend(outer_reference_names(
+                            sort.expr.iter().map(|sort_expr| &sort_expr.expr),
+                        )?);
+                    }
+                    let mut captures_outer_reference = false;
+                    for name in &read_outer_references {
+                        captures_outer_reference |=
+                            names.contains(&self.emitted_column_key(name)?);
+                    }
+                    if captures_outer_reference {
+                        return not_impl_err!(
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when the projection reads an outer reference named like one of the aggregate's outputs"
+                        );
+                    }
+                    let hidden_schema = cur.schema();
+                    let hidden_qualifiers = enclosed_qualifiers(hidden_schema);
+                    let mut ambiguous = false;
+                    let mut repoint = |expr: &mut ast::Expr| {
+                        if let ast::Expr::CompoundIdentifier(idents) = expr {
+                            ambiguous |= Self::repoint_onto_derived_chain(
+                                idents,
+                                hidden_schema,
+                                &hidden_qualifiers,
+                            );
+                        }
+                    };
+                    let mut skipped =
+                        select.visit_expressions_in_clauses_mut(&mut repoint);
+                    // A sort above this projection already set an `ORDER BY`
+                    // whose whole-term key may be a qualified reference the walk
+                    // turns into a bare name. A computed alias of that name in
+                    // this projection's list then captures it — the alias is
+                    // what a bare `ORDER BY` term binds to first — and the order
+                    // reads the computed output rather than the column the plan
+                    // sorts by (`ORDER BY k` binding to `(0 - k) AS "K"`).
+                    //
+                    // A key the plan already spells bare (`ORDER BY s`) binds the
+                    // same way: to a computed alias whose name folds to its own
+                    // (`(0 - s) AS "S"`) rather than to the output it reads. A
+                    // sort above this projection reads its outputs, so its key
+                    // is left alone where it names that one alias, spelled as
+                    // the key spells it: the output the key does read. A sort
+                    // absorbed from below reads the derived table instead, so
+                    // any such alias captures its key, `(0 - s) AS s` included.
+                    let mut captured = false;
+                    let mut captured_bare = false;
+                    if let Some(query_ref) = query.as_mut() {
+                        let qualified_terms = Self::order_by_terms(query_ref)
+                            .iter()
+                            .map(|expr| {
+                                matches!(
+                                    expr,
+                                    ast::Expr::CompoundIdentifier(idents) if idents.len() > 1
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        skipped |= query_ref.visit_order_by_mut(&mut repoint);
+                        for (expr, was_qualified) in
+                            Self::order_by_terms(query_ref).iter().zip(qualified_terms)
+                        {
+                            match expr {
+                                ast::Expr::CompoundIdentifier(idents)
+                                    if was_qualified =>
+                                {
+                                    if let [ident] = idents.as_slice() {
+                                        captured |= computed_aliases.contains_key(
+                                            &self.identifier_comparison_key(&ident.value),
+                                        );
+                                    }
+                                }
+                                ast::Expr::Identifier(ident) => {
+                                    if let Some(spellings) = computed_aliases.get(
+                                        &self.identifier_comparison_key(&ident.value),
+                                    ) {
+                                        captured_bare |= absorbed_sort.is_some()
+                                            || !matches!(
+                                                spellings.as_slice(),
+                                                [only] if *only == ident.value
+                                            );
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    if skipped {
+                        return not_impl_err!(
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when a clause above the projection holds a subquery"
+                        );
+                    }
+                    if ambiguous {
+                        return not_impl_err!(
+                            "Unparsing a sort or limit between a projection and its aggregate is not supported when a reference above the projection names both a column of the hidden relation and a field of an output of the derived table"
+                        );
+                    }
+                    if captured {
+                        return not_impl_err!(
+                            "Unparsing a sort above a projection and its aggregate is not supported when the projection computes an output named like a key it re-points onto the derived table"
+                        );
+                    }
+                    if captured_bare {
+                        return not_impl_err!(
+                            "Unparsing a sort above a projection and its aggregate is not supported when the projection computes an output whose name folds to that of a bare key reading another output"
+                        );
+                    }
+                    // The derived table names every output by the logical name
+                    // the clauses above read it by: an unaliased aggregate
+                    // (`sum(t.v)`) is otherwise named by the engine (`sum` on
+                    // PostgreSQL) and the reference to it binds to nothing.
+                    let named = name_scope_outputs(cur)?;
+                    let alias = if matches!(cur, LogicalPlan::Sort(_)) {
+                        DERIVED_SORT_ALIAS
+                    } else {
+                        DERIVED_LIMIT_ALIAS
+                    };
+                    return self.derive_with_dialect_alias(
+                        alias,
+                        &named,
+                        relation,
+                        false,
+                        vec![],
+                    );
                 }
 
                 self.select_to_sql_recursively(cur, query, select, relation)
@@ -2931,9 +3433,8 @@ impl Unparser<'_> {
                 // derived table takes the scan's own name, which is what the
                 // join's `ON` and the select list already call this input
                 // (spiceai/spiceai#14375).
-                if select.within_join_input()
-                    && (limit.fetch.is_some() || limit.skip.is_some())
-                {
+                let bounded = limit.fetch.is_some() || limit.skip.is_some();
+                if select.within_join_input() && bounded {
                     return self.derive_join_input_limit(plan, select, relation);
                 }
                 // Limit can be top-level plan for derived table
@@ -2946,10 +3447,38 @@ impl Unparser<'_> {
                         vec![],
                     );
                 }
-                if (limit.fetch.is_some() || limit.skip.is_some())
-                    && Self::row_limit_needs_own_scope(plan, select)?
-                {
-                    return self.derive_row_limited_scope(plan, select, relation);
+                if bounded && Self::row_limit_needs_own_scope(plan, select)? {
+                    return self.derive_row_limited_scope(plan, select, relation, false);
+                }
+                // This query holds at most one `ORDER BY` and one row bound,
+                // either of which a node above this one may already have set,
+                // and both apply after everything below them. A limit under an
+                // `ORDER BY` selects its rows before that order, so it needs a
+                // scope of its own; a limit under another limit is read through
+                // it, so the two merge the way the optimizer merges them, or the
+                // inner takes a scope when either is an expression. Emitting this
+                // limit over the one above would keep the inner bound and lose
+                // the outer (spiceai/spiceai#14733).
+                if bounded && let Some(query_ref) = query.as_mut() {
+                    if query_ref.has_order_by() {
+                        return self
+                            .derive_row_limited_scope(plan, select, relation, true);
+                    }
+                    if query_ref.bounds_rows() {
+                        if let (SkipType::Literal(skip), FetchType::Literal(fetch)) =
+                            (limit.get_skip_type()?, limit.get_fetch_type()?)
+                            && query_ref.merge_inner_row_bound(skip, fetch)
+                        {
+                            return self.select_to_sql_recursively(
+                                limit.input.as_ref(),
+                                query,
+                                select,
+                                relation,
+                            );
+                        }
+                        return self
+                            .derive_row_limited_scope(plan, select, relation, false);
+                    }
                 }
                 if let Some(fetch) = &limit.fetch {
                     let Some(query) = query.as_mut() else {
@@ -2991,6 +3520,24 @@ impl Unparser<'_> {
                         vec![],
                     );
                 }
+                // A join leaves its output order unspecified, so a sort on one of
+                // its inputs orders nothing the enclosing query can observe, and
+                // its `ORDER BY` here would land on the enclosing query, displacing
+                // one a sort above the join set. A fetched one bounds that input's
+                // contribution, not the join's output, so it takes a scope of its
+                // own under the scan's name, as a join input's `Limit` does
+                // (spiceai/spiceai#14733).
+                if select.within_join_input() {
+                    if sort.fetch.is_some() {
+                        return self.derive_join_input_limit(plan, select, relation);
+                    }
+                    return self.select_to_sql_recursively(
+                        sort.input.as_ref(),
+                        query,
+                        select,
+                        relation,
+                    );
+                }
                 // A `Sort` carrying a `fetch` renders that fetch as this
                 // query's `LIMIT`, so it reorders against a predicate above it
                 // exactly as a `Limit` node does — but it cannot be moved into
@@ -3004,6 +3551,35 @@ impl Unparser<'_> {
                         "Unparsing a filter applied after a sort's fetch is not supported"
                     );
                 }
+                // A sort above this one has already set this query's `ORDER BY`
+                // and reorders whatever this sort produces: without a fetch this
+                // sort changes nothing it can observe, and with one its rows are
+                // selected before that order, so it takes a scope of its own.
+                // Emitting it here would replace the outer sort's keys under the
+                // outer sort's fetch (spiceai/spiceai#14733).
+                if query.as_ref().is_some_and(QueryBuilder::has_order_by) {
+                    if sort.fetch.is_some() {
+                        return self
+                            .derive_row_limited_scope(plan, select, relation, true);
+                    }
+                    return self.select_to_sql_recursively(
+                        sort.input.as_ref(),
+                        query,
+                        select,
+                        relation,
+                    );
+                }
+                // A bound set above this sort reads the rows its fetch leaves, so
+                // the two merge as literals. When they cannot, the sort is refused:
+                // `scanned_relation` stops at a sort that is not reordered, because
+                // a derived table around it would drop the order the plan returns.
+                if let Some(fetch) = sort.fetch
+                    && let Some(query_ref) = query.as_mut()
+                    && query_ref.bounds_rows()
+                    && !query_ref.merge_inner_row_bound(0, Some(fetch))
+                {
+                    return self.derive_row_limited_scope(plan, select, relation, false);
+                }
 
                 let Some(query_ref) = query else {
                     return internal_err!(
@@ -3011,29 +3587,66 @@ impl Unparser<'_> {
                     );
                 };
 
-                if let Some(fetch) = sort.fetch {
+                if let Some(fetch) = sort.fetch
+                    && !query_ref.bounds_rows()
+                {
                     query_ref.limit(Some(ast::Expr::value(ast::Value::Number(
                         fetch.to_string(),
                         false,
                     ))));
                 };
 
+                // The projection below may leave the chain under it in a derived
+                // table because of this sort's `ORDER BY` (see
+                // `projection_chain_derives_under_order`). The aggregate and any
+                // window are then that table's: a key reading their outputs
+                // keeps the reference the plan holds, which names the table's
+                // column, while the projection's own expressions are still
+                // substituted — inside a compound key a bare alias binds to the
+                // table's column rather than to the `SELECT` list's.
+                //
+                // An unfetched sort directly below is reordered by this one and
+                // dropped by the walk (see the `has_order_by` branch above), so
+                // the node this sort's keys resolve against is the one under it.
+                let mut below = sort.input.as_ref();
+                loop {
+                    match below {
+                        LogicalPlan::Sort(inner) if inner.fetch.is_none() => {
+                            below = inner.input.as_ref();
+                        }
+                        // A DISTINCT keeps its input's outputs and names, so the
+                        // keys resolve against what it reads.
+                        LogicalPlan::Distinct(Distinct::All(input)) => {
+                            below = input.as_ref();
+                        }
+                        _ => break,
+                    }
+                }
+                let keys_name_derived_outputs = matches!(
+                    below,
+                    LogicalPlan::Projection(projection)
+                        if Self::projection_chain_derives_under_order(projection)
+                );
                 // The projection below may be about to move the aggregate into a
                 // scope of its own. The aggregate is then not this SELECT's, and the
                 // sort key has to stay the reference the plan holds so it names that
                 // scope's output rather than the grouping expression inside it.
-                let agg = if self
-                    .projection_scopes_its_aggregate(sort.input.as_ref(), select)
+                let agg = if keys_name_derived_outputs
+                    || self.projection_scopes_its_aggregate(below, select)
                 {
                     None
                 } else {
                     find_agg_node_within_select(plan, select.already_projected())
                 };
-                let window_nodes = find_window_nodes_within_select(
-                    plan,
-                    None,
-                    select.already_projected(),
-                );
+                let window_nodes = if keys_name_derived_outputs {
+                    None
+                } else {
+                    find_window_nodes_within_select(
+                        plan,
+                        None,
+                        select.already_projected(),
+                    )
+                };
                 let windows: Option<Vec<&Window>> =
                     window_nodes.as_deref().map(|ws| ws.to_vec());
                 // unproject sort expressions
@@ -3045,12 +3658,15 @@ impl Unparser<'_> {
                             sort_expr.clone(),
                             agg,
                             windows.as_deref(),
-                            sort.input.as_ref(),
+                            below,
                         )
                     })
                     .collect::<Result<Vec<_>>>()?;
 
                 query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                query_ref.set_order_by_outer_references(outer_reference_names(
+                    sort_exprs.iter().map(|sort_expr| &sort_expr.expr),
+                )?);
 
                 self.select_to_sql_recursively(
                     sort.input.as_ref(),

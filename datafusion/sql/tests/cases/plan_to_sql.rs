@@ -56,6 +56,7 @@ use crate::common::{MockContextProvider, MockSessionState};
 use datafusion_expr::builder::{
     project, subquery_alias, table_scan_with_filter_and_fetch, table_scan_with_filters,
 };
+use datafusion_functions::core::expr_fn::{get_field, get_field_path};
 use datafusion_functions::core::planner::CoreFunctionPlanner;
 use datafusion_functions::unicode::planner::UnicodeFunctionPlanner;
 use datafusion_functions_nested::expr_fn::array_element;
@@ -6392,7 +6393,7 @@ fn test_unparse_aggregate_with_non_literal_limit_over_sort_with_fetch() -> Resul
         .build()?;
 
     let sql = Unparser::default().plan_to_sql(&plan)?.to_string();
-    insta::assert_snapshot!(sql, @r#"SELECT __agg_0 AS "max1(j1_id)" FROM (SELECT max(bla.j1_rename) AS __agg_0 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST LIMIT 5) LIMIT CAST(7 AS INTEGER)"#);
+    insta::assert_snapshot!(sql, @r#"SELECT __agg_0 AS "max1(j1_id)" FROM (SELECT max(bla.j1_rename) AS __agg_0 FROM (SELECT j1.j1_id AS j1_rename FROM j1) AS bla ORDER BY max(bla.j1_rename) ASC NULLS FIRST LIMIT 5) ORDER BY __agg_0 ASC NULLS FIRST LIMIT CAST(7 AS INTEGER)"#);
     Ok(())
 }
 
@@ -16235,7 +16236,7 @@ fn test_sort_above_union_keeps_a_struct_field_path() -> Result<()> {
             false,
         ),
     ]);
-    let key = datafusion_functions::core::expr_fn::get_field(col("t.s"), "f") + lit(1);
+    let key = get_field(col("t.s"), "f") + lit(1);
     for (union_distinct, right_table) in
         [(false, "w"), (true, "w"), (false, "s"), (true, "s")]
     {
@@ -16302,5 +16303,2184 @@ fn test_sort_above_union_drops_a_schema_qualified_relation() -> Result<()> {
             )
         );
     }
+    Ok(())
+}
+// A `Sort` or `Limit` stacked under one this SELECT already carries: the query
+// builder holds one `ORDER BY` and one row bound, so the inner node must either
+// fold into them faithfully or take a scope of its own, never overwrite them
+// (spiceai/spiceai#14733).
+
+#[test]
+fn test_a_fetched_sort_over_an_unfetched_sort_keeps_the_outer_keys() -> Result<()> {
+    // The outer sort decides both the order and the rows its fetch keeps; the inner
+    // sort is reordered by it, so it is emitted nowhere.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .sort(vec![col("u.b").sort(true, true)])?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_over_a_volatile_sort_keeps_the_outer_keys() -> Result<()> {
+    // Same stack over a volatile output: dropping the inner sort is also what keeps
+    // `random()` from being drawn a second time in an `ORDER BY`.
+    let plan = volatile_projection("u")?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, random() AS r FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_under_an_outer_sort_takes_a_scope_of_its_own() -> Result<()> {
+    // The inner fetch selects its rows before the outer sort orders them, so the
+    // inner sort becomes a derived table and the outer `ORDER BY` reads it.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .sort_with_limit(vec![col("u.b").sort(true, true)], Some(2))?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u ORDER BY u.b ASC NULLS FIRST LIMIT 2) AS u ORDER BY u.a ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_an_outer_sort_takes_a_scope_of_its_own() -> Result<()> {
+    // `LIMIT` is applied after `ORDER BY`, while this plan limits first and sorts
+    // the two survivors: the limit moves into a derived table.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u LIMIT 2) AS u ORDER BY u.a ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_a_sort_under_a_limit_keeps_every_bound() -> Result<()> {
+    // The outer `LIMIT 1` and the `ORDER BY` share this SELECT; the inner limit,
+    // applied before the sort, cannot, so it is the derived table's.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .sort(vec![col("u.a").sort(false, true)])?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u LIMIT 2) AS u ORDER BY u.a DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_stacked_limits_combine_as_the_optimizer_combines_them() -> Result<()> {
+    // `Limit(skip 1, fetch 2)` over `Limit(skip 2, fetch 5)`: the outer bound reads
+    // the inner's output, so the skips add and the outer fetch is cut to what the
+    // inner leaves past the outer skip.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(2, Some(5))?
+        .limit(1, Some(2))?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT * FROM u LIMIT 2 OFFSET 3");
+
+    // The outer fetch reaches past the inner one: what the inner leaves is the bound.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .limit(0, Some(5))?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT * FROM u LIMIT 2");
+
+    // The outer fetch is the smaller: it wins.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .limit(0, Some(1))?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT * FROM u LIMIT 1");
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_a_non_literal_limit_takes_a_scope_of_its_own() -> Result<()> {
+    // An outer bound that is an expression cannot be merged with the inner one, so
+    // the inner limit keeps its own scope and the outer applies above it.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(2))?
+        .limit_by_expr(None, Some(cast(lit(7_i64), DataType::Int32)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a, u.b FROM (SELECT * FROM u LIMIT 2) AS u LIMIT CAST(7 AS INTEGER)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_unfetched_sort_in_a_join_input_leaves_the_order_above_the_join_alone()
+-> Result<()> {
+    // A join leaves its output order unspecified, so an input's own sort orders
+    // nothing the enclosing query can observe — and must not replace the `ORDER BY`
+    // a sort above the join already set, which decides what its `LIMIT` keeps.
+    let inner = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .sort(vec![col("u.a").sort(false, false)])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join_on(
+            inner,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .sort_with_limit(vec![col("t.a").sort(true, true)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, u.a FROM t INNER JOIN u ON (t.a = u.a) ORDER BY t.a ASC NULLS FIRST LIMIT 3"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_in_a_join_input_bounds_that_input_only() -> Result<()> {
+    // The fetch bounds the input's contribution, not the join's output, so the
+    // sorted input becomes a derived table under the scan's own name.
+    let inner = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .sort_with_limit(vec![col("u.a").sort(false, false)], Some(2))?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .join_on(
+            inner,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, u.a FROM t INNER JOIN (SELECT u.a FROM u ORDER BY u.a DESC NULLS LAST LIMIT 2) AS u ON (t.a = u.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_folded_through_two_projections_keeps_the_outer_keys() -> Result<()> {
+    // The inner projection exposes a column nobody above reads; the sort over it is
+    // still hoisted, so the outer sort's order is the result's rather than a derived
+    // table's, which SQL does not carry out.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort(vec![col("u.b").sort(true, true)])?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort(vec![col("u.a").add(lit(1)).sort(true, true)])?
+        .project(vec![col("u.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a FROM u ORDER BY (u.a + 1) ASC NULLS FIRST"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_under_a_non_literal_limit_is_refused() -> Result<()> {
+    // The outer bound is an expression, so it cannot merge with the fetch, and a
+    // derived table around the sort would drop the order the plan returns its
+    // rows in. Refused rather than emitted with one bound in place of the other.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .limit_by_expr(None, Some(cast(lit(7_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("a fetched sort under an expression bound cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+    Ok(())
+}
+
+#[test]
+fn test_a_limit_under_a_sort_over_an_aggregate_is_refused() -> Result<()> {
+    // The limit selects its groups before the sort orders them, and an aggregate
+    // is not a scan a derived table can take the name of. Refused rather than
+    // emitted as `ORDER BY … LIMIT`, which would sort first.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .aggregate(vec![col("u.b")], vec![max(col("u.a")).alias("m")])?
+        .limit(0, Some(1))?
+        .sort(vec![col("m").sort(true, true)])?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("a limit under a sort over an aggregate cannot be unparsed");
+    assert_contains!(error.to_string(), "limited input is a single table scan");
+    Ok(())
+}
+
+#[test]
+fn test_a_compound_sort_key_over_a_computed_alias_above_a_derived_aggregate() -> Result<()>
+{
+    // The limit under the sort moves the aggregate into a derived table, so the
+    // key must not expand `s` to the aggregate expression — but it must still
+    // substitute the projection's own expression for the alias: inside a compound
+    // key `s` binds to the derived table's column, the un-negated sum, and the
+    // rows the fetch keeps would be the wrong ones.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![(lit(0) - col("s")).alias("s")])?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - s) AS s FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY ((0 - s) + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_compound_sort_key_on_a_group_column_above_a_derived_aggregate() -> Result<()> {
+    // The limit under the sort moves the aggregate into a derived table, which
+    // hides `t`; the passthrough item and the key that name `t.k` bind to the
+    // derived table's output by its bare name instead.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
+    );
+
+    // The same with the group column passed through under an alias.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k").alias("k")])?
+        .sort_with_limit(vec![(col("k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k AS k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_folded_through_two_projections_of_unaliased_expressions() -> Result<()> {
+    // The inner projection's unaliased expression is read by nobody above; the
+    // sorts still hoist through both projections, so the outer key is emitted on
+    // the scan's own column rather than on a relation a derived table would hide.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a") + col("u.b"), col("u.a"), col("u.b")])?
+        .sort(vec![(col("u.b") + lit(1)).sort(true, true)])?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort_with_limit(vec![(col("u.a") + lit(1)).sort(false, true)], Some(1))?
+        .project(vec![col("u.b")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.b FROM u ORDER BY (u.a + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_having_above_a_limited_aggregate_under_a_sort_is_refused() -> Result<()> {
+    // The filter on the aggregate's output is a HAVING; the limit under it moves
+    // the aggregate into a derived table, which no HAVING outside can apply to.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .filter(col("s").gt(lit(10)))?
+        .sort(vec![col("t.k").sort(true, true)])?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("a HAVING applied after a row limit cannot be unparsed");
+    assert_contains!(
+        error.to_string(),
+        "HAVING or QUALIFY predicate that is applied after a row limit"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_derived_aggregate_with_two_outputs_of_one_name_is_refused() -> Result<()> {
+    // `t.k` and `u.k` share one bare name once the derived table hides their
+    // qualifiers, so the passthrough items and the key could not be told apart.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["k"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.k").eq(col("u.k"))],
+        )?
+        .aggregate(
+            vec![col("t.k"), col("u.k")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), col("u.k")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("two derived outputs named alike cannot be unparsed");
+    assert_contains!(error.to_string(), "share the name 'k'");
+    Ok(())
+}
+
+#[test]
+fn test_an_unaliased_aggregate_output_above_a_derived_aggregate_is_named() -> Result<()> {
+    // The derived table names every output by the logical name the clauses above
+    // read it by; an engine would otherwise name `sum(t.v)` itself.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v"))])?
+        .limit(0, Some(2))?
+        .project(vec![col("sum(t.v)"), col("t.k")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "sum(t.v)", k FROM (SELECT t.k AS k, sum(t.v) AS "sum(t.v)" FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) DESC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_over_reordered_and_pruned_computed_aliases_keeps_its_scope() -> Result<()>
+{
+    // The outer projection reorders `x` and `y` and drops `u.c`. Dropping an
+    // output is folded only when every output kept is a plain column under its
+    // own name; `x` and `y` are computed, so the sort keeps its scope, where
+    // the fetch still selects the row the plan selects.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("u.a") + lit(1)).alias("x"),
+            (col("u.b") + lit(1)).alias("y"),
+            col("u.c"),
+        ])?
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![col("y"), col("x")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT y, x FROM (SELECT (u.a + 1) AS x, (u.b + 1) AS y, u.c FROM u ORDER BY ((u.a + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_on_an_unnamed_computed_output_the_outer_projection_drops()
+-> Result<()> {
+    // The sort reads the unnamed `u.a + u.b` by its schema name. The fold would
+    // drop that output and `u.c`, but it keeps `u.a AS x`, a renamed column, so
+    // it is not taken: the sort keeps its scope and reads the output by name.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            col("u.a").alias("x"),
+            col("u.a") + col("u.b"),
+            col("u.c"),
+        ])?
+        .sort_with_limit(vec![col("u.a + u.b").sort(true, true)], Some(1))?
+        .project(vec![col("x")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT x FROM (SELECT u.a AS x, (u.a + u.b) AS "u.a + u.b", u.c FROM u ORDER BY "u.a + u.b" ASC NULLS FIRST LIMIT 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_fetched_sort_over_an_unfetched_sort_resolves_its_keys_under_the_dropped_sort()
+-> Result<()> {
+    // The inner sort is dropped under the outer order, so the outer keys resolve
+    // against the projection beneath it: `s` names the derived table's output
+    // rather than expanding to the aggregate inside it.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .sort(vec![col("t.k").sort(true, true)])?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (s + 1) DESC NULLS FIRST LIMIT 1"
+    );
+
+    // The projection's own expression is still substituted into the key.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .sort(vec![col("t.k").sort(true, true)])?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - s) AS s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY ((0 - s) + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_key_reading_a_dropped_volatile_output_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // Folding the sort would substitute `random()` at both references of `r`,
+    // turning the key `(r - r) * 100 + a`, which is `a`, into a difference of two
+    // draws. The fold is skipped, so the sort stays in the scope that computes
+    // `r`. The repetition of `random()` inside that scope's own key is
+    // spiceai/spiceai#14109's, fixed by spiceai/datafusion#247.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a"), random().alias("r"), col("u.c")])?
+        .sort_with_limit(
+            vec![((col("r") - col("r")) * lit(100.0) + col("u.a")).sort(true, true)],
+            Some(1),
+        )?
+        .project(vec![col("u.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a FROM (SELECT u.a, random() AS r, u.c FROM u ORDER BY (((random() - random()) * 100.0) + u.a) ASC NULLS FIRST LIMIT 1)"
+    );
+
+    // The same without `u.c`: the fold the sets' equality admits declines too.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .sort_with_limit(
+            vec![((col("r") - col("r")) * lit(100.0) + col("u.a")).sort(true, true)],
+            Some(1),
+        )?
+        .project(vec![col("u.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a FROM (SELECT u.a, random() AS r FROM u ORDER BY (((random() - random()) * 100.0) + u.a) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_reading_a_same_named_output_below_is_substituted_once()
+-> Result<()> {
+    // `(s + 1) AS s` reads the aggregate's own `s`; the substitution must not
+    // walk into its replacement and substitute that `s` again.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .project(vec![
+            col("t.k"),
+            (col("s") + lit(1)).alias("s"),
+            col("t.k").alias("unused"),
+        ])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(1))?
+        .project(vec![col("t.k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.k FROM t GROUP BY t.k ORDER BY (sum(t.v) + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_key_reading_a_projected_integer_literal_is_dropped_from_the_fold()
+-> Result<()> {
+    // Substituted, the key would be the bare `1`, which `ORDER BY` reads as the
+    // first select item; a constant orders nothing, so the key is dropped and
+    // the remaining key decides.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a"), col("u.b"), lit(1), col("u.c")])?
+        .sort_with_limit(
+            vec![
+                col("Int32(1)").sort(true, true),
+                col("u.b").sort(true, true),
+            ],
+            Some(1),
+        )?
+        .project(vec![col("u.a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a FROM u ORDER BY u.b ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_whose_column_a_surviving_alias_shadows_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // Dropping `s AS x` would substitute `s` into the key, where the surviving
+    // `0 - s AS s` captures the name; the plan orders by the input's `s`. The
+    // fold is skipped, so the sort stays in the scope that reads it.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a").alias("s"), col("u.c").alias("unused")])?
+        .project(vec![
+            (lit(0) - col("s")).alias("s"),
+            col("s").alias("x"),
+            col("unused"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT (0 - s) AS s, s AS x, unused FROM (SELECT u.a AS s, u.c AS unused FROM u) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_expression_bound_above_a_sorted_chain_re_establishes_the_order() -> Result<()>
+{
+    // The expression bound cannot merge with the fetch, so the sorted chain
+    // becomes a derived table whose order the outer `LIMIT` would not see; the
+    // outer query orders by the same key, which the derived table exposes.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(vec![col("s").sort(false, true)], Some(3))?
+        .project(vec![col("s"), col("t.k")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k ORDER BY sum(t.v) DESC NULLS FIRST LIMIT 3) ORDER BY s DESC NULLS FIRST LIMIT CAST(1 AS INTEGER)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_derived_outputs_whose_names_differ_only_by_case_are_refused() -> Result<()> {
+    // `k` and `K` are one name to an engine that folds identifier case, so the
+    // derived table's two outputs could not be told apart by bare name.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["K"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.k").eq(Expr::Column(Column::new(Some("u"), "K")))],
+        )?
+        .aggregate(
+            vec![col("t.k"), Expr::Column(Column::new(Some("u"), "K"))],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), Expr::Column(Column::new(Some("u"), "K"))])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan)
+        .expect_err("two derived outputs named alike up to case cannot be unparsed");
+    assert_contains!(error.to_string(), "share the name 'K'");
+    Ok(())
+}
+
+#[test]
+fn test_a_struct_field_key_above_a_derived_aggregate_is_repointed() -> Result<()> {
+    // The key reads a field of the struct output; the derived table hides `t`,
+    // so the field path keeps everything after the relation.
+    let payload = DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("t.payload")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("t.payload"), col("s")])?
+        .sort_with_limit(
+            vec![(get_field(col("t.payload"), "x") + lit(1)).sort(false, true)],
+            Some(1),
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT payload, s FROM (SELECT t.payload AS payload, sum(t.v) AS s FROM t GROUP BY t.payload LIMIT 2) ORDER BY (payload.x + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_named_like_a_derived_output_is_refused() -> Result<()> {
+    // `outer_ref(s)` renders as the bare `s`, which the derived table's own `s`
+    // would capture.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(1))?
+        .project(vec![
+            Expr::OuterReferenceColumn(
+                Arc::new(Field::new("s", DataType::Int32, false)),
+                Column::from_name("s"),
+            )
+            .alias("wanted"),
+            col("t.k"),
+        ])?
+        .sort_with_limit(vec![col("t.k").sort(true, true)], Some(1))?
+        .project(vec![col("wanted")])?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference a derived output would capture cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer reference named like one of the aggregate's outputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_scalar_output_named_like_the_hidden_relation_does_not_keep_its_qualifier()
+-> Result<()> {
+    // The aggregate's scalar `t` shares its name with the relation the derived
+    // table hides, but `t.k` is no field access on it: the key is repointed
+    // onto the derived table's `k` like any other column of `t`.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("t")])?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), Expr::Column(Column::from_name("t"))])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k, t FROM (SELECT t.k AS k, sum(t.v) AS t FROM t GROUP BY t.k LIMIT 2) ORDER BY (k + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_expression_bound_above_a_computed_alias_named_like_the_key_in_another_case_is_refused()
+-> Result<()> {
+    // `(0 - s) AS "S"` captures the re-established `ORDER BY s` wherever
+    // identifiers fold case, as `(0 - s) AS s` does everywhere.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(3))?
+        .project(vec![(lit(0) - col("s")).alias("S"), col("t.k")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a computed alias named like the re-established key in another case cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like one of the sort's keys"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_named_like_a_derived_output_in_another_case_is_refused()
+-> Result<()> {
+    // `outer_ref(S)` renders as `"S"`, which the derived table's own `s` would
+    // capture wherever identifiers fold case.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(1))?
+        .project(vec![
+            Expr::OuterReferenceColumn(
+                Arc::new(Field::new("S", DataType::Int32, false)),
+                Column::from_name("S"),
+            )
+            .alias("wanted"),
+            col("t.k"),
+        ])?
+        .sort_with_limit(vec![col("t.k").sort(true, true)], Some(1))?
+        .project(vec![col("wanted")])?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference a derived output would capture in another case cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer reference named like one of the aggregate's outputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_whose_column_a_surviving_alias_in_another_case_shadows_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // The surviving `(0 - s) AS "S"` captures a substituted `s` wherever
+    // identifiers fold case, so the fold is skipped as it is for `AS s`.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a").alias("s"), col("u.c").alias("unused")])?
+        .project(vec![
+            (lit(0) - col("s")).alias("S"),
+            col("s").alias("x"),
+            col("unused"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![Expr::Column(Column::from_name("S"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT \"S\" FROM (SELECT (0 - s) AS \"S\", s AS x, unused FROM (SELECT u.a AS s, u.c AS unused FROM u) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_over_a_distinct_over_a_projection_resolves_its_keys_under_the_distinct()
+-> Result<()> {
+    // The DISTINCT keeps the projection's outputs and names, so the key resolves
+    // against the projection beneath it rather than expanding to the aggregate.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("s"), col("t.k")])?
+        .distinct()?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(false, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT DISTINCT s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (s + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_struct_output_named_like_the_hidden_relation_keeps_its_root() -> Result<()> {
+    // The aggregate exposes `t.payload AS t`; a key reading `t.x` reads that
+    // struct output, not a column of the hidden relation `t`, so its root stays.
+    let payload = DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.payload").alias("t")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t"), col("s")])?
+        .sort_with_limit(
+            vec![(get_field(col("t"), "x") + lit(1)).sort(false, true)],
+            Some(1),
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t, s FROM (SELECT t.payload AS t, sum(t.v) AS s FROM t GROUP BY t.payload LIMIT 2) ORDER BY (t.x + 1) DESC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_expression_bound_above_a_computed_alias_named_like_the_key_is_refused()
+-> Result<()> {
+    // The re-established `ORDER BY s` would bind to the projection's
+    // `(0 - s) AS s` rather than to the derived table's `s`, and the bound would
+    // keep the row the negated output ranks first.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(3))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a computed alias named like the re-established key cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like one of the sort's keys"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_group_column_key_beside_a_struct_output_named_like_the_hidden_relation_is_repointed()
+-> Result<()> {
+    // The aggregate exposes both the group column `t.k` and the struct output
+    // `t.payload AS t`, whose only field is `x`. The key `t.k` reads the group
+    // column, not a field of the struct output, so it is repointed onto the
+    // derived table's `k` like any other column of the hidden `t`.
+    let payload = DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.k"), col("t.payload").alias("t")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), col("t"), col("s")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k, t, s FROM (SELECT t.k AS k, t.payload AS t, sum(t.v) AS s FROM t GROUP BY t.k, t.payload LIMIT 2) ORDER BY (k + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_group_column_key_that_is_also_a_field_of_a_struct_output_named_like_the_hidden_relation_is_refused()
+-> Result<()> {
+    // The struct output `t` has a field `k` and the hidden `t` a column `k`:
+    // `t.k` outside the derived table could only read the struct's field, so the
+    // key that reads the column cannot be told apart from it.
+    let payload = DataType::Struct(vec![Field::new("k", DataType::Int32, false)].into());
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("payload", payload, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(
+            vec![col("t.k"), col("t.payload").alias("t")],
+            vec![sum(col("t.v")).alias("s")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k"), col("t"), col("s")])?
+        .sort_with_limit(vec![(col("t.k") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a key naming both a hidden column and a struct output's field cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "names both a column of the hidden relation and a field of an output"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sort_above_a_computed_alias_named_like_its_repointed_key_in_another_case_is_refused()
+-> Result<()> {
+    // The key `t.k` is repointed onto the derived table's bare `k`, which the
+    // projection's `(0 - t.k) AS "K"` captures wherever identifiers fold case:
+    // the fetch would keep the row the negated output ranks first.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![(lit(0) - col("t.k")).alias("K"), col("t.k")])?
+        .sort_with_limit(vec![col("t.k").sort(true, true)], Some(1))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "a computed alias capturing a repointed key in another case cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like a key it re-points onto the derived table"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_schema_qualified_key_above_a_derived_aggregate_drops_its_whole_qualifier()
+-> Result<()> {
+    // Under full qualification `t.s.a` reads column `a` of the schema-qualified
+    // `t.s`, not field `a` of table `t`'s column `s`, although `t` has a column
+    // `s` the derived table also exposes. The key is repointed onto the derived
+    // table's `a`: `s.a` would read a field of the scalar output `s`.
+    let t_s = TableReference::partial("t", "s");
+    let left = table_scan(Some("t"), &int32_schema(&["s"]), None)?.build()?;
+    let right =
+        table_scan(Some(t_s.clone()), &int32_schema(&["a", "v"]), None)?.build()?;
+    let a = Expr::Column(Column::new(Some(t_s.clone()), "a"));
+    let plan = LogicalPlanBuilder::from(left)
+        .cross_join(right)?
+        .aggregate(
+            vec![col("t.s"), a.clone()],
+            vec![sum(Expr::Column(Column::new(Some(t_s), "v"))).alias("total")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s"), a.clone()])?
+        .sort_with_limit(vec![(a + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @"SELECT s, a FROM (SELECT t.s AS s, t.s.a AS a, sum(t.s.v) AS total FROM t CROSS JOIN t.s GROUP BY t.s, t.s.a LIMIT 2) ORDER BY (a + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_schema_qualified_key_that_is_also_a_field_path_above_a_derived_aggregate_is_refused()
+-> Result<()> {
+    // Here `t`'s column `s` is a struct with a field `a`, so under full
+    // qualification `t.s.a` reads both that field and column `a` of `t.s`:
+    // outside the derived table one is `s.a` and the other `a`, and the
+    // emitted reference no longer says which.
+    let t_s = TableReference::partial("t", "s");
+    let payload = DataType::Struct(vec![Field::new("a", DataType::Int32, false)].into());
+    let left = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let right =
+        table_scan(Some(t_s.clone()), &int32_schema(&["a", "v"]), None)?.build()?;
+    let a = Expr::Column(Column::new(Some(t_s.clone()), "a"));
+    let plan = LogicalPlanBuilder::from(left)
+        .cross_join(right)?
+        .aggregate(
+            vec![col("t.s"), a.clone()],
+            vec![sum(Expr::Column(Column::new(Some(t_s), "v"))).alias("total")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s"), a.clone()])?
+        .sort_with_limit(vec![(a + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let error = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("a key that is both a column and a field path cannot be unparsed");
+    assert_contains!(
+        error.to_string(),
+        "names both a column of the hidden relation and a field of an output"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_in_a_sort_above_a_derived_aggregate_named_like_its_output_is_refused()
+-> Result<()> {
+    // The sort key's `outer_ref(s)` renders as the bare `s`, which the derived
+    // table's own `s` would capture: the order would read the aggregate rather
+    // than the enclosing query's value.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k")])?
+        .sort_with_limit(
+            vec![
+                (Expr::OuterReferenceColumn(
+                    Arc::new(Field::new("s", DataType::Int32, false)),
+                    Column::from_name("s"),
+                ) * col("t.k"))
+                .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference in a sort key a derived output would capture cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer reference named like one of the aggregate's outputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_whose_column_a_declared_output_name_shadows_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // The inner projection declares its schema: `a + b` is named `c`. The key
+    // `x` reads the dropped `c AS x`, whose substituted `c` the kept `a + b`
+    // (declared `c`) would capture, ordering by `a + b` instead of `c`.
+    let input = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("c"),
+        ])?
+        .build()?;
+    let declared = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("x", DataType::Int32, false),
+            Field::new("unused", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let projection = datafusion_expr::Projection::try_new_with_schema(
+        vec![
+            col("a") + col("b"),
+            col("c").alias("x"),
+            col("a").alias("unused"),
+        ],
+        Arc::new(input),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(projection))
+        .sort_with_limit(vec![col("x").sort(true, false)], Some(1))?
+        .project(vec![col("c")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT c FROM (SELECT (a + b) AS c, c AS x, a AS unused FROM (SELECT t.a AS a, t.b AS b, t.c AS c FROM t) ORDER BY x ASC NULLS LAST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_in_a_sort_absorbed_over_a_derived_aggregate_named_like_its_output_is_refused()
+-> Result<()> {
+    // The sort sits between the projection and the bounded aggregate, so its
+    // `ORDER BY` lands on the projection's SELECT; its `outer_ref(s)` renders as
+    // the bare `s` there, which the derived table's own `s` would capture.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .limit(0, Some(2))?
+        .sort(vec![
+            (Expr::OuterReferenceColumn(
+                Arc::new(Field::new("s", DataType::Int32, false)),
+                Column::from_name("s"),
+            ) * col("t.k"))
+            .sort(true, true),
+        ])?
+        .project(vec![col("t.k")])?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference in an absorbed sort key a derived output would capture cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer reference named like one of the aggregate's outputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_field_path_key_spelled_like_a_schema_qualified_column_is_refused() -> Result<()>
+{
+    // Relations `t`, `t.s` and `t.s.a`: the key reads the field path `a.b` of
+    // `t`'s struct `s`, which renders as `t.s.a.b`, the spelling of column `b`
+    // of `t.s.a` too, although `t.s`'s own `a` is a scalar. The key is refused
+    // rather than repointed onto the derived table's unrelated `b`.
+    let t_s = TableReference::partial("t", "s");
+    let t_s_a = TableReference::full("t", "s", "a");
+    let inner = DataType::Struct(vec![Field::new("b", DataType::Int32, false)].into());
+    let payload = DataType::Struct(vec![Field::new("a", inner, false)].into());
+    let t = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let ts = table_scan(Some(t_s.clone()), &int32_schema(&["a"]), None)?.build()?;
+    let tsa =
+        table_scan(Some(t_s_a.clone()), &int32_schema(&["b", "v"]), None)?.build()?;
+    let b = Expr::Column(Column::new(Some(t_s_a.clone()), "b"));
+    let plan = LogicalPlanBuilder::from(t)
+        .cross_join(ts)?
+        .cross_join(tsa)?
+        .aggregate(
+            vec![
+                col("t.s"),
+                Expr::Column(Column::new(Some(t_s), "a")),
+                b.clone(),
+            ],
+            vec![sum(Expr::Column(Column::new(Some(t_s_a), "v"))).alias("total")],
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s"), b])?
+        .sort_with_limit(
+            vec![(get_field(get_field(col("t.s"), "a"), "b") + lit(1)).sort(true, true)],
+            Some(1),
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let error = Unparser::new(&dialect)
+        .plan_to_sql(&plan)
+        .expect_err("a key that is both a column and a field path cannot be unparsed");
+    assert_contains!(
+        error.to_string(),
+        "names both a column of the hidden relation and a field of an output"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_in_a_re_established_sort_named_like_a_derived_output_is_refused()
+-> Result<()> {
+    // The expression bound above cannot merge with the sort's fetch, so the
+    // sorted chain becomes a derived table and the bound's query re-establishes
+    // its order; the key's `outer_ref(s)` renders there as the bare `s`, which
+    // the derived table's own `s` would capture.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(
+            vec![
+                (Expr::OuterReferenceColumn(
+                    Arc::new(Field::new("s", DataType::Int32, false)),
+                    Column::from_name("s"),
+                ) * col("t.k"))
+                .sort(true, true),
+            ],
+            Some(3),
+        )?
+        .project(vec![col("t.k")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference in a re-established sort key a derived output would capture cannot be unparsed",
+    );
+    assert_contains!(
+        error.to_string(),
+        "outer reference named like one of the aggregate's outputs"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_output_keeps_the_declared_name_the_fold_gives_it_in_the_shadow_guard()
+-> Result<()> {
+    // The outer list repeats `c`, so the folded projection names the second
+    // copy of `a + b` by the outer field `z`. The key `x` reads the dropped
+    // `z AS x`, whose substituted `z` that second copy would capture, ordering
+    // by `a + b` instead of `z`.
+    let input = table_scan(Some("t"), &int32_schema(&["a", "b", "z"]), None)?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.z").alias("z"),
+        ])?
+        .build()?;
+    let inner_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("x", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![col("a") + col("b"), col("z").alias("x")],
+        Arc::new(input),
+        Arc::new(inner_schema),
+    )?;
+    let sorted = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("c", DataType::Int32, false),
+            Field::new("z", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("c"), col("c")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT c, c FROM (SELECT (a + b) AS c, z AS x FROM (SELECT t.a AS a, t.b AS b, t.z AS z FROM t) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_output_whose_fold_names_collide_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // The outer list repeats `x`, so the folded projection would name the
+    // second copy by the outer field `y`, colliding with the kept `y`. Taking
+    // the outer schema instead would resolve the key `y + 1` by position onto
+    // the second copy of `t.a + 1`. The fold is skipped.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c").alias("unused"),
+        ])?
+        .sort_with_limit(vec![(col("y") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x"), col("y")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x, x, y FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y, t.c AS unused FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+
+    // The same without `unused`: the fold the sets' equality admits declines too.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+        ])?
+        .sort_with_limit(vec![(col("y") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+            Field::new("w", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x"), col("y")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x, x, y FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_reading_an_outer_reference_a_kept_output_shadows_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // Dropping `outer_ref(s) * u.a AS x` would substitute the outer `s` into
+    // the key, which renders by its bare name and binds to the kept `0 - u.a
+    // AS s` instead of the enclosing query's `s`. The fold is skipped.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (lit(0) - col("u.a")).alias("s"),
+            (out_ref_col(DataType::Int32, "s") * col("u.a")).alias("x"),
+            col("u.c"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT (0 - u.a) AS s, (s * u.a) AS x, u.c FROM u ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_flattened_field_path_key_takes_the_prefix_whose_type_has_the_path() -> Result<()>
+{
+    // Relations `t` (struct `s` with path `a.b`) and `t.s` (scalar `a`): the
+    // flattened key `get_field(t.s, 'a', 'b')` renders as `t.s.a.b`. The
+    // longest relation prefix `t.s` leaves `a.b`, a field of a scalar; the
+    // prefix `t` leaves `s.a.b`, the path the key reads.
+    let t_s = TableReference::partial("t", "s");
+    let inner = DataType::Struct(vec![Field::new("b", DataType::Int32, false)].into());
+    let payload = DataType::Struct(vec![Field::new("a", inner, false)].into());
+    let t = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let ts = table_scan(Some(t_s.clone()), &int32_schema(&["a"]), None)?.build()?;
+    let plan = LogicalPlanBuilder::from(t)
+        .cross_join(ts)?
+        .aggregate(
+            vec![col("t.s"), Expr::Column(Column::new(Some(t_s), "a"))],
+            Vec::<Expr>::new(),
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s")])?
+        .sort_with_limit(
+            vec![
+                (get_field_path(col("t.s"), vec![lit("a"), lit("b")]) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT t.s AS s, t.s.a AS a FROM t CROSS JOIN t.s GROUP BY t.s, t.s.a LIMIT 2) ORDER BY (s.a.b + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_flattened_field_path_key_does_not_read_past_a_map_value_that_has_no_field()
+-> Result<()> {
+    // Relations `t` (struct `s` with path `a.b.c`) and `t.s` (map `a` of int
+    // values): the flattened key `get_field(t.s, 'a', 'b', 'c')` renders as
+    // `t.s.a.b.c`. Through the prefix `t.s`, `a['b']` is an int with no field
+    // `c`, so only the prefix `t` leaves the path the key reads, `s.a.b.c`.
+    let t_s = TableReference::partial("t", "s");
+    let leaf = DataType::Struct(vec![Field::new("c", DataType::Int32, false)].into());
+    let inner = DataType::Struct(vec![Field::new("b", leaf, false)].into());
+    let payload = DataType::Struct(vec![Field::new("a", inner, false)].into());
+    let map = DataType::Map(
+        Arc::new(Field::new(
+            "entries",
+            DataType::Struct(
+                vec![
+                    Field::new("key", DataType::Utf8, false),
+                    Field::new("value", DataType::Int32, true),
+                ]
+                .into(),
+            ),
+            false,
+        )),
+        false,
+    );
+    let t = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let ts = table_scan(
+        Some(t_s.clone()),
+        &Schema::new(vec![Field::new("a", map, false)]),
+        None,
+    )?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(t)
+        .cross_join(ts)?
+        .aggregate(
+            vec![col("t.s"), Expr::Column(Column::new(Some(t_s), "a"))],
+            Vec::<Expr>::new(),
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s")])?
+        .sort_with_limit(
+            vec![
+                (get_field_path(col("t.s"), vec![lit("a"), lit("b"), lit("c")]) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    assert_snapshot!(
+        Unparser::new(&dialect).plan_to_sql(&plan)?,
+        @"SELECT s FROM (SELECT t.s AS s, t.s.a AS a FROM t CROSS JOIN t.s GROUP BY t.s, t.s.a LIMIT 2) ORDER BY (s.a.b.c + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_flattened_field_path_key_two_relation_prefixes_can_read_is_refused()
+-> Result<()> {
+    // Relations `t` (struct `s` with path `a.b`) and `t.s` (struct `a` with
+    // field `b`): the flattened key `get_field(t.s, 'a', 'b')` renders as
+    // `t.s.a.b`, which both prefixes read as a valid path. Stripping either
+    // could read the other relation's output, so the plan is refused.
+    let t_s = TableReference::partial("t", "s");
+    let inner = DataType::Struct(vec![Field::new("b", DataType::Int32, false)].into());
+    let payload = DataType::Struct(vec![Field::new("a", inner.clone(), false)].into());
+    let t = table_scan(
+        Some("t"),
+        &Schema::new(vec![Field::new("s", payload, false)]),
+        None,
+    )?
+    .build()?;
+    let ts = table_scan(
+        Some(t_s.clone()),
+        &Schema::new(vec![Field::new("a", inner, false)]),
+        None,
+    )?
+    .build()?;
+    let plan = LogicalPlanBuilder::from(t)
+        .cross_join(ts)?
+        .aggregate(
+            vec![col("t.s"), Expr::Column(Column::new(Some(t_s), "a"))],
+            Vec::<Expr>::new(),
+        )?
+        .limit(0, Some(2))?
+        .project(vec![col("t.s")])?
+        .sort_with_limit(
+            vec![
+                (get_field_path(col("t.s"), vec![lit("a"), lit("b")]) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .build()?;
+
+    let dialect = CustomDialectBuilder::default()
+        .with_full_qualified_col(true)
+        .build();
+    let err = Unparser::new(&dialect).plan_to_sql(&plan).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("names both a column of the hidden relation"),
+        "{err}"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_output_taking_a_dropped_outputs_name_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // The outer list repeats `x` and declares the copies `z` and `y`, so the
+    // folded projection names the second copy `y`, the name of the inner
+    // `t.b + 1` it drops. The key `y + 1` would then read the copy of `t.a + 1`
+    // by that name instead of being substituted. The fold is skipped.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c").alias("unused"),
+        ])?
+        .sort_with_limit(vec![(col("y") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x, x FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y, t.c AS unused FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+
+    // The same without `unused`: the fold the sets' equality admits declines too.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+        ])?
+        .sort_with_limit(vec![(col("y") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x, x FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_output_taking_a_dropped_outputs_name_keeps_the_sort_for_a_key_not_reading_it()
+-> Result<()> {
+    // As above, with the key reading `x`. The fold would drop `y` and `unused`
+    // while keeping the computed `x` twice, outside the subset it is taken in,
+    // so the sort keeps its scope here too.
+    let sorted = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c").alias("unused"),
+        ])?
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(3))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("z", DataType::Int32, false),
+            Field::new("y", DataType::Int32, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("x"), col("x")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x, x FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y, t.c AS unused FROM t ORDER BY ((t.a + 1) + 1) ASC NULLS FIRST LIMIT 3)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_unnamed_output_declared_under_another_name_is_substituted_by_its_field()
+-> Result<()> {
+    // The inner projection declares `t.a + t.b` as `x` and `t.c + 1` under the
+    // field name `t.a + t.b`. The key reads the second output by that field
+    // name; the fold keeps only `t.d`, so the key must be substituted with
+    // `t.c + 1`, not left reading a name the first output's expression spells.
+    let input =
+        table_scan(Some("t"), &int32_schema(&["a", "b", "c", "d"]), None)?.build()?;
+    let inner_schema = DFSchema::new_with_metadata(
+        vec![
+            (None, Arc::new(Field::new("x", DataType::Int32, false))),
+            (
+                None,
+                Arc::new(Field::new("t.a + t.b", DataType::Int32, false)),
+            ),
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("d", DataType::Int32, false)),
+            ),
+        ],
+        Default::default(),
+    )?;
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![col("t.a") + col("t.b"), col("t.c") + lit(1), col("t.d")],
+        Arc::new(input),
+        Arc::new(inner_schema),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort_with_limit(
+            vec![Expr::Column(Column::new_unqualified("t.a + t.b")).sort(true, true)],
+            Some(1),
+        )?
+        .project(vec![col("t.d")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.d FROM t ORDER BY (t.c + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_unqualified_by_a_derived_aggregate_scope_keeps_the_sort()
+-> Result<()> {
+    // `x` is `t.k` over an aggregate that reads a derived projection, so the
+    // aggregate scope renders the substituted key as the bare `k`, which the
+    // kept `(0 - t.k) AS k` would capture. The fold is skipped.
+    let agg = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(agg)
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+            col("s"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k FROM (SELECT (0 - k) AS k, k AS x, sum(v) AS s FROM (SELECT t.k, t.v FROM t) GROUP BY k ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_over_a_join_still_folds() -> Result<()> {
+    // `x` is `t.k` over a join that keeps `t` in scope, so the substituted
+    // `t.k` keeps its qualifier and the kept `(0 - t.k) AS k` cannot capture
+    // it. The sort is hoisted, and the two same-named `v` columns stay apart.
+    let u = table_scan(Some("u"), &int32_schema(&["v"]), None)?.build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .cross_join(u)?
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+            col("t.v"),
+            col("u.v"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k"), col("t.v"), col("u.v")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - t.k) AS k, t.v, u.v FROM t CROSS JOIN u ORDER BY t.k ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_in_a_compound_key_over_a_derived_aggregate_keeps_the_sort()
+-> Result<()> {
+    // As above, but the key is `x + 1`. The fold would keep the computed
+    // `(0 - t.k) AS k` while dropping `x` and `s`, outside the subset it is
+    // taken in, so the sort keeps its scope, as on the base.
+    let agg = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(agg)
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+            col("s"),
+        ])?
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k FROM (SELECT (0 - k) AS k, k AS x, sum(v) AS s FROM (SELECT t.k, t.v FROM t) GROUP BY k ORDER BY (x + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+// The sort fold over a projection that drops inner outputs is limited to a
+// subset that is safe by construction: every output it keeps is a plain column
+// under its own name, nothing it keeps or drops is volatile, nothing it keeps
+// is repeated, and names compare case-folded. Every shape outside that subset
+// keeps the sort in its own scope, as before the fold was widened
+// (spiceai/spiceai#14733).
+
+#[test]
+fn test_an_expression_bound_above_a_sorted_chain_with_a_volatile_key_is_refused()
+-> Result<()> {
+    // Re-establishing the chain's order outside the derived table would draw
+    // `random()` again, so the outer bound would keep the row a fresh ranking
+    // puts first instead of the row the plan's sort ranked first.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(
+            vec![(random() * lit(100.0) + col("t.k")).sort(true, true)],
+            Some(3),
+        )?
+        .project(vec![col("t.k"), col("s")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+
+    match plan_to_sql(&plan) {
+        Ok(sql) => panic!("expected a refusal, emitted: {sql}"),
+        Err(error) => {
+            assert_contains!(
+                error.to_string(),
+                "a sort key that cannot be evaluated a second time"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_a_repeated_volatile_output_keeps_the_sort_in_its_scope() -> Result<()> {
+    // The outer list reads `random() AS r` twice. Folded, the replacement
+    // projection would compute `random()` once per copy, two draws where the
+    // plan copies one value into both columns.
+    let sorted = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a"), random().alias("r"), col("u.c")])?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("r", DataType::Float64, false),
+            Field::new("r2", DataType::Float64, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("r"), col("r")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r, r FROM (SELECT u.a, random() AS r, u.c FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 1)"
+    );
+
+    // The same without the dropped `u.c`: the fold the sets' equality admits
+    // does not repeat it either.
+    let sorted = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![col("u.a"), random().alias("r")])?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(1))?
+        .build()?;
+    let outer_schema = DFSchema::from_unqualified_fields(
+        vec![
+            Field::new("r", DataType::Float64, false),
+            Field::new("r2", DataType::Float64, false),
+        ]
+        .into(),
+        Default::default(),
+    )?;
+    let plan = LogicalPlan::Projection(datafusion_expr::Projection::try_new_with_schema(
+        vec![col("r"), col("r")],
+        Arc::new(sorted),
+        Arc::new(outer_schema),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r, r FROM (SELECT u.a, random() AS r FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+/// `Projection(t.a AS a, t.b AS b, t.c AS c)` over `t`, the unqualified input
+/// a projection with a declared schema reads.
+fn unqualified_abc() -> Result<LogicalPlan> {
+    table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            col("t.a").alias("a"),
+            col("t.b").alias("b"),
+            col("t.c").alias("c"),
+        ])?
+        .build()
+}
+
+/// `Projection(a, b, c)` over [`unqualified_abc`], with the fields `names`.
+fn declared_abc(names: [&str; 3]) -> Result<LogicalPlan> {
+    let declared = DFSchema::from_unqualified_fields(
+        names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int32, false))
+            .collect::<Vec<_>>()
+            .into(),
+        Default::default(),
+    )?;
+    Ok(LogicalPlan::Projection(
+        datafusion_expr::Projection::try_new_with_schema(
+            vec![col("a"), col("b"), col("c")],
+            Arc::new(unqualified_abc()?),
+            Arc::new(declared),
+        )?,
+    ))
+}
+
+#[test]
+fn test_a_renamed_plain_column_output_keeps_the_sort_in_its_scope() -> Result<()> {
+    // The inner projection declares its schema: `a` is named `x` and `b` is
+    // named `a`. The key and the outer list read the field `a`, which is `b`;
+    // folded, the outer list would select `b` while the key read the input `a`.
+    let plan = LogicalPlanBuilder::from(declared_abc(["x", "a", "c"])?)
+        .sort_with_limit(vec![col("a").sort(true, true)], Some(1))?
+        .project(vec![col("a")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a FROM (SELECT a, b, c FROM (SELECT t.a AS a, t.b AS b, t.c AS c FROM t) ORDER BY a ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_renamed_plain_column_nothing_reads_keeps_the_sort_in_its_scope() -> Result<()> {
+    // `b` is declared `unused`. Nothing above reads it, but the fold is taken
+    // only over a projection whose outputs carry their declared names, so the
+    // sort keeps its scope.
+    let plan = LogicalPlanBuilder::from(declared_abc(["a", "unused", "c"])?)
+        .sort_with_limit(vec![col("a").sort(true, true)], Some(1))?
+        .project(vec![col("c")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT c FROM (SELECT a, b, c FROM (SELECT t.a AS a, t.b AS b, t.c AS c FROM t) ORDER BY a ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_in_another_case_unqualified_by_a_derived_aggregate_scope_keeps_the_sort()
+-> Result<()> {
+    // As `…_unqualified_by_a_derived_aggregate_scope_keeps_the_sort`, with the
+    // input column spelled `t."K"`: the aggregate scope renders the substituted
+    // key as the bare `"K"`, which the kept `(0 - t."K") AS k` captures wherever
+    // identifiers fold case.
+    let big_k = || Expr::Column(Column::new(Some("t"), "K"));
+    let agg = table_scan(Some("t"), &int32_schema(&["K", "v"]), None)?
+        .project(vec![big_k(), col("t.v")])?
+        .aggregate(vec![big_k()], vec![sum(col("t.v")).alias("s")])?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(agg.clone())
+        .project(vec![
+            (lit(0) - big_k()).alias("k"),
+            big_k().alias("x"),
+            col("s"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT k FROM (SELECT (0 - "K") AS k, "K" AS x, sum(v) AS s FROM (SELECT t."K", t.v FROM t) GROUP BY "K" ORDER BY x ASC NULLS FIRST LIMIT 1)"#
+    );
+
+    // The same without the dropped `s`: the fold the sets' equality admits
+    // compares the names case-folded too.
+    let plan = LogicalPlanBuilder::from(agg)
+        .project(vec![(lit(0) - big_k()).alias("k"), big_k().alias("x")])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT k FROM (SELECT (0 - "K") AS k, "K" AS x FROM (SELECT t."K", t.v FROM t) GROUP BY "K" ORDER BY x ASC NULLS FIRST LIMIT 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_qualified_substitution_unqualified_by_a_derived_projection_scope_keeps_the_sort()
+-> Result<()> {
+    // The inner projection reads a derived projection, so the substituted
+    // `t.k` loses its qualifier once `t` is out of scope, and the bare `k` binds
+    // to the kept `(0 - t.k) AS k`.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+            col("t.v"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k FROM (SELECT (0 - k) AS k, k AS x, v FROM (SELECT t.k, t.v FROM t) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+
+    // The same without the dropped `t.v`: the fold the sets' equality admits
+    // sees the derived projection's scope as well.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .project(vec![
+            (lit(0) - col("t.k")).alias("k"),
+            col("t.k").alias("x"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("k")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT k FROM (SELECT (0 - k) AS k, k AS x FROM (SELECT t.k, t.v FROM t) ORDER BY x ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_dropped_alias_reading_an_outer_reference_a_kept_output_shadows_in_another_case_keeps_the_sort_in_its_scope()
+-> Result<()> {
+    // As `…_reading_an_outer_reference_a_kept_output_shadows_…`, with the
+    // outer reference spelled `S`: rendered as `"S"`, it binds to the kept
+    // `(0 - u.a) AS s` wherever identifiers fold case.
+    let outer_s = || {
+        Expr::OuterReferenceColumn(
+            Arc::new(Field::new("S", DataType::Int32, false)),
+            Column::from_name("S"),
+        )
+    };
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (lit(0) - col("u.a")).alias("s"),
+            (outer_s() * col("u.a")).alias("x"),
+            col("u.c"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s FROM (SELECT (0 - u.a) AS s, ("S" * u.a) AS x, u.c FROM u ORDER BY x ASC NULLS FIRST LIMIT 1)"#
+    );
+
+    // The same without the dropped `u.c`: the fold the sets' equality admits
+    // compares the names case-folded too.
+    let plan = table_scan(Some("u"), &int32_schema(&["a", "b", "c"]), None)?
+        .project(vec![
+            (lit(0) - col("u.a")).alias("s"),
+            (outer_s() * col("u.a")).alias("x"),
+        ])?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(1))?
+        .project(vec![col("s")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT s FROM (SELECT (0 - u.a) AS s, ("S" * u.a) AS x FROM u ORDER BY x ASC NULLS FIRST LIMIT 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_key_a_computed_alias_in_another_case_would_capture_above_a_derived_aggregate_is_refused()
+-> Result<()> {
+    // The plan orders by the derived table's `s`; a bare `ORDER BY s` binds to
+    // `(0 - s) AS "S"` wherever identifiers fold case.
+    let derived = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+            .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+            .limit(0, Some(2))
+    };
+    let plan = derived()?
+        .project(vec![(lit(0) - col("s")).alias("S"), col("s")])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(1))?
+        .build()?;
+    let error = plan_to_sql(&plan)
+        .expect_err("a bare key a computed alias in another case captures is refused");
+    assert_contains!(
+        error.to_string(),
+        "computes an output whose name folds to that of a bare key reading another output"
+    );
+
+    // The same with `s` itself computed: two computed aliases fold to one name.
+    let plan = derived()?
+        .project(vec![
+            (lit(0) - col("s")).alias("S"),
+            (col("s") + lit(0)).alias("s"),
+        ])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(1))?
+        .build()?;
+    let error = plan_to_sql(&plan)
+        .expect_err("a bare key two computed aliases fold to is refused");
+    assert_contains!(
+        error.to_string(),
+        "computes an output whose name folds to that of a bare key reading another output"
+    );
+
+    // A bare key that reads the one computed alias of its name, spelled as it
+    // is, binds to that alias: still unparsed.
+    let plan = derived()?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(1))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - s) AS s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY s ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_absorbed_sort_key_a_computed_alias_of_its_name_would_capture_is_refused()
+-> Result<()> {
+    // The sort sits below the projection, so its key `s` reads the derived
+    // table's `sum(t.v)`. Absorbed into the projection's SELECT, the bare
+    // `ORDER BY s` binds to `(0 - s) AS s` instead, reversing the ranking the
+    // fetch keeps, even though the alias is spelled exactly as the key is.
+    let derived = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+            .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+            .limit(0, Some(2))
+    };
+    let plan = derived()?
+        .sort_with_limit(vec![col("s").sort(true, true)], Some(1))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "an absorbed bare key a computed alias of its name captures is refused",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output whose name folds to that of a bare key reading another output"
+    );
+
+    // Inside a compound key the name reads the input column: still unparsed.
+    let plan = derived()?
+        .sort_with_limit(vec![(col("s") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![(lit(0) - col("s")).alias("s"), col("t.k")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (0 - s) AS s, k FROM (SELECT t.k AS k, sum(t.v) AS s FROM t GROUP BY t.k LIMIT 2) ORDER BY (s + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_outer_reference_in_a_re_established_key_a_computed_alias_captures_is_refused()
+-> Result<()> {
+    // The re-established `ORDER BY r` renders `outer_ref(r)` by its bare name,
+    // which binds to the projection's `(0 - t.k) AS r` rather than to the
+    // enclosing query, so the outer bound would rank by `-k` instead of `k`.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(
+            vec![
+                out_ref_col(DataType::Int32, "r").sort(true, true),
+                col("t.k").sort(true, true),
+            ],
+            Some(3),
+        )?
+        .project(vec![(lit(0) - col("t.k")).alias("r")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference in a re-established key a computed alias captures is refused",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like one of the sort's keys"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_outputs_whose_display_names_collide_keep_the_sort_in_its_scope() -> Result<()> {
+    // `t."a.b"` and the alias `"t.a.b"` both display as `t.a.b`, the spelling
+    // the fold matches outputs by. It would take the alias's field for the kept
+    // column, so the dropped alias would not be substituted and the key would
+    // be left as `ORDER BY ("t.a.b" + 1)`, naming an output the folded
+    // projection no longer has.
+    let schema = Schema::new(vec![
+        Field::new("a.b", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let dotted = || Expr::Column(Column::new(Some("t"), "a.b"));
+    // The builder refuses the two outputs as one name, so the projection is
+    // built with its schema, as a plan producer that skips that check would.
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("a.b", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("t.a.b", DataType::Int32, false))),
+        ],
+        Default::default(),
+    )?;
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![dotted(), (col("t.b") + lit(1)).alias("t.a.b")],
+        Arc::new(table_scan(Some("t"), &schema, None)?.build()?),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort_with_limit(
+            vec![
+                (Expr::Column(Column::new_unqualified("t.a.b")) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .project(vec![dotted()])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a.b" FROM (SELECT t."a.b", (t.b + 1) AS "t.a.b" FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_alias_declared_under_another_name_keeps_the_sort_in_its_scope() -> Result<()> {
+    // The inner projection declares its schema `[y, x, t.c]` over
+    // `[(t.a + 1) AS x, (t.b + 1) AS y, t.c]`, so the field `x` is the second
+    // output, `t.b + 1`. The fold looks a dropped alias up by its own name and
+    // would substitute `t.a + 1` into the key `x + 1`.
+    let input = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?.build()?;
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (None, Arc::new(Field::new("y", DataType::Int32, false))),
+            (None, Arc::new(Field::new("x", DataType::Int32, false))),
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("c", DataType::Int32, false)),
+            ),
+        ],
+        Default::default(),
+    )?;
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c"),
+        ],
+        Arc::new(input),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![col("t.c")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT c FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y, t.c FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
     Ok(())
 }

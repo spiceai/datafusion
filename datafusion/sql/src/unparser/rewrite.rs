@@ -26,6 +26,9 @@ use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Distinct, Expr, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::Ident;
 
+use super::Unparser;
+use super::utils::output_is_repeatable;
+
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
 /// DataFusion will return an error if two columns in the schema have the same name with no table qualifiers.
@@ -218,6 +221,7 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// hoist to be valid -- it only has to be computable from them, as `age + 1` is from
 /// `age`.
 pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
+    unparser: &Unparser,
     p: &Projection,
 ) -> Option<LogicalPlan> {
     let LogicalPlan::Sort(sort) = p.input.as_ref() else {
@@ -227,6 +231,15 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     let LogicalPlan::Projection(inner_p) = sort.input.as_ref() else {
         return None;
     };
+
+    // The fold reads an output by the name its expression gives it, so it is
+    // taken only where that is the name the schema declares for it: a
+    // projection built with a declared schema that renames an alias or a column
+    // (`(t.a + 1) AS x` declared `y`) would have it substitute one output for
+    // another.
+    if !outputs_named_as_declared(inner_p) {
+        return None;
+    }
 
     let mut map = HashMap::new();
     let inner_exprs = inner_p
@@ -253,6 +266,20 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         })
         .collect::<Vec<_>>();
+
+    // The inner output each outer expression reads, matched by the spelling the
+    // comparison below uses, so every expression the fold accepts finds its own.
+    let position = inner_exprs
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.to_string(), i))
+        .collect::<HashMap<_, _>>();
+    // That spelling is not a unique identity: `t."a.b"` and an alias `"t.a.b"`
+    // both display as `t.a.b`. Two outputs that share one leave the plan
+    // unfolded, since the fold could not tell which of them an expression reads.
+    if position.len() != inner_exprs.len() {
+        return None;
+    }
 
     // Compare outer collects Expr::to_string with inner collected transformed values
     // alias -> alias column
@@ -289,9 +316,19 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
 
     let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
 
-    if outer_collects == inner_collects {
+    // The inner projection may expose outputs that neither the outer projection
+    // nor the sort reads. Dropping them changes nothing above, and leaving the
+    // sort unhoisted over them puts its `ORDER BY` in a derived table, whose
+    // order SQL does not carry out (spiceai/spiceai#14733). That widening of the
+    // fold (a strict subset, where the fold has always required equal sets) is
+    // taken only where it is safe by construction: see `widened_fold_is_safe`.
+    // Anything else keeps the sort in its own scope, as it did before.
+    if outer_collects.is_subset(&inner_collects)
+        && (outer_collects == inner_collects
+            || widened_fold_is_safe(p, inner_p, &position))
+    {
         let mut sort = sort.clone();
-        let mut inner_p = inner_p.clone();
+        let inner_p = inner_p.clone();
 
         let new_exprs = p
             .expr
@@ -299,35 +336,183 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             .map(|e| map.get(e).unwrap_or(e).clone())
             .collect::<Vec<_>>();
 
-        // The inner Projection may define aliases that the Sort references
-        // but the outer Projection does not include.  Since we are about to
-        // replace the inner Projection's expressions with `new_exprs` (which
-        // only contains the outer Projection's columns), those alias
-        // definitions will be lost.  To keep the Sort valid, rewrite any
-        // sort expression that references a dropped alias so that it uses
-        // the alias's underlying expression instead.
-        let projected_aliases: HashSet<&str> = new_exprs
+        // The inner Projection may define outputs that the Sort references but
+        // the outer Projection does not include — an alias, or an unnamed
+        // expression the sort reads by its schema name. Since the inner
+        // Projection's expressions are about to be replaced with `new_exprs`
+        // (which only contains the outer Projection's columns), those outputs
+        // will be lost. To keep the Sort valid, rewrite any sort expression that
+        // references a dropped output so that it uses the underlying expression
+        // instead.
+        //
+        // A projection built with a declared schema (`Projection::try_new_with_schema`)
+        // names an output by its field rather than by its expression (`a + b`
+        // declared `c`), and the kept output keeps that field, so the name it
+        // is read by above is the one the folded projection's schema gives it.
+        //
+        // The inner Projection takes the outer one's expressions, and each is the
+        // inner output the outer list reads, so it keeps that output's field: the
+        // name the sort's keys and the inliner (`unproject_sort_expr` resolves a
+        // key's column by position) look it up by, at the position the expression
+        // takes in the outer list. Carrying the inner schema over unchanged would
+        // name each output after the inner expression at the same index, `ORDER BY
+        // x + 1` emitted over the expression at `x`'s inner index; taking the outer
+        // schema would rename an output the outer list renames, so the key that
+        // reads it by its inner name resolves to nothing. An output the outer list
+        // repeats takes the outer field the second time, since one schema cannot
+        // name two outputs alike. Fields that still collide leave the plan
+        // unfolded: the outer schema names outputs by the outer list's
+        // positions, so the inliner would resolve a key against the wrong one.
+        //
+        // A repeat named by an outer field that is the name of another inner
+        // output (`x` repeated and declared `y` over an inner `y`) keeps that
+        // output from being substituted, so a key reading it by that name would
+        // read the repeat instead. Such a key leaves the plan unfolded too.
+        //
+        // A repeat of an output that cannot be repeated (`random() AS r` read
+        // twice) would compute it once per copy, two draws where the plan copies
+        // one value. That leaves the plan unfolded as well.
+        let mut read = HashSet::new();
+        let mut borrowed_names = HashSet::new();
+        let mut fields = Vec::with_capacity(p.expr.len());
+        for (i, e) in p.expr.iter().enumerate() {
+            let reads = position.get(&e.to_string()).copied();
+            let (schema, index) = match reads {
+                Some(k) if read.insert(k) => (&inner_p.schema, k),
+                Some(k) if !output_is_repeatable(&inner_p.expr[k]) => return None,
+                _ => (&p.schema, i),
+            };
+            let (qualifier, field) = schema.qualified_field(index);
+            if std::ptr::eq(schema, &p.schema)
+                && inner_p
+                    .schema
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .any(|(k, inner)| inner.name() == field.name() && Some(k) != reads)
+            {
+                borrowed_names.insert(field.name().clone());
+            }
+            fields.push((qualifier.cloned(), Arc::clone(&schema.fields()[index])));
+        }
+        let key_reads_borrowed_name =
+            sort.expr.iter().any(|sort_expr| {
+                sort_expr.expr.column_refs().iter().any(|col| {
+                    col.relation.is_none() && borrowed_names.contains(col.name())
+                })
+            });
+        if key_reads_borrowed_name {
+            return None;
+        }
+        let schema = Arc::new(
+            DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
+                .ok()?,
+        );
+        let declared_names = schema
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect::<Vec<_>>();
+        // An unnamed kept expression is read by its declared field, not by the
+        // name its expression spells: a dropped output declared under that
+        // spelling (`t.c + 1` declared `t.a + t.b`) is still dropped.
+        let kept_names: HashSet<String> = new_exprs
             .iter()
             .filter_map(|e| match e {
-                Expr::Alias(alias) => Some(alias.name.as_str()),
+                Expr::Alias(alias) => Some(alias.name.clone()),
                 _ => None,
             })
+            .chain(declared_names.iter().cloned())
             .collect();
 
-        let dropped_aliases: HashMap<String, Expr> = inner_p
+        let dropped_outputs: HashMap<String, Expr> = inner_p
             .expr
             .iter()
-            .filter_map(|e| match e {
-                Expr::Alias(alias)
-                    if !projected_aliases.contains(alias.name.as_str()) =>
-                {
-                    Some((alias.name.clone(), (*alias.expr).clone()))
-                }
-                _ => None,
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let (name, underlying) = match e {
+                    Expr::Alias(alias) => (alias.name.clone(), (*alias.expr).clone()),
+                    // A plain column keeps its own name wherever it is read.
+                    Expr::Column(_) => return None,
+                    other => (inner_p.schema.field(i).name().clone(), other.clone()),
+                };
+                (!kept_names.contains(&name)).then_some((name, underlying))
             })
             .collect();
 
-        if !dropped_aliases.is_empty() {
+        // A dropped output that cannot be repeated — a volatile expression, or
+        // one holding a subquery — must not be substituted at every reference
+        // the key makes to it: `(r - r)` over `random() AS r` is 0 drawn once
+        // and a difference of two draws when repeated. The fold is skipped,
+        // and the sort keeps the scope it has, where the output is computed once.
+        let key_reads_unrepeatable = sort.expr.iter().any(|sort_expr| {
+            sort_expr.expr.column_refs().iter().any(|col| {
+                col.relation.is_none()
+                    && dropped_outputs
+                        .get(col.name())
+                        .is_some_and(|underlying| !output_is_repeatable(underlying))
+            })
+        });
+        if key_reads_unrepeatable {
+            return None;
+        }
+        // A substituted expression reads the scope below by bare column names.
+        // Where such a name is also the name of a surviving alias (`0 - s AS s`
+        // kept, `s AS x` dropped, the key reading `x`), the substituted `s`
+        // would be bound to the alias by the unprojection that follows, and the
+        // key would order by `0 - s` instead of `s`. The fold is skipped. A
+        // computed output named by a declared schema (`a + b` declared `c`)
+        // captures a substituted `c` the same way; a plain column kept under
+        // its own name is the column the substitution reads. An unqualified
+        // outer reference renders by its bare name too, so any output the fold
+        // keeps under that name captures it the same way. A qualified read is
+        // safe while its relation stays in scope, but an aggregate over a
+        // derived projection, or a projection over one, renders `t.k` as the
+        // bare `k`. A key that is that bare name alone binds to the kept
+        // `(0 - t.k) AS k`; inside a compound key (`k + 1`) the name reads the
+        // input column, so that key folds. Names are compared the way the
+        // engine binds them: `t."K"` and `outer_ref(S)` render as `"K"` and
+        // `"S"`, which `k` and `s` capture wherever identifiers fold case.
+        let qualifiers_stripped = scope_strips_qualifiers(&inner_p.input);
+        let mut kept_aliases = HashSet::new();
+        for (e, declared) in new_exprs.iter().zip(&declared_names) {
+            if let Expr::Alias(alias) = e {
+                kept_aliases.insert(unparser.emitted_column_key(&alias.name).ok()?);
+            }
+            if !matches!(e, Expr::Column(column) if column.name() == declared.as_str()) {
+                kept_aliases.insert(unparser.emitted_column_key(declared).ok()?);
+            }
+        }
+        let kept_keys = declared_names
+            .iter()
+            .map(|name| unparser.emitted_column_key(name).ok())
+            .collect::<Option<HashSet<_>>>()?;
+        let substitution_shadowed = sort.expr.iter().any(|sort_expr| {
+            let mut key = &sort_expr.expr;
+            while let Expr::Alias(alias) = key {
+                key = &alias.expr;
+            }
+            let bare_key = matches!(key, Expr::Column(_));
+            sort_expr.expr.column_refs().iter().any(|col| {
+                col.relation.is_none()
+                    && dropped_outputs.get(col.name()).is_some_and(|underlying| {
+                        underlying.column_refs().iter().any(|read| {
+                            (read.relation.is_none() || (qualifiers_stripped && bare_key))
+                                && unparser
+                                    .emitted_column_key(read.name())
+                                    .ok()
+                                    .is_none_or(|key| kept_aliases.contains(&key))
+                        }) || reads_outer_reference_named_in(
+                            unparser, underlying, &kept_keys,
+                        )
+                    })
+            })
+        });
+        if substitution_shadowed {
+            return None;
+        }
+
+        if !dropped_outputs.is_empty() {
             for sort_expr in &mut sort.expr {
                 let mut expr = sort_expr.expr.clone();
                 while let Expr::Alias(alias) = expr {
@@ -335,16 +520,18 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 }
                 // Substitute nested references too, not just a whole-expression
                 // one: `ORDER BY x + 1` over a dropped `expr AS x` has to become
-                // `ORDER BY expr + 1`.
+                // `ORDER BY expr + 1`. Bottom-up, so the substituted expression
+                // is not walked again: `(s + 1) AS s` reads an `s` of the scope
+                // below, which a top-down walk would substitute without end.
                 sort_expr.expr = expr
                     .clone()
-                    .transform_down(|e| {
+                    .transform_up(|e| {
                         Ok(match &e {
                             // Only an unqualified column can name a projection
-                            // alias: `t.x` refers to `t`'s own column even when a
-                            // dropped alias happens to share the name.
+                            // output: `t.x` refers to `t`'s own column even when a
+                            // dropped output happens to share the name.
                             Expr::Column(col) if col.relation.is_none() => {
-                                match dropped_aliases.get(col.name()) {
+                                match dropped_outputs.get(col.name()) {
                                     Some(underlying) => {
                                         Transformed::yes(underlying.clone())
                                     }
@@ -356,15 +543,121 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                     })
                     .map_or(expr, |transformed| transformed.data);
             }
+            // A key that is now a literal orders nothing, and an integer literal
+            // in `ORDER BY` would be read as a column position. Such a key is
+            // dropped; a sort left with no key is not folded.
+            sort.expr
+                .retain(|sort_expr| !matches!(sort_expr.expr, Expr::Literal(..)));
+            if sort.expr.is_empty() {
+                return None;
+            }
         }
 
-        inner_p.expr.clone_from(&new_exprs);
+        let inner_p = Projection::try_new_with_schema(
+            new_exprs,
+            Arc::clone(&inner_p.input),
+            schema,
+        )
+        .ok()?;
         sort.input = Arc::new(LogicalPlan::Projection(inner_p));
 
         Some(LogicalPlan::Sort(sort))
     } else {
         None
     }
+}
+
+/// Whether the fold may drop inner outputs nobody above reads, which the fold
+/// did not do before spiceai/spiceai#14733. It is taken only in a subset that
+/// is safe by construction, rather than guarded shape by shape:
+///
+/// - every output the outer list keeps is a plain column, named by that column
+///   in the outer schema as well (the inner one already is, see
+///   [`outputs_named_as_declared`]), so the folded `SELECT` list introduces no
+///   alias that a bare `ORDER BY` name, a substituted expression or an outer
+///   reference could bind to, and the result keeps the plan's names;
+/// - the outer list reads each kept output once;
+/// - no inner output is volatile or holds a subquery, so substituting a dropped
+///   output into a key evaluates nothing the plan evaluates once.
+///
+/// Outside it the sort keeps its own scope, as it did before the widening.
+fn widened_fold_is_safe(
+    p: &Projection,
+    inner_p: &Projection,
+    position: &HashMap<String, usize>,
+) -> bool {
+    if !inner_p.expr.iter().all(output_is_repeatable) {
+        return false;
+    }
+    let mut kept = HashSet::new();
+    p.expr.iter().enumerate().all(|(j, e)| {
+        position.get(&e.to_string()).is_some_and(|&i| {
+            matches!(&inner_p.expr[i], Expr::Column(column) if {
+                let (qualifier, field) = p.schema.qualified_field(j);
+                field.name() == &column.name && qualifier == column.relation.as_ref()
+            }) && kept.insert(i)
+        })
+    })
+}
+
+/// Whether every aliased or plain-column output of `projection` carries the
+/// name its schema declares for it, and any relation the expression names is
+/// the declared qualifier. An unnamed computed output is read by its declared
+/// name throughout the fold, so it always agrees.
+fn outputs_named_as_declared(projection: &Projection) -> bool {
+    projection.expr.len() == projection.schema.fields().len()
+        && projection.expr.iter().enumerate().all(|(i, e)| {
+            let (relation, name) = match e {
+                Expr::Alias(alias) => (alias.relation.as_ref(), &alias.name),
+                Expr::Column(column) => (column.relation.as_ref(), &column.name),
+                _ => return true,
+            };
+            let (qualifier, field) = projection.schema.qualified_field(i);
+            field.name() == name && relation.is_none_or(|r| Some(r) == qualifier)
+        })
+}
+
+/// Whether `plan` renders in a scope that hides the relations its input
+/// columns are qualified by, where the unparser strips their qualifiers: a
+/// derived projection, or an aggregate whose input is one (see
+/// `UnparserAggScope`).
+fn scope_strips_qualifiers(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Aggregate(agg) => {
+            Unparser::contains_projection_before_relation(&agg.input)
+        }
+        LogicalPlan::Projection(_) => true,
+        LogicalPlan::TableScan(_)
+        | LogicalPlan::Subquery(_)
+        | LogicalPlan::SubqueryAlias(_)
+        | LogicalPlan::Join(_)
+        | LogicalPlan::EmptyRelation(_)
+        | LogicalPlan::Values(_) => false,
+        _ => matches!(
+            plan.inputs().as_slice(),
+            [input] if scope_strips_qualifiers(input)
+        ),
+    }
+}
+
+/// Whether `expr` holds an unqualified outer reference whose bare name folds to
+/// one of `names` (keys from [`Unparser::emitted_column_key`]), so that a scope
+/// projecting those names would bind it to its own output rather than to the
+/// enclosing query.
+fn reads_outer_reference_named_in(
+    unparser: &Unparser,
+    expr: &Expr,
+    names: &HashSet<String>,
+) -> bool {
+    expr.exists(|e| {
+        Ok(match e {
+            Expr::OuterReferenceColumn(_, column) if column.relation.is_none() => {
+                names.contains(&unparser.emitted_column_key(column.name())?)
+            }
+            _ => false,
+        })
+    })
+    .unwrap_or(true)
 }
 
 /// This logic is to work out the columns and inner query for SubqueryAlias plan for some types of
