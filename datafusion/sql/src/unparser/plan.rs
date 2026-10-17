@@ -488,15 +488,47 @@ impl Unparser<'_> {
     }
 
     fn render_statement(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
+        self.render_statement_as(plan, false)
+    }
+
+    /// [`Self::render_statement`], with the statement's `SELECT` marked as the body
+    /// of an `EXISTS` when `exists_body` — see [`Self::exists_subquery_to_sql`].
+    fn render_statement_as(
+        &self,
+        plan: &LogicalPlan,
+        exists_body: bool,
+    ) -> Result<ast::Statement> {
         self.statements_in_flight
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let rendered = self.render_statement_inner(plan);
+        let rendered = self.render_statement_inner(plan, exists_body);
         self.statements_in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         rendered
     }
 
-    fn render_statement_inner(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
+    /// [`Self::plan_to_sql_nested`] for the subquery of an explicit `EXISTS`. Its
+    /// `SELECT` is marked as an EXISTS body, as the body
+    /// [`Self::build_exists_subquery`] builds for an EXISTS-style join is: the
+    /// rows are only tested for existence, so a sort no row bound makes observable
+    /// is left out there (`sort_order_is_observable`) rather than scoped, or
+    /// refused on a dialect that cannot take the scope.
+    pub(crate) fn exists_subquery_to_sql(
+        &self,
+        plan: &LogicalPlan,
+    ) -> Result<ast::Statement> {
+        self.derived_depth
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let rendered = self.render_statement_as(plan, true);
+        self.derived_depth
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        rendered
+    }
+
+    fn render_statement_inner(
+        &self,
+        plan: &LogicalPlan,
+        exists_body: bool,
+    ) -> Result<ast::Statement> {
         let mut plan = normalize_union_schema(plan)?;
         if !self.dialect.supports_qualify() {
             plan = rewrite_qualify(plan)?;
@@ -518,7 +550,9 @@ impl Unparser<'_> {
             | LogicalPlan::Limit(_)
             | LogicalPlan::Statement(_)
             | LogicalPlan::Values(_)
-            | LogicalPlan::Distinct(_) => self.select_to_sql_statement(&plan),
+            | LogicalPlan::Distinct(_) => {
+                self.select_to_sql_statement(&plan, exists_body)
+            }
             LogicalPlan::Dml(_) => self.dml_to_sql(&plan),
             LogicalPlan::Extension(extension) => {
                 self.extension_to_statement(extension.node.as_ref())
@@ -581,10 +615,19 @@ impl Unparser<'_> {
         not_impl_err!("Unsupported extension node: {node:?}")
     }
 
-    fn select_to_sql_statement(&self, plan: &LogicalPlan) -> Result<ast::Statement> {
+    fn select_to_sql_statement(
+        &self,
+        plan: &LogicalPlan,
+        exists_body: bool,
+    ) -> Result<ast::Statement> {
         let mut query_builder = Some(QueryBuilder::default());
 
-        let body = self.select_to_sql_expr(plan, &mut query_builder)?;
+        let mut select_builder = SelectBuilder::default();
+        if exists_body {
+            select_builder.mark_exists_body();
+        }
+        let body =
+            self.select_to_sql_expr_with(plan, &mut query_builder, select_builder)?;
 
         // Recursive CTEs met anywhere below here belong on *this* query, not on
         // whichever derived table happened to enclose them — see

@@ -15256,6 +15256,41 @@ fn test_sort_key_reading_a_dropped_column_named_like_an_output_is_refused() -> R
 }
 
 #[test]
+fn test_sort_fold_is_declined_when_its_schema_would_collide() -> Result<()> {
+    // The outer list `[c, a, c]`, declared `[d, c, a]`, repeats `c`. Its second
+    // `c` takes the outer field `a`, so the folded fields would be `[c, a, a]`,
+    // which no schema holds. Naming the substituted expressions by the outer
+    // schema instead would put `c` at the position of `(t.a + 1)`, and the key
+    // `c + 1` would order by `(t.a + 1) + 1`: under the fetch, another row. The
+    // fold is declined, and the key keeps reading `(t.b * 2)`.
+    let inner = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![
+            (col("t.b") * lit(2)).alias("c"),
+            (col("t.a") + lit(1)).alias("a"),
+        ])?
+        .sort_with_limit(vec![(col("c") + lit(1)).sort(true, true)], Some(1))?
+        .build()?;
+    let declared = DFSchema::new_with_metadata(
+        ["d", "c", "a"]
+            .into_iter()
+            .map(|name| (None, Arc::new(Field::new(name, DataType::Int32, false))))
+            .collect(),
+        std::collections::HashMap::new(),
+    )?;
+    let plan = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![col("c"), col("a"), col("c")],
+        Arc::new(inner),
+        Arc::new(declared),
+    )?);
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT c, a, c FROM (SELECT (t.b * 2) AS c, (t.a + 1) AS a FROM t ORDER BY ((t.b * 2) + 1) ASC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_build_side()
 -> Result<()> {
     // An EXISTS body's rows are only tested for existence, so without a row bound
@@ -15359,6 +15394,78 @@ fn test_sort_key_reading_a_volatile_output_below_an_unfolded_exists_projection_i
                 "{join_type:?}"
             );
         }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_reading_a_volatile_output_in_an_explicit_exists_subquery() -> Result<()>
+{
+    // An `EXISTS` written in a predicate, not one built for a semi or anti join:
+    // its subquery is rendered through the expression path, and its SELECT is
+    // marked as an EXISTS body all the same. Unbounded, the sort's order reaches
+    // nothing and is left out on every dialect. Under a fetch the order picks the
+    // row, and the key is scoped, or refused where the dialect cannot take the
+    // scope, as before.
+    let schema = int32_schema(&["a"]);
+    let plan = |fetch: Option<usize>, negated: bool| -> Result<LogicalPlan> {
+        let body = Arc::new(
+            table_scan(Some("u"), &schema, None)?
+                .filter(col("u.a").eq(out_ref_col(DataType::Int32, "t.a")))?
+                .project(vec![col("u.a"), random().alias("r")])?
+                .sort_with_limit(vec![(col("r") + lit(1.0)).sort(true, true)], fetch)?
+                .build()?,
+        );
+        let predicate = if negated {
+            datafusion_expr::not_exists(body)
+        } else {
+            exists(body)
+        };
+        table_scan(Some("t"), &schema, None)?
+            .filter(predicate)?
+            .build()
+    };
+    let dialects: [(&dyn UnparserDialect, &str); 4] = [
+        (
+            &DefaultDialect {},
+            "SELECT * FROM t WHERE {exists} (SELECT u.a, random() AS r FROM u WHERE (u.a = t.a))",
+        ),
+        (
+            &SqliteDialect {},
+            "SELECT * FROM `t` WHERE {exists} (SELECT `u`.`a`, random() AS `r` FROM `u` WHERE (`u`.`a` = `t`.`a`))",
+        ),
+        (
+            &UnparserMySqlDialect {},
+            "SELECT * FROM `t` WHERE {exists} (SELECT `u`.`a`, random() AS `r` FROM `u` WHERE (`u`.`a` = `t`.`a`))",
+        ),
+        (
+            &UnparserPostgreSqlDialect {},
+            r#"SELECT * FROM "t" WHERE {exists} (SELECT "u"."a", random() AS "r" FROM "u" WHERE ("u"."a" = "t"."a"))"#,
+        ),
+    ];
+    for (negated, exists) in [(false, "EXISTS"), (true, "NOT EXISTS")] {
+        let unbounded = plan(None, negated)?;
+        for (dialect, expected) in dialects {
+            assert_eq!(
+                Unparser::new(dialect).plan_to_sql(&unbounded)?.to_string(),
+                expected.replace("{exists}", exists),
+            );
+        }
+
+        let bounded = plan(Some(1), negated)?;
+        assert_eq!(
+            plan_to_sql(&bounded)?.to_string(),
+            format!(
+                "SELECT * FROM t WHERE {exists} (SELECT a, r FROM (SELECT u.a, random() AS r FROM u WHERE (u.a = t.a)) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1)"
+            )
+        );
+        assert_eq!(
+            Unparser::new(&SqliteDialect {})
+                .plan_to_sql(&bounded)
+                .expect_err("SQLite cannot take the scope")
+                .to_string(),
+            VOLATILE_SORT_SCOPE_REFUSAL
+        );
     }
     Ok(())
 }

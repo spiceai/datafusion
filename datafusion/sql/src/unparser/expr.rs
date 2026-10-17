@@ -607,7 +607,7 @@ impl Unparser<'_> {
             }
             Expr::Exists(Exists { subquery, negated }) => {
                 let sub_statement =
-                    self.plan_to_sql_nested(subquery.subquery.as_ref())?;
+                    self.exists_subquery_to_sql(subquery.subquery.as_ref())?;
                 let sub_query = if let ast::Statement::Query(inner_query) = sub_statement
                 {
                     inner_query

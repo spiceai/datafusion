@@ -376,8 +376,12 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // schema would rename an output the outer list renames, so the key that
         // reads it by its inner name resolves to nothing. An output the outer list
         // repeats takes the outer field the second time, since one schema cannot
-        // name two outputs alike, and fields that still collide leave the outer
-        // schema in place rather than the plan unfolded.
+        // name two outputs alike. Fields that still collide decline the fold: the
+        // outer schema would name the substituted expressions by the outer list's
+        // positions, and a key reading an inner output by name would resolve to
+        // the expression of whichever output the outer list put at that name's
+        // position (`c` reading `(t.a + 1)` under an outer `[c, a, c]` declared
+        // `[d, c, a]`).
         let mut read = HashSet::new();
         let fields = p
             .expr
@@ -392,9 +396,10 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
             })
             .collect::<Vec<_>>();
-        let schema =
+        let schema = Arc::new(
             DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
-                .map_or_else(|_| Arc::clone(&p.schema), Arc::new);
+                .ok()?,
+        );
         let inner_p = Projection::try_new_with_schema(
             new_exprs,
             Arc::clone(&inner_p.input),
