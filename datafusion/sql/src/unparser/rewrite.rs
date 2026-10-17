@@ -622,10 +622,7 @@ fn reads_outer_reference_named_in(
     expr.exists(|e| {
         Ok(match e {
             Expr::OuterReferenceColumn(_, column) if column.relation.is_none() => {
-                unparser
-                    .emitted_column_key(column.name())
-                    .ok()
-                    .is_none_or(|key| names.contains(&key))
+                names.contains(&unparser.emitted_column_key(column.name())?)
             }
             _ => false,
         })

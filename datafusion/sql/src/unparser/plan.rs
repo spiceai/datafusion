@@ -68,7 +68,11 @@ use datafusion_expr::{
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
-use std::{collections::HashSet, sync::Arc, vec};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    vec,
+};
 
 /// Convert a DataFusion [`LogicalPlan`] to [`ast::Statement`]
 ///
@@ -128,7 +132,7 @@ fn merged_without_conflict(have: &DFSchema, add: &DFSchema) -> Option<DFSchema> 
             Err(_) => {
                 let addition = DFSchema::new_with_metadata(
                     vec![(qualifier.cloned(), Arc::clone(field))],
-                    std::collections::HashMap::new(),
+                    HashMap::new(),
                 )
                 .ok()?;
                 merged = merged.join(&addition).ok()?;
@@ -2893,10 +2897,8 @@ impl Unparser<'_> {
                     // the engine compares them, so `(0 - s) AS "S"` captures `s`
                     // where identifiers fold. Each folded name keeps the
                     // spellings that fold to it, for a key the plan spells bare.
-                    let mut computed_aliases: std::collections::HashMap<
-                        String,
-                        Vec<String>,
-                    > = std::collections::HashMap::new();
+                    let mut computed_aliases: HashMap<String, Vec<String>> =
+                        HashMap::new();
                     for expr in &p.expr {
                         if let Expr::Alias(alias) = expr
                             && !matches!(
@@ -2904,10 +2906,11 @@ impl Unparser<'_> {
                                 Expr::Column(column) if column.name() == alias.name
                             )
                         {
+                            let name = self.emitted_column_name(&alias.name)?;
                             computed_aliases
-                                .entry(self.emitted_column_key(&alias.name)?)
+                                .entry(self.identifier_comparison_key(&name))
                                 .or_default()
-                                .push(self.emitted_column_name(&alias.name)?);
+                                .push(name);
                         }
                     }
                     // A row bound the enclosing query carries applies to the
@@ -2937,6 +2940,7 @@ impl Unparser<'_> {
                         // The re-established keys name the derived table's
                         // outputs by bare name, which a computed alias of the
                         // same name in this projection's list would capture.
+                        // Their outer references render as bare names too.
                         let mut captured = false;
                         for sort_expr in &sort.expr {
                             for column in sort_expr.expr.column_refs() {
@@ -2944,6 +2948,12 @@ impl Unparser<'_> {
                                     &self.emitted_column_key(column.name())?,
                                 );
                             }
+                        }
+                        for name in outer_reference_names(
+                            sort.expr.iter().map(|sort_expr| &sort_expr.expr),
+                        )? {
+                            captured |= computed_aliases
+                                .contains_key(&self.emitted_column_key(&name)?);
                         }
                         if captured {
                             return not_impl_err!(

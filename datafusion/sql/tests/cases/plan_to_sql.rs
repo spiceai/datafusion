@@ -17969,3 +17969,31 @@ fn test_an_absorbed_sort_key_a_computed_alias_of_its_name_would_capture_is_refus
     );
     Ok(())
 }
+
+#[test]
+fn test_an_outer_reference_in_a_re_established_key_a_computed_alias_captures_is_refused()
+-> Result<()> {
+    // The re-established `ORDER BY r` renders `outer_ref(r)` by its bare name,
+    // which binds to the projection's `(0 - t.k) AS r` rather than to the
+    // enclosing query, so the outer bound would rank by `-k` instead of `k`.
+    let plan = table_scan(Some("t"), &int32_schema(&["k", "v"]), None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+        .sort_with_limit(
+            vec![
+                out_ref_col(DataType::Int32, "r").sort(true, true),
+                col("t.k").sort(true, true),
+            ],
+            Some(3),
+        )?
+        .project(vec![(lit(0) - col("t.k")).alias("r")])?
+        .limit_by_expr(None, Some(cast(lit(1_i64), DataType::Int32)))?
+        .build()?;
+    let error = plan_to_sql(&plan).expect_err(
+        "an outer reference in a re-established key a computed alias captures is refused",
+    );
+    assert_contains!(
+        error.to_string(),
+        "computes an output named like one of the sort's keys"
+    );
+    Ok(())
+}
