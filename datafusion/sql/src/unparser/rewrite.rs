@@ -17,6 +17,7 @@
 
 use std::{collections::HashSet, sync::Arc};
 
+use arrow::datatypes::DataType;
 use datafusion_common::tree_node::TreeNodeContainer;
 use datafusion_common::{
     Column, DFSchema, HashMap, Result, TableReference,
@@ -24,7 +25,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Distinct, Expr, LogicalPlan, Projection, Sort, SortExpr};
-use sqlparser::ast::Ident;
+use sqlparser::ast::{self, Ident};
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -254,6 +255,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         })
         .collect::<Vec<_>>();
 
+    // The inner output each outer expression reads, matched by the spelling the
+    // comparison below uses, so every expression the fold accepts finds its own.
+    let position = inner_exprs
+        .iter()
+        .enumerate()
+        .map(|(i, e)| (e.to_string(), i))
+        .collect::<HashMap<_, _>>();
+
     // Compare outer collects Expr::to_string with inner collected transformed values
     // alias -> alias column
     // column -> remain
@@ -291,7 +300,6 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
 
     if outer_collects == inner_collects {
         let mut sort = sort.clone();
-        let mut inner_p = inner_p.clone();
 
         let new_exprs = p
             .expr
@@ -358,7 +366,46 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         }
 
-        inner_p.expr.clone_from(&new_exprs);
+        // The inner Projection takes the outer one's expressions, and each is the
+        // inner output the outer list reads, so it keeps that output's field: the
+        // name the sort's keys and the inliner (`unproject_sort_expr` resolves a
+        // key's column by position) look it up by, at the position the expression
+        // takes in the outer list. Carrying the inner schema over unchanged would
+        // name each output after the inner expression at the same index, `ORDER BY
+        // a + 1` emitted over the expression at `a`'s inner index; taking the outer
+        // schema would rename an output the outer list renames, so the key that
+        // reads it by its inner name resolves to nothing. An output the outer list
+        // repeats takes the outer field the second time, since one schema cannot
+        // name two outputs alike. Fields that still collide decline the fold: the
+        // outer schema would name the substituted expressions by the outer list's
+        // positions, and a key reading an inner output by name would resolve to
+        // the expression of whichever output the outer list put at that name's
+        // position (`c` reading `(t.a + 1)` under an outer `[c, a, c]` declared
+        // `[d, c, a]`).
+        let mut read = HashSet::new();
+        let fields = p
+            .expr
+            .iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let (schema, index) = match position.get(&e.to_string()) {
+                    Some(&k) if read.insert(k) => (&inner_p.schema, k),
+                    _ => (&p.schema, i),
+                };
+                let (qualifier, _) = schema.qualified_field(index);
+                (qualifier.cloned(), Arc::clone(&schema.fields()[index]))
+            })
+            .collect::<Vec<_>>();
+        let schema = Arc::new(
+            DFSchema::new_with_metadata(fields, inner_p.schema.metadata().clone())
+                .ok()?,
+        );
+        let inner_p = Projection::try_new_with_schema(
+            new_exprs,
+            Arc::clone(&inner_p.input),
+            schema,
+        )
+        .ok()?;
         sort.input = Arc::new(LogicalPlan::Projection(inner_p));
 
         Some(LogicalPlan::Sort(sort))
@@ -622,12 +669,25 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// rejects the query even though DataFusion re-plans it.
 ///
 /// A reference is rewritten only when its qualifier names one of the relations the derived
-/// table encloses (`derived_qualifiers`), so a reference to a relation the SELECT still
+/// table encloses (`derived_relations`), so a reference to a relation the SELECT still
 /// reads directly — the other side of a join, say — keeps the qualifier it needs. With
 /// `Some(alias)` the column is then addressed through `alias`, which the derived table
 /// carries, rather than reduced to a bare name: bare would be ambiguous wherever the derived
 /// table is not the SELECT's only relation. `None` is for a derived table that *is* the
 /// SELECT's only relation and carries no alias: its outputs are addressed by name alone.
+///
+/// The qualifier is everything before the last identifier when that names an enclosed
+/// relation, so a multi-part one (`db.schema.t`) is recognised whole. A reference that
+/// goes on past the column — a field path, `t.payload.x` — has a shorter qualifier, and
+/// is re-pointed only where the derived table is the SELECT's only relation (`None`):
+/// there the qualifier is the longest leading run naming an enclosed relation through
+/// whose columns the rest is a field path — a column, then a field of each struct in
+/// turn — and the column and its path are kept. Beside another relation, a join's other
+/// input, a shorter run cannot be told apart on names alone from that relation's own
+/// name — `t.s.a` is as much column `a` of a relation `t.s` — so with `Some(alias)` only
+/// the full qualifier is matched. Requiring the path to exist in the enclosed types keeps
+/// a correlated reference to an enclosing `t.s` as it is unless `t` also has a struct
+/// column `s` with a field `a`, where the SQL text itself reads either way.
 ///
 /// Both tests are on names alone, so neither distinguishes a correlated reference to an
 /// enclosing query — that qualifier can name the very same relation. A caller must not
@@ -637,28 +697,53 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
 pub fn requalify_column_onto_derived_table(
     idents: &mut Vec<Ident>,
-    derived_qualifiers: &HashSet<String>,
+    derived_relations: &HashMap<String, HashMap<String, DataType>>,
     alias: Option<&Ident>,
 ) {
-    let Some((last, qualifier)) = idents.split_last() else {
+    let shortest = if alias.is_some() {
+        idents.len().saturating_sub(1).max(1)
+    } else {
+        1
+    };
+    let qualifier_len = (shortest..idents.len()).rev().find(|&len| {
+        let qualifier = idents[..len]
+            .iter()
+            .map(|ident| ident.value.clone())
+            .collect::<Vec<String>>()
+            .join(".");
+        derived_relations.get(&qualifier).is_some_and(|columns| {
+            len + 1 == idents.len() || is_field_path(columns, &idents[len..])
+        })
+    });
+    let Some(qualifier_len) = qualifier_len else {
         return;
     };
-    if qualifier.is_empty() {
-        return;
-    }
-    let qualifier = qualifier
-        .iter()
-        .map(|ident| ident.value.clone())
-        .collect::<Vec<String>>()
-        .join(".");
-    if !derived_qualifiers.contains(&qualifier) {
-        return;
-    }
-    let last = last.clone();
+    let rest = idents.split_off(qualifier_len);
     *idents = match alias {
-        Some(alias) => vec![alias.clone(), last],
-        None => vec![last],
+        Some(alias) => std::iter::once(alias.clone()).chain(rest).collect(),
+        None => rest,
     };
+}
+
+/// Whether `path` — a column, then a field of each struct in turn — names a field
+/// path through `columns`.
+fn is_field_path(columns: &HashMap<String, DataType>, path: &[Ident]) -> bool {
+    let Some((column, fields)) = path.split_first() else {
+        return false;
+    };
+    let Some(mut data_type) = columns.get(&column.value) else {
+        return false;
+    };
+    for field in fields {
+        let DataType::Struct(struct_fields) = data_type else {
+            return false;
+        };
+        let Some(next) = struct_fields.iter().find(|f| *f.name() == field.value) else {
+            return false;
+        };
+        data_type = next.data_type();
+    }
+    true
 }
 
 /// Takes an input list of identifiers and a list of identifiers that are available from relations or joins.
@@ -680,6 +765,30 @@ pub fn remove_dangling_identifiers(idents: &mut Vec<Ident>, available_idents: &[
             // Reset the identifiers to only the last element, which is the column name
             *idents = vec![last.clone()];
         }
+    }
+}
+
+/// [`remove_dangling_identifiers`] over a column reference, or over the column a
+/// struct field path (`t.s.f`) is rooted at, keeping the path.
+///
+/// Only a path of `.field` steps is judged. That is the shape `get_field` is emitted
+/// in, and its root is always a column of this query's own relations: a correlated
+/// column is refused there. A subscript (`t.a[1]`) is left alone, as its root can be
+/// a correlated reference, which binds in the enclosing query whatever this `FROM`
+/// reads.
+pub fn remove_dangling_qualifier(expr: &mut ast::Expr, available_idents: &[String]) {
+    match expr {
+        ast::Expr::CompoundIdentifier(idents) => {
+            remove_dangling_identifiers(idents, available_idents);
+        }
+        ast::Expr::CompoundFieldAccess { root, access_chain }
+            if access_chain
+                .iter()
+                .all(|access| matches!(access, ast::AccessExpr::Dot(_))) =>
+        {
+            remove_dangling_qualifier(root, available_idents);
+        }
+        _ => {}
     }
 }
 
@@ -720,6 +829,41 @@ mod tests {
             remove_dangling_identifiers(&mut idents, &test_in);
             assert_eq!(idents, test_out);
         }
+    }
+
+    #[test]
+    fn test_remove_dangling_qualifier() {
+        let column = |parts: &[&str]| {
+            ast::Expr::CompoundIdentifier(
+                parts.iter().map(|part| Ident::new(*part)).collect(),
+            )
+        };
+        let field_path = |root: ast::Expr| ast::Expr::CompoundFieldAccess {
+            root: Box::new(root),
+            access_chain: vec![ast::AccessExpr::Dot(ast::Expr::Identifier(Ident::new(
+                "product",
+            )))],
+        };
+        let subscript = |root: ast::Expr| ast::Expr::CompoundFieldAccess {
+            root: Box::new(root),
+            access_chain: vec![ast::AccessExpr::Subscript(ast::Subscript::Index {
+                index: ast::Expr::value(ast::Value::Number("1".to_string(), false)),
+            })],
+        };
+
+        // A field path is judged by the column it is rooted at, and keeps its path.
+        let mut expr = field_path(column(&["t", "metadata"]));
+        remove_dangling_qualifier(&mut expr, &[]);
+        assert_eq!(expr, field_path(column(&["metadata"])));
+
+        let mut expr = field_path(column(&["t", "metadata"]));
+        remove_dangling_qualifier(&mut expr, &["t".to_string()]);
+        assert_eq!(expr, field_path(column(&["t", "metadata"])));
+
+        // A subscript's root may be a correlated reference, so it is left alone.
+        let mut expr = subscript(column(&["o", "array_col"]));
+        remove_dangling_qualifier(&mut expr, &[]);
+        assert_eq!(expr, subscript(column(&["o", "array_col"])));
     }
 
     // this is a regression test: when the outer projection has fewer expressions than
