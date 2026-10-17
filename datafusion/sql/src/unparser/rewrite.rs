@@ -232,6 +232,15 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         return None;
     };
 
+    // The fold reads an output by the name its expression gives it, so it is
+    // taken only where that is the name the schema declares for it: a
+    // projection built with a declared schema that renames an alias or a column
+    // (`(t.a + 1) AS x` declared `y`) would have it substitute one output for
+    // another.
+    if !outputs_named_as_declared(inner_p) {
+        return None;
+    }
+
     let mut map = HashMap::new();
     let inner_exprs = inner_p
         .expr
@@ -265,6 +274,12 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         .enumerate()
         .map(|(i, e)| (e.to_string(), i))
         .collect::<HashMap<_, _>>();
+    // That spelling is not a unique identity: `t."a.b"` and an alias `"t.a.b"`
+    // both display as `t.a.b`. Two outputs that share one leave the plan
+    // unfolded, since the fold could not tell which of them an expression reads.
+    if position.len() != inner_exprs.len() {
+        return None;
+    }
 
     // Compare outer collects Expr::to_string with inner collected transformed values
     // alias -> alias column
@@ -310,7 +325,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     // Anything else keeps the sort in its own scope, as it did before.
     if outer_collects.is_subset(&inner_collects)
         && (outer_collects == inner_collects
-            || widened_fold_is_safe(p, inner_p, &position, &outer_collects))
+            || widened_fold_is_safe(p, inner_p, &position))
     {
         let mut sort = sort.clone();
         let inner_p = inner_p.clone();
@@ -556,13 +571,11 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
 /// did not do before spiceai/spiceai#14733. It is taken only in a subset that
 /// is safe by construction, rather than guarded shape by shape:
 ///
-/// - every output the outer list keeps is a plain column named by that column,
-///   in the inner schema and in the outer one, so the folded `SELECT` list
-///   introduces no alias that a bare `ORDER BY` name, a substituted expression
-///   or an outer reference could bind to, and the result keeps the plan's names;
-/// - no plain column the inner projection renames is read above: a name read
-///   above is matched against a plain column by the column's own name, while
-///   the output it reads is the one the schema gives that name;
+/// - every output the outer list keeps is a plain column, named by that column
+///   in the outer schema as well (the inner one already is, see
+///   [`outputs_named_as_declared`]), so the folded `SELECT` list introduces no
+///   alias that a bare `ORDER BY` name, a substituted expression or an outer
+///   reference could bind to, and the result keeps the plan's names;
 /// - the outer list reads each kept output once;
 /// - no inner output is volatile or holds a subquery, so substituting a dropped
 ///   output into a key evaluates nothing the plan evaluates once.
@@ -572,32 +585,36 @@ fn widened_fold_is_safe(
     p: &Projection,
     inner_p: &Projection,
     position: &HashMap<String, usize>,
-    read_above: &HashSet<String>,
 ) -> bool {
-    let named_by_own_column = |schema: &DFSchema, i: usize, column: &Column| {
-        let (qualifier, field) = schema.qualified_field(i);
-        field.name() == &column.name && qualifier == column.relation.as_ref()
-    };
-    let renamed_column_read_above =
-        inner_p.expr.iter().enumerate().any(|(i, e)| match e {
-            Expr::Column(column) => {
-                !named_by_own_column(&inner_p.schema, i, column)
-                    && read_above.contains(&e.to_string())
-            }
-            _ => false,
-        });
-    if renamed_column_read_above || !inner_p.expr.iter().all(output_is_repeatable) {
+    if !inner_p.expr.iter().all(output_is_repeatable) {
         return false;
     }
     let mut kept = HashSet::new();
     p.expr.iter().enumerate().all(|(j, e)| {
         position.get(&e.to_string()).is_some_and(|&i| {
-            matches!(&inner_p.expr[i], Expr::Column(column)
-                if named_by_own_column(&inner_p.schema, i, column)
-                    && named_by_own_column(&p.schema, j, column))
-                && kept.insert(i)
+            matches!(&inner_p.expr[i], Expr::Column(column) if {
+                let (qualifier, field) = p.schema.qualified_field(j);
+                field.name() == &column.name && qualifier == column.relation.as_ref()
+            }) && kept.insert(i)
         })
     })
+}
+
+/// Whether every aliased or plain-column output of `projection` carries the
+/// name its schema declares for it, and any relation the expression names is
+/// the declared qualifier. An unnamed computed output is read by its declared
+/// name throughout the fold, so it always agrees.
+fn outputs_named_as_declared(projection: &Projection) -> bool {
+    projection.expr.len() == projection.schema.fields().len()
+        && projection.expr.iter().enumerate().all(|(i, e)| {
+            let (relation, name) = match e {
+                Expr::Alias(alias) => (alias.relation.as_ref(), &alias.name),
+                Expr::Column(column) => (column.relation.as_ref(), &column.name),
+                _ => return true,
+            };
+            let (qualifier, field) = projection.schema.qualified_field(i);
+            field.name() == name && relation.is_none_or(|r| Some(r) == qualifier)
+        })
 }
 
 /// Whether `plan` renders in a scope that hides the relations its input

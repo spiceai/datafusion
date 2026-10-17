@@ -18142,9 +18142,10 @@ fn test_a_renamed_plain_column_output_keeps_the_sort_in_its_scope() -> Result<()
 }
 
 #[test]
-fn test_a_renamed_plain_column_nothing_reads_still_folds() -> Result<()> {
-    // `b` is declared `unused`, and neither the key nor the outer list reads
-    // `b` or `unused`, so the fold drops it and keeps `c` under its own name.
+fn test_a_renamed_plain_column_nothing_reads_keeps_the_sort_in_its_scope() -> Result<()> {
+    // `b` is declared `unused`. Nothing above reads it, but the fold is taken
+    // only over a projection whose outputs carry their declared names, so the
+    // sort keeps its scope.
     let plan = LogicalPlanBuilder::from(declared_abc(["a", "unused", "c"])?)
         .sort_with_limit(vec![col("a").sort(true, true)], Some(1))?
         .project(vec![col("c")])?
@@ -18152,7 +18153,7 @@ fn test_a_renamed_plain_column_nothing_reads_still_folds() -> Result<()> {
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT c FROM (SELECT t.a AS a, t.b AS b, t.c AS c FROM t) ORDER BY a ASC NULLS FIRST LIMIT 1"
+        @"SELECT c FROM (SELECT a, b, c FROM (SELECT t.a AS a, t.b AS b, t.c AS c FROM t) ORDER BY a ASC NULLS FIRST LIMIT 1)"
     );
     Ok(())
 }
@@ -18394,6 +18395,92 @@ fn test_an_outer_reference_in_a_re_established_key_a_computed_alias_captures_is_
     assert_contains!(
         error.to_string(),
         "computes an output named like one of the sort's keys"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_outputs_whose_display_names_collide_keep_the_sort_in_its_scope() -> Result<()> {
+    // `t."a.b"` and the alias `"t.a.b"` both display as `t.a.b`, the spelling
+    // the fold matches outputs by. It would take the alias's field for the kept
+    // column, so the dropped alias would not be substituted and the key would
+    // be left as `ORDER BY ("t.a.b" + 1)`, naming an output the folded
+    // projection no longer has.
+    let schema = Schema::new(vec![
+        Field::new("a.b", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let dotted = || Expr::Column(Column::new(Some("t"), "a.b"));
+    // The builder refuses the two outputs as one name, so the projection is
+    // built with its schema, as a plan producer that skips that check would.
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("a.b", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("t.a.b", DataType::Int32, false))),
+        ],
+        Default::default(),
+    )?;
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![dotted(), (col("t.b") + lit(1)).alias("t.a.b")],
+        Arc::new(table_scan(Some("t"), &schema, None)?.build()?),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort_with_limit(
+            vec![
+                (Expr::Column(Column::new_unqualified("t.a.b")) + lit(1))
+                    .sort(true, true),
+            ],
+            Some(1),
+        )?
+        .project(vec![dotted()])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "a.b" FROM (SELECT t."a.b", (t.b + 1) AS "t.a.b" FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_alias_declared_under_another_name_keeps_the_sort_in_its_scope() -> Result<()> {
+    // The inner projection declares its schema `[y, x, t.c]` over
+    // `[(t.a + 1) AS x, (t.b + 1) AS y, t.c]`, so the field `x` is the second
+    // output, `t.b + 1`. The fold looks a dropped alias up by its own name and
+    // would substitute `t.a + 1` into the key `x + 1`.
+    let input = table_scan(Some("t"), &int32_schema(&["a", "b", "c"]), None)?.build()?;
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (None, Arc::new(Field::new("y", DataType::Int32, false))),
+            (None, Arc::new(Field::new("x", DataType::Int32, false))),
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("c", DataType::Int32, false)),
+            ),
+        ],
+        Default::default(),
+    )?;
+    let inner = datafusion_expr::Projection::try_new_with_schema(
+        vec![
+            (col("t.a") + lit(1)).alias("x"),
+            (col("t.b") + lit(1)).alias("y"),
+            col("t.c"),
+        ],
+        Arc::new(input),
+        Arc::new(declared),
+    )?;
+    let plan = LogicalPlanBuilder::from(LogicalPlan::Projection(inner))
+        .sort_with_limit(vec![(col("x") + lit(1)).sort(true, true)], Some(1))?
+        .project(vec![col("t.c")])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT c FROM (SELECT (t.a + 1) AS x, (t.b + 1) AS y, t.c FROM t ORDER BY ((t.b + 1) + 1) ASC NULLS FIRST LIMIT 1)"
     );
     Ok(())
 }
