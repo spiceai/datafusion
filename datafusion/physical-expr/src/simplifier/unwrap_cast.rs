@@ -37,8 +37,8 @@ use arrow::datatypes::{DataType, Schema};
 use datafusion_common::{Result, ScalarValue, tree_node::Transformed};
 use datafusion_expr::Operator;
 use datafusion_expr_common::casts::{
-    is_date_narrowing_cast, is_timestamp_precision_narrowing_cast,
-    try_cast_literal_to_type,
+    is_date_narrowing_cast, is_decimal_scale_narrowing_cast,
+    is_timestamp_precision_narrowing_cast, try_cast_literal_to_type,
 };
 
 use crate::PhysicalExpr;
@@ -132,6 +132,7 @@ fn try_unwrap_cast_comparison(
 
     if is_timestamp_precision_narrowing_cast(&inner_type, cast_type)
         || is_date_narrowing_cast(&inner_type, cast_type)
+        || is_decimal_scale_narrowing_cast(&inner_type, cast_type)
     {
         return Ok(None);
     }
@@ -149,7 +150,7 @@ fn try_unwrap_cast_comparison(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::expressions::col;
+    use crate::expressions::{Column, col};
     use arrow::datatypes::{Field, TimeUnit};
     use datafusion_common::tree_node::TreeNode;
 
@@ -420,6 +421,72 @@ mod tests {
             let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
             assert!(result.transformed);
         }
+    }
+
+    #[test]
+    fn test_not_unwrap_decimal_scale_narrowing() {
+        // A Decimal128(15, 2) column cast to an integer, or to a decimal of a
+        // smaller scale, maps many values to one; the comparison keeps the cast
+        // (apache/datafusion#23095).
+        let schema = Schema::new(vec![Field::new(
+            "price",
+            DataType::Decimal128(15, 2),
+            false,
+        )]);
+        let narrowing: Vec<(DataType, ScalarValue)> = vec![
+            (DataType::Int64, ScalarValue::Int64(Some(173665))),
+            (DataType::Int32, ScalarValue::Int32(Some(173665))),
+            (
+                DataType::Decimal128(15, 0),
+                ScalarValue::Decimal128(Some(173665), 15, 0),
+            ),
+            (
+                DataType::Decimal128(15, 1),
+                ScalarValue::Decimal128(Some(1736655), 15, 1),
+            ),
+        ];
+        for (cast_type, literal) in narrowing {
+            for op in [Operator::Eq, Operator::Lt, Operator::LtEq, Operator::Gt] {
+                let cast_expr = Arc::new(CastExpr::new(
+                    col("price", &schema).unwrap(),
+                    cast_type.clone(),
+                    None,
+                ));
+                let binary_expr =
+                    Arc::new(BinaryExpr::new(cast_expr, op, lit(literal.clone())));
+                let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
+                assert!(
+                    !result.transformed,
+                    "CAST(price AS {cast_type}) {op} {literal} must keep its cast"
+                );
+            }
+        }
+
+        // The widening direction still unwraps: 173665.2900 at scale 4 is
+        // exactly 173665.29 at scale 2.
+        let cast_expr = Arc::new(CastExpr::new(
+            col("price", &schema).unwrap(),
+            DataType::Decimal128(20, 4),
+            None,
+        ));
+        let binary_expr = Arc::new(BinaryExpr::new(
+            cast_expr,
+            Operator::Eq,
+            lit(ScalarValue::Decimal128(Some(1736652900), 20, 4)),
+        ));
+        let result = unwrap_cast_in_comparison(binary_expr, &schema).unwrap();
+        assert!(result.transformed);
+        let unwrapped = result.data.downcast_ref::<BinaryExpr>().unwrap();
+        assert_eq!(
+            unwrapped.left().downcast_ref::<Column>().unwrap().name(),
+            "price",
+            "the cast comes off the column"
+        );
+        assert_eq!(unwrapped.op(), &Operator::Eq);
+        assert_eq!(
+            unwrapped.right().downcast_ref::<Literal>().unwrap().value(),
+            &ScalarValue::Decimal128(Some(17366529), 15, 2)
+        );
     }
 
     #[test]

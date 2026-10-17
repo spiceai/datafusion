@@ -15905,6 +15905,406 @@ fn test_mysql_timestamp_cast_keeps_fractional_seconds() -> Result<()> {
     Ok(())
 }
 
+/// A union input's own `ORDER BY` and row bound select that input's rows, so
+/// they must stay inside it. Written on the union's query they bound the whole
+/// `UNION ALL` instead: `u UNION ALL <the top row of v>` returned only that one
+/// row (spiceai/spiceai#14737).
+#[test]
+fn test_union_input_keeps_its_own_sort_and_fetch() -> Result<()> {
+    let v_top = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .sort_with_limit(vec![col("v.a").sort(false, true)], Some(1))?
+        .build()?;
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .union(v_top)?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM u UNION ALL SELECT * FROM (SELECT * FROM v ORDER BY v.a DESC NULLS FIRST LIMIT 1)"
+    );
+    Ok(())
+}
+
+/// Each bounded input keeps its own bound, and a dialect that requires a
+/// derived-table alias gets one, so the statement is accepted where an
+/// unaliased subquery is refused.
+#[test]
+fn test_union_inputs_each_keep_their_own_bound() -> Result<()> {
+    let u_first = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+        .build()?;
+    let v_page = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .limit(1, Some(2))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(u_first).union(v_page)?.build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM (SELECT * FROM u ORDER BY u.a ASC NULLS FIRST LIMIT 2) \
+         UNION ALL SELECT * FROM (SELECT * FROM v LIMIT 2 OFFSET 1)"
+    );
+
+    let unparser = Unparser::new(&UnparserPostgreSqlDialect {});
+    assert_eq!(
+        unparser.plan_to_sql(&plan)?.to_string(),
+        r#"SELECT * FROM (SELECT * FROM "u" ORDER BY "u"."a" ASC NULLS FIRST LIMIT 2) AS "derived_union_input" UNION ALL SELECT * FROM (SELECT * FROM "v" LIMIT 2 OFFSET 1) AS "derived_union_input""#
+    );
+    Ok(())
+}
+
+/// A sort above the union orders and bounds the union as a whole, so it stays
+/// on the union's own query: only an input's clauses move into that input.
+#[test]
+fn test_sort_above_union_still_bounds_the_union() -> Result<()> {
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .union(table_scan(Some("v"), &int32_schema(&["a"]), None)?.build()?)?
+        .sort_with_limit(vec![col("a").sort(true, true)], Some(3))?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM u UNION ALL SELECT * FROM v ORDER BY a ASC NULLS FIRST LIMIT 3"
+    );
+    Ok(())
+}
+
+/// A union nested in a bounded input takes its quantifier from its own plan,
+/// not from the `DISTINCT` union around it: the bound picks from
+/// `a UNION ALL b`, duplicates included, and only then is the outer union
+/// deduplicated.
+#[test]
+fn test_bounded_union_input_keeps_its_own_quantifier() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let inner = table_scan(Some("a"), &s, None)?
+        .union(table_scan(Some("b"), &s, None)?.build()?)?
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(2))?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(inner)
+        .union_distinct(table_scan(Some("c"), &s, None)?.build()?)?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM (SELECT * FROM a UNION ALL SELECT * FROM b ORDER BY x ASC NULLS FIRST LIMIT 2) \
+         UNION SELECT * FROM c"
+    );
+    Ok(())
+}
+
+/// A `DISTINCT` union nested in an input deduplicates that input only. It must
+/// not turn the enclosing `UNION ALL` into a `UNION`, and it is scoped so that
+/// SQL's left-to-right grouping of set operations cannot regroup it either.
+#[test]
+fn test_distinct_union_input_does_not_dedupe_its_siblings() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let distinct = table_scan(Some("b"), &s, None)?
+        .union_distinct(table_scan(Some("c"), &s, None)?.build()?)?
+        .build()?;
+    let plan = table_scan(Some("a"), &s, None)?
+        .union(distinct.clone())?
+        .build()?;
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM (SELECT * FROM b UNION SELECT * FROM c)"
+    );
+
+    let bounded = LogicalPlanBuilder::from(distinct)
+        .sort_with_limit(vec![col("x").sort(true, true)], Some(5))?
+        .build()?;
+    let plan = table_scan(Some("a"), &s, None)?.union(bounded)?.build()?;
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM (SELECT * FROM b UNION SELECT * FROM c \
+         ORDER BY x ASC NULLS FIRST LIMIT 5)"
+    );
+    Ok(())
+}
+
+/// Under `DISTINCT ON` the `ORDER BY` picks which row of each group survives,
+/// so a union input's ordering is kept in that input's scope even with no
+/// bound: emitted on the union it would no longer decide between `(1, 10)` and
+/// `(1, 20)`.
+#[test]
+fn test_distinct_on_union_input_keeps_its_order_by() -> Result<()> {
+    let s = int32_schema(&["k", "v"]);
+    let latest = table_scan(Some("t"), &s, None)?
+        .distinct_on(
+            vec![col("t.k")],
+            vec![col("t.k"), col("t.v")],
+            Some(vec![
+                col("t.k").sort(true, true),
+                col("t.v").sort(false, true),
+            ]),
+        )?
+        .build()?;
+    let plan = table_scan(Some("u"), &s, None)?.union(latest)?.build()?;
+
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT * FROM "u" UNION ALL SELECT * FROM (SELECT DISTINCT ON ("t"."k") "t"."k", "t"."v" FROM "t" ORDER BY "t"."k" ASC NULLS FIRST, "t"."v" DESC NULLS FIRST) AS "derived_union_input""#
+    );
+    Ok(())
+}
+
+/// An input sorted with no bound keeps its `ORDER BY` in its own scope, like
+/// any other clause it leaves on its query.
+#[test]
+fn test_unbounded_sort_on_union_input_stays_in_its_scope() -> Result<()> {
+    let v_sorted = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .sort(vec![col("v.a").sort(true, true)])?
+        .build()?;
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .union(v_sorted)?
+        .build()?;
+
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM u UNION ALL SELECT * FROM (SELECT * FROM v ORDER BY v.a ASC NULLS FIRST)"
+    );
+    Ok(())
+}
+
+/// An extension unparser that defines a CTE on the query it is handed and
+/// reads it as its relation.
+struct MockCteWritingUnparser {}
+
+impl UserDefinedLogicalNodeUnparser for MockCteWritingUnparser {
+    fn unparse(
+        &self,
+        node: &dyn UserDefinedLogicalNode,
+        _unparser: &Unparser,
+        query: &mut Option<&mut QueryBuilder>,
+        _select: &mut Option<&mut SelectBuilder>,
+        relation: &mut Option<&mut RelationBuilder>,
+    ) -> Result<UnparseWithinStatementResult> {
+        if node
+            .as_any()
+            .downcast_ref::<MockUserDefinedLogicalPlan>()
+            .is_none()
+        {
+            return Ok(UnparseWithinStatementResult::Unmodified);
+        }
+        let Statement::Query(defining) = Parser::new(&GenericDialect {})
+            .try_with_sql("WITH c AS (SELECT 1 AS j1_id, 'x' AS j1_string) SELECT 1")?
+            .parse_statement()?
+        else {
+            return internal_err!("expected a query");
+        };
+        let Some(with) = defining.with else {
+            return internal_err!("expected a WITH clause");
+        };
+        if let Some(query) = query {
+            for cte in with.cte_tables {
+                query.push_cte(cte, false);
+            }
+        }
+        if let Some(rel) = relation {
+            let mut table = TableRelationBuilder::default();
+            table.name(ObjectName::from(vec![Ident::new("c")]));
+            rel.table(table);
+        }
+        Ok(UnparseWithinStatementResult::Modified)
+    }
+}
+
+/// A CTE an extension puts on a union input's query stays defined: the input
+/// keeps it in a scope of its own instead of losing it with its builder.
+#[test]
+fn test_union_input_keeps_a_cte_its_extension_defines() -> Result<()> {
+    let state = MockSessionState::default();
+    let context = MockContextProvider { state };
+    let sql_to_rel = SqlToRel::new(&context);
+    let j1 = sql_to_rel.sql_statement_to_plan(
+        Parser::new(&GenericDialect {})
+            .try_with_sql("SELECT * FROM j1")?
+            .parse_statement()?,
+    )?;
+    let extension = LogicalPlan::Extension(Extension {
+        node: Arc::new(MockUserDefinedLogicalPlan { input: j1.clone() }),
+    });
+    let plan = LogicalPlanBuilder::from(j1).union(extension)?.build()?;
+
+    let unparser = Unparser::default()
+        .with_extension_unparsers(vec![Arc::new(MockCteWritingUnparser {})]);
+    assert_eq!(
+        unparser.plan_to_sql(&plan)?.to_string(),
+        "SELECT j1.j1_id, j1.j1_string FROM j1 UNION ALL \
+         SELECT * FROM (WITH c AS (SELECT 1 AS j1_id, 'x' AS j1_string) SELECT * FROM c)"
+    );
+    Ok(())
+}
+
+/// A nested union whose grouping the flat form already states stays flat: one
+/// that comes first groups left to right anyway, and one with the enclosing
+/// union's own quantifier is associative with it. Scoping either would add a
+/// derived table whose duplicate column names some engines refuse.
+#[test]
+fn test_nested_union_that_groups_alike_stays_flat() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let scan = |name: &str| table_scan(Some(name), &s, None)?.build();
+    let first = LogicalPlanBuilder::from(scan("a")?)
+        .union_distinct(scan("b")?)?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(first).union(scan("c")?)?.build()?;
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION SELECT * FROM b UNION ALL SELECT * FROM c"
+    );
+
+    let same = LogicalPlanBuilder::from(scan("b")?)
+        .union(scan("c")?)?
+        .build()?;
+    let plan = LogicalPlan::Union(Union::try_new_with_loose_types(vec![
+        Arc::new(scan("a")?),
+        Arc::new(same),
+    ])?);
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM b UNION ALL SELECT * FROM c"
+    );
+    Ok(())
+}
+
+/// A quantifier that differs anywhere in a nested union's exposed chain, not
+/// only at its top, scopes the input: flat, `a UNION ALL b UNION c UNION ALL d`
+/// would deduplicate `a` too.
+#[test]
+fn test_union_input_with_a_mixed_quantifier_below_its_top_is_scoped() -> Result<()> {
+    let s = int32_schema(&["x"]);
+    let scan = |name: &str| table_scan(Some(name), &s, None)?.build();
+    let b_or_c = LogicalPlanBuilder::from(scan("b")?)
+        .union_distinct(scan("c")?)?
+        .build()?;
+    let nested = LogicalPlanBuilder::from(b_or_c)
+        .union(scan("d")?)?
+        .build()?;
+    let plan = LogicalPlan::Union(Union::try_new_with_loose_types(vec![
+        Arc::new(scan("a")?),
+        Arc::new(nested),
+    ])?);
+    assert_eq!(
+        plan_to_sql(&plan)?.to_string(),
+        "SELECT * FROM a UNION ALL SELECT * FROM (SELECT * FROM b UNION SELECT * FROM c UNION ALL SELECT * FROM d)"
+    );
+    Ok(())
+}
+
+/// A sort above a union orders the union's output, whose columns carry no
+/// relation: a key the plan qualifies with an input's table is written bare,
+/// since `ORDER BY "u"."a"` after a `UNION` names a table out of scope.
+#[test]
+fn test_sort_above_union_names_the_output_column() -> Result<()> {
+    let s = int32_schema(&["a"]);
+    for union_distinct in [false, true] {
+        let left = table_scan(Some("u"), &s, None)?;
+        let right = table_scan(Some("v"), &s, None)?.build()?;
+        let union = if union_distinct {
+            left.union_distinct(right)?
+        } else {
+            left.union(right)?
+        };
+        let plan = union
+            .sort_with_limit(vec![col("u.a").sort(true, true)], Some(2))?
+            .build()?;
+        let quantifier = if union_distinct { "UNION" } else { "UNION ALL" };
+        assert_eq!(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+            format!(
+                r#"SELECT "a" FROM (SELECT * FROM "u" {quantifier} SELECT * FROM "v" ORDER BY "a" ASC NULLS FIRST LIMIT 2) AS "derived_sort""#
+            )
+        );
+    }
+    Ok(())
+}
+
+/// Unqualifying a sort key above a union drops only the relation: a struct
+/// field read through the column keeps its path, or `s.f + 1` would sort by the
+/// top-level column `f` instead. That holds when the struct column shares its
+/// name with an input table (`s`), so the struct name is never mistaken for a
+/// relation.
+#[test]
+fn test_sort_above_union_keeps_a_struct_field_path() -> Result<()> {
+    let s = Schema::new(vec![
+        Field::new("f", DataType::Int32, false),
+        Field::new(
+            "s",
+            DataType::Struct(vec![Field::new("f", DataType::Int32, false)].into()),
+            false,
+        ),
+    ]);
+    let key = get_field(col("t.s"), "f") + lit(1);
+    for (union_distinct, right_table) in
+        [(false, "w"), (true, "w"), (false, "s"), (true, "s")]
+    {
+        let left = table_scan(Some("t"), &s, None)?;
+        let right = table_scan(Some(right_table), &s, None)?.build()?;
+        let union = if union_distinct {
+            left.union_distinct(right)?
+        } else {
+            left.union(right)?
+        };
+        let sql = plan_to_sql(
+            &union
+                .sort_with_limit(vec![key.clone().sort(true, true)], Some(1))?
+                .build()?,
+        )?
+        .to_string();
+        let quantifier = if union_distinct { "UNION" } else { "UNION ALL" };
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT f, s FROM (SELECT * FROM t {quantifier} SELECT * FROM {right_table} \
+                 ORDER BY (s.f + 1) ASC NULLS FIRST LIMIT 1)"
+            )
+        );
+    }
+    Ok(())
+}
+
+/// A sort key above a `UNION` names the union's output column alone, even when
+/// its relation is schema-qualified: `"u"."a"` would name a table that is out of
+/// scope there, which `PostgreSQL` rejects.
+#[test]
+fn test_sort_above_union_drops_a_schema_qualified_relation() -> Result<()> {
+    let s = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    // `distinct_twice` stacks a second `Distinct` over the union's own, which
+    // the unparser folds into the same `UNION`.
+    for (union_distinct, distinct_twice) in [(false, false), (true, false), (true, true)]
+    {
+        let left = table_scan(Some("public.u"), &s, None)?;
+        let right = table_scan(Some("public.v"), &s, None)?.build()?;
+        let union = if union_distinct {
+            left.union_distinct(right)?
+        } else {
+            left.union(right)?
+        };
+        let union = if distinct_twice {
+            union.distinct()?
+        } else {
+            union
+        };
+        let plan = union
+            .sort_with_limit(vec![col("public.u.a").sort(true, true)], Some(1))?
+            .build()?;
+        let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        let quantifier = if union_distinct { "UNION" } else { "UNION ALL" };
+        assert_eq!(
+            sql,
+            format!(
+                "SELECT \"a\" FROM (SELECT * FROM \"public\".\"u\" {quantifier} \
+                 SELECT * FROM \"public\".\"v\" ORDER BY \"a\" ASC NULLS FIRST LIMIT 1) \
+                 AS \"derived_sort\""
+            )
+        );
+    }
+    Ok(())
+}
 // A `Sort` or `Limit` stacked under one this SELECT already carries: the query
 // builder holds one `ORDER BY` and one row bound, so the inner node must either
 // fold into them faithfully or take a scope of its own, never overwrite them
