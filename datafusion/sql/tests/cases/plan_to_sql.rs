@@ -16505,6 +16505,36 @@ fn test_a_sort_folded_through_two_projections_keeps_the_outer_keys() -> Result<(
 }
 
 #[test]
+fn test_a_sort_over_two_folded_projections_resolves_its_keys_against_the_fold()
+-> Result<()> {
+    // The two projections fold into one SELECT with the aggregate, so the outer
+    // key `s + 1` reads `sum(t.v)`. Emitted as `s + 1`, the `s` inside the
+    // expression binds to the source column `t.s`: SQLite returns `(20, 2)` for
+    // `t(k, v, s) = (1, 10, 100), (2, 20, 0)`, not `(10, 1)`.
+    let plan = |inner: Vec<Expr>, key: Expr| -> Result<LogicalPlan> {
+        table_scan(Some("t"), &int32_schema(&["k", "v", "s"]), None)?
+            .aggregate(vec![col("t.k")], vec![sum(col("t.v")).alias("s")])?
+            .project(inner)?
+            .sort(vec![(col("s") + lit(1)).sort(true, true)])?
+            .project(vec![col("s"), col("t.k")])?
+            .sort_with_limit(vec![key.sort(true, true)], Some(1))?
+            .build()
+    };
+    assert_snapshot!(
+        plan_to_sql(&plan(vec![col("s"), col("t.k")], col("s") + lit(1))?)?,
+        @"SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k ORDER BY (sum(t.v) + 1) ASC NULLS FIRST LIMIT 1"
+    );
+    // A key on the group column keeps its qualifier: the fold leaves no derived
+    // table for it to be out of scope in.
+    assert_snapshot!(
+        plan_to_sql(&plan(vec![col("s"), col("t.k")], col("t.k") + lit(1))?)?,
+        @"SELECT sum(t.v) AS s, t.k FROM t GROUP BY t.k ORDER BY (t.k + 1) ASC NULLS FIRST LIMIT 1"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn test_a_fetched_sort_under_a_non_literal_limit_is_refused() -> Result<()> {
     // The outer bound is an expression, so it cannot merge with the fetch, and a
     // derived table around the sort would drop the order the plan returns its

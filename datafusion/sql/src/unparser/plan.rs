@@ -3608,6 +3608,16 @@ impl Unparser<'_> {
                 // An unfetched sort directly below is reordered by this one and
                 // dropped by the walk (see the `has_order_by` branch above), so
                 // the node this sort's keys resolve against is the one under it.
+                //
+                // A projection over such a sort over another projection is folded
+                // by the Projection arm into one projection under the hoisted
+                // sort, which the walk then drops. The keys resolve against that
+                // folded projection, whose aggregate and windows join this SELECT:
+                // resolved against the outer projection alone, a key `s + 1`
+                // reading the inner `sum(t.v) AS s` would be emitted bare, and
+                // inside the expression `s` binds to a source column of that name.
+                let mut folded: Option<LogicalPlan> = None;
+                let mut keys_read_a_fold = false;
                 let mut below = sort.input.as_ref();
                 loop {
                     match below {
@@ -3618,6 +3628,19 @@ impl Unparser<'_> {
                         // keys resolve against what it reads.
                         LogicalPlan::Distinct(Distinct::All(input)) => {
                             below = input.as_ref();
+                        }
+                        LogicalPlan::Projection(projection) => {
+                            match rewrite_plan_for_sort_on_non_projected_fields(
+                                self, projection,
+                            ) {
+                                Some(
+                                    plan @ LogicalPlan::Sort(Sort { fetch: None, .. }),
+                                ) => {
+                                    below = folded.insert(plan);
+                                    keys_read_a_fold = true;
+                                }
+                                _ => break,
+                            }
                         }
                         _ => break,
                     }
@@ -3635,11 +3658,16 @@ impl Unparser<'_> {
                     || self.projection_scopes_its_aggregate(below, select)
                 {
                     None
+                } else if keys_read_a_fold {
+                    // `below` is the folded projection, already this SELECT's.
+                    find_agg_node_within_select(below, true)
                 } else {
                     find_agg_node_within_select(plan, select.already_projected())
                 };
                 let window_nodes = if keys_name_derived_outputs {
                     None
+                } else if keys_read_a_fold {
+                    find_window_nodes_within_select(below, None, true)
                 } else {
                     find_window_nodes_within_select(
                         plan,
