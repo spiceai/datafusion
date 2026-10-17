@@ -223,6 +223,9 @@ fn roundtrip_statement() -> Result<()> {
             "SELECT left[1] FROM array",
             "SELECT {a:1, b:2}",
             "SELECT s.a FROM (SELECT {a:1, b:2} AS s)",
+            // A qualified struct field path, fed back to the planner as the AST it
+            // was emitted as, not as re-parsed text.
+            "SELECT u.struct_col.field1 FROM unnest_table u",
             "SELECT MAP {'a': 1, 'b': 2}"
     ];
 
@@ -400,7 +403,8 @@ fn roundtrip_statement_with_dialect_5() -> Result<(), DataFusionError> {
         sql: "select j1_id from (select j1_id from j1 limit 10);",
         parser_dialect: MySqlDialect {},
         unparser_dialect: UnparserMySqlDialect {},
-        expected: @"SELECT `j1`.`j1_id` FROM (SELECT `j1`.`j1_id` FROM `j1` LIMIT 10) AS `derived_limit`",
+        // `j1` is enclosed by `derived_limit`, so the outer reference is left unqualified.
+        expected: @"SELECT `j1_id` FROM (SELECT `j1`.`j1_id` FROM `j1` LIMIT 10) AS `derived_limit`",
     );
     Ok(())
 }
@@ -1791,7 +1795,9 @@ fn test_table_scan_pushdown() -> Result<()> {
         plan_to_sql(&query_from_table_scan_with_two_projections)?;
     assert_snapshot!(
         query_from_table_scan_with_two_projections,
-        @"SELECT t1.id, t1.age FROM (SELECT t1.id, t1.age FROM t1)"
+        // `t1` is enclosed by the un-aliased derived table, so the outer references are
+        // left unqualified.
+        @"SELECT id, age FROM (SELECT t1.id, t1.age FROM t1)"
     );
 
     let table_scan_with_filter = table_scan_with_filters(
@@ -1949,8 +1955,9 @@ fn test_sort_with_scalar_fn_and_push_down_fetch() -> Result<()> {
     // Build a plan that mimics the DF52 optimizer output:
     // Projection(search_phrase) → Sort(substr(event_time), fetch=10)
     //   → Projection(search_phrase, event_time) → Filter → TableScan
-    // This triggers a subquery because the outer projection differs from the inner one.
-    // The ORDER BY scalar function must not reference the inner table qualifier.
+    // The sort is hoisted onto the statement itself: an ORDER BY inside a derived table
+    // is one the remote engine is free to ignore, so the inner projection that only
+    // exposed the sort key's column is folded away.
     let plan = table_scan(Some("t1"), &schema, None)?
         .filter(col("search_phrase").not_eq(lit("")))?
         .project(vec![col("search_phrase"), col("event_time")])?
@@ -1968,7 +1975,7 @@ fn test_sort_with_scalar_fn_and_push_down_fetch() -> Result<()> {
     let sql = plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @"SELECT t1.search_phrase FROM (SELECT t1.search_phrase, t1.event_time FROM t1 WHERE (t1.search_phrase <> '') ORDER BY substr(t1.event_time, 1, 5) ASC NULLS FIRST LIMIT 10)"
+        @"SELECT t1.search_phrase FROM t1 WHERE (t1.search_phrase <> '') ORDER BY substr(t1.event_time, 1, 5) ASC NULLS FIRST LIMIT 10"
     );
     Ok(())
 }
@@ -16302,5 +16309,163 @@ fn test_sort_above_union_drops_a_schema_qualified_relation() -> Result<()> {
             )
         );
     }
+    Ok(())
+}
+
+/// A column named like its own table is no reason to keep a dangling qualifier: the
+/// derived table encloses `t`, whatever its columns are called.
+#[test]
+fn test_dangling_qualifier_is_stripped_when_a_column_shares_the_table_name() -> Result<()>
+{
+    let schema = Schema::new(vec![
+        Field::new("t", DataType::Int32, false),
+        Field::new("id", DataType::Int32, false),
+    ]);
+    let plan = LogicalPlanBuilder::from(
+        table_scan(Some("t"), &schema, Some(vec![0, 1]))?.build()?,
+    )
+    .project(vec![col("t"), col("id")])?
+    .project(vec![col("id")])?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT id FROM (SELECT t.t, t.id FROM t)"
+    );
+    Ok(())
+}
+
+/// An aliased projection item is swept like an unnamed one.
+#[test]
+fn test_dangling_qualifier_is_stripped_under_a_column_alias() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("age", DataType::Int32, false),
+    ]);
+    let plan = LogicalPlanBuilder::from(
+        table_scan(Some("t1"), &schema, Some(vec![0, 1]))?.build()?,
+    )
+    .project(vec![col("id"), col("age")])?
+    .project(vec![col("id").alias("x")])?
+    .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT id AS x FROM (SELECT t1.id, t1.age FROM t1)"
+    );
+    Ok(())
+}
+
+/// A struct field path over an un-aliased derived table keeps its path and loses only
+/// the qualifier the derived table encloses. Dropping the qualifier changes the name
+/// the engine would give the output, so it is aliased back to the plan's own name.
+#[test]
+fn test_dangling_qualifier_leaves_a_field_path_in_place() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "metadata",
+        DataType::Struct(arrow::datatypes::Fields::from(vec![Field::new(
+            "product",
+            DataType::Utf8,
+            true,
+        )])),
+        true,
+    )]);
+    let plan =
+        LogicalPlanBuilder::from(table_scan(Some("t"), &schema, Some(vec![0]))?.build()?)
+            .project(vec![col("metadata")])?
+            .project(vec![datafusion_functions::core::expr_fn::get_field(
+                col("metadata"),
+                "product",
+            )])?
+            .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "metadata".product AS "t.metadata[product]" FROM (SELECT t."metadata" FROM t)"#
+    );
+    Ok(())
+}
+
+/// A correlated reference in an aliased projection item binds in the enclosing
+/// query, so its qualifier is not dangling in the subquery's own `FROM`.
+#[test]
+fn test_correlated_reference_keeps_its_qualifier_under_an_alias()
+-> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT j1.j1_id AS x FROM j2 LIMIT 1) FROM j1",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT j1.j1_id AS x FROM j2 LIMIT 1) FROM j1",
+    );
+    Ok(())
+}
+
+/// A local column read through an un-aliased derived table loses the qualifier the
+/// derived table encloses, even when a correlated reference in the same `SELECT`
+/// spells its qualifier the same way: `t.j2_id` is the derived table's, `t.j1_string`
+/// is the enclosing query's, and only the latter keeps `t`.
+#[test]
+fn test_local_and_correlated_references_sharing_a_qualifier_are_told_apart()
+-> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT t.j2_id FROM (SELECT t.j2_id FROM j2 AS t) WHERE t.j1_string = 'x') FROM j1 AS t",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT j2_id FROM (SELECT t.j2_id FROM j2 AS t) WHERE (t.j1_string = 'x')) FROM j1 AS t",
+    );
+    Ok(())
+}
+
+/// A correlated reference read through an array subscript binds in the enclosing
+/// query, so it keeps its qualifier in the subquery's projection and `ORDER BY`:
+/// `array_col[1]` alone would read the subquery's own row.
+#[test]
+fn test_correlated_array_subscript_keeps_its_qualifier() -> Result<(), DataFusionError> {
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT o.array_col[1] FROM unnest_table AS i LIMIT 1) FROM unnest_table AS o",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT o.array_col[1] FROM unnest_table AS i LIMIT 1) FROM unnest_table AS o",
+    );
+    roundtrip_statement_with_dialect_helper!(
+        sql: "SELECT (SELECT i.array_col FROM unnest_table AS i ORDER BY o.array_col[1] LIMIT 1) FROM unnest_table AS o",
+        parser_dialect: GenericDialect {},
+        unparser_dialect: UnparserDefaultDialect {},
+        expected: @"SELECT (SELECT i.array_col FROM unnest_table AS i ORDER BY o.array_col[1] ASC NULLS LAST LIMIT 1) FROM unnest_table AS o",
+    );
+    Ok(())
+}
+
+/// A struct field path over a derived table that no rescoping reaches (a `LIMIT`
+/// input) loses only the qualifier the derived table encloses, and keeps its path.
+/// One whose qualifier the `FROM` does name keeps it.
+#[test]
+fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "metadata",
+        DataType::Struct(arrow::datatypes::Fields::from(vec![Field::new(
+            "product",
+            DataType::Utf8,
+            true,
+        )])),
+        true,
+    )]);
+    let plan = LogicalPlanBuilder::from(table_scan(Some("t"), &schema, None)?.build()?)
+        .limit(0, Some(1))?
+        .project(vec![datafusion_functions::core::expr_fn::get_field(
+            col("metadata"),
+            "product",
+        )])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "metadata".product FROM (SELECT * FROM t LIMIT 1)"#
+    );
+
+    let statement = generate_round_trip_statement(
+        GenericDialect {},
+        "SELECT u.struct_col.field1 FROM (SELECT * FROM unnest_table LIMIT 1) AS u",
+    );
+    assert_snapshot!(
+        statement,
+        @"SELECT u.struct_col.field1 FROM (SELECT unnest_table.array_col, unnest_table.struct_col FROM unnest_table LIMIT 1) AS u"
+    );
     Ok(())
 }
