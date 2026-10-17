@@ -570,6 +570,18 @@ impl SelectBuilder {
         self.from.push(value);
         self
     }
+    /// How many joins the last entry of the `FROM` holds.
+    pub(super) fn last_from_join_count(&self) -> usize {
+        self.from.last().map_or(0, |from| from.joins.len())
+    }
+    /// The joins appended to the last entry of the `FROM` from position
+    /// `start` on.
+    pub(super) fn last_from_joins_since(&self, start: usize) -> &[ast::Join] {
+        self.from
+            .last()
+            .and_then(|from| from.joins.get(start..))
+            .unwrap_or_default()
+    }
     pub fn pop_from(&mut self) -> Option<TableWithJoinsBuilder> {
         self.from.pop()
     }

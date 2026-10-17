@@ -16440,3 +16440,256 @@ fn test_a_derived_window_input_under_a_no_op_limit_or_an_empty_window_reads_the_
     );
     Ok(())
 }
+
+/// `main.l` aliased as `t`, which a dialect qualifying by table name alone
+/// addresses by the same `t` as an unaliased `other.t`.
+fn main_l_aliased_as_t(columns: &[&str]) -> Result<LogicalPlan> {
+    table_scan(Some("main.l"), &int32_schema(columns), None)?
+        .alias("t")?
+        .build()
+}
+
+#[test]
+fn test_join_inputs_answering_to_one_qualifier_read_through_a_bare_wildcard() -> Result<()>
+{
+    // `main.l AS t` and `other.t` both answer to `t`, so `t.*, t.*` would read
+    // both relations twice (SQLite) or be refused as ambiguous (DuckDB). Each
+    // input reads its relations whole and no join merges a column, so a bare
+    // `*` reads exactly the plan's columns, in its order.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM "main".l AS t INNER JOIN "other".t ON true"#
+    );
+    assert_snapshot!(
+        Unparser::new(&SqliteDialect {}).plan_to_sql(&plan)?,
+        @"SELECT * FROM `main`.`l` AS `t` INNER JOIN `other`.`t` ON true"
+    );
+
+    // Unaliased relations of two schemas collide the same way.
+    let plan = table_scan(Some("s1.t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("s2.t"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM s1.t INNER JOIN s2.t ON true"
+    );
+
+    // With a third relation between them, and with the colliding relation
+    // inside a nested join on the right, the join that lists all of them sees
+    // the collision.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["c"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM "main".l AS t INNER JOIN u ON true INNER JOIN "other".t ON true"#
+    );
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), None)?
+                .join_on(
+                    table_scan(Some("u"), &int32_schema(&["c"]), None)?.build()?,
+                    datafusion_expr::JoinType::Inner,
+                    vec![lit(true)],
+                )?
+                .build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM "main".l AS t INNER JOIN ("other".t INNER JOIN u ON true) ON true"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_join_inputs_answering_to_one_qualifier_are_refused_where_a_bare_wildcard_misreads()
+-> Result<()> {
+    let refused = |plan: &LogicalPlan| -> String {
+        match plan_to_sql(plan) {
+            Ok(sql) => panic!("expected a refusal, got: {sql}"),
+            Err(e) => e.to_string(),
+        }
+    };
+    let collision =
+        "reads t.* is not supported when more than one relation of its FROM answers to t";
+
+    // `USING` merges the key a bare `*` reads once, where the plan keeps both.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["k", "a"])?)
+        .join_using(
+            table_scan(Some("other.t"), &int32_schema(&["k", "b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![Column::from("k")],
+        )?
+        .build()?;
+    assert_contains!(refused(&plan), collision);
+
+    // A column-less input: a bare `*` would read its hidden columns.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_contains!(refused(&plan), collision);
+
+    // An input listing its own columns: a bare `*` would read the columns it
+    // leaves out, and `t.*` beside `t.b` reads both relations.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b", "c"]), None)?
+                .project(vec![col("other.t.b")])?
+                .build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_contains!(refused(&plan), collision);
+    Ok(())
+}
+
+#[test]
+fn test_an_unqualified_wildcard_expr_in_a_join_input_reads_only_that_input() -> Result<()>
+{
+    // A projection built directly can list `Expr::Wildcard`, which is rendered as
+    // an expression item rather than a `SelectItem::Wildcard`; beside another
+    // relation it is narrowed to the projection's own relation all the same,
+    // alone or among the projection's other items, on either side.
+    #[expect(deprecated, reason = "Expr::Wildcard is still constructible")]
+    let wildcard = Expr::Wildcard {
+        qualifier: None,
+        options: Box::new(datafusion_expr::expr::WildcardOptions::default()),
+    };
+    let u = table_scan(Some("u"), &int32_schema(&["b"]), None)?.build()?;
+    let projected = LogicalPlan::Projection(
+        datafusion_expr::logical_plan::Projection::try_new_with_schema(
+            vec![wildcard.clone()],
+            Arc::new(u.clone()),
+            Arc::clone(u.schema()),
+        )?,
+    );
+
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            projected.clone(),
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.* FROM t INNER JOIN u ON true"
+    );
+
+    let plan = LogicalPlanBuilder::from(projected)
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.*, t.* FROM u INNER JOIN t ON true"
+    );
+
+    let mixed_schema = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("u")),
+                Arc::new(Field::new("b", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("c", DataType::Int32, false))),
+        ],
+        Default::default(),
+    )?;
+    let mixed = LogicalPlan::Projection(
+        datafusion_expr::logical_plan::Projection::try_new_with_schema(
+            vec![wildcard, (col("u.b") + lit(1)).alias("c")],
+            Arc::new(u),
+            Arc::new(mixed_schema),
+        )?,
+    );
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(mixed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, (u.b + 1) AS c FROM t INNER JOIN u ON true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_alias_over_a_join_as_a_join_input_reads_every_relation_it_holds() -> Result<()>
+{
+    // The alias renames only the first relation of the join it is put on, so the
+    // input's relations are read under the names the FROM gives them: `j` for
+    // `t`, and `u` as it was scanned.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .alias("j")?
+        .join_on(
+            table_scan(Some("w"), &int32_schema(&["c"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT j.*, u.*, w.* FROM t AS j INNER JOIN u ON true INNER JOIN w ON true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_mark_join_read_through_a_wildcard_as_a_join_input_is_refused() -> Result<()> {
+    // A mark join lists its probe's columns but not the mark it adds
+    // (spiceai/spiceai#15220), so its relations read whole would lack the mark
+    // the plan's schema has.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::LeftMark,
+            vec![lit(true)],
+        )?
+        .join_on(
+            table_scan(Some("w"), &int32_schema(&["c"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    let err = match plan_to_sql(&plan) {
+        Ok(sql) => panic!("expected a refusal, got: {sql}"),
+        Err(e) => e.to_string(),
+    };
+    assert_contains!(err, "the mark it adds is not among them");
+    Ok(())
+}

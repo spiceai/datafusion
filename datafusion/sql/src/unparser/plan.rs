@@ -321,6 +321,75 @@ fn collect_relation_idents(relation: &ast::TableFactor, idents: &mut Vec<String>
     }
 }
 
+/// The relations a stretch of a `SELECT`'s `FROM` introduces, in `FROM` order.
+#[derive(Default)]
+struct FromRelations {
+    /// The qualifier each relation answers to in a `q.*`, or `None` for one
+    /// with no name a qualifier can use (a derived table with no alias, say).
+    qualifiers: Vec<Option<ast::ObjectName>>,
+    /// Whether a join among them merges the columns it joins on (`USING`,
+    /// `NATURAL`), which a bare `*` then reads once.
+    merges_columns: bool,
+}
+
+/// Whether `item` is an unqualified `*`: the select-list wildcard, or the
+/// expression item an `Expr::Wildcard` listed by a projection renders as.
+fn is_unqualified_wildcard(item: &ast::SelectItem) -> bool {
+    matches!(
+        item,
+        ast::SelectItem::Wildcard(_)
+            | ast::SelectItem::UnnamedExpr(ast::Expr::Wildcard(_))
+    )
+}
+
+/// The qualifier of a `q.*` item, in either of the forms
+/// [`is_unqualified_wildcard`] names.
+fn qualified_wildcard_name(item: &ast::SelectItem) -> Option<&ast::ObjectName> {
+    match item {
+        ast::SelectItem::QualifiedWildcard(
+            ast::SelectItemQualifiedWildcardKind::ObjectName(name),
+            _,
+        )
+        | ast::SelectItem::UnnamedExpr(ast::Expr::QualifiedWildcard(name, _)) => {
+            Some(name)
+        }
+        _ => None,
+    }
+}
+
+/// Whether a join merges the columns it joins on, which a bare `*` then reads
+/// once where the plan keeps one per input.
+fn join_merges_columns(operator: &ast::JoinOperator) -> bool {
+    use ast::JoinOperator as Op;
+    let constraint = match operator {
+        Op::Join(c)
+        | Op::Inner(c)
+        | Op::Left(c)
+        | Op::LeftOuter(c)
+        | Op::Right(c)
+        | Op::RightOuter(c)
+        | Op::FullOuter(c)
+        | Op::CrossJoin(c)
+        | Op::Semi(c)
+        | Op::LeftSemi(c)
+        | Op::RightSemi(c)
+        | Op::Anti(c)
+        | Op::LeftAnti(c)
+        | Op::RightAnti(c)
+        | Op::StraightJoin(c)
+        | Op::AsOf { constraint: c, .. } => c,
+        Op::CrossApply
+        | Op::OuterApply
+        | Op::ArrayJoin
+        | Op::LeftArrayJoin
+        | Op::InnerArrayJoin => return false,
+    };
+    matches!(
+        constraint,
+        ast::JoinConstraint::Using(_) | ast::JoinConstraint::Natural
+    )
+}
+
 /// The refusal for a predicate below a FULL JOIN that no scan's own derived
 /// table applies: `WHERE`, `HAVING` and `QUALIFY` all run after the join and
 /// would discard the rows it preserves.
@@ -1281,28 +1350,37 @@ impl Unparser<'_> {
     }
 
     /// The `SELECT` items one input of a join contributes to the shared list,
-    /// taken from what its walk set.
+    /// taken from what its walk set. That walk wrote the input's relations into
+    /// `input_relation` and, for a left input, into the `FROM`'s joins from
+    /// position `input_joins_from` on.
     ///
     /// An input whose walk set nothing (a scan with no projection, reached
     /// directly or through a filter) or only an unqualified `*` (an aliased
-    /// scan) names no column of its own, and beside another relation neither
-    /// form stands for exactly its columns: the list the join assembles would
-    /// not line up with the plan's schema, so a consumer reading the result
-    /// by position gets the other input's columns under this one's names,
-    /// and a dialect that rejects an empty list gets a parse error. Such an
-    /// input contributes every column of each relation it reads — `t.*`, one
-    /// per relation, in the plan's order — or a bare `*` when it is the only
-    /// relation the `FROM` holds, as a scan unparsed on its own renders. The
-    /// `t.*` form stays even when every input reads whole relations: a bare
+    /// scan) reads every column of the relations its walk wrote; beside another
+    /// relation neither form stands for exactly those, so the list the join
+    /// assembled would not line up with the plan's schema — a consumer reading
+    /// by position gets the other input's columns under this one's names, and a
+    /// dialect that rejects an empty list gets a parse error. Such an input
+    /// contributes one `q.*` per relation its walk wrote, in `FROM` order, or a
+    /// bare `*` when it is the only relation the `FROM` holds (the probe side of
+    /// an EXISTS-style join). An unqualified `*` inside a longer list (a window
+    /// input's) is narrowed the same way in place. The relations are read from
+    /// the `FROM` rather than from the plan, so whatever the walk derived or
+    /// renamed on the way — a window's derived input, an alias that renames only
+    /// the first relation of a join — is read under the name the `*` read it by.
+    ///
+    /// The `q.*` form stays even when every input reads whole relations: a bare
     /// `*` would also read a column-less input's hidden columns, and under
-    /// `USING` would merge the key columns the plan keeps apart. An
-    /// input that already lists its own columns is returned as it was set,
-    /// and one with no columns contributes nothing beside another relation
-    /// (spiceai/spiceai#14738).
+    /// `USING` merge the key columns the plan keeps apart (see
+    /// [`Self::join_select_list`] for where it stands in). An input that lists
+    /// its own columns is returned as it was set, and one with no columns
+    /// contributes nothing beside another relation (spiceai/spiceai#14738).
     fn join_input_select_items(
         &self,
         input: &LogicalPlan,
         alone_in_from: bool,
+        input_relation: &RelationBuilder,
+        input_joins_from: Option<usize>,
         select: &mut SelectBuilder,
     ) -> Result<Vec<ast::SelectItem>> {
         let items = select.pop_projections();
@@ -1314,11 +1392,11 @@ impl Unparser<'_> {
             return Ok(if alone_in_from { items } else { vec![] });
         }
         // Nothing, or an unqualified `*`: the input names no column of its own.
-        let names_no_column =
-            matches!(items.as_slice(), [] | [ast::SelectItem::Wildcard(_)]);
-        let has_wildcard = items
-            .iter()
-            .any(|item| matches!(item, ast::SelectItem::Wildcard(_)));
+        let names_no_column = match items.as_slice() {
+            [] => true,
+            [item] => is_unqualified_wildcard(item),
+            _ => false,
+        };
         if alone_in_from {
             return Ok(if names_no_column {
                 vec![ast::SelectItem::Wildcard(
@@ -1328,140 +1406,244 @@ impl Unparser<'_> {
                 items
             });
         }
-        if !names_no_column && !has_wildcard {
+        if !names_no_column && !items.iter().any(is_unqualified_wildcard) {
             return Ok(items);
         }
-        // An unqualified `*` inside a longer list (a window over a bare scan
-        // lists `*` and then its window expressions) reads every relation of
-        // the enclosing FROM as well; it is narrowed to this input's relations
-        // in place, and the explicit items around it are kept.
-        if !names_no_column {
-            let relation_items = self.whole_relation_items(input)?;
-            return Ok(items
-                .into_iter()
-                .flat_map(|item| match item {
-                    ast::SelectItem::Wildcard(_) => relation_items.clone(),
-                    other => vec![other],
-                })
-                .collect());
+        Self::refuse_wildcard_over_a_mark(input)?;
+        let input_from = self.relations_in_from(
+            input_relation,
+            input_joins_from.map_or(&[][..], |from| select.last_from_joins_since(from)),
+        );
+        let relation_items = Self::qualified_wildcards(&input_from)?;
+        if names_no_column {
+            return Ok(relation_items);
         }
-        // A window that derives its input lists a lone `*` when it has no
-        // expressions of its own; that `*` reads the derived table.
-        if Self::wildcard_source(input).is_none() {
-            return Ok(self.derived_window_input_wildcard());
-        }
-        let mut relations: Vec<&TableReference> = vec![];
-        for (qualifier, field) in input.schema().iter() {
-            // An output no relation qualifies — an aggregate's, say — is
-            // addressable only by the name its own scope gives it, which the
-            // shared list cannot see from here.
-            let Some(qualifier) = qualifier else {
-                return not_impl_err!(
-                    "Unparsing a join input that lists none of its columns is only supported when every output of the input is qualified by a relation, but '{}' is not",
-                    field.name()
-                );
-            };
-            if relations.last() != Some(&qualifier) {
-                relations.push(qualifier);
-            }
-        }
-        Ok(self.qualified_wildcards(&relations))
+        Ok(items
+            .into_iter()
+            .flat_map(|item| {
+                if is_unqualified_wildcard(&item) {
+                    relation_items.clone()
+                } else {
+                    vec![item]
+                }
+            })
+            .collect())
     }
 
-    /// One `t.*` per relation the `*` of the input's walk reads, in the plan's
-    /// order. That `*` stands for the columns of what lies below the input's
-    /// windows and the operators folded into the same SELECT, so the relations
-    /// are read from there (see [`Self::wildcard_source`]): a window's own
-    /// outputs are named by the explicit items the caller keeps, whatever
-    /// qualifier the plan gives them.
-    fn whole_relation_items(&self, input: &LogicalPlan) -> Result<Vec<ast::SelectItem>> {
-        let Some(source) = Self::wildcard_source(input) else {
-            return Ok(self.derived_window_input_wildcard());
-        };
-        let mut relations: Vec<&TableReference> = vec![];
-        for (qualifier, _) in source.schema().iter() {
-            if let Some(qualifier) = qualifier
-                && relations.last() != Some(&qualifier)
-            {
-                relations.push(qualifier);
-            }
+    /// A mark join lists its probe's columns and not the mark it adds
+    /// (spiceai/spiceai#15220), so an input whose output still carries the
+    /// mark is not read by its relations' columns; it is refused rather than
+    /// narrowed to them. The mark is told by its name, which an alias above
+    /// keeps while requalifying it, and a name too many costs a pushdown, not
+    /// a column.
+    fn refuse_wildcard_over_a_mark(input: &LogicalPlan) -> Result<()> {
+        if !input
+            .schema()
+            .fields()
+            .iter()
+            .any(|field| field.name() == "mark")
+        {
+            return Ok(());
         }
-        if relations.is_empty() {
+        let holds_a_mark_join = input.exists(|node| {
+            Ok(matches!(
+                node,
+                LogicalPlan::Join(join)
+                    if matches!(join.join_type, JoinType::LeftMark | JoinType::RightMark)
+            ))
+        })?;
+        if holds_a_mark_join {
             return not_impl_err!(
-                "Unparsing a join input that reads every column with `*` is only supported when the input reads at least one relation"
+                "Unparsing a join input that holds a mark join is only supported below a projection: read through `*`, its columns are its relations', and the mark it adds is not among them"
             );
         }
-        Ok(self.qualified_wildcards(&relations))
+        Ok(())
     }
 
-    /// The plan whose columns the `*` of a join input's walk reads, or `None`
-    /// when that `*` reads the table the window arm derives under
-    /// [`DERIVED_WINDOW_INPUT_ALIAS`].
-    ///
-    /// Windows and the filters, sorts, `DISTINCT`s, limits with neither skip
-    /// nor fetch, and semi or anti joins above them fold into the one SELECT (a
-    /// filter as its WHERE or QUALIFY, a sort as the statement's ORDER BY, a
-    /// semi or anti join as an `EXISTS`), so the walk looks through them. A
-    /// window whose input the window arm derives (see
-    /// `window_input_requires_derived_subquery`) reads that derived table under
-    /// its alias, not the relations the plan's schema still names.
-    fn wildcard_source(input: &LogicalPlan) -> Option<&LogicalPlan> {
-        let mut cur = input;
-        loop {
-            match cur {
-                LogicalPlan::Window(window) => {
-                    if Self::window_input_requires_derived_subquery(window.input.as_ref())
-                    {
-                        return None;
-                    }
-                    cur = window.input.as_ref();
-                }
-                LogicalPlan::Filter(filter) => cur = filter.input.as_ref(),
-                LogicalPlan::Sort(sort) => cur = sort.input.as_ref(),
-                LogicalPlan::Distinct(Distinct::All(distinct_input)) => {
-                    cur = distinct_input.as_ref()
-                }
-                // The Limit arm forwards a limit that bounds nothing; one that
-                // does is derived under the input's own name.
-                LogicalPlan::Limit(limit)
-                    if limit.skip.is_none() && limit.fetch.is_none() =>
-                {
-                    cur = limit.input.as_ref()
-                }
-                // A semi or anti join lists only its probe side, whose list it
-                // forwards as it was set (see `Self::swaps_join_inputs`).
-                LogicalPlan::Join(join) => match join.join_type {
-                    JoinType::LeftSemi | JoinType::LeftAnti => cur = join.left.as_ref(),
-                    JoinType::RightSemi | JoinType::RightAnti => {
-                        cur = join.right.as_ref()
-                    }
-                    _ => return Some(cur),
-                },
-                _ => return Some(cur),
-            }
+    /// The relations a stretch of the `FROM` introduces: `relation`, then
+    /// each of `joins`, in `FROM` order.
+    fn relations_in_from(
+        &self,
+        relation: &RelationBuilder,
+        joins: &[ast::Join],
+    ) -> FromRelations {
+        let mut from = FromRelations::default();
+        // A walk that wrote no relation (a bare `UNION` replaces the
+        // statement's body; an empty relation builds to nothing) adds none. A
+        // builder left incomplete fails where the `FROM` itself is built.
+        if let Ok(Some(factor)) = relation.build() {
+            self.collect_from_relations(&factor, &mut from);
+        }
+        self.collect_joined_relations(joins, &mut from);
+        from
+    }
+
+    fn collect_joined_relations(&self, joins: &[ast::Join], from: &mut FromRelations) {
+        for join in joins {
+            from.merges_columns |= join_merges_columns(&join.join_operator);
+            self.collect_from_relations(&join.relation, from);
         }
     }
 
-    fn derived_window_input_wildcard(&self) -> Vec<ast::SelectItem> {
-        let derived = TableReference::bare(DERIVED_WINDOW_INPUT_ALIAS);
-        self.qualified_wildcards(&[&derived])
+    /// Adds the relations `factor` introduces to `from`, each with the
+    /// qualifier it answers to: a parenthesised join with no alias of its own
+    /// keeps the names of the relations inside it, a table with no alias
+    /// answers to its own name as the dialect qualifies a column of it (see
+    /// [`Self::emitted_qualifier`]), and anything else to its alias, if it has
+    /// one.
+    #[cfg_attr(feature = "recursive_protection", recursive::recursive)]
+    fn collect_from_relations(
+        &self,
+        factor: &ast::TableFactor,
+        from: &mut FromRelations,
+    ) {
+        let alias = match factor {
+            ast::TableFactor::NestedJoin {
+                table_with_joins,
+                alias: None,
+            } => {
+                self.collect_from_relations(&table_with_joins.relation, from);
+                self.collect_joined_relations(&table_with_joins.joins, from);
+                return;
+            }
+            ast::TableFactor::Table {
+                name, alias: None, ..
+            } => {
+                let name = if self.dialect.full_qualified_col() {
+                    name.clone()
+                } else {
+                    ast::ObjectName(name.0.last().cloned().into_iter().collect())
+                };
+                from.qualifiers.push(Some(name));
+                return;
+            }
+            ast::TableFactor::Table { alias, .. }
+            | ast::TableFactor::Derived { alias, .. }
+            | ast::TableFactor::NestedJoin { alias, .. }
+            | ast::TableFactor::UNNEST { alias, .. }
+            | ast::TableFactor::Function { alias, .. }
+            | ast::TableFactor::TableFunction { alias, .. } => alias.as_ref(),
+            _ => None,
+        };
+        from.qualifiers
+            .push(alias.map(|alias| ast::ObjectName::from(vec![alias.name.clone()])));
     }
 
-    fn qualified_wildcards(&self, relations: &[&TableReference]) -> Vec<ast::SelectItem> {
-        relations
+    /// One `q.*` per relation of `from`, in its order.
+    fn qualified_wildcards(from: &FromRelations) -> Result<Vec<ast::SelectItem>> {
+        if from.qualifiers.is_empty() {
+            return not_impl_err!(
+                "Unparsing a join input that reads every column with `*` is only supported when the input writes a relation into the FROM"
+            );
+        }
+        from.qualifiers
             .iter()
-            .map(|relation| {
-                let name = self
-                    .emitted_qualifier(relation)
-                    .into_iter()
-                    .map(|part| self.new_ident_quoted_if_needs(part))
-                    .collect::<Vec<_>>();
-                ast::SelectItem::QualifiedWildcard(
-                    ast::SelectItemQualifiedWildcardKind::ObjectName(
-                        ast::ObjectName::from(name),
-                    ),
+            .map(|qualifier| {
+                let Some(qualifier) = qualifier else {
+                    return not_impl_err!(
+                        "Unparsing a join input that reads every column with `*` is only supported when every relation it writes into the FROM has a name to qualify `*` by"
+                    );
+                };
+                Ok(ast::SelectItem::QualifiedWildcard(
+                    ast::SelectItemQualifiedWildcardKind::ObjectName(qualifier.clone()),
                     ast::WildcardAdditionalOptions::default(),
-                )
+                ))
+            })
+            .collect()
+    }
+
+    /// The list a join with no projection above it emits: its inputs' items in
+    /// the plan's order, read against the relations of its `FROM` — `relation`
+    /// and the joins appended from position `joins_from` on.
+    ///
+    /// A `q.*` reads every relation of the `FROM` that answers to `q`, and two
+    /// can answer to the same one: `main.l AS t` and `other.t` are both `t` to
+    /// a dialect that qualifies by table name alone, so `t.*` reads both of
+    /// them (SQLite) or is refused as ambiguous (DuckDB). Where the list is one
+    /// `q.*` per relation, in `FROM` order, and no join merges the columns it
+    /// joins on, it reads every column of every relation once, in order —
+    /// which is what a bare `*` reads, so the list is that `*`. Anywhere else
+    /// no list of wildcards reads the plan's columns, and telling the
+    /// relations apart needs an alias the `FROM` does not give them, so the
+    /// join is refused. Only wildcards are checked: a column reference
+    /// qualified by a colliding name is as ambiguous, here and in `ON` or
+    /// `WHERE`, and is left as it was.
+    fn join_select_list(
+        &self,
+        left: Vec<ast::SelectItem>,
+        right: Vec<ast::SelectItem>,
+        relation: &RelationBuilder,
+        joins_from: usize,
+        select: &SelectBuilder,
+    ) -> Result<Vec<ast::SelectItem>> {
+        if left.is_empty() && right.is_empty() {
+            // Neither input has a column, so neither contributed one: the join's
+            // output has none either, and takes the same placeholder a projection
+            // of nothing does.
+            return self
+                .empty_projection_fallback()
+                .iter()
+                .map(|e| self.select_item_to_sql(e))
+                .collect();
+        }
+        let items: Vec<_> = left.into_iter().chain(right).collect();
+        if !items
+            .iter()
+            .any(|item| qualified_wildcard_name(item).is_some())
+        {
+            return Ok(items);
+        }
+        let from =
+            self.relations_in_from(relation, select.last_from_joins_since(joins_from));
+        let keys: Vec<Option<Vec<String>>> = from
+            .qualifiers
+            .iter()
+            .map(|qualifier| qualifier.as_ref().map(|q| self.object_name_key(q)))
+            .collect();
+        // A `q.*` answers to every relation whose name ends in `q`: `t.*` reads
+        // `other.t` as readily as an alias `t`. Each suffix is counted once, so
+        // an item is checked without scanning every relation again.
+        let mut answering: std::collections::HashMap<&[String], usize> =
+            std::collections::HashMap::new();
+        for key in keys.iter().flatten() {
+            for start in 0..key.len() {
+                *answering.entry(&key[start..]).or_default() += 1;
+            }
+        }
+        let item_keys: Vec<Option<Vec<String>>> = items
+            .iter()
+            .map(|item| qualified_wildcard_name(item).map(|q| self.object_name_key(q)))
+            .collect();
+        let Some(colliding) = items.iter().zip(&item_keys).find_map(|(item, key)| {
+            let relations = answering.get(key.as_ref()?.as_slice())?;
+            if *relations > 1 {
+                qualified_wildcard_name(item)
+            } else {
+                None
+            }
+        }) else {
+            return Ok(items);
+        };
+        let reads_each_relation_once =
+            !from.merges_columns && item_keys == keys && keys.iter().all(Option::is_some);
+        if reads_each_relation_once {
+            return Ok(vec![ast::SelectItem::Wildcard(
+                ast::WildcardAdditionalOptions::default(),
+            )]);
+        }
+        not_impl_err!(
+            "Unparsing a join whose select list reads {colliding}.* is not supported when more than one relation of its FROM answers to {colliding}"
+        )
+    }
+
+    /// `name` in the form two qualifiers are compared by (see
+    /// [`Self::identifier_comparison_key`]).
+    fn object_name_key(&self, name: &ast::ObjectName) -> Vec<String> {
+        name.0
+            .iter()
+            .map(|part| match part.as_ident() {
+                Some(ident) => self.identifier_comparison_key(&ident.value),
+                None => part.to_string(),
             })
             .collect()
     }
@@ -3449,6 +3631,9 @@ impl Unparser<'_> {
                     0
                 };
 
+                // Where the left input's joins start in the shared `FROM`: what its
+                // walk appends there from this position on is its own.
+                let left_joins_from = select.last_from_join_count();
                 // A RIGHT JOIN null-extends its left input, a FULL JOIN both of
                 // its inputs: a mark join reached there is refused (see above).
                 self.walk_possibly_null_extended_join_input(
@@ -3520,6 +3705,8 @@ impl Unparser<'_> {
                     Some(self.join_input_select_items(
                         left_plan.as_ref(),
                         is_exists_join,
+                        relation,
+                        Some(left_joins_from),
                         select,
                     )?)
                 } else {
@@ -3691,6 +3878,8 @@ impl Unparser<'_> {
                         Some(self.join_input_select_items(
                             right_plan.as_ref(),
                             false,
+                            &right_relation,
+                            None,
                             select,
                         )?)
                     } else {
@@ -3773,27 +3962,13 @@ impl Unparser<'_> {
                                 return internal_err!("Right projection is missing");
                             };
 
-                            // Each input's items are kept as they are, qualified
-                            // wildcards included: a bare `*` would also read a
-                            // column-less input's hidden columns, and under
-                            // `USING` would merge the key columns the plan keeps
-                            // apart.
-                            let projection = if left_projection.is_empty()
-                                && right_projection.is_empty()
-                            {
-                                // Neither input has a column, so neither contributed
-                                // one: the join's output has none either, and takes
-                                // the same placeholder a projection of nothing does.
-                                self.empty_projection_fallback()
-                                    .iter()
-                                    .map(|e| self.select_item_to_sql(e))
-                                    .collect::<Result<Vec<_>>>()?
-                            } else {
-                                left_projection
-                                    .into_iter()
-                                    .chain(right_projection)
-                                    .collect()
-                            };
+                            let projection = self.join_select_list(
+                                left_projection,
+                                right_projection,
+                                relation,
+                                left_joins_from,
+                                select,
+                            )?;
                             select.projection(projection);
                         }
                     }
