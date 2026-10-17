@@ -58,9 +58,10 @@ use crate::{
     PlanProperties, ReplaceChildrenOptions, SendableRecordBatchStream, Statistics,
 };
 
-use arrow::array::{RecordBatch, RecordBatchOptions};
+use arrow::array::{ArrayData, RecordBatch, RecordBatchOptions};
+use arrow::buffer::Buffer;
 use arrow::compute::{concat_batches, lexsort_to_indices, take_arrays};
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{DataType, SchemaRef};
 use datafusion_common::config::SpillCompression;
 use datafusion_common::tree_node::TreeNodeRecursion;
 use datafusion_common::{
@@ -338,8 +339,8 @@ impl ExternalSorter {
         Ok(())
     }
 
-    /// Returns how to copy `input` into buffers of its own when the buffers it
-    /// shares hold at least twice what the copy would.
+    /// Returns how to copy `input` into buffers of its own when its rows are
+    /// slices of buffers that hold at least twice what the copy would.
     ///
     /// A grouped aggregate emits all of its groups as one batch and then hands
     /// them on as `batch_size` slices of it. Every slice shares the whole
@@ -349,6 +350,12 @@ impl ExternalSorter {
     /// sort over a few million groups then needs many times the memory its
     /// rows occupy, spills long before it has to, and fails outright when the
     /// first slice's charge alone does not fit.
+    ///
+    /// A batch whose own views, offsets and values are not slices is admitted
+    /// as it is, even when its views point into data buffers it shares, as a
+    /// reader that decodes a page once hands its batches out. Copying every
+    /// such batch would slow every sort over string views to correct a charge
+    /// that matters only once memory runs short.
     fn compaction_worth_making(input: &RecordBatch) -> Result<Option<BatchCompaction>> {
         let retained = get_record_batch_memory_size(input);
         // A copy needs at least the bytes of the rows themselves (for a view
@@ -356,14 +363,17 @@ impl ExternalSorter {
         // a view column, unless it could pay off. `get_sliced_size` would not
         // do here: it counts a view column's shared data buffers in full.
         let mut own_bytes = 0usize;
+        let mut sliced_from = 0usize;
         for column in input.columns() {
+            let data = column.to_data();
             // Leave a batch Arrow cannot size to the usual admission path.
-            let Ok(bytes) = column.to_data().get_slice_memory_size() else {
+            let Ok(bytes) = data.get_slice_memory_size() else {
                 return Ok(None);
             };
             own_bytes = own_bytes.saturating_add(bytes);
+            sliced_from = sliced_from.saturating_add(sliced_from_capacity(&data));
         }
-        if retained / 2 < own_bytes {
+        if retained / 2 < own_bytes || sliced_from / 2 < own_bytes {
             return Ok(None);
         }
         let Some(compaction) = BatchCompaction::try_new(input)? else {
@@ -1790,6 +1800,18 @@ impl SortExec {
 
         Ok(Arc::new(new_sort))
     }
+}
+
+/// The capacity of the buffers the rows of `data` are sliced out of: all of its
+/// own buffers but a view column's data buffers, which its views only point
+/// into.
+fn sliced_from_capacity(data: &ArrayData) -> usize {
+    let buffers = match data.data_type() {
+        DataType::Utf8View | DataType::BinaryView => data.buffers().get(..1).unwrap_or_default(),
+        _ => data.buffers(),
+    };
+    buffers.iter().map(Buffer::capacity).sum::<usize>()
+        + data.nulls().map_or(0, |nulls| nulls.buffer().capacity())
 }
 
 #[cfg(test)]
@@ -3348,6 +3370,31 @@ mod tests {
             }
         }
         assert_eq!(expected, rows as i64);
+        Ok(())
+    }
+
+    #[test]
+    fn test_view_batch_sharing_only_its_data_buffer_is_admitted_as_it_is() -> Result<()> {
+        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, false)]));
+        // One data buffer that many batches' views point into, as a reader that
+        // decodes a page once hands them out. Each view references 20 of its
+        // bytes.
+        let page = Buffer::from_vec(vec![b'x'; 1 << 20]);
+        let views = |rows: u32| {
+            (0..rows)
+                .map(|row| make_view(&[b'x'; 20], 0, row * 20))
+                .collect::<Vec<_>>()
+        };
+        let own_views = StringViewArray::try_new(views(512).into(), vec![page.clone()], None)?;
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(own_views)])?;
+        assert!(ExternalSorter::compaction_worth_making(&batch)?.is_none());
+
+        // The same 512 rows sliced out of a batch of 4096 are copied.
+        let sliced = StringViewArray::try_new(views(4096).into(), vec![page], None)?.slice(0, 512);
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(sliced)])?;
+        let compaction = ExternalSorter::compaction_worth_making(&batch)?
+            .expect("512 views sliced out of 4096 are worth copying");
+        assert_eq!(compaction.capacity, 512 * 16 + 512 * 20);
         Ok(())
     }
 
