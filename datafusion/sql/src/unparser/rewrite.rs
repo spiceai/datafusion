@@ -24,7 +24,7 @@ use datafusion_common::{
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Distinct, Expr, LogicalPlan, Projection, Sort, SortExpr};
-use sqlparser::ast::Ident;
+use sqlparser::ast::{self, Ident};
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -683,6 +683,30 @@ pub fn remove_dangling_identifiers(idents: &mut Vec<Ident>, available_idents: &[
     }
 }
 
+/// [`remove_dangling_identifiers`] over a column reference, or over the column a
+/// struct field path (`t.s.f`) is rooted at, keeping the path.
+///
+/// Only a path of `.field` steps is judged. That is the shape `get_field` is emitted
+/// in, and its root is always a column of this query's own relations: a correlated
+/// column is refused there. A subscript (`t.a[1]`) is left alone, as its root can be
+/// a correlated reference, which binds in the enclosing query whatever this `FROM`
+/// reads.
+pub fn remove_dangling_qualifier(expr: &mut ast::Expr, available_idents: &[String]) {
+    match expr {
+        ast::Expr::CompoundIdentifier(idents) => {
+            remove_dangling_identifiers(idents, available_idents);
+        }
+        ast::Expr::CompoundFieldAccess { root, access_chain }
+            if access_chain
+                .iter()
+                .all(|access| matches!(access, ast::AccessExpr::Dot(_))) =>
+        {
+            remove_dangling_qualifier(root, available_idents);
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -720,6 +744,41 @@ mod tests {
             remove_dangling_identifiers(&mut idents, &test_in);
             assert_eq!(idents, test_out);
         }
+    }
+
+    #[test]
+    fn test_remove_dangling_qualifier() {
+        let column = |parts: &[&str]| {
+            ast::Expr::CompoundIdentifier(
+                parts.iter().map(|part| Ident::new(*part)).collect(),
+            )
+        };
+        let field_path = |root: ast::Expr| ast::Expr::CompoundFieldAccess {
+            root: Box::new(root),
+            access_chain: vec![ast::AccessExpr::Dot(ast::Expr::Identifier(Ident::new(
+                "product",
+            )))],
+        };
+        let subscript = |root: ast::Expr| ast::Expr::CompoundFieldAccess {
+            root: Box::new(root),
+            access_chain: vec![ast::AccessExpr::Subscript(ast::Subscript::Index {
+                index: ast::Expr::value(ast::Value::Number("1".to_string(), false)),
+            })],
+        };
+
+        // A field path is judged by the column it is rooted at, and keeps its path.
+        let mut expr = field_path(column(&["t", "metadata"]));
+        remove_dangling_qualifier(&mut expr, &[]);
+        assert_eq!(expr, field_path(column(&["metadata"])));
+
+        let mut expr = field_path(column(&["t", "metadata"]));
+        remove_dangling_qualifier(&mut expr, &["t".to_string()]);
+        assert_eq!(expr, field_path(column(&["t", "metadata"])));
+
+        // A subscript's root may be a correlated reference, so it is left alone.
+        let mut expr = subscript(column(&["o", "array_col"]));
+        remove_dangling_qualifier(&mut expr, &[]);
+        assert_eq!(expr, subscript(column(&["o", "array_col"])));
     }
 
     // this is a regression test: when the outer projection has fewer expressions than

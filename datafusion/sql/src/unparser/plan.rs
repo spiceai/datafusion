@@ -27,7 +27,7 @@ use super::{
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_identifiers, requalify_column_onto_derived_table,
+        remove_dangling_qualifier, requalify_column_onto_derived_table,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
@@ -963,10 +963,8 @@ impl Unparser<'_> {
         // Ensure that the projection contains references to sources that actually exist
         let mut projection = select_builder.get_projection();
         projection.iter_mut().for_each(|select_item| {
-            if let ast::SelectItem::UnnamedExpr(ast::Expr::CompoundIdentifier(idents)) =
-                select_item
-            {
-                remove_dangling_identifiers(idents, &all_idents);
+            if let ast::SelectItem::UnnamedExpr(expr) = select_item {
+                remove_dangling_qualifier(expr, &all_idents);
             }
         });
 
@@ -975,9 +973,7 @@ impl Unparser<'_> {
             && let Some(OrderByKind::Expressions(mut order_by)) = query.get_order_by()
         {
             order_by.iter_mut().for_each(|sort_item| {
-                if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                    remove_dangling_identifiers(idents, &all_idents);
-                }
+                remove_dangling_qualifier(&mut sort_item.expr, &all_idents);
             });
 
             query.order_by(OrderByKind::Expressions(order_by));
@@ -986,9 +982,7 @@ impl Unparser<'_> {
         // Order by could be a sort in the select builder
         let mut sort = select_builder.get_sort_by();
         sort.iter_mut().for_each(|sort_item| {
-            if let ast::Expr::CompoundIdentifier(idents) = &mut sort_item.expr {
-                remove_dangling_identifiers(idents, &all_idents);
-            }
+            remove_dangling_qualifier(&mut sort_item.expr, &all_idents);
         });
 
         select_builder.projection(projection);

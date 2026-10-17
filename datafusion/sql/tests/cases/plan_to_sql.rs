@@ -16432,3 +16432,40 @@ fn test_correlated_array_subscript_keeps_its_qualifier() -> Result<(), DataFusio
     );
     Ok(())
 }
+
+/// A struct field path over a derived table that no rescoping reaches (a `LIMIT`
+/// input) loses only the qualifier the derived table encloses, and keeps its path.
+/// One whose qualifier the `FROM` does name keeps it.
+#[test]
+fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "metadata",
+        DataType::Struct(arrow::datatypes::Fields::from(vec![Field::new(
+            "product",
+            DataType::Utf8,
+            true,
+        )])),
+        true,
+    )]);
+    let plan = LogicalPlanBuilder::from(table_scan(Some("t"), &schema, None)?.build()?)
+        .limit(0, Some(1))?
+        .project(vec![datafusion_functions::core::expr_fn::get_field(
+            col("metadata"),
+            "product",
+        )])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "metadata".product FROM (SELECT * FROM t LIMIT 1)"#
+    );
+
+    let statement = generate_round_trip_statement(
+        GenericDialect {},
+        "SELECT u.struct_col.field1 FROM (SELECT * FROM unnest_table LIMIT 1) AS u",
+    );
+    assert_snapshot!(
+        statement,
+        @"SELECT u.struct_col.field1 FROM (SELECT unnest_table.array_col, unnest_table.struct_col FROM unnest_table LIMIT 1) AS u"
+    );
+    Ok(())
+}
