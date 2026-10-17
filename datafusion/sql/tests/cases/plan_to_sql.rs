@@ -1146,7 +1146,7 @@ fn test_aggregation_without_projection() -> Result<()> {
     let statement = unparser.plan_to_sql(&plan)?;
     assert_snapshot!(
         statement,
-        @r#"SELECT sum(users.age), users."name" FROM users GROUP BY users."name""#
+        @r#"SELECT users."name", sum(users.age) FROM users GROUP BY users."name""#
     );
 
     Ok(())
@@ -2021,7 +2021,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_with_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
     );
 
     let join_plan_no_filter = LogicalPlanBuilder::from(left_plan.clone())
@@ -2036,7 +2036,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_no_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id WHERE "left"."name" LIKE 'some_name' AND (age > 10)"#
     );
 
     let right_plan_with_filter = table_scan_with_filters(
@@ -2061,7 +2061,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_multiple_filters)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE ("left"."name" = 'after_join_filter_val') AND "left"."name" LIKE 'some_name' AND (right_table."name" = 'before_join_filter_val') AND (age > 10)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE ("left"."name" = 'after_join_filter_val') AND "left"."name" LIKE 'some_name' AND (right_table."name" = 'before_join_filter_val') AND (age > 10)"#
     );
 
     let right_plan_with_filter_schema = table_scan_with_filters(
@@ -2091,7 +2091,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_duplicated_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT * FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (right_table.age > 10) AND (right_table.age < 11)"#
+        @r#"SELECT "left".*, right_table.* FROM left_table AS "left" INNER JOIN right_table ON "left".id = right_table.id AND ("left".id > 5) WHERE "left"."name" LIKE 'some_name' AND (right_table.age > 10) AND (right_table.age < 11)"#
     );
 
     // Inner join with a scalar subquery in table_scan_filters. The subquery filter should appear in WHERE, not in JOIN ON,
@@ -2123,7 +2123,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_subquery_filter)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT left_table.id, left_table."name" FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE (right_table.id = (SELECT max(subquery_table.id) FROM subquery_table))"#
+        @r#"SELECT left_table.id, left_table."name", right_table.* FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE (right_table.id = (SELECT max(subquery_table.id) FROM subquery_table))"#
     );
 
     // Inner join with an IN subquery in table_scan_filters.
@@ -2156,7 +2156,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_in_subquery)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT left_table.id, left_table."name" FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE right_table.id IN (SELECT subquery_table.id FROM subquery_table)"#
+        @r#"SELECT left_table.id, left_table."name", right_table.* FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE right_table.id IN (SELECT subquery_table.id FROM subquery_table)"#
     );
 
     // Inner join with an EXISTS subquery in table_scan_filters.
@@ -2187,7 +2187,7 @@ fn test_join_with_table_scan_filters() -> Result<()> {
     let sql = plan_to_sql(&join_plan_exists)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT left_table.id, left_table."name" FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE EXISTS (SELECT * FROM subquery_table WHERE (subquery_table.id = right_table.id))"#
+        @r#"SELECT left_table.id, left_table."name", right_table.* FROM left_table INNER JOIN right_table ON left_table.id = right_table.id WHERE EXISTS (SELECT * FROM subquery_table WHERE (subquery_table.id = right_table.id))"#
     );
 
     Ok(())
@@ -5586,7 +5586,7 @@ fn test_unparse_window_over_aggregate_without_projection() -> Result<()> {
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT sum(gas."value") AS sum_n, gas."time", row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time""#
+        @r#"SELECT gas."time", sum(gas."value") AS sum_n, row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time""#
     );
 
     Ok(())
@@ -5620,7 +5620,7 @@ fn test_unparse_filter_on_window_over_aggregate_without_projection() -> Result<(
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT sum(gas."value") AS sum_n, gas."time", row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) = 0)"#
+        @r#"SELECT gas."time", sum(gas."value") AS sum_n, row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) = 0)"#
     );
 
     Ok(())
@@ -5655,7 +5655,7 @@ fn test_unparse_filter_on_aggregate_output_above_window_without_projection() -> 
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT sum(gas."value") AS sum_n, gas."time", row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (sum(gas."value") = 0.0)"#
+        @r#"SELECT gas."time", sum(gas."value") AS sum_n, row_number() OVER (ORDER BY gas."time" ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM gas GROUP BY gas."time" QUALIFY (sum(gas."value") = 0.0)"#
     );
 
     Ok(())
@@ -5869,7 +5869,7 @@ fn test_unparse_window_over_derived_aggregate_without_projection() -> Result<()>
     let sql = Unparser::default().plan_to_sql(&plan)?;
     assert_snapshot!(
         sql,
-        @r#"SELECT *, row_number() OVER (ORDER BY agg.sum_n ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM (SELECT sum(gas."value") AS sum_n, gas."time" FROM gas GROUP BY gas."time") AS agg"#
+        @r#"SELECT *, row_number() OVER (ORDER BY agg.sum_n ASC NULLS FIRST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS row_idx FROM (SELECT gas."time", sum(gas."value") AS sum_n FROM gas GROUP BY gas."time") AS agg"#
     );
 
     Ok(())
@@ -7209,7 +7209,7 @@ fn stacked_aggregate_is_unparsed_as_a_derived_table() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(test.b), test.a FROM test GROUP BY test.a"
+        @"SELECT test.a, COUNT(test.b) FROM test GROUP BY test.a"
     );
 
     Ok(())
@@ -7238,7 +7238,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a"
     );
 
     // A qualifier nested inside a grouping expression is reached too — the projection and
@@ -7248,7 +7248,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), (derived_aggregate_1.a + 1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY (derived_aggregate_1.a + 1)"
+        @"SELECT (derived_aggregate_1.a + 1), COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY (derived_aggregate_1.a + 1)"
     );
 
     // HAVING is built from a Filter above the aggregate and was never swept.
@@ -7258,7 +7258,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
     );
 
     // A query-level ORDER BY is reached by the existing dangling-identifier sweep, which
@@ -7270,7 +7270,7 @@ fn stacked_aggregate_requalifies_every_clause_onto_the_derived_table() -> Result
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a ORDER BY a ASC NULLS LAST"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a ORDER BY a ASC NULLS LAST"
     );
 
     Ok(())
@@ -7306,7 +7306,7 @@ fn stacked_aggregate_requalifies_onto_a_required_derived_table_alias() -> Result
     let unparser = Unparser::new(&AliasedDerivedTableDialect {});
     assert_snapshot!(
         unparser.plan_to_sql(&plan)?,
-        @"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
+        @"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (derived_aggregate_1.a > 1)"
     );
 
     Ok(())
@@ -7349,7 +7349,7 @@ fn stacked_aggregate_under_a_join_leaves_the_other_side_qualified() -> Result<()
     // here keeps the gap visible rather than silent.
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(derived_aggregate_1.a), "other".a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
+        @r#"SELECT "other".a, COUNT(derived_aggregate_1.a) FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN "other" ON (test.a = "other".a) GROUP BY "other".a"#
     );
 
     Ok(())
@@ -7392,7 +7392,7 @@ fn stacked_aggregates_on_both_join_sides_get_distinct_aliases() -> Result<()> {
     // as spiceai/spiceai#12695 and is pinned here rather than left silent.
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(derived_aggregate_1.a), derived_aggregate_2.a FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN (SELECT "other".a FROM "other" GROUP BY "other".a) AS derived_aggregate_2 ON (test.a = "other".a) GROUP BY derived_aggregate_2.a"#
+        @r#"SELECT derived_aggregate_2.a, COUNT(derived_aggregate_1.a) FROM (SELECT test.a FROM test GROUP BY test.a) AS derived_aggregate_1 INNER JOIN (SELECT "other".a FROM "other" GROUP BY "other".a) AS derived_aggregate_2 ON (test.a = "other".a) GROUP BY derived_aggregate_2.a"#
     );
 
     Ok(())
@@ -7439,7 +7439,7 @@ fn stacked_aggregate_leaves_a_correlated_outer_reference_alone() -> Result<()> {
     // clauses that hold no subquery.
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(alias1), derived_aggregate_1.a FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
+        @r#"SELECT derived_aggregate_1.a, COUNT(alias1) FROM (SELECT test.a, test.b AS alias1 FROM test GROUP BY test.a, test.b) AS derived_aggregate_1 GROUP BY derived_aggregate_1.a HAVING (test.a > (SELECT COUNT("other".c) FROM "other" WHERE ("other".c = test.a)))"#
     );
 
     Ok(())
@@ -7605,7 +7605,7 @@ fn test_having_above_limit_is_refused() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT COUNT(t.id), t."name" FROM t GROUP BY t."name" HAVING (COUNT(t.id) > 1) LIMIT 5"#
+        @r#"SELECT t."name", COUNT(t.id) FROM t GROUP BY t."name" HAVING (COUNT(t.id) > 1) LIMIT 5"#
     );
 
     Ok(())
@@ -16339,7 +16339,7 @@ fn test_derived_aggregate_keeps_a_sibling_relation_whose_name_extends_an_enclose
             .build();
         let sql = Unparser::new(&dialect).plan_to_sql(&plan)?.to_string();
         assert!(
-            sql.starts_with("SELECT count(1) AS m, t.s.a FROM "),
+            sql.starts_with("SELECT t.s.a, count(1) AS m FROM "),
             "grouped_s={grouped_s}: {sql}"
         );
         assert!(
@@ -18405,6 +18405,193 @@ fn test_sort_above_union_drops_a_schema_qualified_relation() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_a_bare_scan_on_the_probe_side_of_a_semi_join_reads_as_a_bare_wildcard()
+-> Result<()> {
+    // The probe side sets no SELECT items of its own and is the only relation
+    // of the FROM, so it reads as `*`, the way a scan unparsed on its own does,
+    // rather than as an empty list a dialect such as DuckDB rejects.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM t WHERE EXISTS (SELECT 1 FROM u WHERE (t.a = u.a))"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_scan_beside_a_projected_join_input_lists_its_columns() -> Result<()> {
+    // The right input's projection is folded into the shared SELECT; the left
+    // scan's columns go in front of it, where the plan's schema has them, and
+    // a bare `*` could not stand for them beside the other relation.
+    let right = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("u.a"), (col("u.a") * lit(2)).alias("d")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.a, (u.a * 2) AS d FROM t INNER JOIN u ON (t.a = u.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_two_bare_scans_in_a_join_read_each_relation_whole() -> Result<()> {
+    // Neither input lists anything, so each contributes its relation whole.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Full,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.* FROM t FULL JOIN u ON (t.a = u.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_scan_under_a_filter_in_a_join_lists_its_columns() -> Result<()> {
+    // The filter sets a predicate, not a SELECT list; the scan under it still
+    // contributes its columns.
+    let right = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("u.a"), (col("u.a") * lit(2)).alias("d")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .filter(col("t.b").gt(lit(1)))?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.a, (u.a * 2) AS d FROM t INNER JOIN u ON (t.a = u.a) WHERE (t.b > 1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_two_aliased_bare_scans_in_a_join_read_each_alias_whole() -> Result<()> {
+    // Each alias claims every column with a bare `*`; side by side each would
+    // read both relations, so each is narrowed to its own alias.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .alias("x")?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?
+                .alias("y")?
+                .build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("x.a").eq(col("y.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x.*, y.* FROM t AS x INNER JOIN u AS y ON (x.a = y.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_nested_join_of_bare_scans_reads_each_relation_whole() -> Result<()> {
+    // The nested join contributes one `t.*` per relation it holds, in the
+    // plan's order, ahead of the projected input's items.
+    let right = table_scan(Some("w"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("w.a"), (col("w.a") * lit(2)).alias("d")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .join_on(
+            right,
+            datafusion_expr::JoinType::Inner,
+            vec![col("t.a").eq(col("w.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, w.a, (w.a * 2) AS d FROM t INNER JOIN u ON (t.a = u.a) INNER JOIN w ON (t.a = w.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_bare_scan_on_the_right_of_an_outer_join_lists_its_columns() -> Result<()> {
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![0, 1]))?
+        .project(vec![col("t.a"), (col("t.b") + lit(1)).alias("c")])?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Right,
+            vec![col("t.a").eq(col("u.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, (t.b + 1) AS c, u.* FROM t RIGHT OUTER JOIN u ON (t.a = u.a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_aggregate_with_no_projection_lists_group_keys_before_aggregates() -> Result<()>
+{
+    // The plan's schema has the group keys first; a consumer reading by position,
+    // and a `g.*` over this SELECT as a derived table, depend on that order.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a, sum(t.b) FROM t GROUP BY t.a"
+    );
+
+    // Aliased and joined to a bare scan, the derived table's columns are read
+    // whole through its alias, in the order the plan's schema has them.
+    let grouped = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .aggregate(vec![col("t.a")], vec![sum(col("t.b"))])?
+        .alias("g")?
+        .build()?;
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .join_on(
+            grouped,
+            datafusion_expr::JoinType::Inner,
+            vec![col("u.a").eq(col("g.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.*, g.* FROM u INNER JOIN (SELECT t.a, sum(t.b) FROM t GROUP BY t.a) AS g ON (u.a = g.a)"
+    );
+    Ok(())
+}
+
 /// A column named like its own table is no reason to keep a dangling qualifier: the
 /// derived table encloses `t`, whatever its columns are called.
 #[test]
@@ -18427,6 +18614,61 @@ fn test_dangling_qualifier_is_stripped_when_a_column_shares_the_table_name() -> 
     Ok(())
 }
 
+#[test]
+fn test_a_join_input_with_no_columns_contributes_nothing_beside_another() -> Result<()> {
+    // A scan projected to no columns gets the `SELECT 1` placeholder on its own;
+    // beside a relation with columns that placeholder would be a column the plan
+    // does not have.
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT u.* FROM u INNER JOIN t ON true");
+
+    // Two inputs with no columns keep the placeholder, as a projection of
+    // nothing does.
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), Some(vec![]))?
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+
+    assert_snapshot!(plan_to_sql(&plan)?, @"SELECT 1 FROM u INNER JOIN t ON true");
+    Ok(())
+}
+
+#[test]
+fn test_a_nested_join_holding_a_column_less_input_keeps_qualified_wildcards() -> Result<()>
+{
+    // The nested join's FROM holds `t`, projected to no columns; a bare `*` for
+    // the outer list would read `t`'s columns too, so each relation with columns
+    // is read through its own `t.*`.
+    let plan = table_scan(Some("u"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a", "b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .join_on(
+            table_scan(Some("w"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![col("u.a").eq(col("w.a"))],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.*, w.* FROM u INNER JOIN t ON true INNER JOIN w ON (u.a = w.a)"
+    );
+    Ok(())
+}
+
 /// An aliased projection item is swept like an unnamed one.
 #[test]
 fn test_dangling_qualifier_is_stripped_under_a_column_alias() -> Result<()> {
@@ -18443,6 +18685,205 @@ fn test_dangling_qualifier_is_stripped_under_a_column_alias() -> Result<()> {
     assert_snapshot!(
         plan_to_sql(&plan)?,
         @"SELECT id AS x FROM (SELECT t1.id, t1.age FROM t1)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bare_scans_joined_with_using_keep_both_key_columns() -> Result<()> {
+    // `USING` merges the key column under a bare `*`, while the plan keeps `t.a`
+    // and `u.a` apart; each relation read whole keeps its own.
+    let plan = table_scan(Some("t"), &int32_schema(&["a", "b"]), None)?
+        .join_using(
+            table_scan(Some("u"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![Column::from("a")],
+        )?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.* FROM t INNER JOIN u USING(a)"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_window_over_a_bare_scan_as_a_join_input_narrows_its_wildcard() -> Result<()> {
+    // The window arm lists `*` and then the window expression; beside another
+    // relation that `*` would read it too, so it is narrowed to the scan's own
+    // relation while the window item is kept.
+    let row_number = Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        params: WindowFunctionParams {
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![col("u.a").sort(true, true)],
+            window_frame: WindowFrame::new(Some(false)),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }))
+    .alias("rn");
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .window(vec![row_number])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_window_over_a_derived_input_as_a_join_input_reads_the_derived_alias()
+-> Result<()> {
+    // The window arm derives a projection or a limit under it as
+    // `derived_window_input`; the input's `*` beside another relation is
+    // narrowed to that alias, since the plan's own relation is hidden inside.
+    fn row_number_over_a() -> Expr {
+        Expr::WindowFunction(Box::new(WindowFunction {
+            fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+            params: WindowFunctionParams {
+                args: vec![],
+                partition_by: vec![],
+                order_by: vec![col("u.a").sort(true, true)],
+                window_frame: WindowFrame::new(Some(false)),
+                null_treatment: None,
+                distinct: false,
+                filter: None,
+            },
+        }))
+        .alias("rn")
+    }
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a")])?
+        .window(vec![row_number_over_a()])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true"
+    );
+
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .limit(0, Some(10))?
+        .window(vec![row_number_over_a()])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT * FROM u LIMIT 10) AS derived_window_input ON true"
+    );
+    Ok(())
+}
+
+fn row_number_over_u_a() -> Expr {
+    Expr::WindowFunction(Box::new(WindowFunction {
+        fun: WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+        params: WindowFunctionParams {
+            args: vec![],
+            partition_by: vec![],
+            order_by: vec![col("u.a").sort(true, true)],
+            window_frame: WindowFrame::new(Some(false)),
+            null_treatment: None,
+            distinct: false,
+            filter: None,
+        },
+    }))
+}
+
+#[test]
+fn test_a_filtered_window_over_a_derived_input_as_a_join_input_reads_the_derived_alias()
+-> Result<()> {
+    // A filter above the window leaves the window arm deriving its input as
+    // `derived_window_input`; the input's `*` is narrowed to that alias, not to
+    // the relation hidden inside it.
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .project(vec![col("u.a")])?
+        .window(vec![row_number_over_u_a().alias("rn")])?
+        .filter(lit(true))?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true QUALIFY true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_window_with_a_qualified_alias_as_a_join_input_reads_only_its_input_relations()
+-> Result<()> {
+    // The window's output qualified as `x.rn` is named by its own item; `x` is
+    // not a relation of the FROM, so the input's `*` reads only the window's
+    // input relations.
+    let windowed = table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+        .window(vec![row_number_over_u_a().alias_qualified(Some("x"), "rn")])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_sorted_or_distinct_window_as_a_join_input_reads_only_its_input_relations()
+-> Result<()> {
+    // A sort or a `DISTINCT` above the window folds into the same SELECT as the
+    // window, so the input's `*` is still narrowed to what lies below the
+    // window: the alias of a derived input, and never the qualifier of the
+    // window's own output.
+    let derived = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .project(vec![col("u.a")])?
+            .window(vec![row_number_over_u_a().alias("rn")])
+    };
+    let qualified = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .window(vec![row_number_over_u_a().alias_qualified(Some("x"), "rn")])
+    };
+    let joined_to_t = |windowed: LogicalPlan| -> Result<String> {
+        let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+
+    assert_snapshot!(
+        joined_to_t(derived()?.sort(vec![col("rn").sort(true, true)])?.build()?)?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true ORDER BY rn ASC NULLS FIRST"
+    );
+    assert_snapshot!(
+        joined_to_t(derived()?.distinct()?.build()?)?,
+        @"SELECT DISTINCT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true"
+    );
+    assert_snapshot!(
+        joined_to_t(qualified()?.sort(vec![col("u.a").sort(true, true)])?.build()?)?,
+        @"SELECT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true ORDER BY u.a ASC NULLS FIRST"
+    );
+    assert_snapshot!(
+        joined_to_t(qualified()?.distinct()?.build()?)?,
+        @"SELECT DISTINCT t.*, u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN u ON true"
     );
     Ok(())
 }
@@ -18476,6 +18917,67 @@ fn test_dangling_qualifier_leaves_a_field_path_in_place() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_a_window_under_a_semi_or_anti_join_as_a_join_input_reads_only_its_input_relations()
+-> Result<()> {
+    // A semi or anti join forwards its probe's list, `*` and the window item
+    // included, so the `*` is narrowed to what lies below the probe's window:
+    // the alias of a derived input, and never the qualifier of the window's own
+    // output. The probe is the right input of a RIGHT SEMI or RIGHT ANTI join.
+    let derived = || -> Result<LogicalPlan> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .project(vec![col("u.a")])?
+            .window(vec![row_number_over_u_a().alias("rn")])?
+            .build()
+    };
+    let qualified = || -> Result<LogicalPlan> {
+        table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+            .window(vec![row_number_over_u_a().alias_qualified(Some("x"), "rn")])?
+            .build()
+    };
+    let v = || -> Result<LogicalPlan> {
+        table_scan(Some("v"), &int32_schema(&["c"]), None)?.build()
+    };
+    let joined_to_t = |input: LogicalPlan| -> Result<String> {
+        let plan = LogicalPlanBuilder::from(input)
+            .join_on(
+                table_scan(Some("t"), &int32_schema(&["d"]), None)?.build()?,
+                datafusion_expr::JoinType::Inner,
+                vec![lit(true)],
+            )?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+    let semi = |probe: LogicalPlan, join_type| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(probe)
+            .join_on(v()?, join_type, vec![lit(true)])?
+            .build()
+    };
+    let right_semi = |probe: LogicalPlan, join_type| -> Result<LogicalPlan> {
+        LogicalPlanBuilder::from(v()?)
+            .join_on(probe, join_type, vec![lit(true)])?
+            .build()
+    };
+
+    assert_snapshot!(
+        joined_to_t(semi(derived()?, datafusion_expr::JoinType::LeftSemi)?)?,
+        @"SELECT derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM (SELECT u.a FROM u) AS derived_window_input INNER JOIN t ON true WHERE EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    assert_snapshot!(
+        joined_to_t(semi(qualified()?, datafusion_expr::JoinType::LeftAnti)?)?,
+        @"SELECT u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM u INNER JOIN t ON true WHERE NOT EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    assert_snapshot!(
+        joined_to_t(right_semi(derived()?, datafusion_expr::JoinType::RightAnti)?)?,
+        @"SELECT derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM (SELECT u.a FROM u) AS derived_window_input INNER JOIN t ON true WHERE NOT EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    assert_snapshot!(
+        joined_to_t(right_semi(qualified()?, datafusion_expr::JoinType::RightSemi)?)?,
+        @"SELECT u.*, row_number() OVER (ORDER BY u.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn, t.* FROM u INNER JOIN t ON true WHERE EXISTS (SELECT 1 FROM v WHERE true)"
+    );
+    Ok(())
+}
+
 /// A correlated reference in an aliased projection item binds in the enclosing
 /// query, so its qualifier is not dangling in the subquery's own `FROM`.
 #[test]
@@ -18486,6 +18988,41 @@ fn test_correlated_reference_keeps_its_qualifier_under_an_alias()
         parser_dialect: GenericDialect {},
         unparser_dialect: UnparserDefaultDialect {},
         expected: @"SELECT (SELECT j1.j1_id AS x FROM j2 LIMIT 1) FROM j1",
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_derived_window_input_under_a_no_op_limit_or_an_empty_window_reads_the_derived_alias()
+-> Result<()> {
+    // A limit that bounds nothing folds into the window's SELECT, and a window
+    // with no expressions lists a lone `*`; either way that `*` reads the table
+    // the window arm derives, not the relation hidden inside it.
+    let joined_to_t = |windowed: LogicalPlan| -> Result<String> {
+        let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+            .join_on(windowed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+            .build()?;
+        Ok(plan_to_sql(&plan)?.to_string())
+    };
+
+    assert_snapshot!(
+        joined_to_t(
+            table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+                .project(vec![col("u.a")])?
+                .window(vec![row_number_over_u_a().alias("rn")])?
+                .limit(0, None)?
+                .build()?
+        )?,
+        @"SELECT t.*, derived_window_input.*, row_number() OVER (ORDER BY derived_window_input.a ASC NULLS FIRST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rn FROM t INNER JOIN (SELECT u.a FROM u) AS derived_window_input ON true"
+    );
+    assert_snapshot!(
+        joined_to_t(
+            table_scan(Some("u"), &int32_schema(&["a", "b"]), None)?
+                .project(vec![col("u.b")])?
+                .window(Vec::<Expr>::new())?
+                .build()?
+        )?,
+        @"SELECT t.*, derived_window_input.* FROM t INNER JOIN (SELECT u.b FROM u) AS derived_window_input ON true"
     );
     Ok(())
 }
@@ -18502,6 +19039,89 @@ fn test_local_and_correlated_references_sharing_a_qualifier_are_told_apart()
         parser_dialect: GenericDialect {},
         unparser_dialect: UnparserDefaultDialect {},
         expected: @"SELECT (SELECT j2_id FROM (SELECT t.j2_id FROM j2 AS t) WHERE (t.j1_string = 'x')) FROM j1 AS t",
+    );
+    Ok(())
+}
+
+/// `main.l` aliased as `t`, which a dialect qualifying by table name alone
+/// addresses by the same `t` as an unaliased `other.t`.
+fn main_l_aliased_as_t(columns: &[&str]) -> Result<LogicalPlan> {
+    table_scan(Some("main.l"), &int32_schema(columns), None)?
+        .alias("t")?
+        .build()
+}
+
+#[test]
+fn test_join_inputs_answering_to_one_qualifier_read_through_a_bare_wildcard() -> Result<()>
+{
+    // `main.l AS t` and `other.t` both answer to `t`, so `t.*, t.*` would read
+    // both relations twice (SQLite) or be refused as ambiguous (DuckDB). Each
+    // input reads its relations whole and no join merges a column, so a bare
+    // `*` reads exactly the plan's columns, in its order.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM "main".l AS t INNER JOIN "other".t ON true"#
+    );
+    assert_snapshot!(
+        Unparser::new(&SqliteDialect {}).plan_to_sql(&plan)?,
+        @"SELECT * FROM `main`.`l` AS `t` INNER JOIN `other`.`t` ON true"
+    );
+
+    // Unaliased relations of two schemas collide the same way.
+    let plan = table_scan(Some("s1.t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("s2.t"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT * FROM s1.t INNER JOIN s2.t ON true"
+    );
+
+    // With a third relation between them, and with the colliding relation
+    // inside a nested join on the right, the join that lists all of them sees
+    // the collision.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["c"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM "main".l AS t INNER JOIN u ON true INNER JOIN "other".t ON true"#
+    );
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), None)?
+                .join_on(
+                    table_scan(Some("u"), &int32_schema(&["c"]), None)?.build()?,
+                    datafusion_expr::JoinType::Inner,
+                    vec![lit(true)],
+                )?
+                .build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT * FROM "main".l AS t INNER JOIN ("other".t INNER JOIN u ON true) ON true"#
     );
     Ok(())
 }
@@ -18523,6 +19143,172 @@ fn test_correlated_array_subscript_keeps_its_qualifier() -> Result<(), DataFusio
         unparser_dialect: UnparserDefaultDialect {},
         expected: @"SELECT (SELECT i.array_col FROM unnest_table AS i ORDER BY o.array_col[1] ASC NULLS LAST LIMIT 1) FROM unnest_table AS o",
     );
+    Ok(())
+}
+
+#[test]
+fn test_join_inputs_answering_to_one_qualifier_are_refused_where_a_bare_wildcard_misreads()
+-> Result<()> {
+    let refused = |plan: &LogicalPlan| -> String {
+        match plan_to_sql(plan) {
+            Ok(sql) => panic!("expected a refusal, got: {sql}"),
+            Err(e) => e.to_string(),
+        }
+    };
+    let collision =
+        "reads t.* is not supported when more than one relation of its FROM answers to t";
+
+    // `USING` merges the key a bare `*` reads once, where the plan keeps both.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["k", "a"])?)
+        .join_using(
+            table_scan(Some("other.t"), &int32_schema(&["k", "b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![Column::from("k")],
+        )?
+        .build()?;
+    assert_contains!(refused(&plan), collision);
+
+    // A column-less input: a bare `*` would read its hidden columns.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b"]), Some(vec![]))?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_contains!(refused(&plan), collision);
+
+    // An input listing its own columns: a bare `*` would read the columns it
+    // leaves out, and `t.*` beside `t.b` reads both relations.
+    let plan = LogicalPlanBuilder::from(main_l_aliased_as_t(&["a"])?)
+        .join_on(
+            table_scan(Some("other.t"), &int32_schema(&["b", "c"]), None)?
+                .project(vec![col("other.t.b")])?
+                .build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_contains!(refused(&plan), collision);
+    Ok(())
+}
+
+#[test]
+fn test_an_unqualified_wildcard_expr_in_a_join_input_reads_only_that_input() -> Result<()>
+{
+    // A projection built directly can list `Expr::Wildcard`, which is rendered as
+    // an expression item rather than a `SelectItem::Wildcard`; beside another
+    // relation it is narrowed to the projection's own relation all the same,
+    // alone or among the projection's other items, on either side.
+    #[expect(deprecated, reason = "Expr::Wildcard is still constructible")]
+    let wildcard = Expr::Wildcard {
+        qualifier: None,
+        options: Box::new(datafusion_expr::expr::WildcardOptions::default()),
+    };
+    let u = table_scan(Some("u"), &int32_schema(&["b"]), None)?.build()?;
+    let projected = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![wildcard.clone()],
+        Arc::new(u.clone()),
+        Arc::clone(u.schema()),
+    )?);
+
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            projected.clone(),
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.* FROM t INNER JOIN u ON true"
+    );
+
+    let plan = LogicalPlanBuilder::from(projected)
+        .join_on(
+            table_scan(Some("t"), &int32_schema(&["a"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.*, t.* FROM u INNER JOIN t ON true"
+    );
+
+    let mixed_schema = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("u")),
+                Arc::new(Field::new("b", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("c", DataType::Int32, false))),
+        ],
+        Default::default(),
+    )?;
+    let mixed = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![wildcard, (col("u.b") + lit(1)).alias("c")],
+        Arc::new(u),
+        Arc::new(mixed_schema),
+    )?);
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(mixed, datafusion_expr::JoinType::Inner, vec![lit(true)])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.*, u.*, (u.b + 1) AS c FROM t INNER JOIN u ON true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_an_alias_over_a_join_as_a_join_input_reads_every_relation_it_holds() -> Result<()>
+{
+    // The alias renames only the first relation of the join it is put on, so the
+    // input's relations are read under the names the FROM gives them: `j` for
+    // `t`, and `u` as it was scanned.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .alias("j")?
+        .join_on(
+            table_scan(Some("w"), &int32_schema(&["c"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT j.*, u.*, w.* FROM t AS j INNER JOIN u ON true INNER JOIN w ON true"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_a_mark_join_read_through_a_wildcard_as_a_join_input_is_refused() -> Result<()> {
+    // A mark join lists its probe's columns but not the mark it adds
+    // (spiceai/spiceai#15220), so its relations read whole would lack the mark
+    // the plan's schema has.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), None)?
+        .join_on(
+            table_scan(Some("u"), &int32_schema(&["b"]), None)?.build()?,
+            datafusion_expr::JoinType::LeftMark,
+            vec![lit(true)],
+        )?
+        .join_on(
+            table_scan(Some("w"), &int32_schema(&["c"]), None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            vec![lit(true)],
+        )?
+        .build()?;
+    let err = match plan_to_sql(&plan) {
+        Ok(sql) => panic!("expected a refusal, got: {sql}"),
+        Err(e) => e.to_string(),
+    };
+    assert_contains!(err, "the mark it adds is not among them");
     Ok(())
 }
 
