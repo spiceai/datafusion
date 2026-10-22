@@ -18,7 +18,9 @@
 use core::fmt;
 use std::ops::ControlFlow;
 
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion_common::utils::combine_limit;
+use datafusion_expr::Expr;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     self, LimitClause, OrderByKind, SelectFlavor, visit_expressions,
@@ -350,6 +352,9 @@ pub struct SelectBuilder {
     /// output — so it is derived in a scope of its own whatever else this
     /// SELECT carries.
     join_inputs_in_progress: usize,
+    /// Whether this SELECT is the body of an `EXISTS` built for an EXISTS-style
+    /// join — see [`Self::within_exists_body`].
+    exists_body: bool,
     /// Whether a `LogicalPlan::Aggregate` has already been folded into this SELECT,
     /// as its select list and `GROUP BY`. A SELECT expresses at most one grouping, so
     /// a second aggregate below it belongs in a derived table.
@@ -395,6 +400,15 @@ pub struct SelectBuilder {
     /// the predicate already there in place — taking it out would change
     /// what the walk sees.
     predicates_added: usize,
+    /// The outer references read by the clauses already on this SELECT — a
+    /// `WHERE` from a filter above, an `ORDER BY` from a sort above. Emitted,
+    /// an unqualified outer reference is a bare identifier like a local one, so
+    /// a derived table built later under those clauses reads them from here to
+    /// tell whether it would capture one.
+    ///
+    /// Added to with `note_clause_outer_references()` and read with
+    /// `clause_outer_references()`.
+    clause_outer_references: Vec<Expr>,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -522,6 +536,20 @@ impl SelectBuilder {
     /// outputs by bare name, taking the SELECT list for itself — is wrong here.
     pub fn within_join_input(&self) -> bool {
         self.join_inputs_in_progress > 0
+    }
+
+    /// Marks this SELECT as the body of an `EXISTS` built for an EXISTS-style join.
+    /// Only this builder carries the mark: a derived table inside the body is
+    /// unparsed with a builder of its own.
+    pub fn mark_exists_body(&mut self) {
+        self.exists_body = true;
+    }
+
+    /// Whether this SELECT is the body of an `EXISTS` built for an EXISTS-style
+    /// join, whose rows are only tested for existence: the order they come in
+    /// reaches nothing unless a row bound picks some of them.
+    pub fn within_exists_body(&self) -> bool {
+        self.exists_body
     }
 
     /// Register a table alias as pointing to a LATERAL FLATTEN relation.
@@ -653,6 +681,18 @@ impl SelectBuilder {
         self.from.push(value);
         self
     }
+    /// How many joins the last entry of the `FROM` holds.
+    pub(super) fn last_from_join_count(&self) -> usize {
+        self.from.last().map_or(0, |from| from.joins.len())
+    }
+    /// The joins appended to the last entry of the `FROM` from position
+    /// `start` on.
+    pub(super) fn last_from_joins_since(&self, start: usize) -> &[ast::Join] {
+        self.from
+            .last()
+            .and_then(|from| from.joins.get(start..))
+            .unwrap_or_default()
+    }
     pub fn pop_from(&mut self) -> Option<TableWithJoinsBuilder> {
         self.from.pop()
     }
@@ -704,6 +744,25 @@ impl SelectBuilder {
     /// How many predicates `selection()` has added to this SELECT so far.
     pub fn predicates_added(&self) -> usize {
         self.predicates_added
+    }
+
+    /// Records the outer references `expr` reads, for a clause it is emitted into
+    /// on this SELECT. A subquery in `expr` is not entered: its outer references
+    /// are resolved inside it.
+    pub fn note_clause_outer_references(&mut self, expr: &Expr) {
+        // The visitor never fails, so there is no error to keep.
+        let _ = expr.apply(|node| {
+            if matches!(node, Expr::OuterReferenceColumn(..)) {
+                self.clause_outer_references.push(node.clone());
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+
+    /// The outer references the clauses already on this SELECT read — see
+    /// [`Self::note_clause_outer_references`].
+    pub fn clause_outer_references(&self) -> &[Expr] {
+        &self.clause_outer_references
     }
 
     fn and_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
@@ -921,11 +980,13 @@ impl SelectBuilder {
             derived_aggregate_alias_counter: 0,
             flatten_table_aliases: Vec::new(),
             join_inputs_in_progress: 0,
+            exists_body: false,
             aggregated: false,
             right_join_inputs: 0,
             null_extended_join_inputs: 0,
             input_predicates_stay_scoped: false,
             predicates_added: 0,
+            clause_outer_references: Vec::new(),
         }
     }
 }
@@ -1027,6 +1088,19 @@ impl RelationBuilder {
             Some(TableFactorBuilder::Derived(ref value)) => {
                 value.alias.as_ref().map(|a| a.name.to_string())
             }
+            Some(TableFactorBuilder::Unnest(ref value)) => {
+                value.alias.as_ref().map(|a| a.name.to_string())
+            }
+            Some(TableFactorBuilder::Flatten(ref value)) => {
+                value.alias.as_ref().map(|a| a.name.to_string())
+            }
+            _ => None,
+        }
+    }
+    /// The name of the bare table this relation reads, if it is one.
+    pub(super) fn table_name(&self) -> Option<&ast::ObjectName> {
+        match self.relation {
+            Some(TableFactorBuilder::Table(ref value)) => value.name.as_ref(),
             _ => None,
         }
     }
