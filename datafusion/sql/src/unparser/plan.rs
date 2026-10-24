@@ -28,6 +28,7 @@ use super::{
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
         remove_dangling_qualifier, requalify_column_onto_derived_table,
+        rewrite_plan_for_projection_over_limited_sort,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
@@ -3004,7 +3005,28 @@ impl Unparser<'_> {
                 Ok(())
             }
             LogicalPlan::Projection(p) => {
-                if let Some(new_plan) = rewrite_plan_for_sort_on_non_projected_fields(p) {
+                let emitted_key = |name: &str| self.emitted_column_key(name);
+                if let Some(new_plan) =
+                    rewrite_plan_for_sort_on_non_projected_fields(p, &emitted_key)
+                {
+                    return self
+                        .select_to_sql_recursively(&new_plan, query, select, relation);
+                }
+                // The same fold, for a projection above the limit of the sorted
+                // projection. The limit lands on the query this projection opens,
+                // so only where that query is still empty: no list taken, no
+                // `WHERE` the limit would be applied after, no `ORDER BY` or row
+                // bound it would be reordered under or overwrite, and not a join
+                // input, whose limit needs a derived table of its own.
+                if !select.already_projected()
+                    && !select.has_selection()
+                    && !select.within_join_input()
+                    && query.as_ref().is_some_and(|query| {
+                        query.get_order_by().is_none() && !query.has_row_bound()
+                    })
+                    && let Some(new_plan) =
+                        rewrite_plan_for_projection_over_limited_sort(p, &emitted_key)
+                {
                     return self
                         .select_to_sql_recursively(&new_plan, query, select, relation);
                 }

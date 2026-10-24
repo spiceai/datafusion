@@ -106,6 +106,11 @@ impl QueryBuilder {
         self.limit = value;
         self
     }
+    /// Whether this query already bounds its rows with a `LIMIT`, `OFFSET` or
+    /// `FETCH`.
+    pub fn has_row_bound(&self) -> bool {
+        self.limit.is_some() || self.offset.is_some() || self.fetch.is_some()
+    }
     pub fn limit_by(&mut self, value: Vec<ast::Expr>) -> &mut Self {
         self.limit_by = value;
         self
