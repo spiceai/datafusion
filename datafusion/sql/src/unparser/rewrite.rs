@@ -457,6 +457,53 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             }
         }
 
+        // A rename now lands in the `SELECT` whose `ORDER BY` the keys are emitted
+        // in, and an engine resolves a bare key name to an output alias before a
+        // column (DuckDB, PostgreSQL). Whether a key keeps its qualifier is only
+        // decided later (an aggregate over a derived input drops it), so a rename
+        // taking the name of any other column a key reads declines the fold. A
+        // correlated reference counts too: it names a value of the enclosing
+        // query, is written as a plain column, and is never the column a rename
+        // reads.
+        let mut key_columns = vec![];
+        for sort_expr in &sort.expr {
+            sort_expr
+                .expr
+                .apply(|e| {
+                    match e {
+                        Expr::Column(column) => key_columns.push((column, false)),
+                        Expr::OuterReferenceColumn(_, column) => {
+                            key_columns.push((column, true))
+                        }
+                        _ => {}
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .ok()?;
+        }
+        for e in &p.expr {
+            let Some(alias) = renamed_output(e) else {
+                continue;
+            };
+            let renamed_column = match alias.expr.as_ref() {
+                Expr::Column(column) => Some(column),
+                _ => None,
+            };
+            let emitted_key = renames?;
+            let Ok(alias_key) = emitted_key(&alias.name) else {
+                return None;
+            };
+            for &(column, correlated) in &key_columns {
+                if !correlated && Some(column) == renamed_column {
+                    continue;
+                }
+                match emitted_key(column.name()) {
+                    Ok(column_key) if column_key != alias_key => {}
+                    _ => return None,
+                }
+            }
+        }
+
         // The inner Projection takes the outer one's expressions, and each is the
         // inner output the outer list reads, so it keeps that output's field: the
         // name the sort's keys and the inliner (`unproject_sort_expr` resolves a
@@ -473,40 +520,6 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // the expression of whichever output the outer list put at that name's
         // position (`c` reading `(t.a + 1)` under an outer `[c, a, c]` declared
         // `[d, c, a]`).
-        // A rename now lands in the `SELECT` whose `ORDER BY` the keys are emitted
-        // in, and an engine resolves a bare key name to an output alias before a
-        // column (DuckDB, PostgreSQL). Whether a key keeps its qualifier is only
-        // decided later (an aggregate over a derived input drops it), so a rename
-        // taking the name of any other column a key reads declines the fold.
-        let key_columns = sort
-            .expr
-            .iter()
-            .flat_map(|sort_expr| sort_expr.expr.column_refs())
-            .cloned()
-            .collect::<Vec<_>>();
-        for e in &p.expr {
-            let Some(alias) = renamed_output(e) else {
-                continue;
-            };
-            let renamed_column = match alias.expr.as_ref() {
-                Expr::Column(column) => Some(column),
-                _ => None,
-            };
-            let emitted_key = renames?;
-            let Ok(alias_key) = emitted_key(&alias.name) else {
-                return None;
-            };
-            for column in &key_columns {
-                if Some(column) == renamed_column {
-                    continue;
-                }
-                match emitted_key(column.name()) {
-                    Ok(column_key) if column_key != alias_key => {}
-                    _ => return None,
-                }
-            }
-        }
-
         let mut read = HashSet::new();
         let fields = p
             .expr

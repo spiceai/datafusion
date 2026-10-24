@@ -19691,3 +19691,30 @@ fn test_rename_dropping_a_constant_alias_is_not_folded() -> Result<()> {
     );
     Ok(())
 }
+
+/// A correlated reference in a sort key names a value of the enclosing query,
+/// and the unparser writes it as a plain column. A rename taking its name would
+/// capture it in the folded `SELECT`: `ORDER BY s` would read the new output
+/// instead of the enclosing query's `s`. The fold is declined, and the plan is
+/// unparsed as it was before.
+#[test]
+fn test_rename_capturing_a_correlated_sort_key_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("u"), &schema, None)?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort(vec![
+            out_ref_col(DataType::Int32, "s").sort(true, false),
+            col("u.b").sort(true, false),
+        ])?
+        .limit(0, Some(1))?
+        .project(vec![col("u.a").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a AS s FROM (SELECT u.a, u.b FROM u ORDER BY s ASC NULLS LAST, u.b ASC NULLS LAST LIMIT 1)"
+    );
+    Ok(())
+}
