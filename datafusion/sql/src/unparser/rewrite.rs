@@ -408,6 +408,17 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             })
             .collect();
 
+        // Substituting a dropped alias into the keys is what a fold with a rename
+        // must not need: a rename drops the inner alias it renames, and the
+        // aliased expression a key then takes can mean something else there (a
+        // constant is an output ordinal in `ORDER BY`). A fold with a rename
+        // takes no alias out of the inner list.
+        if p.expr.iter().any(|e| renamed_output(e).is_some())
+            && !dropped_aliases.is_empty()
+        {
+            return None;
+        }
+
         if !dropped_aliases.is_empty() {
             for sort_expr in &mut sort.expr {
                 let mut expr = sort_expr.expr.clone();

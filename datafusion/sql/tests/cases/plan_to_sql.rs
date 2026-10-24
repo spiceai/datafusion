@@ -19632,9 +19632,10 @@ fn test_filter_over_a_renaming_projection_is_not_folded() -> Result<()> {
 /// A sort key reading an alias the fold drops takes the aliased expression. An
 /// alias that reads the input column it shadows (`(x + 1) AS x`) is substituted
 /// once: the column inside the replacement belongs to the input, not to the
-/// alias. Before, the substitution descended into its own replacement and never
-/// stopped. Covers the alias dropped because the outer list does not read it,
-/// and dropped by a rename, with and without a limit.
+/// alias. Before, the substitution descended into its own replacement until the
+/// stack overflowed, on `spiceai-55` too, for an alias the outer list does not
+/// read. A rename of that alias, with and without a limit, is not folded at all,
+/// since a fold with a rename drops no alias.
 #[test]
 fn test_a_self_referencing_dropped_alias_is_substituted_once() -> Result<()> {
     let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
@@ -19654,7 +19655,7 @@ fn test_a_self_referencing_dropped_alias_is_substituted_once() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT (x + 1) AS s, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY (x + 1) ASC NULLS LAST"
+        @"SELECT x AS s, y FROM (SELECT (x + 1) AS x, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY x ASC NULLS LAST)"
     );
     let plan = shadowed()?
         .limit(0, Some(10))?
@@ -19662,7 +19663,31 @@ fn test_a_self_referencing_dropped_alias_is_substituted_once() -> Result<()> {
         .build()?;
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT (x + 1) AS s, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY (x + 1) ASC NULLS LAST LIMIT 10"
+        @"SELECT x AS s, y FROM (SELECT (x + 1) AS x, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY x ASC NULLS LAST LIMIT 10)"
+    );
+    Ok(())
+}
+
+/// A rename that drops an inner alias would have a sort key reading the alias
+/// take the aliased expression. A constant is then a bare number in `ORDER BY`,
+/// which SQL reads as an output ordinal: `2 AS x` renamed to `s` and sorted on
+/// `x` would order by the second output instead. A fold with a rename takes no
+/// alias out of the inner list, so the plan is unparsed as it was before.
+#[test]
+fn test_rename_dropping_a_constant_alias_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![lit(2).alias("x"), col("t.a")])?
+        .sort(vec![
+            col("x").sort(true, false),
+            col("t.a").sort(false, false),
+        ])?
+        .limit(0, Some(1))?
+        .project(vec![col("x").alias("s"), col("t.a")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x AS s, a FROM (SELECT 2 AS x, t.a FROM t ORDER BY x ASC NULLS LAST, t.a DESC NULLS LAST LIMIT 1)"
     );
     Ok(())
 }
