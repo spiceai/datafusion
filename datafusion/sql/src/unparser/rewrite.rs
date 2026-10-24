@@ -27,6 +27,8 @@ use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Distinct, Expr, Limit, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::{self, Ident};
 
+use super::utils::expr_contains_subquery;
+
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
 /// DataFusion will return an error if two columns in the schema have the same name with no table qualifiers.
@@ -364,6 +366,19 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 _ => None,
             })
             .collect();
+
+        // A rename drops the inner alias it renames, so a key reading that alias
+        // takes the aliased expression instead and evaluates it a second time:
+        // a key over `random() AS r` renamed to `s` would order by another draw.
+        // A fold with a rename is declined when a dropped alias names an
+        // expression that cannot be repeated.
+        if p.expr.iter().any(|e| renamed_output(e).is_some())
+            && dropped_aliases
+                .values()
+                .any(|expr| expr.is_volatile() || expr_contains_subquery(expr))
+        {
+            return None;
+        }
 
         if !dropped_aliases.is_empty() {
             for sort_expr in &mut sort.expr {

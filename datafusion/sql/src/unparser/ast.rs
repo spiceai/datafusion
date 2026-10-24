@@ -629,6 +629,26 @@ impl SelectBuilder {
     pub fn has_selection(&self) -> bool {
         self.selection.is_some()
     }
+    /// Whether this `SELECT` carries none of the clauses a row bound is applied
+    /// after: `DISTINCT`, `TOP`, `WHERE`, `GROUP BY`, `SORT BY`, `HAVING` and
+    /// `QUALIFY`. Only then does a `LIMIT` set on its query bound the rows the
+    /// plan's limit bounds.
+    pub fn holds_no_clause_before_limit(&self) -> bool {
+        self.distinct.is_none()
+            && self.top.is_none()
+            && self.selection.is_none()
+            // An empty list is how a fresh builder starts.
+            && match &self.group_by {
+                None => true,
+                Some(ast::GroupByExpr::Expressions(exprs, modifiers)) => {
+                    exprs.is_empty() && modifiers.is_empty()
+                }
+                Some(_) => false,
+            }
+            && self.sort_by.is_empty()
+            && self.having.is_none()
+            && self.qualify.is_none()
+    }
     pub fn lateral_views(&mut self, value: Vec<ast::LateralView>) -> &mut Self {
         self.lateral_views = value;
         self

@@ -19501,3 +19501,44 @@ fn test_rename_capturing_a_sort_key_is_judged_by_emitted_names() -> Result<()> {
     );
     Ok(())
 }
+
+/// A `DISTINCT` above the projection deduplicates the limited rows. Folding the
+/// limit into the `SELECT DISTINCT` would deduplicate first and limit after, so
+/// over `[1, 1, 2]` with `LIMIT 2` the statement would return two rows where the
+/// plan returns one. The limit stays in its derived table.
+#[test]
+fn test_distinct_over_projection_over_limit_keeps_the_limit_scoped() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.k")])?
+        .sort(vec![col("t.k").sort(true, false)])?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k").alias("s")])?
+        .distinct()?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT DISTINCT t.k AS s FROM (SELECT t.k FROM t ORDER BY t.k ASC NULLS LAST LIMIT 2)"
+    );
+    Ok(())
+}
+
+/// A rename of a sorted projection's output drops the inner alias, so a sort key
+/// reading the alias would take its expression instead. Over `random() AS r`
+/// that orders by a second draw, not by the value the row shows, so the fold is
+/// declined and the plan is unparsed as it was before.
+#[test]
+fn test_rename_over_a_volatile_sort_key_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![random().alias("r")])?
+        .sort(vec![(col("r") + lit(1)).sort(true, false)])?
+        .limit(0, Some(10))?
+        .project(vec![col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r AS s FROM (SELECT r FROM (SELECT random() AS r FROM t) ORDER BY (r + 1) ASC NULLS LAST LIMIT 10)"
+    );
+    Ok(())
+}
