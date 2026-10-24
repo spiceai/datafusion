@@ -3024,7 +3024,7 @@ impl Unparser<'_> {
                 let renames =
                     opens_its_own_query.then_some(&emitted_key as EmittedKey<'_>);
                 if let Some(new_plan) =
-                    rewrite_plan_for_sort_on_non_projected_fields(p, renames)
+                    rewrite_plan_for_sort_on_non_projected_fields(p, renames, true)
                 {
                     return self
                         .select_to_sql_recursively(&new_plan, query, select, relation);

@@ -235,9 +235,14 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// ([`super::Unparser::emitted_column_key`]): the dialect may rename a column as
 /// it writes it, and a rename the fold lets into the `SELECT` is judged by what
 /// the statement will contain.
+///
+/// `drops_aliases` says whether the fold may take an inner alias out of the
+/// list and substitute its expression into the keys that read it, which it
+/// always did; a fold with a rename never does.
 pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     p: &Projection,
     renames: Option<EmittedKey<'_>>,
+    drops_aliases: bool,
 ) -> Option<LogicalPlan> {
     let LogicalPlan::Sort(sort) = p.input.as_ref() else {
         return None;
@@ -334,15 +339,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     if outer_collects == inner_collects {
         // A fold with a rename is held to a subset that keeps every value the
         // plan computes:
-        // - Every inner output can be repeated. A rename can make the folded
-        //   `SELECT` evaluate an inner output twice: where the outer list reads
-        //   it twice (`r, r AS s`), or where a sort key reading the alias a
-        //   rename drops takes the aliased expression (`ORDER BY r + 1` over
-        //   `random() AS r` renamed to `s`). Two evaluations of `random()` are
-        //   two draws.
-        // - Each renamed output is a column or an alias. A computed output with
-        //   no alias is named by its display name, which a sort key reads it by,
-        //   and once renamed no output keeps that name.
+        // - Every inner output can be repeated. The outer list can read one
+        //   output under two names (`r, r AS s`), and the folded `SELECT`
+        //   evaluates it once per name: two evaluations of `random()` are two
+        //   draws.
+        // - Each renamed output is a column. A computed output with no alias is
+        //   named by its display name, which a sort key reads it by, and once
+        //   renamed no output keeps that name; an aliased one is dropped by its
+        //   rename, which the check further down declines.
         let renamed_outputs =
             p.expr.iter().filter_map(renamed_output).collect::<Vec<_>>();
         if !renamed_outputs.is_empty() {
@@ -355,7 +359,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                     position
                         .get(&alias.expr.to_string())
                         .map(|&index| &inner_p.expr[index]),
-                    Some(Expr::Column(_) | Expr::Alias(_))
+                    Some(Expr::Column(_))
                 )
             });
             if !repeatable || !names_survive {
@@ -408,13 +412,12 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             })
             .collect();
 
-        // Substituting a dropped alias into the keys is what a fold with a rename
-        // must not need: a rename drops the inner alias it renames, and the
-        // aliased expression a key then takes can mean something else there (a
-        // constant is an output ordinal in `ORDER BY`). A fold with a rename
-        // takes no alias out of the inner list.
-        if p.expr.iter().any(|e| renamed_output(e).is_some())
-            && !dropped_aliases.is_empty()
+        // The aliased expression a key takes in place of a dropped alias can mean
+        // something else there: a constant is an output ordinal in `ORDER BY`,
+        // and a volatile call is drawn again. A rename drops the alias it
+        // renames, so a fold with a rename, and a fold the caller does not let
+        // drop aliases, takes none out of the inner list.
+        if (!drops_aliases || !renamed_outputs.is_empty()) && !dropped_aliases.is_empty()
         {
             return None;
         }
@@ -565,6 +568,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
 ///
 /// Only one `Limit` is looked through: the caller sets its bound on the query
 /// being built, and a second one directly below it would overwrite that bound.
+/// The fold drops no inner alias, so no key takes an expression in its place.
 pub(super) fn rewrite_plan_for_projection_over_limited_sort(
     p: &Projection,
     renames: EmittedKey<'_>,
@@ -578,7 +582,8 @@ pub(super) fn rewrite_plan_for_projection_over_limited_sort(
         Arc::clone(&p.schema),
     )
     .ok()?;
-    let rewritten = rewrite_plan_for_sort_on_non_projected_fields(&below, Some(renames))?;
+    let rewritten =
+        rewrite_plan_for_sort_on_non_projected_fields(&below, Some(renames), false)?;
     Some(LogicalPlan::Limit(Limit {
         skip: limit.skip.clone(),
         fetch: limit.fetch.clone(),

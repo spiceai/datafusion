@@ -19718,3 +19718,26 @@ fn test_rename_capturing_a_correlated_sort_key_is_not_folded() -> Result<()> {
     );
     Ok(())
 }
+
+/// The limit fold drops no inner alias either, renamed or not: a sort key that
+/// reads a dropped `1 AS x` would take the bare constant, which `ORDER BY`
+/// reads as the first output's ordinal, and the limit would keep a different
+/// row. The plan is unparsed as it was before.
+#[test]
+fn test_limit_fold_dropping_a_constant_alias_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![lit(1).alias("x"), col("t.a")])?
+        .sort(vec![
+            col("x").sort(true, false),
+            col("t.a").sort(false, false),
+        ])?
+        .limit(0, Some(1))?
+        .project(vec![col("t.a")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a FROM (SELECT 1 AS x, t.a FROM t ORDER BY x ASC NULLS LAST, t.a DESC NULLS LAST LIMIT 1)"
+    );
+    Ok(())
+}
