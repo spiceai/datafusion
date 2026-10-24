@@ -21,7 +21,9 @@ use arrow::datatypes::DataType;
 use datafusion_common::tree_node::TreeNodeContainer;
 use datafusion_common::{
     Column, DFSchema, HashMap, Result, TableReference,
-    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
+    tree_node::{
+        Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
+    },
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Distinct, Expr, Limit, LogicalPlan, Projection, Sort, SortExpr};
@@ -424,9 +426,16 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                             // dropped alias happens to share the name.
                             Expr::Column(col) if col.relation.is_none() => {
                                 match dropped_aliases.get(col.name()) {
-                                    Some(underlying) => {
-                                        Transformed::yes(underlying.clone())
-                                    }
+                                    // The replacement's columns belong to the
+                                    // input, so it is not walked again: an alias
+                                    // reading the column it shadows
+                                    // (`(x + 1) AS x`) would be substituted into
+                                    // itself without end.
+                                    Some(underlying) => Transformed::new(
+                                        underlying.clone(),
+                                        true,
+                                        TreeNodeRecursion::Jump,
+                                    ),
                                     None => Transformed::no(e),
                                 }
                             }

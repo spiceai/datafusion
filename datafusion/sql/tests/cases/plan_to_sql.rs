@@ -19628,3 +19628,41 @@ fn test_filter_over_a_renaming_projection_is_not_folded() -> Result<()> {
     );
     Ok(())
 }
+
+/// A sort key reading an alias the fold drops takes the aliased expression. An
+/// alias that reads the input column it shadows (`(x + 1) AS x`) is substituted
+/// once: the column inside the replacement belongs to the input, not to the
+/// alias. Before, the substitution descended into its own replacement and never
+/// stopped. Covers the alias dropped because the outer list does not read it,
+/// and dropped by a rename, with and without a limit.
+#[test]
+fn test_a_self_referencing_dropped_alias_is_substituted_once() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let shadowed = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &schema, None)?
+            .project(vec![col("t.a").alias("x"), col("t.a").alias("y")])?
+            .project(vec![(col("x") + lit(1)).alias("x"), col("y")])?
+            .sort(vec![col("x").sort(true, false)])
+    };
+    let plan = shadowed()?.project(vec![col("y")])?.build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY (x + 1) ASC NULLS LAST"
+    );
+    let plan = shadowed()?
+        .project(vec![col("x").alias("s"), col("y")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (x + 1) AS s, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY (x + 1) ASC NULLS LAST"
+    );
+    let plan = shadowed()?
+        .limit(0, Some(10))?
+        .project(vec![col("x").alias("s"), col("y")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT (x + 1) AS s, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY (x + 1) ASC NULLS LAST LIMIT 10"
+    );
+    Ok(())
+}
