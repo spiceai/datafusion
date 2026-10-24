@@ -322,22 +322,34 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
 
     if outer_collects == inner_collects {
-        // A computed inner output with no alias is named by its display name,
-        // which is what a sort key reads it by. Renamed, no output keeps that
-        // name, so a key reading it would read a column the folded `SELECT`
-        // does not have. Only a column, or an alias the substitution below
-        // carries into the keys, can be renamed.
-        let renames_an_unnamed_output =
-            p.expr.iter().filter_map(renamed_output).any(|alias| {
-                match position.get(&alias.expr.to_string()) {
-                    Some(&index) => {
-                        !matches!(inner_p.expr[index], Expr::Column(_) | Expr::Alias(_))
-                    }
-                    None => true,
-                }
+        // A fold with a rename is held to a subset that keeps every value the
+        // plan computes:
+        // - Every inner output can be repeated. A rename can make the folded
+        //   `SELECT` evaluate an inner output twice: where the outer list reads
+        //   it twice (`r, r AS s`), or where a sort key reading the alias a
+        //   rename drops takes the aliased expression (`ORDER BY r + 1` over
+        //   `random() AS r` renamed to `s`). Two evaluations of `random()` are
+        //   two draws.
+        // - Each renamed output is a column or an alias. A computed output with
+        //   no alias is named by its display name, which a sort key reads it by,
+        //   and once renamed no output keeps that name.
+        let renames = p.expr.iter().filter_map(renamed_output).collect::<Vec<_>>();
+        if !renames.is_empty() {
+            let repeatable = inner_p
+                .expr
+                .iter()
+                .all(|expr| !expr.is_volatile() && !expr_contains_subquery(expr));
+            let names_survive = renames.iter().all(|alias| {
+                matches!(
+                    position
+                        .get(&alias.expr.to_string())
+                        .map(|&index| &inner_p.expr[index]),
+                    Some(Expr::Column(_) | Expr::Alias(_))
+                )
             });
-        if renames_an_unnamed_output {
-            return None;
+            if !repeatable || !names_survive {
+                return None;
+            }
         }
 
         let mut sort = sort.clone();
@@ -384,19 +396,6 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 _ => None,
             })
             .collect();
-
-        // A rename drops the inner alias it renames, so a key reading that alias
-        // takes the aliased expression instead and evaluates it a second time:
-        // a key over `random() AS r` renamed to `s` would order by another draw.
-        // A fold with a rename is declined when a dropped alias names an
-        // expression that cannot be repeated.
-        if p.expr.iter().any(|e| renamed_output(e).is_some())
-            && dropped_aliases
-                .values()
-                .any(|expr| expr.is_volatile() || expr_contains_subquery(expr))
-        {
-            return None;
-        }
 
         if !dropped_aliases.is_empty() {
             for sort_expr in &mut sort.expr {

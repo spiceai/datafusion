@@ -19573,3 +19573,33 @@ fn test_rename_of_an_unaliased_computed_output_is_not_folded() -> Result<()> {
     );
     Ok(())
 }
+
+/// A rename next to the output it renames would have the folded `SELECT`
+/// evaluate that output twice, once per name. Over `random() AS r`, `r` and `s`
+/// would be two draws where the plan shows one value under both names, so the
+/// fold is declined, with and without a limit.
+#[test]
+fn test_rename_beside_a_volatile_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let sorted = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &schema, None)?
+            .project(vec![random().alias("r")])?
+            .sort(vec![col("r").sort(true, false)])
+    };
+    let plan = sorted()?
+        .project(vec![col("r"), col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r, r AS s FROM (SELECT random() AS r FROM t ORDER BY r ASC NULLS LAST)"
+    );
+    let plan = sorted()?
+        .limit(0, Some(10))?
+        .project(vec![col("r"), col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r, r AS s FROM (SELECT random() AS r FROM t ORDER BY r ASC NULLS LAST LIMIT 10)"
+    );
+    Ok(())
+}
