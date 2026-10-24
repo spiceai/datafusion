@@ -19741,3 +19741,66 @@ fn test_limit_fold_dropping_a_constant_alias_is_not_folded() -> Result<()> {
     );
     Ok(())
 }
+
+/// A volatile aggregate behind a plain column: `r` reads `sum(random())`, and the
+/// folded `SELECT` would unproject both `r` and `s` into separate
+/// `sum(random())` calls where the plan shows one value under both names. The
+/// fold is declined.
+#[test]
+fn test_rename_beside_a_volatile_aggregate_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![] as Vec<Expr>, vec![sum(random()).alias("r")])?
+        .project(vec![col("r")])?
+        .sort(vec![col("r").sort(true, false)])?
+        .project(vec![col("r"), col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r, r AS s FROM (SELECT sum(random()) AS r FROM t ORDER BY sum(random()) ASC NULLS LAST)"#
+    );
+    Ok(())
+}
+
+/// A window output renamed: the sort key reads it by its own name, which only
+/// the projection the fold removes defines. The fold is declined.
+#[test]
+fn test_rename_of_a_window_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .window(vec![
+            Expr::from(WindowFunction::new(
+                WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+                vec![],
+            ))
+            .alias("w"),
+        ])?
+        .project(vec![col("w")])?
+        .sort(vec![col("w").sort(false, false)])?
+        .project(vec![col("w").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT w AS s FROM (SELECT row_number() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS w FROM t ORDER BY w DESC NULLS LAST)"#
+    );
+    Ok(())
+}
+
+/// The limit fold drops no computed inner output either: a sort key reading
+/// `t.k + 1` by its display name would read a column the folded `SELECT` does
+/// not have. The fold is declined.
+#[test]
+fn test_limit_fold_dropping_a_computed_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.k"), col("t.k") + lit(1)])?
+        .sort(vec![col("t.k + Int32(1)").sort(true, false)])?
+        .limit(0, Some(1))?
+        .project(vec![col("t.k")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT k FROM (SELECT t.k, (t.k + 1) AS "t.k + Int32(1)" FROM t ORDER BY "t.k + Int32(1)" ASC NULLS LAST LIMIT 1)"#
+    );
+    Ok(())
+}

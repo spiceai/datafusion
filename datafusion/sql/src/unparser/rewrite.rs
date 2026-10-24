@@ -29,7 +29,7 @@ use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
 use datafusion_expr::{Distinct, Expr, Limit, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::{self, Ident};
 
-use super::utils::expr_contains_subquery;
+use super::utils::{expr_contains_subquery, find_agg_node_within_select};
 
 /// The form the unparser compares two emitted column names by: see
 /// [`rewrite_plan_for_sort_on_non_projected_fields`].
@@ -337,32 +337,43 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
 
     if outer_collects == inner_collects {
-        // A fold with a rename is held to a subset that keeps every value the
-        // plan computes:
-        // - Every inner output can be repeated. The outer list can read one
-        //   output under two names (`r, r AS s`), and the folded `SELECT`
-        //   evaluates it once per name: two evaluations of `random()` are two
-        //   draws.
-        // - Each renamed output is a column. A computed output with no alias is
-        //   named by its display name, which a sort key reads it by, and once
-        //   renamed no output keeps that name; an aliased one is dropped by its
-        //   rename, which the check further down declines.
+        // The folds this function did not always make, one with a rename and
+        // one the caller does not let drop aliases (the limit fold), are held to
+        // a subset that keeps every value and name the plan reads:
+        // - Every inner output is a column. An alias would be dropped by its
+        //   rename, and a computed output the outer list does not read leaves a
+        //   key that reads it by display name with no such column.
+        // - The outer list reads each inner output once. A column can stand for
+        //   an aggregate the `SELECT` evaluates per reference
+        //   (`sum(random())`), so reading it under two names draws twice.
+        // - No window sits anywhere below the inner projection, and no aggregate
+        //   folding into it is volatile: a key reading a window output by name
+        //   is not resolved against the window, and an `ORDER BY` over a
+        //   volatile aggregate evaluates it again.
         let renamed_outputs =
             p.expr.iter().filter_map(renamed_output).collect::<Vec<_>>();
-        if !renamed_outputs.is_empty() {
-            let repeatable = inner_p
+        if !drops_aliases || !renamed_outputs.is_empty() {
+            let all_columns = inner_p
                 .expr
                 .iter()
-                .all(|expr| !expr.is_volatile() && !expr_contains_subquery(expr));
-            let names_survive = renamed_outputs.iter().all(|alias| {
-                matches!(
-                    position
-                        .get(&alias.expr.to_string())
-                        .map(|&index| &inner_p.expr[index]),
-                    Some(Expr::Column(_))
-                )
+                .all(|expr| matches!(expr, Expr::Column(_)));
+            let mut read = HashSet::new();
+            let read_once = p.expr.iter().all(|e| {
+                let underlying = renamed_output(e).map_or(e, |alias| &*alias.expr);
+                read.insert(underlying.to_string())
             });
-            if !repeatable || !names_survive {
+            let no_window = !inner_p
+                .input
+                .exists(|node| Ok(matches!(node, LogicalPlan::Window(_))))
+                .unwrap_or(true);
+            let no_volatile_aggregate =
+                find_agg_node_within_select(&inner_p.input, false).is_none_or(|agg| {
+                    agg.aggr_expr
+                        .iter()
+                        .chain(&agg.group_expr)
+                        .all(|expr| !expr.is_volatile() && !expr_contains_subquery(expr))
+                });
+            if !all_columns || !read_once || !no_window || !no_volatile_aggregate {
                 return None;
             }
         }
