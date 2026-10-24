@@ -19542,3 +19542,34 @@ fn test_rename_over_a_volatile_sort_key_output_is_not_folded() -> Result<()> {
     );
     Ok(())
 }
+
+/// A computed inner output with no alias of its own is named by its display
+/// name, which a sort key reads it by. Renaming it leaves no output under that
+/// name, so the key would read a column the folded `SELECT` does not have. The
+/// fold is declined, with and without a limit, and the plan is unparsed as it
+/// was before.
+#[test]
+fn test_rename_of_an_unaliased_computed_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let sorted = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &schema, None)?
+            .project(vec![col("t.k") + lit(1)])?
+            .sort(vec![col("t.k + Int32(1)").sort(true, false)])
+    };
+    let plan = sorted()?
+        .project(vec![col("t.k + Int32(1)").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.k + Int32(1)" AS s FROM (SELECT (t.k + 1) AS "t.k + Int32(1)" FROM t ORDER BY "t.k + Int32(1)" ASC NULLS LAST)"#
+    );
+    let plan = sorted()?
+        .limit(0, Some(10))?
+        .project(vec![col("t.k + Int32(1)").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.k + Int32(1)" AS s FROM (SELECT (t.k + 1) AS "t.k + Int32(1)" FROM t ORDER BY "t.k + Int32(1)" ASC NULLS LAST LIMIT 10)"#
+    );
+    Ok(())
+}

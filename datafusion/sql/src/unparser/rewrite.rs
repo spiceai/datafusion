@@ -322,6 +322,24 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
 
     if outer_collects == inner_collects {
+        // A computed inner output with no alias is named by its display name,
+        // which is what a sort key reads it by. Renamed, no output keeps that
+        // name, so a key reading it would read a column the folded `SELECT`
+        // does not have. Only a column, or an alias the substitution below
+        // carries into the keys, can be renamed.
+        let renames_an_unnamed_output =
+            p.expr.iter().filter_map(renamed_output).any(|alias| {
+                match position.get(&alias.expr.to_string()) {
+                    Some(&index) => {
+                        !matches!(inner_p.expr[index], Expr::Column(_) | Expr::Alias(_))
+                    }
+                    None => true,
+                }
+            });
+        if renames_an_unnamed_output {
+            return None;
+        }
+
         let mut sort = sort.clone();
 
         let new_exprs = p
