@@ -29,6 +29,10 @@ use sqlparser::ast::{self, Ident};
 
 use super::utils::expr_contains_subquery;
 
+/// The form the unparser compares two emitted column names by: see
+/// [`rewrite_plan_for_sort_on_non_projected_fields`].
+pub(super) type EmittedKey<'a> = &'a dyn Fn(&str) -> Result<String>;
+
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
 /// DataFusion will return an error if two columns in the schema have the same name with no table qualifiers.
@@ -221,13 +225,17 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// hoist to be valid -- it only has to be computable from them, as `age + 1` is from
 /// `age`.
 ///
-/// `emitted_key` is the form the unparser compares two emitted column names by
-/// ([`super::Unparser::emitted_column_key`]): the dialect may rename a column
-/// as it writes it, and a rename the fold lets into the `SELECT` is judged by
-/// what the statement will contain.
+/// An outer expression that only renames an inner output (`t.k AS K`, as a root
+/// projection naming a plan's outputs does) is folded only when `renames` is
+/// given. Folding it removes the inner name the rename reads, so the caller
+/// gives it only where nothing outside this projection can read that name.
+/// `renames` is then the form the unparser compares two emitted column names by
+/// ([`super::Unparser::emitted_column_key`]): the dialect may rename a column as
+/// it writes it, and a rename the fold lets into the `SELECT` is judged by what
+/// the statement will contain.
 pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     p: &Projection,
-    emitted_key: &dyn Fn(&str) -> Result<String>,
+    renames: Option<EmittedKey<'_>>,
 ) -> Option<LogicalPlan> {
     let LogicalPlan::Sort(sort) = p.input.as_ref() else {
         return None;
@@ -281,7 +289,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         .collect::<HashSet<_>>();
 
     // An outer expression that only renames one of the inner outputs reads that
-    // output, as a root projection naming a plan's outputs does (`t.k AS K`).
+    // output, where renames are folded at all.
     fn renamed<'a>(e: &'a Expr, inner_collects: &HashSet<String>) -> Option<&'a Alias> {
         match e {
             Expr::Alias(alias) if inner_collects.contains(&alias.expr.to_string()) => {
@@ -290,7 +298,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             _ => None,
         }
     }
-    let renamed_output = |e| renamed(e, &inner_collects);
+    let renamed_output = |e| renames.and_then(|_| renamed(e, &inner_collects));
     let mut collects = p
         .expr
         .iter()
@@ -333,13 +341,14 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         // - Each renamed output is a column or an alias. A computed output with
         //   no alias is named by its display name, which a sort key reads it by,
         //   and once renamed no output keeps that name.
-        let renames = p.expr.iter().filter_map(renamed_output).collect::<Vec<_>>();
-        if !renames.is_empty() {
+        let renamed_outputs =
+            p.expr.iter().filter_map(renamed_output).collect::<Vec<_>>();
+        if !renamed_outputs.is_empty() {
             let repeatable = inner_p
                 .expr
                 .iter()
                 .all(|expr| !expr.is_volatile() && !expr_contains_subquery(expr));
-            let names_survive = renames.iter().all(|alias| {
+            let names_survive = renamed_outputs.iter().all(|alias| {
                 matches!(
                     position
                         .get(&alias.expr.to_string())
@@ -463,6 +472,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                 Expr::Column(column) => Some(column),
                 _ => None,
             };
+            let emitted_key = renames?;
             let Ok(alias_key) = emitted_key(&alias.name) else {
                 return None;
             };
@@ -524,7 +534,7 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
 /// being built, and a second one directly below it would overwrite that bound.
 pub(super) fn rewrite_plan_for_projection_over_limited_sort(
     p: &Projection,
-    emitted_key: &dyn Fn(&str) -> Result<String>,
+    renames: EmittedKey<'_>,
 ) -> Option<LogicalPlan> {
     let LogicalPlan::Limit(limit) = p.input.as_ref() else {
         return None;
@@ -535,7 +545,7 @@ pub(super) fn rewrite_plan_for_projection_over_limited_sort(
         Arc::clone(&p.schema),
     )
     .ok()?;
-    let rewritten = rewrite_plan_for_sort_on_non_projected_fields(&below, emitted_key)?;
+    let rewritten = rewrite_plan_for_sort_on_non_projected_fields(&below, Some(renames))?;
     Some(LogicalPlan::Limit(Limit {
         skip: limit.skip.clone(),
         fetch: limit.fetch.clone(),

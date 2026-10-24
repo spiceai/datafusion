@@ -19603,3 +19603,28 @@ fn test_rename_beside_a_volatile_output_is_not_folded() -> Result<()> {
     );
     Ok(())
 }
+
+/// A filter above a renaming projection reads the renamed output, and the
+/// `WHERE` it puts on the query reads the inner name the rename removes once
+/// folded. Over a table that has a column of that name the predicate would bind
+/// to the column: rows `(a, x) = (0, 20), (20, 0)` would return `s = 1` instead
+/// of `s = 21`. Renames are only folded where the projection opens its own
+/// query, so the plan is unparsed as it was before.
+#[test]
+fn test_filter_over_a_renaming_projection_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("x", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![(col("t.a") + lit(1)).alias("x")])?
+        .sort(vec![col("x").sort(true, false)])?
+        .project(vec![col("x").alias("s")])?
+        .filter(col("s").gt(lit(10)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x AS s FROM (SELECT (t.a + 1) AS x FROM t ORDER BY x ASC NULLS LAST) WHERE (x > 10)"
+    );
+    Ok(())
+}
