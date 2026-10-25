@@ -32,7 +32,7 @@ use datafusion_common::tree_node::{
 };
 use datafusion_common::{
     Column, DFSchemaRef, ExprSchema, NullEquality, Result, assert_or_internal_err,
-    plan_err,
+    internal_err, plan_err,
 };
 use datafusion_expr::expr::{Exists, InSubquery};
 use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
@@ -40,7 +40,7 @@ use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::{conjunction, expr_to_columns, split_conjunction_owned};
 use datafusion_expr::{
     BinaryExpr, Expr, Filter, LogicalPlan, LogicalPlanBuilder, Operator, exists,
-    in_subquery, lit, not, not_exists, not_in_subquery,
+    in_subquery, lit, not, not_exists, not_in_subquery, when,
 };
 
 use log::debug;
@@ -432,6 +432,33 @@ fn build_join(
     }
     if !pull_up.can_pull_up {
         return Ok(None);
+    }
+    // TODO(#24960): stopgap until count-bug compensation covers `IN`/`NOT IN`.
+    // The subquery stays correlated unless an outer row with no match gets the
+    // right answer anyway.
+    if !exists_sub_query && pull_up.pulled_up_scalar_agg {
+        // This branch has no null-aware mark join, so only a semi join reads a
+        // NULL result as false.
+        let null_reads_as_false = join_type == JoinType::LeftSemi;
+        let count_bug_is_harmless = match rewrite(true) {
+            Ok((plan, pull_up)) => pull_up
+                .collected_count_expr_map
+                .get(&plan)
+                .filter(|m| !m.is_empty())
+                .is_none_or(|empty_input_values| {
+                    null_reads_as_false
+                        && empty_input_values
+                            .get(subquery.schema().field(0).name())
+                            .is_some_and(|value| {
+                                matches!(value, Expr::Literal(v, _) if v.is_null())
+                            })
+                }),
+            // Count-bug handling errors on some shapes it cannot compensate.
+            Err(_) => false,
+        };
+        if !count_bug_is_harmless {
+            return Ok(None);
+        }
     }
 
     let sub_query_alias = LogicalPlanBuilder::from(new_plan)
