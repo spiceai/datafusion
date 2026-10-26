@@ -36,7 +36,7 @@ use super::{
         filters_scope_their_projection, find_agg_node_within_select,
         find_unnest_node_within_select, find_window_nodes_within_select,
         hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
-        name_scope_outputs, partition_subquery_filters,
+        name_scope_outputs, output_is_repeatable, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, scope_sort_keys, scope_sort_over_projection,
         select_list_wraps_a_grouping_expr, sort_keys_scope_their_projection,
@@ -4190,9 +4190,9 @@ impl Unparser<'_> {
                 let left_joins_from = select.last_from_join_count();
                 // A RIGHT JOIN null-extends its left input, a FULL JOIN both of
                 // its inputs: a mark join reached there is refused (see above).
-                if let Some(alias) = scoped_probe {
+                if let Some((alias, input)) = scoped_probe {
                     self.derive(
-                        &alias.input,
+                        input,
                         relation,
                         Some(
                             self.new_table_alias(alias.alias.table().to_string(), vec![]),
@@ -6171,7 +6171,12 @@ impl Unparser<'_> {
     fn projected_exists_input<'a>(
         &self,
         plan: &'a LogicalPlan,
-    ) -> Result<Option<&'a datafusion_expr::SubqueryAlias>> {
+    ) -> Result<Option<(&'a datafusion_expr::SubqueryAlias, &'a LogicalPlan)>> {
+        if let LogicalPlan::Distinct(Distinct::All(input)) = plan {
+            return Ok(self
+                .projected_exists_input(input)?
+                .map(|(alias, _)| (alias, plan)));
+        }
         let LogicalPlan::SubqueryAlias(alias) = plan else {
             return Ok(None);
         };
@@ -6206,7 +6211,7 @@ impl Unparser<'_> {
                     if projection
                         .expr
                         .iter()
-                        .any(|expr| expr.is_volatile() || expr_contains_subquery(expr))
+                        .any(|expr| !output_is_repeatable(expr))
                     {
                         self.ensure_derived_table_fixes_volatile_outputs()?;
                     }
@@ -6216,7 +6221,7 @@ impl Unparser<'_> {
                 _ => break,
             }
         }
-        Ok(Some(alias))
+        Ok(Some((alias, alias.input.as_ref())))
     }
 
     /// Builds the body of an `EXISTS` subquery for a semi/anti/mark join.
@@ -6291,7 +6296,7 @@ impl Unparser<'_> {
         let projected_scope = self.projected_exists_input(right_plan)?;
         if query_builder.bounds_rows() || projected_scope.is_some() {
             let scope_name = match projected_scope {
-                Some(alias) => alias.alias.table().to_string(),
+                Some((alias, _)) => alias.alias.table().to_string(),
                 None => self.exists_scope_name(join)?,
             };
             query_builder.body(Box::new(SetExpr::Select(select)));
@@ -7452,7 +7457,7 @@ impl Unparser<'_> {
             if !self.scope_answers(build_scope, column)? {
                 return Ok(false);
             }
-            if let Some(alias) = self.projected_exists_input(build_plan)?
+            if let Some((alias, _)) = self.projected_exists_input(build_plan)?
                 && self.emitted_qualifier_key(relation)
                     == vec![self.identifier_comparison_key(alias.alias.table())]
             {

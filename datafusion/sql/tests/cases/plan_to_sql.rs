@@ -7142,6 +7142,53 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
 }
 
 #[test]
+fn test_projected_exists_inputs_keep_subquery_repeatability_guard() -> Result<()> {
+    let body = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .project(vec![random().alias("d")])?
+        .build()?;
+    let comparison = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+        Box::new(lit(0.5)),
+        datafusion_expr::Subquery {
+            subquery: Arc::new(body),
+            outer_ref_columns: vec![],
+            spans: datafusion_common::Spans::new(),
+        },
+        datafusion_expr::Operator::Gt,
+        datafusion_expr::expr::SetQuantifier::All,
+    ));
+    let projected = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![comparison.alias("c")])?
+        .alias("q")?
+        .build()?;
+    let plain = table_scan(
+        Some("p"),
+        &Schema::new(vec![Field::new("c", DataType::Boolean, false)]),
+        Some(vec![0]),
+    )?
+    .build()?;
+    for (probe, build, probe_key, build_key) in [
+        (plain.clone(), projected.clone(), "p.c", "q.c"),
+        (projected, plain, "q.c", "p.c"),
+    ] {
+        let plan = LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (vec![probe_key], vec![build_key]),
+                None,
+            )?
+            .build()?;
+        let error = Unparser::new(&UnparserMySqlDialect {})
+            .plan_to_sql(&plan)
+            .expect_err(
+                "MySQL cannot promise one evaluation of derived subquery outputs",
+            );
+        assert_contains!(error.to_string(), "evaluates the expression again");
+    }
+    Ok(())
+}
+
+#[test]
 fn test_unparse_projected_set_operation_scopes() -> Result<()> {
     let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
     let input = |name: &str| -> Result<LogicalPlan> {
@@ -7150,28 +7197,56 @@ fn test_unparse_projected_set_operation_scopes() -> Result<()> {
             .alias(name)?
             .build()
     };
-    for join_type in [
-        datafusion_expr::JoinType::LeftSemi,
-        datafusion_expr::JoinType::LeftAnti,
-    ] {
-        let plan = LogicalPlanBuilder::from(input("left")?)
-            .join(
-                input("right")?,
-                join_type,
-                (vec!["left.x"], vec!["right.x"]),
-                None,
-            )?
-            .build()?;
-        let output = Unparser::new(&UnparserPostgreSqlDialect {})
-            .plan_to_sql(&plan)?
-            .to_string();
-        assert!(output.contains("AS \"left\""), "{output}");
-        assert!(output.contains("AS \"right\""), "{output}");
-        assert!(
-            output.contains("\"left\".\"x\" = \"right\".\"x\""),
-            "{output}"
-        );
+    for distinct in [false, true] {
+        for join_type in [
+            datafusion_expr::JoinType::LeftSemi,
+            datafusion_expr::JoinType::LeftAnti,
+        ] {
+            let probe = if distinct {
+                LogicalPlanBuilder::from(input("left")?)
+                    .distinct()?
+                    .build()?
+            } else {
+                input("left")?
+            };
+            let plan = LogicalPlanBuilder::from(probe)
+                .join(
+                    input("right")?,
+                    join_type,
+                    (vec!["left.x"], vec!["right.x"]),
+                    None,
+                )?
+                .build()?;
+            let output = Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string();
+            assert!(output.contains("AS \"left\""), "{output}");
+            assert!(output.contains("AS \"right\""), "{output}");
+            let statement = Parser::new(&GenericDialect {})
+                .try_with_sql(&output)?
+                .parse_statement()?;
+            let context = MockContextProvider {
+                state: MockSessionState::default(),
+            };
+            SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        }
     }
+    Ok(())
+}
+
+#[test]
+fn test_sql_unsigned_negation_uses_the_lossless_result_schema() -> Result<()> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql("SELECT -CAST('18446744073709551615' AS BIGINT UNSIGNED) AS n")?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    assert_eq!(
+        plan.schema().field(0).data_type(),
+        &DataType::Decimal128(20, 0)
+    );
     Ok(())
 }
 
