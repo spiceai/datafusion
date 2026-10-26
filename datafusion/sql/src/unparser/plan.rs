@@ -6268,6 +6268,12 @@ impl Unparser<'_> {
         let body_plan = projected_scope
             .as_ref()
             .map_or(right_plan, |(_, input)| input.as_ref());
+        let named = if projected_scope.is_some() {
+            name_derived_scope_outputs(body_plan)?
+        } else {
+            None
+        };
+        let body_plan = named.as_ref().unwrap_or(body_plan);
         let mut query_builder = Some(QueryBuilder::default());
         let mut body_select = SelectBuilder::default();
         body_select.mark_exists_body();
@@ -6297,7 +6303,7 @@ impl Unparser<'_> {
         //
         // `bounds_rows()` is tested first so the scope name is only demanded
         // when a bound actually has to be moved: naming it can refuse the plan
-        // outright, and an unbounded build side has nothing to get wrong.
+        // outright, and an unbounded build side without renamed outputs needs no extra scope.
         if query_builder.bounds_rows() || projected_scope.is_some() {
             let scope_name = match projected_scope {
                 Some((alias, _)) => alias.alias.table().to_string(),

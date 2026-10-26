@@ -7254,6 +7254,42 @@ fn test_unparse_projected_set_operation_scopes() -> Result<()> {
 }
 
 #[test]
+fn test_projected_exists_inputs_name_computed_outputs() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+    let input = |name: &str| -> Result<LogicalPlan> {
+        table_scan(Some("person"), &schema, Some(vec![0]))?
+            .project(vec![col("person.id") + lit(1)])?
+            .alias(name)?
+            .build()
+    };
+    let probe = input("left")?;
+    let build = input("right")?;
+    let field = probe.schema().field(0).name().clone();
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (
+                vec![Column::new(Some("left"), field.clone())],
+                vec![Column::new(Some("right"), field)],
+            ),
+            None,
+        )?
+        .build()?;
+    let output = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(&output)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    Ok(())
+}
+
+#[test]
 fn test_sql_unsigned_negation_uses_the_lossless_result_schema() -> Result<()> {
     let statement = Parser::new(&GenericDialect {})
         .try_with_sql("SELECT -CAST('18446744073709551615' AS BIGINT UNSIGNED) AS n")?
