@@ -1176,6 +1176,12 @@ impl Unparser<'_> {
                 .map(|e| self.select_item_to_sql(e))
                 .collect::<Result<Vec<_>>>()?;
             select.projection(items);
+            if fully_absorbed && let Some(agg) = find_agg_node_within_select(plan, true) {
+                select.group_by(ast::GroupByExpr::Expressions(
+                    self.group_by_keys(agg, &UnparserAggScope::new(agg))?,
+                    vec![],
+                ));
+            }
             return Ok(false);
         }
 
@@ -1364,8 +1370,9 @@ impl Unparser<'_> {
         // expressions go out as they stand: no unprojection, which is what would
         // substitute the grouping expression back into the select item, and no
         // GROUP BY on this SELECT, which now groups nothing.
-        let items = p
-            .expr
+        let fallback = p.expr.is_empty().then(|| self.empty_projection_fallback());
+        let exprs = fallback.as_deref().unwrap_or(&p.expr);
+        let items = exprs
             .iter()
             .map(|expr| self.select_item_to_sql(expr))
             .collect::<Result<Vec<_>>>()?;
@@ -1421,16 +1428,29 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         select: &SelectBuilder,
     ) -> bool {
-        if self.dialect.group_by_matches_select_subexpressions()
-            || select.has_grouped_predicate()
-        {
+        if select.has_grouped_predicate() {
             return false;
         }
         let LogicalPlan::Projection(projection) = plan else {
             return false;
         };
-        find_agg_node_within_select(plan, true)
-            .is_some_and(|agg| select_list_wraps_a_grouping_expr(&projection.expr, agg))
+        let reads_no_columns = projection.expr.iter().all(|expr| {
+            matches!(
+                expr.exists(|expr| Ok(matches!(expr, Expr::Column(_)))),
+                Ok(false)
+            )
+        });
+        if self.dialect.group_by_matches_select_subexpressions() && !reads_no_columns {
+            return false;
+        }
+        let Some(agg) = find_agg_node_within_select(plan, true) else {
+            return false;
+        };
+        // A projection that reads none of the aggregate's outputs still needs
+        // its rows: one for a global aggregate, or one per group. Keep the
+        // aggregate in its own scope so constants and an empty SELECT list
+        // cannot turn it into a scan of its input.
+        reads_no_columns || select_list_wraps_a_grouping_expr(&projection.expr, agg)
     }
 
     fn derive(
@@ -5597,6 +5617,28 @@ impl Unparser<'_> {
                     builder = builder.alias(alias.clone())?;
                 }
 
+                let filter_expr: Result<Option<Expr>> = table_scan
+                    .filters
+                    .iter()
+                    .cloned()
+                    .map(|expr| {
+                        if let Some(ref mut rewriter) = filter_alias_rewriter {
+                            expr.rewrite(rewriter).data()
+                        } else {
+                            Ok(expr)
+                        }
+                    })
+                    .reduce(|acc, expr_result| {
+                        acc.and_then(|acc_expr| {
+                            expr_result.map(|expr| acc_expr.and(expr))
+                        })
+                    })
+                    .transpose();
+
+                if let Some(filter) = filter_expr? {
+                    builder = builder.filter(filter)?;
+                }
+
                 // Avoid creating a duplicate Projection node, which would result in an additional subquery if a projection already exists.
                 // For example, if the `optimize_projection` rule is applied, there will be a Projection node, and duplicate projection
                 // information included in the TableScan node.
@@ -5622,28 +5664,6 @@ impl Unparser<'_> {
                             .collect::<Vec<_>>();
                         builder = builder.project(project_columns)?;
                     };
-                }
-
-                let filter_expr: Result<Option<Expr>> = table_scan
-                    .filters
-                    .iter()
-                    .cloned()
-                    .map(|expr| {
-                        if let Some(ref mut rewriter) = filter_alias_rewriter {
-                            expr.rewrite(rewriter).data()
-                        } else {
-                            Ok(expr)
-                        }
-                    })
-                    .reduce(|acc, expr_result| {
-                        acc.and_then(|acc_expr| {
-                            expr_result.map(|expr| acc_expr.and(expr))
-                        })
-                    })
-                    .transpose();
-
-                if let Some(filter) = filter_expr? {
-                    builder = builder.filter(filter)?;
                 }
 
                 if let Some(fetch) = table_scan.fetch {

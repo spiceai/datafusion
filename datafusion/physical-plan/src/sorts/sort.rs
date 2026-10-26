@@ -1807,7 +1807,9 @@ impl SortExec {
 /// into.
 fn sliced_from_capacity(data: &ArrayData) -> usize {
     let buffers = match data.data_type() {
-        DataType::Utf8View | DataType::BinaryView => data.buffers().get(..1).unwrap_or_default(),
+        DataType::Utf8View | DataType::BinaryView => {
+            data.buffers().get(..1).unwrap_or_default()
+        }
         _ => data.buffers(),
     };
     buffers.iter().map(Buffer::capacity).sum::<usize>()
@@ -3375,7 +3377,11 @@ mod tests {
 
     #[test]
     fn test_view_batch_sharing_only_its_data_buffer_is_admitted_as_it_is() -> Result<()> {
-        let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, false)]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "s",
+            DataType::Utf8View,
+            false,
+        )]));
         // One data buffer that many batches' views point into, as a reader that
         // decodes a page once hands them out. Each view references 20 of its
         // bytes.
@@ -3385,12 +3391,14 @@ mod tests {
                 .map(|row| make_view(&[b'x'; 20], 0, row * 20))
                 .collect::<Vec<_>>()
         };
-        let own_views = StringViewArray::try_new(views(512).into(), vec![page.clone()], None)?;
+        let own_views =
+            StringViewArray::try_new(views(512).into(), vec![page.clone()], None)?;
         let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(own_views)])?;
         assert!(ExternalSorter::compaction_worth_making(&batch)?.is_none());
 
         // The same 512 rows sliced out of a batch of 4096 are copied.
-        let sliced = StringViewArray::try_new(views(4096).into(), vec![page], None)?.slice(0, 512);
+        let sliced =
+            StringViewArray::try_new(views(4096).into(), vec![page], None)?.slice(0, 512);
         let batch = RecordBatch::try_new(schema, vec![Arc::new(sliced)])?;
         let compaction = ExternalSorter::compaction_worth_making(&batch)?
             .expect("512 views sliced out of 4096 are worth copying");

@@ -1,0 +1,22 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: "sql.join(\"\\n\")"
+---
+pretty=false: (NOT flag) IS NULL
+pretty=false: (NOT flag) IS NOT NULL
+pretty=false: (NOT flag) IS TRUE
+pretty=false: (NOT flag) IS NOT TRUE
+pretty=false: (NOT flag) IS FALSE
+pretty=false: (NOT flag) IS NOT FALSE
+pretty=false: (NOT flag) IS UNKNOWN
+pretty=false: (NOT flag) IS NOT UNKNOWN
+pretty=false: (flag IS TRUE) IS NULL
+pretty=true: (NOT flag) IS NULL
+pretty=true: (NOT flag) IS NOT NULL
+pretty=true: (NOT flag) IS TRUE
+pretty=true: (NOT flag) IS NOT TRUE
+pretty=true: (NOT flag) IS FALSE
+pretty=true: (NOT flag) IS NOT FALSE
+pretty=true: (NOT flag) IS UNKNOWN
+pretty=true: (NOT flag) IS NOT UNKNOWN
+pretty=true: (flag IS TRUE) IS NULL

@@ -1455,6 +1455,110 @@ fn test_table_scan_with_empty_projection_and_filter_default_dialect() {
     );
 }
 
+#[test]
+fn test_unparser_preserves_is_predicate_operands() -> Result<()> {
+    let flag = col("flag");
+    let expressions = [
+        Expr::IsNull(Box::new(!flag.clone())),
+        Expr::IsNotNull(Box::new(!flag.clone())),
+        Expr::IsTrue(Box::new(!flag.clone())),
+        Expr::IsNotTrue(Box::new(!flag.clone())),
+        Expr::IsFalse(Box::new(!flag.clone())),
+        Expr::IsNotFalse(Box::new(!flag.clone())),
+        Expr::IsUnknown(Box::new(!flag.clone())),
+        Expr::IsNotUnknown(Box::new(!flag.clone())),
+        Expr::IsNull(Box::new(Expr::IsTrue(Box::new(flag)))),
+    ];
+    let mut sql = Vec::new();
+    for pretty in [false, true] {
+        let unparser = Unparser::new(&UnparserDefaultDialect {}).with_pretty(pretty);
+        for expr in &expressions {
+            sql.push(format!("pretty={pretty}: {}", unparser.expr_to_sql(expr)?));
+        }
+    }
+    assert_snapshot!("is_predicate_operands", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_pruned_aggregate_rows() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v", DataType::Int32, true),
+    ]);
+    let mut sql = Vec::new();
+    for group_expr in [vec![], vec![col("v")]] {
+        for projection in [Vec::<Expr>::new(), vec![lit(42)]] {
+            let plan = table_scan(Some("e"), &schema, None)?
+                .aggregate(group_expr.clone(), vec![max(col("id"))])?
+                .project(projection)?
+                .build()?;
+            sql.push(
+                Unparser::new(&UnparserDefaultDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string(),
+            );
+        }
+    }
+    assert_snapshot!("pruned_aggregate_rows", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_filtered_set_operation_scope() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v", DataType::Int32, true),
+    ]);
+    let left = table_scan(Some("e"), &schema, Some(vec![1]))?
+        .project(vec![col("e.v")])?
+        .build()?;
+    let right = table_scan_with_filter_and_fetch(
+        Some("e"),
+        &schema,
+        Some(vec![1]),
+        vec![col("e.id").gt(lit(1))],
+        None,
+    )?
+    .project(vec![col("e.v")])?
+    .build()?;
+    let mut sql = Vec::new();
+    for plan in [
+        LogicalPlanBuilder::intersect(left.clone(), right.clone(), false)?,
+        LogicalPlanBuilder::except(left, right, false)?,
+    ] {
+        sql.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+        );
+    }
+    assert_snapshot!("filtered_set_operation_scope", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_mysql_length_units() -> Result<()> {
+    let schema = Arc::new(DFSchema::try_from(Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new("b", DataType::Binary, true),
+    ]))?);
+    let dialect = UnparserMySqlDialect {};
+    let unparser = Unparser::new(&dialect).with_schema(schema);
+    let mut sql = Vec::new();
+    for name in ["s", "b"] {
+        let args = [col(name)];
+        let expr =
+            match dialect.scalar_function_to_sql_overrides(&unparser, "length", &args)? {
+                Some(expr) => expr,
+                None => unparser.scalar_function_to_sql("length", &args)?,
+            };
+        sql.push(expr.to_string());
+    }
+    assert_snapshot!("mysql_length_units", sql.join("\n"));
+    Ok(())
+}
+
 fn table_scan_with_empty_projection_and_none_projection_helper(
     table_name: &str,
     table_schema: Schema,
