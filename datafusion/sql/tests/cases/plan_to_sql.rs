@@ -7157,7 +7157,9 @@ fn test_projected_exists_inputs_keep_subquery_repeatability_guard() -> Result<()
         datafusion_expr::expr::SetQuantifier::All,
     ));
     let projected = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
-        .project(vec![comparison.alias("c")])?
+        .project(vec![comparison.alias("inner_c")])?
+        .alias("inner")?
+        .project(vec![col("inner.inner_c").alias("c")])?
         .alias("q")?
         .build()?;
     let plain = table_scan(
@@ -7191,44 +7193,61 @@ fn test_projected_exists_inputs_keep_subquery_repeatability_guard() -> Result<()
 #[test]
 fn test_unparse_projected_set_operation_scopes() -> Result<()> {
     let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
-    let input = |name: &str| -> Result<LogicalPlan> {
-        table_scan(Some("person"), &schema, Some(vec![0]))?
-            .project(vec![col("person.id").alias("x")])?
-            .alias(name)?
-            .build()
+    let input = |name: &str, shape: u8| -> Result<LogicalPlan> {
+        let scan = table_scan(Some("person"), &schema, Some(vec![0]))?;
+        let input = if shape == 3 {
+            scan.project(vec![col("person.id").alias("z")])?
+                .alias("inner")?
+                .project(vec![col("inner.z").alias("x")])?
+        } else {
+            scan.project(vec![col("person.id").alias("x")])?
+        };
+        let input = if shape == 2 {
+            input.project(vec![col("x")])?
+        } else {
+            input
+        };
+        let input = if shape > 0 {
+            input.filter(col("x").gt(lit(0)))?
+        } else {
+            input
+        };
+        input.alias(name)?.build()
     };
-    for distinct in [false, true] {
-        for join_type in [
-            datafusion_expr::JoinType::LeftSemi,
-            datafusion_expr::JoinType::LeftAnti,
-        ] {
-            let probe = if distinct {
-                LogicalPlanBuilder::from(input("left")?)
-                    .distinct()?
-                    .build()?
-            } else {
-                input("left")?
-            };
-            let plan = LogicalPlanBuilder::from(probe)
-                .join(
-                    input("right")?,
-                    join_type,
-                    (vec!["left.x"], vec!["right.x"]),
-                    None,
-                )?
-                .build()?;
-            let output = Unparser::new(&UnparserPostgreSqlDialect {})
-                .plan_to_sql(&plan)?
-                .to_string();
-            assert!(output.contains("AS \"left\""), "{output}");
-            assert!(output.contains("AS \"right\""), "{output}");
-            let statement = Parser::new(&GenericDialect {})
-                .try_with_sql(&output)?
-                .parse_statement()?;
-            let context = MockContextProvider {
-                state: MockSessionState::default(),
-            };
-            SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    for shape in [0, 1, 2, 3] {
+        for distinct in [false, true] {
+            for join_type in [
+                datafusion_expr::JoinType::LeftSemi,
+                datafusion_expr::JoinType::LeftAnti,
+            ] {
+                let probe = if distinct {
+                    LogicalPlanBuilder::from(input("left", shape)?)
+                        .distinct()?
+                        .build()?
+                } else {
+                    input("left", shape)?
+                };
+                let plan = LogicalPlanBuilder::from(probe)
+                    .join(
+                        input("right", shape)?,
+                        join_type,
+                        (vec!["left.x"], vec!["right.x"]),
+                        None,
+                    )?
+                    .build()?;
+                let output = Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string();
+                assert!(output.contains("AS \"left\""), "{output}");
+                assert!(output.contains("AS \"right\""), "{output}");
+                let statement = Parser::new(&GenericDialect {})
+                    .try_with_sql(&output)?
+                    .parse_statement()?;
+                let context = MockContextProvider {
+                    state: MockSessionState::default(),
+                };
+                SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+            }
         }
     }
     Ok(())
