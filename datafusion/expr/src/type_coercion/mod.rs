@@ -75,3 +75,23 @@ pub fn is_datetime(dt: &DataType) -> bool {
         DataType::Date32 | DataType::Date64 | DataType::Timestamp(_, _)
     )
 }
+
+/// The lossless operand type for numeric negation, including unsigned integers.
+/// `UInt64` needs a decimal because no signed integer covers its full domain.
+pub fn negation_coercion(data_type: &DataType) -> Option<DataType> {
+    Some(match data_type {
+        DataType::UInt8 => DataType::Int16,
+        DataType::UInt16 => DataType::Int32,
+        DataType::UInt32 => DataType::Int64,
+        DataType::UInt64 => DataType::Decimal128(20, 0),
+        other
+            if other.is_null()
+                || is_signed_numeric(other)
+                || is_interval(other)
+                || is_timestamp(other) =>
+        {
+            other.clone()
+        }
+        _ => return None,
+    })
+}

@@ -429,56 +429,56 @@ pub fn aggregate_functional_dependencies(
     let target_indices = (0..aggr_schema.fields().len()).collect::<Vec<_>>();
     // Get functional dependencies of the schema:
     let func_dependencies = aggr_input_schema.functional_dependencies();
-    for FunctionalDependence {
-        source_indices,
-        nullable,
-        mode,
-        ..
-    } in &func_dependencies.deps
-    {
-        // Keep source indices in a `HashSet` to prevent duplicate entries:
-        let mut new_source_indices = vec![];
-        let mut new_source_field_names = vec![];
-        let source_field_names = source_indices
+    for dependency in &func_dependencies.deps {
+        // Nullable unique keys need not determine other values for NULL rows.
+        if dependency.nullable {
+            continue;
+        }
+        let source_names = dependency
+            .source_indices
             .iter()
-            .map(|&idx| &aggr_input_fields[idx])
+            .map(|&index| &aggr_input_fields[index])
             .collect::<Vec<_>>();
-
-        for (idx, group_by_expr_name) in group_by_expr_names.iter().enumerate() {
-            // When one of the input determinant expressions matches with
-            // the GROUP BY expression, add the index of the GROUP BY
-            // expression as a new determinant key:
-            if source_field_names.contains(&group_by_expr_name) {
-                new_source_indices.push(idx);
-                new_source_field_names.push(group_by_expr_name.clone());
-            }
+        let new_source_indices = group_by_expr_names
+            .iter()
+            .enumerate()
+            .filter_map(|(index, name)| source_names.contains(&name).then_some(index))
+            .collect::<Vec<_>>();
+        if new_source_indices.len() != dependency.source_indices.len() {
+            continue;
         }
-        let existing_target_indices =
-            get_target_functional_dependencies(aggr_input_schema, group_by_expr_names);
-        let new_target_indices = get_target_functional_dependencies(
-            aggr_input_schema,
-            &new_source_field_names,
+        let mut closure = dependency.target_indices.clone();
+        closure.extend(&dependency.source_indices);
+        let dependent_groups = group_by_expr_names
+            .iter()
+            .enumerate()
+            .filter_map(|(output_index, name)| {
+                aggr_input_fields
+                    .iter()
+                    .position(|field| field == name)
+                    .filter(|input_index| closure.contains(input_index))
+                    .map(|_| output_index)
+            })
+            .collect::<Vec<_>>();
+        let covers_grouping = dependent_groups.len() == group_by_expr_names.len();
+        // Aggregates are fixed only by a key determining the complete grouping.
+        // A partial determinant retains only the group outputs it determines.
+        aggregate_func_dependencies.push(
+            FunctionalDependence::new(
+                new_source_indices,
+                if covers_grouping {
+                    target_indices.clone()
+                } else {
+                    dependent_groups
+                },
+                false,
+            )
+            .with_mode(if covers_grouping {
+                Dependency::Single
+            } else {
+                Dependency::Multi
+            }),
         );
-        let mode = if existing_target_indices == new_target_indices
-            && new_target_indices.is_some()
-        {
-            // If dependency covers all GROUP BY expressions, mode will be `Single`:
-            Dependency::Single
-        } else {
-            // Otherwise, existing mode is preserved:
-            *mode
-        };
-        // All of the composite indices occur in the GROUP BY expression:
-        if new_source_indices.len() == source_indices.len() {
-            aggregate_func_dependencies.push(
-                FunctionalDependence::new(
-                    new_source_indices,
-                    target_indices.clone(),
-                    *nullable,
-                )
-                .with_mode(mode),
-            );
-        }
     }
 
     // When we have a GROUP BY key, we can guarantee uniqueness after
@@ -496,7 +496,9 @@ pub fn aggregate_functional_dependencies(
 
             // The following simple comparison is working well because
             // GROUP BY expressions come here as a prefix.
-            item.source_indices.iter().all(|idx| idx < &count)
+            item.mode == Dependency::Single
+                && item.target_indices == target_indices
+                && item.source_indices.iter().all(|idx| idx < &count)
         }) {
             // Add a new functional dependency associated with the whole table:
             // Use nullable property of the GROUP BY expression:
@@ -662,6 +664,41 @@ fn add_offset_to_vec<T: Copy + std::ops::Add<Output = T>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_15538_aggregate_dependencies_do_not_invent_join_dependencies() {
+        use arrow::datatypes::{DataType, Field, Schema};
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("label", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+            Field::new("s", DataType::Utf8, true),
+        ]))
+        .expect("schema")
+        .with_functional_dependencies(FunctionalDependencies::new(vec![
+            FunctionalDependence::new(vec![1], vec![1, 2], false)
+                .with_mode(Dependency::Multi),
+        ]))
+        .expect("join-side dependency");
+        let grouping = vec!["label".to_string(), "id".to_string()];
+        let output = DFSchema::try_from(Schema::new(vec![
+            Field::new("label", DataType::Utf8, false),
+            Field::new("id", DataType::Int32, false),
+        ]))
+        .expect("group schema");
+        let dependencies = aggregate_functional_dependencies(&schema, &grouping, &output);
+        assert!(
+            dependencies
+                .iter()
+                .any(|dependency| dependency.source_indices == vec![0, 1]
+                    && dependency.mode == Dependency::Single)
+        );
+        assert!(
+            !dependencies
+                .iter()
+                .any(|dependency| dependency.source_indices == vec![1]
+                    && dependency.target_indices.contains(&0))
+        );
+    }
 
     #[test]
     fn constraints_iter() {
