@@ -192,10 +192,9 @@ impl Unparser<'_> {
         }
     }
 
-    /// An IS operand may itself be a prefix NOT or another IS predicate.
-    /// Parenthesize those shapes because postfix IS binds before NOT and some
-    /// dialects do not accept chained IS predicates without parentheses.
-    fn is_predicate_operand_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
+    /// Keep nested IS and NOT operands explicit: their relative precedence
+    /// differs across dialects, and some reject chained IS predicates.
+    fn predicate_operand_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
         let operand = self.expr_to_sql_inner(expr)?;
         if matches!(
             operand,
@@ -645,31 +644,31 @@ impl Unparser<'_> {
                 })
             }
             Expr::IsNull(expr) => Ok(ast::Expr::IsNull(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsNotNull(expr) => Ok(ast::Expr::IsNotNull(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsTrue(expr) => Ok(ast::Expr::IsTrue(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsNotTrue(expr) => Ok(ast::Expr::IsNotTrue(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsFalse(expr) => Ok(ast::Expr::IsFalse(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsNotFalse(expr) => Ok(ast::Expr::IsNotFalse(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsUnknown(expr) => Ok(ast::Expr::IsUnknown(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsNotUnknown(expr) => Ok(ast::Expr::IsNotUnknown(Box::new(
-                self.is_predicate_operand_to_sql(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::Not(expr) => {
-                let sql_parser_expr = self.expr_to_sql_inner(expr)?;
+                let sql_parser_expr = self.predicate_operand_to_sql(expr)?;
                 Ok(AstExpr::UnaryOp {
                     op: UnaryOperator::Not,
                     expr: Box::new(sql_parser_expr),

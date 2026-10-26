@@ -1467,7 +1467,9 @@ fn test_unparser_preserves_is_predicate_operands() -> Result<()> {
         Expr::IsNotFalse(Box::new(!flag.clone())),
         Expr::IsUnknown(Box::new(!flag.clone())),
         Expr::IsNotUnknown(Box::new(!flag.clone())),
-        Expr::IsNull(Box::new(Expr::IsTrue(Box::new(flag)))),
+        Expr::IsNull(Box::new(Expr::IsTrue(Box::new(flag.clone())))),
+        !Expr::IsNull(Box::new(Expr::IsNotNull(Box::new(flag.clone())))),
+        !Expr::IsNull(Box::new(Expr::IsNull(Box::new(flag)))),
     ];
     let mut sql = Vec::new();
     for pretty in [false, true] {
