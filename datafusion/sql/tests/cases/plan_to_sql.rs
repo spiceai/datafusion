@@ -5086,9 +5086,7 @@ fn test_unparse_exists_join_refuses_build_key_bound_only_by_the_build_projection
         .build()?;
     refused(&plan, "a rename under the build relation's own qualifier");
 
-    // An alias pushed down onto the scan it wraps lifts the rename into the
-    // select list — `SELECT s.x AS c FROM (SELECT s.x FROM b AS s) AS s` on its
-    // own — which is the list `SELECT 1` replaces, so `s.c` binds nowhere.
+    // A named scope preserves the projection output read by the correlation.
     let aliased = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
         .project(vec![col("b.x").alias("c")])?
         .alias("s")?
@@ -5096,7 +5094,8 @@ fn test_unparse_exists_join_refuses_build_key_bound_only_by_the_build_projection
     let plan = LogicalPlanBuilder::from(probe.clone())
         .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
         .build()?;
-    refused(&plan, "a rename behind an alias pushed down onto the scan");
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert_contains!(sql, "AS s WHERE (p.c = s.c)");
 
     // An alias over an inline join renames its primary relation only —
     // `FROM b AS a CROSS JOIN t` — so a column of the relation beside it,
@@ -7139,6 +7138,40 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
         sql,
         @r#"SELECT DISTINCT * FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT "p"."first_name", "o"."order_id" FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id")) AS "right" WHERE ("left"."first_name" IS NOT DISTINCT FROM "right"."first_name") AND ("left"."order_id" IS NOT DISTINCT FROM "right"."order_id")) AND EXISTS (SELECT 1 FROM "person" AS "p" INNER JOIN "orders" AS "o" ON ("p"."id" = "o"."customer_id") WHERE ("left"."first_name" IS NOT DISTINCT FROM "p"."first_name") AND ("left"."order_id" IS NOT DISTINCT FROM "o"."order_id"))"#
     );
+    Ok(())
+}
+
+#[test]
+fn test_unparse_projected_set_operation_scopes() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+    let input = |name: &str| -> Result<LogicalPlan> {
+        table_scan(Some("person"), &schema, Some(vec![0]))?
+            .project(vec![col("person.id").alias("x")])?
+            .alias(name)?
+            .build()
+    };
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
+    ] {
+        let plan = LogicalPlanBuilder::from(input("left")?)
+            .join(
+                input("right")?,
+                join_type,
+                (vec!["left.x"], vec!["right.x"]),
+                None,
+            )?
+            .build()?;
+        let output = Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string();
+        assert!(output.contains("AS \"left\""), "{output}");
+        assert!(output.contains("AS \"right\""), "{output}");
+        assert!(
+            output.contains("\"left\".\"x\" = \"right\".\"x\""),
+            "{output}"
+        );
+    }
     Ok(())
 }
 
@@ -16634,7 +16667,7 @@ fn test_sort_key_reading_an_output_holding_a_set_comparison_is_scoped() -> Resul
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT a, r FROM (SELECT t.a, 0.5 < ANY(SELECT random() AS d FROM v) AS r FROM t) ORDER BY NOT r ASC NULLS FIRST"#
+        @r#"SELECT a, r FROM (SELECT t.a, 0.5 < ANY(SELECT random() AS d FROM v) AS r FROM t) ORDER BY NOT (r) ASC NULLS FIRST"#
     );
     Ok(())
 }
