@@ -1073,7 +1073,7 @@ impl Unparser<'_> {
         }
 
         // Construct a list of all the identifiers present in query sources
-        let mut all_idents = Vec::new();
+        let mut all_idents = select_builder.preserved_outer_qualifiers().to_vec();
         if let Some(source_alias) = relation_builder.get_alias() {
             all_idents.push(source_alias);
         } else if let Some(source_name) = relation_builder.table_name() {
@@ -1387,32 +1387,75 @@ impl Unparser<'_> {
         // scope numbers its own: a join walks both of its sides with one builder,
         // and each side requalifies its own references onto its own alias.
         let named_input = name_scope_outputs(p.input.as_ref())?;
-        // The SQL cleanup and requalification steps cannot distinguish a
-        // direct outer reference from a local column after lowering to SQL AST.
-        // Keep this shape local rather than risk capturing an outer reference.
+        // The derived alias must not shadow a correlated reference. Preserve
+        // the emitted outer qualifiers through SQL cleanup as well.
+        let mut outer_columns = Vec::new();
         for expr in p.expr.iter().chain(select.clause_outer_references()) {
-            if expr.exists(|node| {
-                Ok(match node {
-                    Expr::OuterReferenceColumn(..) => true,
-                    Expr::ScalarSubquery(subquery) => {
-                        !subquery.outer_ref_columns.is_empty()
-                    }
-                    Expr::Exists(exists) => !exists.subquery.outer_ref_columns.is_empty(),
+            expr.apply(|node| {
+                if let Expr::OuterReferenceColumn(_, column) = node {
+                    outer_columns.push(column.clone());
+                }
+                let nested = match node {
+                    Expr::ScalarSubquery(subquery) => Some(&subquery.outer_ref_columns),
+                    Expr::Exists(exists) => Some(&exists.subquery.outer_ref_columns),
                     Expr::InSubquery(subquery) => {
-                        !subquery.subquery.outer_ref_columns.is_empty()
+                        Some(&subquery.subquery.outer_ref_columns)
                     }
                     Expr::SetComparison(comparison) => {
-                        !comparison.subquery.outer_ref_columns.is_empty()
+                        Some(&comparison.subquery.outer_ref_columns)
                     }
-                    _ => false,
-                })
-            })? {
+                    _ => None,
+                };
+                if let Some(references) = nested {
+                    for reference in references {
+                        if let Expr::OuterReferenceColumn(_, column) = reference {
+                            outer_columns.push(column.clone());
+                        }
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        let mut outer_qualifiers = HashSet::new();
+        let outputs = self.scope_output_keys(p.input.schema(), |reason| {
+            not_impl_err!("Cannot scope aggregate projection {reason}")
+        })?;
+        for column in &outer_columns {
+            if let Some(relation) = &column.relation {
+                let key = self.emitted_qualifier_key(relation);
+                if p.input.schema().iter().any(|(qualifier, _)| {
+                    qualifier.is_some_and(|qualifier| {
+                        self.emitted_qualifier_key(qualifier) == key
+                    })
+                }) {
+                    return not_impl_err!(
+                        "Cannot scope aggregate projection when outer reference {} shares an input qualifier",
+                        column.flat_name()
+                    );
+                }
+                outer_qualifiers.insert(key);
+                select.preserve_outer_qualifier(
+                    self.emitted_qualifier(relation)
+                        .iter()
+                        .map(|part| {
+                            self.new_ident_quoted_if_needs(part.clone()).to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+            } else if outputs.contains(&self.emitted_column_key(&column.name)?) {
                 return not_impl_err!(
-                    "Cannot scope an aggregate projection containing an outer reference"
+                    "Cannot scope aggregate projection when unqualified outer reference {} matches a derived output",
+                    column.name
                 );
             }
         }
-        let alias_name = select.next_derived_aggregate_alias();
+        let alias_name = loop {
+            let candidate = select.next_derived_aggregate_alias();
+            if !outer_qualifiers.contains(&vec![self.emitted_column_key(&candidate)?]) {
+                break candidate;
+            }
+        };
         let alias = self.new_ident_quoted_if_needs(alias_name.clone());
         self.derive(
             &named_input,
@@ -1429,11 +1472,18 @@ impl Unparser<'_> {
             enclosed_qualifiers(p.input.schema(), |name| self.emitted_column_name(name))?;
         select.visit_expressions_in_clauses_mut(|expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
-                requalify_column_onto_derived_table(
-                    idents,
-                    &derived_qualifiers,
-                    Some(&alias),
-                );
+                let qualifier = idents
+                    .iter()
+                    .take(idents.len().saturating_sub(1))
+                    .map(|ident| ident.value.clone())
+                    .collect::<Vec<_>>();
+                if !outer_qualifiers.contains(&self.qualifier_key(&qualifier)) {
+                    requalify_column_onto_derived_table(
+                        idents,
+                        &derived_qualifiers,
+                        Some(&alias),
+                    );
+                }
             }
         });
 
