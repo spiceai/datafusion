@@ -1483,6 +1483,43 @@ fn test_unparser_preserves_is_predicate_operands() -> Result<()> {
 }
 
 #[test]
+fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
+    let mut sql = Vec::new();
+    for input in [
+        "SELECT (SELECT person.age) AS age FROM person GROUP BY person.age",
+        "SELECT (SELECT person.age + 1) AS age FROM person GROUP BY person.age",
+        "SELECT (SELECT 42) AS k FROM person GROUP BY age",
+        "SELECT 42 AS k FROM person GROUP BY ROLLUP(age)",
+        "SELECT 42 AS k FROM person l JOIN person r ON l.age = r.age GROUP BY l.id, r.id",
+    ] {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(input)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default(),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        sql.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+        );
+        if input.contains("ROLLUP") || input.contains("JOIN") {
+            let empty = LogicalPlanBuilder::from(plan)
+                .project(Vec::<Expr>::new())?
+                .build()?;
+            sql.push(
+                Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&empty)?
+                    .to_string(),
+            );
+        }
+    }
+    assert_snapshot!("aggregate_projection_scope_guards", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
 fn test_unparser_preserves_pruned_aggregate_rows() -> Result<()> {
     let schema = Schema::new(vec![
         Field::new("id", DataType::Int32, false),
