@@ -6325,12 +6325,13 @@ impl Unparser<'_> {
         loop {
             match node {
                 LogicalPlan::Projection(projection) => {
-                    if projection
-                        .expr
-                        .iter()
-                        .any(|expr| expr.is_volatile() || expr_contains_subquery(expr))
-                    {
-                        self.ensure_derived_table_fixes_volatile_outputs()?;
+                    for expr in &projection.expr {
+                        if expr.is_volatile()
+                            || expr
+                                .exists(|node| Ok(Self::subquery_of(node).is_some()))?
+                        {
+                            self.ensure_derived_table_fixes_volatile_outputs()?;
+                        }
                     }
                     node = projection.input.as_ref();
                 }
