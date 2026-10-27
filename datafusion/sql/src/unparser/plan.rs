@@ -66,8 +66,8 @@ use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_P
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, FetchType, Join, JoinConstraint, JoinType,
     LogicalPlan, LogicalPlanBuilder, Operator, Projection, SkipType, Sort, SortExpr,
-    Subquery, TableScan, Unnest, UserDefinedLogicalNode, Window, expr::Alias,
-    utils::split_conjunction,
+    Subquery, SubqueryAlias, TableScan, Unnest, UserDefinedLogicalNode, Window,
+    expr::Alias, utils::split_conjunction,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
@@ -2228,7 +2228,7 @@ impl Unparser<'_> {
     /// with its columns as that side's select items.
     fn derive_aliased_joined_right_input(
         &self,
-        plan_alias: &datafusion_expr::SubqueryAlias,
+        plan_alias: &SubqueryAlias,
         plan: &LogicalPlan,
         columns: Vec<Ident>,
         select: &mut SelectBuilder,
@@ -3013,8 +3013,11 @@ impl Unparser<'_> {
                 // nothing reads a column of. Its rows still count: a join with it
                 // multiplies the other side by the number of elements. Without a
                 // placeholder column to find, the Unnest below would be dropped and
-                // the projection unparsed as `SELECT 1`, a single row. Projecting the
-                // Unnest's own columns keeps it.
+                // the projection unparsed as `SELECT 1`, a single row. The Unnest's
+                // own columns are projected inside a derived table, which keeps its
+                // rows, and the empty projection is unparsed over that table as any
+                // other is, so its outward shape (one placeholder column, or none)
+                // still matches every other empty projection, e.g. a UNION's.
                 if p.expr.is_empty()
                     && let LogicalPlan::Unnest(unnest) = p.input.as_ref()
                 {
@@ -3024,7 +3027,14 @@ impl Unparser<'_> {
                         .into_iter()
                         .map(Expr::Column)
                         .collect();
-                    let projection = Projection::try_new(expr, Arc::clone(&p.input))?;
+                    let rows = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
+                        Arc::new(LogicalPlan::Projection(Projection::try_new(
+                            expr,
+                            Arc::clone(&p.input),
+                        )?)),
+                        "__unnest_rows",
+                    )?);
+                    let projection = Projection::try_new(vec![], Arc::new(rows))?;
                     return self.select_to_sql_recursively(
                         &LogicalPlan::Projection(projection),
                         query,
@@ -6062,7 +6072,7 @@ impl Unparser<'_> {
     ///
     /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
     fn alias_columns_renamed_by_pushdown(
-        plan_alias: &datafusion_expr::SubqueryAlias,
+        plan_alias: &SubqueryAlias,
         rewritten: &LogicalPlan,
     ) -> Vec<Ident> {
         if !Self::exposes_projection_outputs(rewritten) {
@@ -7448,10 +7458,7 @@ impl Unparser<'_> {
     ///   beside the renamed one is not one the alias answers to.
     ///
     /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
-    fn schema_an_alias_answers_to(
-        &self,
-        alias: &datafusion_expr::SubqueryAlias,
-    ) -> Option<SchemaRef> {
+    fn schema_an_alias_answers_to(&self, alias: &SubqueryAlias) -> Option<SchemaRef> {
         if Self::requires_derived_subquery(&alias.input) {
             return Some(Arc::clone(alias.schema.inner()));
         }
@@ -7499,9 +7506,7 @@ impl Unparser<'_> {
     /// no filter on the way carries a subquery, which the pushdown declines to
     /// rebase. Anything else leaves the alias emitted around its input as
     /// written.
-    fn scan_an_alias_is_pushed_onto(
-        alias: &datafusion_expr::SubqueryAlias,
-    ) -> Option<&TableScan> {
+    fn scan_an_alias_is_pushed_onto(alias: &SubqueryAlias) -> Option<&TableScan> {
         let mut wrapped = alias.input.as_ref();
         loop {
             match wrapped {

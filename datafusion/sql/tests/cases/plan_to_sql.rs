@@ -17,7 +17,7 @@
 
 use arrow::datatypes::{DataType, Field, Schema};
 
-use datafusion_common::tree_node::{Transformed, TreeNode};
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, NullEquality, Result, TableReference,
     assert_contains, internal_err,
@@ -2828,7 +2828,40 @@ fn test_unnest_under_an_empty_projection_keeps_its_rows() -> Result<()> {
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @"SELECT j1.j1_id FROM j1 CROSS JOIN (SELECT UNNEST([1, 2, 3])) AS b"
+        @"SELECT j1.j1_id FROM j1 CROSS JOIN (SELECT 1 FROM (SELECT UNNEST([1, 2, 3])) AS __unnest_rows) AS b"
+    );
+    Ok(())
+}
+
+/// An emptied Unnest keeps the shape every other empty projection has, so a
+/// UNION of it with one still has operands of one width.
+#[test]
+fn test_unnest_under_an_empty_projection_unions_with_another_empty_projection()
+-> Result<()> {
+    let unnest = round_trip_plan(
+        GenericDialect {},
+        "SELECT unnest(make_array(1, 2)) AS x, unnest(make_array(3, 4)) AS y",
+    );
+    let mut found = None;
+    unnest.apply(|plan| {
+        if let LogicalPlan::Unnest(_) = plan {
+            found = Some(plan.clone());
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let unnest = found.expect("the plan has an Unnest");
+    let emptied = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    let table = LogicalPlanBuilder::from(round_trip_plan(
+        GenericDialect {},
+        "SELECT j1_id FROM j1",
+    ))
+    .project(Vec::<Expr>::new())?
+    .build()?;
+    let union = LogicalPlanBuilder::from(emptied).union(table)?.build()?;
+    assert_snapshot!(
+        plan_to_sql(&union)?,
+        @"SELECT 1 FROM (SELECT UNNEST([1, 2]), UNNEST([3, 4])) AS __unnest_rows UNION ALL SELECT 1 FROM (SELECT j1.j1_id FROM j1)"
     );
     Ok(())
 }
