@@ -7298,6 +7298,126 @@ fn test_unparse_projected_set_operation_scopes() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_projected_exists_build_expression_names() -> Result<()> {
+    let probe = table_scan(Some("p"), &int32_schema(&["c"]), Some(vec![0]))?.build()?;
+    let computed = table_scan(Some("b"), &int32_schema(&["x", "y"]), Some(vec![0, 1]))?
+        .project(vec![col("b.x") + col("b.y")])?
+        .alias("s")?
+        .build()?;
+    let scalar = scalar_subquery(Arc::new(
+        LogicalPlanBuilder::empty(true)
+            .project(vec![out_ref_col(DataType::Int32, "b.x").alias("v")])?
+            .build()?,
+    ));
+    let correlated = table_scan(Some("b"), &int32_schema(&["x", "y"]), Some(vec![0, 1]))?
+        .project(vec![scalar.alias("c")])?
+        .alias("s")?
+        .build()?;
+    let bounded = table_scan(Some("b"), &int32_schema(&["x", "y"]), Some(vec![0, 1]))?
+        .project(vec![col("b.x") + col("b.y"), col("b.x")])?
+        .sort(vec![col("b.x").sort(true, true)])?
+        .limit(0, Some(1))?
+        .alias("s")?
+        .build()?;
+    let mut sql = Vec::new();
+    for build in [computed, correlated, bounded] {
+        let name = build.schema().field(0).name().clone();
+        let plan = LogicalPlanBuilder::from(probe.clone())
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (
+                    vec![Column::new(Some("p"), "c")],
+                    vec![Column::new(Some("s"), name)],
+                ),
+                None,
+            )?
+            .build()?;
+        sql.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+        );
+    }
+    assert_snapshot!("projected_exists_build_expression_names", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_volatile_build_is_refused() -> Result<()> {
+    let probe_schema = Schema::new(vec![Field::new("c", DataType::Float64, false)]);
+    let probe = table_scan(Some("p"), &probe_schema, Some(vec![0]))?.build()?;
+    let build = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![random().alias("r")])?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftMark,
+            vec![col("p.c").lt(col("s.r"))],
+        )?
+        .filter(col("s.mark").or(col("p.c").lt(lit(0.0))))?
+        .project(vec![col("p.c")])?
+        .build()?;
+    match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+        Ok(sql) => panic!("unsafe SQL: {sql}"),
+        Err(error) => {
+            assert_contains!(error.to_string(), "volatile build");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_exists_build_checks_nested_and_pushed_volatility() -> Result<()> {
+    let schema = int32_schema(&["a"]);
+    let probe = table_scan(Some("p"), &schema, Some(vec![0]))?.build()?;
+    let scalar = scalar_subquery(Arc::new(
+        LogicalPlanBuilder::empty(true)
+            .project(vec![random().alias("r")])?
+            .build()?,
+    ));
+    let nested = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .project(vec![col("b.a"), scalar.alias("r")])?
+        .build()?;
+    let pushed = table_scan_with_filters(
+        Some("b"),
+        &schema,
+        Some(vec![0]),
+        vec![random().lt(lit(0.5))],
+    )?
+    .build()?;
+    for build in [nested, pushed] {
+        let plan = LogicalPlanBuilder::from(probe.clone())
+            .join_on(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                vec![col("p.a").eq(col("b.a"))],
+            )?
+            .build()?;
+        assert_volatile_exists_build_refused(&plan, &UnparserPostgreSqlDialect {});
+    }
+    // Probe-side values are produced by the outer query, independently of the build.
+    let volatile_probe = volatile_projection("p")?.alias("p")?.build()?;
+    let build_schema = Schema::new(vec![Field::new("r", DataType::Float64, false)]);
+    let stable_build = table_scan(Some("b"), &build_schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(volatile_probe)
+        .join_on(
+            stable_build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("p.r").eq(col("b.r"))],
+        )?
+        .build()?;
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(sql.contains("random()"), "{sql}");
+    assert!(sql.contains("EXISTS"), "{sql}");
+    Ok(())
+}
+
 fn unparse_with_dialect(sql: &str, dialect: &dyn UnparserDialect) -> Result<String> {
     let statement = Parser::new(&GenericDialect {})
         .try_with_sql(sql)?
@@ -9066,6 +9186,18 @@ fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
 /// The volatile call the cases below project.
 fn random() -> Expr {
     datafusion_functions::math::random().call(vec![])
+}
+
+fn assert_volatile_exists_build_refused(
+    plan: &LogicalPlan,
+    dialect: &dyn UnparserDialect,
+) {
+    match Unparser::new(dialect).plan_to_sql(plan) {
+        Ok(sql) => panic!("volatile build needs independent materialization: {sql}"),
+        Err(error) => {
+            assert_contains!(error.to_string(), "volatile build");
+        }
+    }
 }
 
 /// `Projection(<table>.a, random() AS r)` over a one-column scan of `table`: the
@@ -15560,22 +15692,15 @@ fn test_sort_fold_is_declined_when_its_schema_would_collide() -> Result<()> {
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_build_side()
--> Result<()> {
-    // An EXISTS body's rows are only tested for existence, so without a row bound
-    // the order its sort produces reaches nothing, and the sort is left out: no
-    // second draw to order by, and no derived table hiding the `u` the correlation
-    // appended to the body names. Semi and anti joins alike, with the sort at the
-    // top of the build side, below a filter, and under a list the sort fold keeps
-    // `r` in.
+fn test_unbounded_exists_build_with_volatile_projection_is_refused() -> Result<()> {
     let schema = int32_schema(&["a"]);
     let key = || col("r").add(lit(1.0)).sort(true, true);
-    for (join_type, exists) in [
-        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
-        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
     ] {
         let sorted = volatile_projection("u")?.sort(vec![key()])?.build()?;
-        let filtered_above = table_scan(Some("u"), &schema, Some(vec![0]))?
+        let filtered = table_scan(Some("u"), &schema, Some(vec![0]))?
             .project(vec![col("u.a").alias("a"), random().alias("r")])?
             .sort(vec![key()])?
             .filter(col("a").gt(lit(0)))?
@@ -15584,84 +15709,38 @@ fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_bu
             .sort(vec![key()])?
             .project(vec![col("u.a"), col("r")])?
             .build()?;
-        for (build, body_filter) in [
-            (sorted, ""),
-            (filtered_above, "(u.a > 0) AND "),
-            (folded, ""),
-        ] {
+        for build in [sorted, filtered, folded] {
             let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
                 .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
                 .build()?;
-            assert_eq!(
-                plan_to_sql(&plan)?.to_string(),
-                format!(
-                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM u WHERE {body_filter}(t.a = u.a))"
-                ),
-                "{join_type:?}"
-            );
+            assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
         }
     }
     Ok(())
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_below_an_unfolded_exists_projection_is_left_out()
--> Result<()> {
-    // The build side's own projection, `k, (k + 1) AS b`, computes an expression,
-    // so the sort fold leaves it in place and the sort below it is reached by a
-    // SELECT that is already projected, which unparses it as a derived table with
-    // a builder of its own. The body is still unbounded, so the sort's order
-    // reaches nothing and is left out there as it is everywhere else in an EXISTS
-    // body, rather than scoped (or, on a dialect that cannot take the scope,
-    // refused) as though its order could be observed. The correlation reads `k`,
-    // which the derived table exposes.
+fn test_unfolded_exists_build_with_volatile_projection_is_refused() -> Result<()> {
     let schema = int32_schema(&["a"]);
-    let build = || -> Result<LogicalPlan> {
-        table_scan(Some("u"), &schema, Some(vec![0]))?
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
+    ] {
+        let build = table_scan(Some("u"), &schema, Some(vec![0]))?
             .project(vec![col("u.a").alias("k"), random().alias("r")])?
             .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
             .project(vec![col("k"), col("k").add(lit(1)).alias("b")])?
-            .build()
-    };
-    for (join_type, exists) in [
-        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
-        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
-    ] {
-        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
-            .join_on(build()?, join_type, vec![col("t.a").eq(col("k"))])?
             .build()?;
-        let cases: [(&dyn UnparserDialect, String); 4] = [
-            (
-                &DefaultDialect {},
-                format!(
-                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM (SELECT u.a AS k, random() AS r FROM u) WHERE (t.a = k))"
-                ),
-            ),
-            (
-                &SqliteDialect {},
-                format!(
-                    "SELECT `t`.`a` FROM `t` WHERE {exists} (SELECT 1 FROM (SELECT `u`.`a` AS `k`, random() AS `r` FROM `u`) WHERE (`t`.`a` = `k`))"
-                ),
-            ),
-            (
-                &UnparserMySqlDialect {},
-                format!(
-                    "SELECT `t`.`a` FROM `t` WHERE {exists} (SELECT 1 FROM (SELECT `u`.`a` AS `k`, random() AS `r` FROM `u`) AS `derived_projection` WHERE (`t`.`a` = `k`))"
-                ),
-            ),
-            (
-                &UnparserPostgreSqlDialect {},
-                format!(
-                    r#"SELECT "t"."a" FROM "t" WHERE {exists} (SELECT 1 FROM (SELECT "u"."a" AS "k", random() AS "r" FROM "u") AS "derived_projection" WHERE ("t"."a" = "k"))"#
-                ),
-            ),
-        ];
-        for (dialect, expected) in cases {
-            assert_eq!(
-                Unparser::new(dialect).plan_to_sql(&plan)?.to_string(),
-                expected,
-                "{join_type:?}"
-            );
+        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+            .join_on(build, join_type, vec![col("t.a").eq(col("k"))])?
+            .build()?;
+        for dialect in [
+            &DefaultDialect {} as &dyn UnparserDialect,
+            &SqliteDialect {},
+            &UnparserMySqlDialect {},
+            &UnparserPostgreSqlDialect {},
+        ] {
+            assert_volatile_exists_build_refused(&plan, dialect);
         }
     }
     Ok(())
@@ -15813,13 +15892,9 @@ fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_out() -> Resu
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_under_a_limit_below_another_sort_is_scoped()
+fn test_volatile_sort_scope_is_allowed_for_projection_and_refused_for_exists_build()
 -> Result<()> {
-    // `Sort(t.a) → Limit(1) → Sort[(r + 1.0)] → Projection`: the LIMIT keeps the row
-    // the lower sort ranks first, so that sort's order can be observed although an
-    // ORDER BY sits above it, and its key reads `r` from a scope. Ordering the one
-    // row the LIMIT keeps by `t.a` changes nothing. The same on an EXISTS build
-    // side, where the bound moves the body under the build side's name.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let plan = volatile_projection("t")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
         .limit(0, Some(1))?
@@ -15842,10 +15917,7 @@ fn test_sort_key_reading_a_volatile_output_under_a_limit_below_another_sort_is_s
             vec![col("t.a").eq(col("u.a"))],
         )?
         .build()?;
-    assert_snapshot!(
-        plan_to_sql(&plan)?,
-        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1) AS u WHERE (t.a = u.a))"#
-    );
+    assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     Ok(())
 }
 
@@ -15877,11 +15949,9 @@ fn test_fetched_sort_key_reading_a_volatile_output_in_a_join_input_is_refused()
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_scoped()
+fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_refused()
 -> Result<()> {
-    // A bounded build side is emitted as a derived table under the build side's
-    // own name, and the correlation binds to that alias, so the scope inside it
-    // is sound and is built.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let schema = int32_schema(&["a"]);
     let build = table_scan(Some("u"), &schema, Some(vec![0]))?
         .project(vec![col("u.a"), random().alias("r")])?
@@ -15896,26 +15966,18 @@ fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_
         )?
         .build()?;
 
-    assert_snapshot!(
-        plan_to_sql(&plan)?,
-        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"#
-    );
+    assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     Ok(())
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_side_is_scoped()
+fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_side_is_refused()
 -> Result<()> {
-    // A `Sort` carrying its own `fetch` bounds the build side exactly as a `Limit`
-    // above the sort does: the emitted `LIMIT` is what `bounds_rows()` reads, so the
-    // body moves into a derived table under the build side's own name and the
-    // correlation binds to that alias, outside the scope. The bound makes the sort's
-    // order observable, so the scope is built, and the emitted SQL is the one the
-    // `Limit` form of this plan produces.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let schema = int32_schema(&["a"]);
-    for (join_type, exists) in [
-        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
-        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
     ] {
         let build = volatile_projection("u")?
             .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
@@ -15924,24 +15986,15 @@ fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_sid
             .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
             .build()?;
 
-        assert_eq!(
-            plan_to_sql(&plan)?.to_string(),
-            format!(
-                "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
-            ),
-            "{join_type:?}"
-        );
+        assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     }
     Ok(())
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_scoped()
+fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_refused()
 -> Result<()> {
-    // The upper sort's fetch bounds the body, so the lower sort is reached with a
-    // row bound on it and its scope is built, inside the derived table the bound
-    // moves the body into. This pins where the correlation binds; the ORDER BY a
-    // sort directly over another sort emits is spiceai/spiceai#14733.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let schema = int32_schema(&["a"]);
     let build = volatile_projection("u")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
@@ -15955,11 +16008,7 @@ fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_sid
         )?
         .build()?;
 
-    let sql = plan_to_sql(&plan)?.to_string();
-    assert!(
-        sql.ends_with(") AS u WHERE (t.a = u.a))"),
-        "correlation must bind to the bounded scope's alias: {sql}"
-    );
+    assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     Ok(())
 }
 
