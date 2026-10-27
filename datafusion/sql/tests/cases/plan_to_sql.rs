@@ -17,6 +17,7 @@
 
 use arrow::datatypes::{DataType, Field, Schema};
 
+use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, NullEquality, Result, TableReference,
     assert_contains, internal_err,
@@ -1605,6 +1606,13 @@ fn generate_round_trip_statement<D>(dialect: D, sql: &str) -> Statement
 where
     D: Dialect,
 {
+    plan_to_sql(&round_trip_plan(dialect, sql)).unwrap()
+}
+
+fn round_trip_plan<D>(dialect: D, sql: &str) -> LogicalPlan
+where
+    D: Dialect,
+{
     let statement = Parser::new(&dialect)
         .try_with_sql(sql)
         .unwrap()
@@ -1625,9 +1633,7 @@ where
             .with_expr_planner(Arc::new(FieldAccessPlanner)),
     };
     let sql_to_rel = SqlToRel::new(&context);
-    let plan = sql_to_rel.sql_statement_to_plan(statement).unwrap();
-
-    plan_to_sql(&plan).unwrap()
+    sql_to_rel.sql_statement_to_plan(statement).unwrap()
 }
 
 #[test]
@@ -2782,6 +2788,48 @@ fn test_unnest_to_sql_2() {
         statement,
         @"SELECT UNNEST([1, 2, 2, 5, NULL]) AS u1"
     );
+}
+
+/// Once nothing reads a derived table's columns, projection pushdown leaves an
+/// empty `Projection` over its `Unnest`. The derived table still has one row per
+/// element, so a join with it multiplies the other side; unparsing it as
+/// `(SELECT 1)` silently returns one row per row of the other side instead.
+#[test]
+fn test_unnest_under_an_empty_projection_keeps_its_rows() -> Result<()> {
+    let plan = round_trip_plan(
+        GenericDialect {},
+        "SELECT j1.j1_id FROM j1 CROSS JOIN (SELECT unnest(make_array(1, 2, 3)) AS x) AS b",
+    );
+    let plan = plan
+        .transform_up(|plan| match plan {
+            LogicalPlan::Projection(projection)
+                if matches!(projection.input.as_ref(), LogicalPlan::Unnest(_)) =>
+            {
+                Ok(Transformed::yes(LogicalPlan::Projection(
+                    Projection::try_new(vec![], projection.input)?,
+                )))
+            }
+            plan => Ok(Transformed::yes(plan.recompute_schema()?)),
+        })?
+        .data;
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: j1.j1_id
+      Cross Join:
+        TableScan: j1
+        SubqueryAlias: b
+          Projection:
+            Unnest: lists[__unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3)))|depth=1] structs[]
+              Projection: make_array(Int64(1), Int64(2), Int64(3)) AS __unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3)))
+                EmptyRelation: rows=1
+    "
+    );
+
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert_contains!(&sql, "UNNEST([1, 2, 3])");
+    assert!(!sql.contains("(SELECT 1)"), "{sql}");
+    Ok(())
 }
 
 #[test]
