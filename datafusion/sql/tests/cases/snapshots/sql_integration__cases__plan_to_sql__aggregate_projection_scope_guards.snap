@@ -10,7 +10,7 @@ SELECT (SELECT "outer_person"."id" FROM (SELECT "e"."id" AS "id" FROM "person" A
 SELECT (SELECT "derived_aggregate_1"."id" FROM (SELECT COUNT(*) AS "COUNT(*)" FROM "person" AS "e" HAVING (COUNT(*) > 0)) AS "derived_aggregate_2") FROM "person" AS "derived_aggregate_1"
 SELECT (SELECT "derived_aggregate_1"."id" FROM (SELECT COUNT(*) AS "COUNT(*)" FROM "person" AS "e" WHERE ("e"."id" < 0) HAVING (COUNT(*) = 0)) AS "derived_aggregate_2") FROM "person" AS "derived_aggregate_1"
 SELECT (SELECT "derived_aggregate_1"."id" FROM (SELECT COUNT(*) AS "COUNT(*)" FROM "person" AS "e" WHERE ("e"."id" < 0) HAVING (COUNT(*) > 0)) AS "derived_aggregate_2") FROM "person" AS "derived_aggregate_1"
-SELECT (SELECT "age") AS "age" FROM "person" GROUP BY "person"."age"
+SELECT (SELECT "person"."age") AS "age" FROM "person" GROUP BY "person"."age"
 SELECT (SELECT ("person"."age" + 1)) AS "age" FROM "person" GROUP BY "person"."age"
 SELECT (SELECT 42) AS "k" FROM (SELECT "person"."age" AS "age" FROM "person" GROUP BY "person"."age") AS "derived_aggregate_1"
 SELECT 42 AS "k" FROM "person" GROUP BY ROLLUP ("person"."age")

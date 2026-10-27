@@ -3214,6 +3214,28 @@ impl Unparser<'_> {
                     }
                     _ => (plan, p),
                 };
+                // Direct outer references belong to this SELECT even when it
+                // has no aggregate. Keep their qualifiers through SQL cleanup;
+                // nested SELECTs register their own references.
+                for expr in &p.expr {
+                    expr.apply(|node| {
+                        if let Expr::OuterReferenceColumn(_, column) = node
+                            && let Some(relation) = &column.relation
+                        {
+                            select.preserve_outer_qualifier(
+                                self.emitted_qualifier(relation)
+                                    .iter()
+                                    .map(|part| {
+                                        self.new_ident_quoted_if_needs(part.clone())
+                                            .to_string()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                            );
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                }
                 // For Snowflake FLATTEN: when the outer Projection has
                 // UNNEST(...) display-name columns (from SELECT * / SELECT
                 // UNNEST(...)), generate a flatten alias now so that
