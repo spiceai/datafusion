@@ -480,7 +480,7 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                 pg_fields!(
                     "Node Type": "CopyTo",
                     "Output URL": output_url,
-                    "File Type": format!("{}", file_type.get_ext()),
+                    "File Type": file_type.get_ext().to_string(),
                     "Options": op_str
                 )
             }
@@ -544,7 +544,7 @@ impl<'a, 'b> PgJsonVisitor<'a, 'b> {
                     "Node Type": format!("{} Join", join_type),
                     "Join Constraint": format!("{:?}", join_constraint),
                     "Join Keys": join_expr.join(", "),
-                    "Filter": format!("{}", filter_expr)
+                    "Filter": filter_expr
                 )
             }
             LogicalPlan::Repartition(Repartition {

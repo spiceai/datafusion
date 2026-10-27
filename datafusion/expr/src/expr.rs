@@ -2200,7 +2200,21 @@ impl Expr {
     /// - `rand()` returns `true`,
     /// - `a + rand()` returns `false`
     pub fn is_volatile_node(&self) -> bool {
-        matches!(self, Expr::ScalarFunction(func) if func.func.signature().volatility == Volatility::Volatile)
+        match self {
+            Expr::ScalarFunction(func) => {
+                func.func.signature().volatility == Volatility::Volatile
+            }
+            Expr::AggregateFunction(func) => {
+                func.func.signature().volatility == Volatility::Volatile
+            }
+            Expr::WindowFunction(func) => {
+                func.fun.signature().volatility == Volatility::Volatile
+            }
+            Expr::HigherOrderFunction(func) => {
+                func.func.signature().volatility == Volatility::Volatile
+            }
+            _ => false,
+        }
     }
 
     /// Returns true if the expression is volatile, i.e. whether it can return different

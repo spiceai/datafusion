@@ -187,21 +187,36 @@ impl ExprSchemable for Expr {
                 },
                 _ => expr.get_type(schema),
             },
-            Expr::Negative(expr) => expr.get_type(schema),
+            Expr::Negative(expr) => {
+                crate::type_coercion::negation_coercion(&expr.get_type(schema)?)
+                    .ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "Negation only supports numeric, interval and timestamp types"
+                        )
+                    })
+            }
             Expr::Column(c) => Ok(schema.data_type(c)?.clone()),
             Expr::OuterReferenceColumn(field, _) => Ok(field.data_type().clone()),
             Expr::ScalarVariable(field, _) => Ok(field.data_type().clone()),
             Expr::Literal(l, _) => Ok(l.data_type()),
             Expr::Case(case) => {
-                for (_, then_expr) in &case.when_then_expr {
-                    let then_type = then_expr.get_type(schema)?;
-                    if !then_type.is_null() {
-                        return Ok(then_type);
-                    }
-                }
-                case.else_expr
+                let then_types = case
+                    .when_then_expr
+                    .iter()
+                    .map(|(_, expr)| expr.get_type(schema))
+                    .collect::<Result<Vec<_>>>()?;
+                let else_type = case
+                    .else_expr
                     .as_ref()
-                    .map_or(Ok(DataType::Null), |e| e.get_type(schema))
+                    .map(|expr| expr.get_type(schema))
+                    .transpose()?;
+                crate::type_coercion::other::get_coerce_type_for_case_expression(
+                    &then_types,
+                    else_type.as_ref(),
+                )
+                .ok_or_else(|| {
+                    plan_datafusion_err!("CASE result branches have no common type")
+                })
             }
             Expr::Cast(Cast { field, .. }) | Expr::TryCast(TryCast { field, .. }) => {
                 Ok(field.data_type().clone())
@@ -551,7 +566,15 @@ impl ExprSchemable for Expr {
                     .map(|(_, f)| f)?
                     .with_field_metadata(&combined_metadata))
             }
-            Expr::Negative(expr) => expr.to_field(schema).map(|(_, f)| f),
+            Expr::Negative(expr) => {
+                let (_, field) = expr.to_field(schema)?;
+                Ok(Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(self.get_type(schema)?),
+                ))
+            }
             Expr::Column(c) => schema.field_from_column(c).map(Arc::clone),
             Expr::OuterReferenceColumn(field, _) => {
                 Ok(Arc::clone(field).renamed(&schema_name))
@@ -865,6 +888,46 @@ mod tests {
             let expr = lit(ScalarValue::Null).$EXPR_TYPE();
             assert!(!expr.nullable(&MockExprSchema::new()).unwrap());
         }};
+    }
+
+    #[test]
+    fn issue_15538_case_schema_includes_all_result_branches() -> Result<()> {
+        let schema = DFSchema::empty();
+        for (then, otherwise) in [(lit(1_i32), lit(2_i64)), (lit(1_i64), lit(2_i32))] {
+            let expression = Expr::Case(crate::expr::Case::new(
+                None,
+                vec![(Box::new(lit(true)), Box::new(then))],
+                Some(Box::new(otherwise)),
+            ));
+            assert_eq!(expression.get_type(&schema)?, DataType::Int64);
+        }
+        let expression = Expr::Case(crate::expr::Case::new(
+            None,
+            vec![(Box::new(lit(true)), Box::new(lit(ScalarValue::Null)))],
+            Some(Box::new(lit(2_i64))),
+        ));
+        assert_eq!(expression.get_type(&schema)?, DataType::Int64);
+        Ok(())
+    }
+
+    #[test]
+    fn unsigned_negation_schema_has_a_signed_result_type() -> Result<()> {
+        let schema = DFSchema::empty();
+        for (value, expected) in [
+            (ScalarValue::UInt8(Some(u8::MAX)), DataType::Int16),
+            (ScalarValue::UInt16(Some(u16::MAX)), DataType::Int32),
+            (ScalarValue::UInt32(Some(u32::MAX)), DataType::Int64),
+            (ScalarValue::UInt64(Some(u64::MAX)), DataType::Int64),
+        ] {
+            let expression = Expr::Negative(Box::new(lit(value)));
+            assert_eq!(expression.get_type(&schema)?, expected);
+            assert_eq!(expression.to_field(&schema)?.1.data_type(), &expected);
+            let plan = LogicalPlanBuilder::empty(true)
+                .project(vec![expression])?
+                .build()?;
+            assert_eq!(plan.schema().field(0).data_type(), &expected);
+        }
+        Ok(())
     }
 
     #[test]

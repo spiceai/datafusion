@@ -1517,6 +1517,30 @@ mod tests {
         assert_eq!(b.partial_cmp(&o), Some(Ordering::Less));
     }
 
+    #[test]
+    fn test_signature_volatility_is_preserved_in_expressions() {
+        for volatility in [
+            Volatility::Volatile,
+            Volatility::Stable,
+            Volatility::Immutable,
+        ] {
+            let function = Arc::new(HigherOrderUDF::new_from_impl(TestHigherOrderUDF {
+                name: "signature_volatility",
+                field: "value",
+                signature: HigherOrderSignature::variadic_any(volatility),
+            }));
+            let expr = Expr::HigherOrderFunction(HigherOrderFunction::new(
+                function,
+                vec![col("value")],
+            ));
+            assert_eq!(expr.is_volatile_node(), volatility == Volatility::Volatile);
+            assert_eq!(
+                expr.clone().alias("v").is_volatile(),
+                volatility == Volatility::Volatile
+            );
+        }
+    }
+
     fn test_func(name: &'static str, parameter: &'static str) -> Arc<HigherOrderUDF> {
         Arc::new(HigherOrderUDF::new_from_impl(TestHigherOrderUDF {
             name,

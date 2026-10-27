@@ -7265,36 +7265,163 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
 }
 
 #[test]
-fn test_unparse_projected_set_operation_scopes() -> Result<()> {
-    let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
-    let input = |name: &str| -> Result<LogicalPlan> {
-        table_scan(Some("person"), &schema, Some(vec![0]))?
-            .project(vec![col("person.id").alias("x")])?
-            .alias(name)?
-            .build()
-    };
-    for join_type in [
-        datafusion_expr::JoinType::LeftSemi,
-        datafusion_expr::JoinType::LeftAnti,
+fn test_projected_exists_inputs_keep_subquery_repeatability_guard() -> Result<()> {
+    let body = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .project(vec![random().alias("d")])?
+        .build()?;
+    let comparison = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+        Box::new(lit(0.5)),
+        datafusion_expr::Subquery {
+            subquery: Arc::new(body),
+            outer_ref_columns: vec![],
+            spans: datafusion_common::Spans::new(),
+        },
+        datafusion_expr::Operator::Gt,
+        datafusion_expr::expr::SetQuantifier::All,
+    ));
+    let projected = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![comparison.alias("inner_c")])?
+        .alias("inner")?
+        .project(vec![col("inner.inner_c").alias("c")])?
+        .alias("q")?
+        .build()?;
+    let plain = table_scan(
+        Some("p"),
+        &Schema::new(vec![Field::new("c", DataType::Boolean, false)]),
+        Some(vec![0]),
+    )?
+    .build()?;
+    for (probe, build, probe_key, build_key) in [
+        (plain.clone(), projected.clone(), "p.c", "q.c"),
+        (projected, plain, "q.c", "p.c"),
     ] {
-        let plan = LogicalPlanBuilder::from(input("left")?)
+        let plan = LogicalPlanBuilder::from(probe)
             .join(
-                input("right")?,
-                join_type,
-                (vec!["left.x"], vec!["right.x"]),
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (vec![probe_key], vec![build_key]),
                 None,
             )?
             .build()?;
-        let output = Unparser::new(&UnparserPostgreSqlDialect {})
-            .plan_to_sql(&plan)?
-            .to_string();
-        assert!(output.contains("AS \"left\""), "{output}");
-        assert!(output.contains("AS \"right\""), "{output}");
-        assert!(
-            output.contains("\"left\".\"x\" = \"right\".\"x\""),
-            "{output}"
-        );
+        let error = Unparser::new(&UnparserMySqlDialect {})
+            .plan_to_sql(&plan)
+            .expect_err(
+                "MySQL cannot promise one evaluation of derived subquery outputs",
+            );
+        assert_contains!(error.to_string(), "evaluates the expression again");
     }
+    Ok(())
+}
+
+#[test]
+fn test_unparse_projected_set_operation_scopes() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+    let input = |name: &str, shape: u8| -> Result<LogicalPlan> {
+        let scan = table_scan(Some("person"), &schema, Some(vec![0]))?;
+        let input = if shape == 3 {
+            scan.project(vec![col("person.id").alias("z")])?
+                .alias("inner")?
+                .project(vec![col("inner.z").alias("x")])?
+        } else {
+            scan.project(vec![col("person.id").alias("x")])?
+        };
+        let input = if shape == 2 {
+            input.project(vec![col("x")])?
+        } else {
+            input
+        };
+        let input = if shape > 0 {
+            input.filter(col("x").gt(lit(0)))?
+        } else {
+            input
+        };
+        input.alias(name)?.build()
+    };
+    for shape in [0, 1, 2, 3] {
+        for distinct in [false, true] {
+            for join_type in [
+                datafusion_expr::JoinType::LeftSemi,
+                datafusion_expr::JoinType::LeftAnti,
+            ] {
+                let probe = if distinct {
+                    LogicalPlanBuilder::from(input("left", shape)?)
+                        .distinct()?
+                        .build()?
+                } else {
+                    input("left", shape)?
+                };
+                let plan = LogicalPlanBuilder::from(probe)
+                    .join(
+                        input("right", shape)?,
+                        join_type,
+                        (vec!["left.x"], vec!["right.x"]),
+                        None,
+                    )?
+                    .build()?;
+                let output = Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string();
+                assert!(output.contains("AS \"left\""), "{output}");
+                assert!(output.contains("AS \"right\""), "{output}");
+                let statement = Parser::new(&GenericDialect {})
+                    .try_with_sql(&output)?
+                    .parse_statement()?;
+                let context = MockContextProvider {
+                    state: MockSessionState::default(),
+                };
+                SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_inputs_name_computed_outputs() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+    let input = |name: &str| -> Result<LogicalPlan> {
+        table_scan(Some("person"), &schema, Some(vec![0]))?
+            .project(vec![col("person.id") + lit(1)])?
+            .alias(name)?
+            .build()
+    };
+    let probe = input("left")?;
+    let build = input("right")?;
+    let field = probe.schema().field(0).name().clone();
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (
+                vec![Column::new(Some("left"), field.clone())],
+                vec![Column::new(Some("right"), field)],
+            ),
+            None,
+        )?
+        .build()?;
+    let output = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(&output)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    Ok(())
+}
+
+#[test]
+fn test_sql_unsigned_negation_uses_the_checked_signed_result_schema() -> Result<()> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql("SELECT -CAST('18446744073709551615' AS BIGINT UNSIGNED) AS n")?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    assert_eq!(plan.schema().field(0).data_type(), &DataType::Int64);
     Ok(())
 }
 
@@ -7365,6 +7492,79 @@ fn test_projected_exists_volatile_build_is_refused() -> Result<()> {
         Ok(sql) => panic!("unsafe SQL: {sql}"),
         Err(error) => {
             assert_contains!(error.to_string(), "volatile build");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_exists_build_checks_aggregate_and_window_signature_volatility() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("x", DataType::Float64, false)]);
+    let probe = table_scan(Some("p"), &schema, Some(vec![0]))?.build()?;
+    for volatility in [
+        Volatility::Volatile,
+        Volatility::Stable,
+        Volatility::Immutable,
+    ] {
+        let aggregate = Arc::new(datafusion_expr::create_udaf(
+            "signature_aggregate",
+            vec![DataType::Float64],
+            Arc::new(DataType::Float64),
+            volatility,
+            Arc::new(|_| internal_err!("unparser fixture is not executed")),
+            Arc::new(vec![DataType::Float64]),
+        ));
+        let window = Arc::new(datafusion_expr::create_udwf(
+            "signature_window",
+            DataType::Float64,
+            Arc::new(DataType::Float64),
+            volatility,
+            Arc::new(|| internal_err!("unparser fixture is not executed")),
+        ));
+        let aggregate_expr = aggregate.call(vec![col("b.x")]);
+        let aggregate_window = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::AggregateUDF(aggregate),
+            vec![col("b.x")],
+        )));
+        let window_expr = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(window),
+            vec![col("b.x")],
+        )));
+        let build_aggregate = table_scan(Some("b"), &schema, Some(vec![0]))?
+            .aggregate(Vec::<Expr>::new(), vec![aggregate_expr.alias("r")])?
+            .alias("s")?
+            .build()?;
+        let mut builds = vec![build_aggregate];
+        for expression in [aggregate_window, window_expr] {
+            builds.push(
+                table_scan(Some("b"), &schema, Some(vec![0]))?
+                    .window(vec![expression.alias("r")])?
+                    .project(vec![col("r")])?
+                    .alias("s")?
+                    .build()?,
+            );
+        }
+        for build in builds {
+            let plan = LogicalPlanBuilder::from(probe.clone())
+                .join_on(
+                    build,
+                    datafusion_expr::JoinType::LeftMark,
+                    vec![col("p.x").lt(col("s.r"))],
+                )?
+                .filter(col("s.mark").or(col("p.x").lt(lit(0.0))))?
+                .project(vec![col("p.x")])?
+                .build()?;
+            if volatility == Volatility::Volatile {
+                assert_volatile_exists_build_refused(
+                    &plan,
+                    &UnparserPostgreSqlDialect {},
+                );
+            } else {
+                let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string();
+                assert_contains!(sql, "EXISTS");
+            }
         }
     }
     Ok(())
