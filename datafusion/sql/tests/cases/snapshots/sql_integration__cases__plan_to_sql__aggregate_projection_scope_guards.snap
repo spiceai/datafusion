@@ -4,6 +4,7 @@ expression: "sql.join(\"\\n\")"
 ---
 SELECT (SELECT "derived_aggregate_1"."id" FROM (SELECT "e"."id" AS "id" FROM "person" AS "e" GROUP BY "e"."id") AS "derived_aggregate_2") FROM "person" AS "derived_aggregate_1"
 SELECT (SELECT ("derived_aggregate_1"."id" + "derived_aggregate_2"."id") FROM (SELECT "e"."id" AS "id" FROM "person" AS "e" GROUP BY "e"."id") AS "derived_aggregate_3") FROM "person" AS "derived_aggregate_1" CROSS JOIN "person" AS "derived_aggregate_2"
+SELECT FROM (SELECT "derived_aggregate_1".*, "derived_aggregate_2".* FROM "person" AS "derived_aggregate_1" CROSS JOIN "person" AS "derived_aggregate_2" LIMIT 1) AS "derived_limit"
 SELECT FROM (SELECT (SELECT ("derived_aggregate_1"."id" + "derived_aggregate_2"."id") FROM (SELECT "e"."id" AS "id" FROM "person" AS "e" GROUP BY "e"."id") AS "derived_aggregate_3") AS "outer_ref(derived_aggregate_1.id) + outer_ref(derived_aggregate_2.id)" FROM "person" AS "derived_aggregate_1" CROSS JOIN "person" AS "derived_aggregate_2") AS "derived_projection"
 SELECT (SELECT "outer_person"."id" FROM (SELECT "e"."id" AS "id" FROM "person" AS "e" GROUP BY "e"."id") AS "derived_aggregate_1") FROM "person" AS "outer_person"
 SELECT (SELECT "derived_aggregate_1"."id" FROM (SELECT COUNT(*) AS "COUNT(*)" FROM "person" AS "e" HAVING (COUNT(*) > 0)) AS "derived_aggregate_2") FROM "person" AS "derived_aggregate_1"
@@ -13,6 +14,8 @@ SELECT (SELECT "age") AS "age" FROM "person" GROUP BY "person"."age"
 SELECT (SELECT ("person"."age" + 1)) AS "age" FROM "person" GROUP BY "person"."age"
 SELECT (SELECT 42) AS "k" FROM (SELECT "person"."age" AS "age" FROM "person" GROUP BY "person"."age") AS "derived_aggregate_1"
 SELECT 42 AS "k" FROM "person" GROUP BY ROLLUP ("person"."age")
+SELECT FROM "person" GROUP BY ROLLUP ("person"."age") LIMIT 1
 SELECT FROM (SELECT 42 AS "k" FROM "person" GROUP BY ROLLUP ("person"."age")) AS "derived_projection"
 SELECT 42 AS "k" FROM "person" AS "l" INNER JOIN "person" AS "r" ON ("l"."age" = "r"."age") GROUP BY "l"."id", "r"."id"
+SELECT FROM "person" AS "l" INNER JOIN "person" AS "r" ON ("l"."age" = "r"."age") GROUP BY "l"."id", "r"."id" LIMIT 1
 SELECT FROM (SELECT 42 AS "k" FROM "person" AS "l" INNER JOIN "person" AS "r" ON ("l"."age" = "r"."age") GROUP BY "l"."id", "r"."id") AS "derived_projection"
