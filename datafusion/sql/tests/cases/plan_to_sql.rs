@@ -7498,6 +7498,79 @@ fn test_projected_exists_volatile_build_is_refused() -> Result<()> {
 }
 
 #[test]
+fn test_exists_build_checks_aggregate_and_window_signature_volatility() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("x", DataType::Float64, false)]);
+    let probe = table_scan(Some("p"), &schema, Some(vec![0]))?.build()?;
+    for volatility in [
+        Volatility::Volatile,
+        Volatility::Stable,
+        Volatility::Immutable,
+    ] {
+        let aggregate = Arc::new(datafusion_expr::create_udaf(
+            "signature_aggregate",
+            vec![DataType::Float64],
+            Arc::new(DataType::Float64),
+            volatility,
+            Arc::new(|_| internal_err!("unparser fixture is not executed")),
+            Arc::new(vec![DataType::Float64]),
+        ));
+        let window = Arc::new(datafusion_expr::create_udwf(
+            "signature_window",
+            DataType::Float64,
+            Arc::new(DataType::Float64),
+            volatility,
+            Arc::new(|| internal_err!("unparser fixture is not executed")),
+        ));
+        let aggregate_expr = aggregate.call(vec![col("b.x")]);
+        let aggregate_window = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::AggregateUDF(aggregate),
+            vec![col("b.x")],
+        )));
+        let window_expr = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(window),
+            vec![col("b.x")],
+        )));
+        let build_aggregate = table_scan(Some("b"), &schema, Some(vec![0]))?
+            .aggregate(Vec::<Expr>::new(), vec![aggregate_expr.alias("r")])?
+            .alias("s")?
+            .build()?;
+        let mut builds = vec![build_aggregate];
+        for expression in [aggregate_window, window_expr] {
+            builds.push(
+                table_scan(Some("b"), &schema, Some(vec![0]))?
+                    .window(vec![expression.alias("r")])?
+                    .project(vec![col("r")])?
+                    .alias("s")?
+                    .build()?,
+            );
+        }
+        for build in builds {
+            let plan = LogicalPlanBuilder::from(probe.clone())
+                .join_on(
+                    build,
+                    datafusion_expr::JoinType::LeftMark,
+                    vec![col("p.x").lt(col("s.r"))],
+                )?
+                .filter(col("s.mark").or(col("p.x").lt(lit(0.0))))?
+                .project(vec![col("p.x")])?
+                .build()?;
+            if volatility == Volatility::Volatile {
+                assert_volatile_exists_build_refused(
+                    &plan,
+                    &UnparserPostgreSqlDialect {},
+                );
+            } else {
+                let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string();
+                assert_contains!(sql, "EXISTS");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn test_exists_build_checks_nested_and_pushed_volatility() -> Result<()> {
     let schema = int32_schema(&["a"]);
     let probe = table_scan(Some("p"), &schema, Some(vec![0]))?.build()?;
