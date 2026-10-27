@@ -1511,6 +1511,17 @@ fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
                 .to_string(),
         );
         if input.contains("ROLLUP") || input.contains("JOIN") {
+            if let LogicalPlan::Projection(projection) = &plan {
+                let limited = LogicalPlanBuilder::from(projection.input.as_ref().clone())
+                    .limit(0, Some(1))?
+                    .project(Vec::<Expr>::new())?
+                    .build()?;
+                sql.push(
+                    Unparser::new(&UnparserPostgreSqlDialect {})
+                        .plan_to_sql(&limited)?
+                        .to_string(),
+                );
+            }
             let empty = LogicalPlanBuilder::from(plan)
                 .project(Vec::<Expr>::new())?
                 .build()?;
@@ -1522,6 +1533,31 @@ fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
         }
     }
     assert_snapshot!("aggregate_projection_scope_guards", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_external_correlation_over_global_aggregate() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let correlated = scalar_subquery(Arc::new(
+        LogicalPlanBuilder::empty(true)
+            .project(vec![out_ref_col(DataType::Int32, "outer_t.id").alias("k")])?
+            .build()?,
+    ));
+    let mut sql = Vec::new();
+    for predicate in [col("e.id").gt_eq(lit(0)), col("e.id").lt(lit(0))] {
+        let plan = table_scan(Some("e"), &schema, None)?
+            .filter(predicate)?
+            .aggregate(Vec::<Expr>::new(), vec![max(col("e.id"))])?
+            .project(vec![correlated.clone()])?
+            .build()?;
+        sql.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+        );
+    }
+    assert_snapshot!("external_correlation_global_aggregate", sql.join("\n"));
     Ok(())
 }
 

@@ -1181,6 +1181,7 @@ impl Unparser<'_> {
                     self.group_by_keys(agg, &UnparserAggScope::new(agg))?,
                     vec![],
                 ));
+                return Ok(true);
             }
             return Ok(false);
         }
@@ -1509,17 +1510,28 @@ impl Unparser<'_> {
         let LogicalPlan::Projection(projection) = plan else {
             return false;
         };
+        // A subquery can correlate either to this input's outputs or to an
+        // enclosing query. Only the former depends on keeping this input flat.
+        let reads_input = |references: &[Expr]| {
+            references.iter().any(|reference| match reference {
+                Expr::OuterReferenceColumn(_, column) | Expr::Column(column) => {
+                    projection.input.schema().has_column(column)
+                }
+                _ => true,
+            })
+        };
         let reads_no_columns = projection.expr.iter().all(|expr| {
             matches!(
                 expr.exists(|expr| Ok(match expr {
                     Expr::Column(_) => true,
                     Expr::ScalarSubquery(subquery) =>
-                        !subquery.outer_ref_columns.is_empty(),
-                    Expr::Exists(exists) => !exists.subquery.outer_ref_columns.is_empty(),
+                        reads_input(&subquery.outer_ref_columns),
+                    Expr::Exists(exists) =>
+                        reads_input(&exists.subquery.outer_ref_columns),
                     Expr::InSubquery(in_subquery) =>
-                        !in_subquery.subquery.outer_ref_columns.is_empty(),
+                        reads_input(&in_subquery.subquery.outer_ref_columns),
                     Expr::SetComparison(comparison) =>
-                        !comparison.subquery.outer_ref_columns.is_empty(),
+                        reads_input(&comparison.subquery.outer_ref_columns),
                     _ => false,
                 })),
                 Ok(false)
