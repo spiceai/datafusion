@@ -1387,6 +1387,31 @@ impl Unparser<'_> {
         // scope numbers its own: a join walks both of its sides with one builder,
         // and each side requalifies its own references onto its own alias.
         let named_input = name_scope_outputs(p.input.as_ref())?;
+        // The SQL cleanup and requalification steps cannot distinguish a
+        // direct outer reference from a local column after lowering to SQL AST.
+        // Keep this shape local rather than risk capturing an outer reference.
+        for expr in p.expr.iter().chain(select.clause_outer_references()) {
+            if expr.exists(|node| {
+                Ok(match node {
+                    Expr::OuterReferenceColumn(..) => true,
+                    Expr::ScalarSubquery(subquery) => {
+                        !subquery.outer_ref_columns.is_empty()
+                    }
+                    Expr::Exists(exists) => !exists.subquery.outer_ref_columns.is_empty(),
+                    Expr::InSubquery(subquery) => {
+                        !subquery.subquery.outer_ref_columns.is_empty()
+                    }
+                    Expr::SetComparison(comparison) => {
+                        !comparison.subquery.outer_ref_columns.is_empty()
+                    }
+                    _ => false,
+                })
+            })? {
+                return not_impl_err!(
+                    "Cannot scope an aggregate projection containing an outer reference"
+                );
+            }
+        }
         let alias_name = select.next_derived_aggregate_alias();
         let alias = self.new_ident_quoted_if_needs(alias_name.clone());
         self.derive(
