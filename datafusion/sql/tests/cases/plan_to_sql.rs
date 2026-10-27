@@ -2826,9 +2826,10 @@ fn test_unnest_under_an_empty_projection_keeps_its_rows() -> Result<()> {
     "
     );
 
-    let sql = plan_to_sql(&plan)?.to_string();
-    assert_contains!(&sql, "UNNEST([1, 2, 3])");
-    assert!(!sql.contains("(SELECT 1)"), "{sql}");
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT j1.j1_id FROM j1 CROSS JOIN (SELECT UNNEST([1, 2, 3])) AS b"
+    );
     Ok(())
 }
 
