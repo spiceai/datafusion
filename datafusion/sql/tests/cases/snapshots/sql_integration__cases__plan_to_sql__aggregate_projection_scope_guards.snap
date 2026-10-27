@@ -1,0 +1,11 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: "sql.join(\"\\n\")"
+---
+SELECT (SELECT "age") AS "age" FROM "person" GROUP BY "person"."age"
+SELECT (SELECT ("person"."age" + 1)) AS "age" FROM "person" GROUP BY "person"."age"
+SELECT (SELECT 42) AS "k" FROM (SELECT "person"."age" AS "age" FROM "person" GROUP BY "person"."age") AS "derived_aggregate_1"
+SELECT 42 AS "k" FROM "person" GROUP BY ROLLUP ("person"."age")
+SELECT FROM (SELECT 42 AS "k" FROM "person" GROUP BY ROLLUP ("person"."age")) AS "derived_projection"
+SELECT 42 AS "k" FROM "person" AS "l" INNER JOIN "person" AS "r" ON ("l"."age" = "r"."age") GROUP BY "l"."id", "r"."id"
+SELECT FROM (SELECT 42 AS "k" FROM "person" AS "l" INNER JOIN "person" AS "r" ON ("l"."age" = "r"."age") GROUP BY "l"."id", "r"."id") AS "derived_projection"
