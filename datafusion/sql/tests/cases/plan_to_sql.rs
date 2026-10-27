@@ -1483,39 +1483,15 @@ fn test_unparser_preserves_is_predicate_operands() -> Result<()> {
 }
 
 #[test]
-fn test_unparser_refuses_aggregate_projection_outer_reference_capture() -> Result<()> {
+fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
+    let mut sql = Vec::new();
     for input in [
         "SELECT (SELECT derived_aggregate_1.id FROM person e GROUP BY e.id) FROM person AS derived_aggregate_1",
         "SELECT (SELECT derived_aggregate_1.id + derived_aggregate_2.id FROM person e GROUP BY e.id) FROM person AS derived_aggregate_1 CROSS JOIN person AS derived_aggregate_2",
         "SELECT (SELECT outer_person.id FROM person e GROUP BY e.id) FROM person AS outer_person",
         "SELECT (SELECT derived_aggregate_1.id FROM person e HAVING count(*) > 0) FROM person AS derived_aggregate_1",
-    ] {
-        let statement = Parser::new(&GenericDialect {})
-            .try_with_sql(input)?
-            .parse_statement()?;
-        let context = MockContextProvider {
-            state: MockSessionState::default().with_aggregate_function(count_udaf()),
-        };
-        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
-        let err = Unparser::new(&UnparserPostgreSqlDialect {})
-            .plan_to_sql(&plan)
-            .expect_err(
-                "direct outer references must not be captured by an aggregate scope",
-            );
-        assert!(
-            err.to_string().contains(
-                "Cannot scope an aggregate projection containing an outer reference"
-            ),
-            "{input}: {err}"
-        );
-    }
-    Ok(())
-}
-
-#[test]
-fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
-    let mut sql = Vec::new();
-    for input in [
+        "SELECT (SELECT derived_aggregate_1.id FROM person e WHERE e.id < 0 HAVING count(*) = 0) FROM person AS derived_aggregate_1",
+        "SELECT (SELECT derived_aggregate_1.id FROM person e WHERE e.id < 0 HAVING count(*) > 0) FROM person AS derived_aggregate_1",
         "SELECT (SELECT person.age) AS age FROM person GROUP BY person.age",
         "SELECT (SELECT person.age + 1) AS age FROM person GROUP BY person.age",
         "SELECT (SELECT 42) AS k FROM person GROUP BY age",
@@ -1526,7 +1502,7 @@ fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
             .try_with_sql(input)?
             .parse_statement()?;
         let context = MockContextProvider {
-            state: MockSessionState::default(),
+            state: MockSessionState::default().with_aggregate_function(count_udaf()),
         };
         let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
         sql.push(
