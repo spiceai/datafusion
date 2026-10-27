@@ -7516,7 +7516,26 @@ fn test_exists_build_checks_nested_and_pushed_volatility() -> Result<()> {
         vec![random().lt(lit(0.5))],
     )?
     .build()?;
-    for build in [nested, pushed] {
+    let comparison_body = table_scan(Some("v"), &schema, Some(vec![0]))?
+        .project(vec![random().alias("d")])?
+        .build()?;
+    let comparison = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+        Box::new(lit(0.5)),
+        datafusion_expr::Subquery {
+            subquery: Arc::new(comparison_body),
+            outer_ref_columns: vec![],
+            spans: datafusion_common::Spans::new(),
+        },
+        datafusion_expr::Operator::Gt,
+        datafusion_expr::expr::SetQuantifier::All,
+    ));
+    let nested_comparison = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .project(vec![col("b.a"), comparison.alias("r")])?
+        .build()?;
+    let aggregate = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .aggregate(vec![col("b.a")], vec![max(random()).alias("r")])?
+        .build()?;
+    for build in [nested, pushed, nested_comparison, aggregate] {
         let plan = LogicalPlanBuilder::from(probe.clone())
             .join_on(
                 build,
