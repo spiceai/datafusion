@@ -3020,9 +3020,12 @@ impl Unparser<'_> {
                 // empty projection's own select list is the same placeholder every
                 // other empty projection gets, so e.g. a UNION's operands match.
                 // A projection already started here derives this one below, and
-                // the guard fires there.
+                // the guard fires there. An Unnest with no output columns (a
+                // zero-field struct) has nothing to project, and deriving it would
+                // rebuild this same empty projection, so it is left alone.
                 if p.expr.is_empty()
                     && !select.already_projected()
+                    && !p.input.schema().fields().is_empty()
                     && Self::reaches_unnest_through_modifiers(p.input.as_ref())
                 {
                     let items = self

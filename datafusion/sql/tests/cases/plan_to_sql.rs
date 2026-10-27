@@ -19482,3 +19482,27 @@ fn test_unnest_under_a_limit_under_an_empty_projection_keeps_its_rows() -> Resul
     );
     Ok(())
 }
+
+/// Unnesting a zero-field struct leaves no columns for the derived table to
+/// project. Unparsing an empty projection over it must terminate, with the
+/// unparser's existing error for struct columns in UNNEST.
+#[test]
+fn test_empty_projection_over_unnest_with_no_columns_terminates() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(arrow::datatypes::Fields::empty()),
+        true,
+    )]);
+    let unnest = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("s").alias("__unnest_placeholder(s)")])?
+        .unnest_column("__unnest_placeholder(s)")?
+        .build()?;
+    assert!(unnest.schema().fields().is_empty());
+    let plan = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    let err = plan_to_sql(&plan).unwrap_err().to_string();
+    assert!(
+        err.contains("Struct type columns are not currently supported in UNNEST"),
+        "{err}"
+    );
+    Ok(())
+}
