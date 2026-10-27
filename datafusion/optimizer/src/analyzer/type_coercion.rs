@@ -52,9 +52,7 @@ use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_case_when,
     get_coerce_type_for_list,
 };
-use datafusion_expr::type_coercion::{
-    is_datetime, is_interval, is_signed_numeric, is_timestamp,
-};
+use datafusion_expr::type_coercion::{is_datetime, negation_coercion};
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
     Cast, DmlStatement, Expr, ExprSchemable, Join, Limit, LogicalPlan, Operator,
@@ -669,16 +667,25 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
             ))),
             Expr::Negative(expr) => {
                 let data_type = expr.get_type(self.schema)?;
-                if data_type.is_null()
-                    || is_signed_numeric(&data_type)
-                    || is_interval(&data_type)
-                    || is_timestamp(&data_type)
-                {
-                    Ok(Transformed::no(Expr::Negative(expr)))
-                } else {
-                    plan_err!(
+                let target = negation_coercion(&data_type).ok_or_else(|| {
+                    plan_datafusion_err!(
                         "Negation only supports numeric, interval and timestamp types"
                     )
+                })?;
+                if target == data_type {
+                    Ok(Transformed::no(Expr::Negative(expr)))
+                } else {
+                    // UInt64's negated value may fit Int64 even when the positive
+                    // operand does not. Negate exactly before checking the result.
+                    let operand_type = if data_type == DataType::UInt64 {
+                        DataType::Decimal128(20, 0)
+                    } else {
+                        target.clone()
+                    };
+                    let negative = Expr::Negative(Box::new(
+                        (*expr).cast_to(&operand_type, self.schema)?,
+                    ));
+                    Ok(Transformed::yes(negative.cast_to(&target, self.schema)?))
                 }
             }
             Expr::Like(Like {

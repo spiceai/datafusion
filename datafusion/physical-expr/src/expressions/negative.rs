@@ -24,7 +24,7 @@ use crate::PhysicalExpr;
 
 use arrow::datatypes::FieldRef;
 use arrow::{
-    compute::kernels::numeric::neg_wrapping,
+    compute::kernels::numeric::neg,
     datatypes::{DataType, Schema},
     record_batch::RecordBatch,
 };
@@ -90,7 +90,7 @@ impl PhysicalExpr for NegativeExpr {
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         match self.arg.evaluate(batch)? {
             ColumnarValue::Array(array) => {
-                let result = neg_wrapping(array.as_ref())?;
+                let result = neg(array.as_ref())?;
                 Ok(ColumnarValue::Array(result))
             }
             ColumnarValue::Scalar(scalar) => {

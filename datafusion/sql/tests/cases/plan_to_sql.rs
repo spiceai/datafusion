@@ -7289,6 +7289,19 @@ fn test_projected_exists_inputs_name_computed_outputs() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_sql_unsigned_negation_uses_the_checked_signed_result_schema() -> Result<()> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql("SELECT -CAST('18446744073709551615' AS BIGINT UNSIGNED) AS n")?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    assert_eq!(plan.schema().field(0).data_type(), &DataType::Int64);
+    Ok(())
+}
+
 fn unparse_with_dialect(sql: &str, dialect: &dyn UnparserDialect) -> Result<String> {
     let statement = Parser::new(&GenericDialect {})
         .try_with_sql(sql)?

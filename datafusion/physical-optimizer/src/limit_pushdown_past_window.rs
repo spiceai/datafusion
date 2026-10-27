@@ -347,7 +347,7 @@ mod tests {
         let optimized = optimize(plan);
         assert_snapshot!(plan_str(optimized.as_ref()), @r#"
         GlobalLimitExec: skip=0, fetch=100
-          BoundedWindowAggExec: wdw=[row_number: Field { "row_number": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+          BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
             SortExec: TopK(fetch=100), expr=[a@0 ASC], preserve_partitioning=[true]
               PlaceholderRowExec
         "#);
@@ -361,7 +361,7 @@ mod tests {
         let optimized = optimize(plan);
         assert_snapshot!(plan_str(optimized.as_ref()), @r#"
         LocalLimitExec: fetch=100
-          BoundedWindowAggExec: wdw=[row_number: Field { "row_number": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+          BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
             SortExec: TopK(fetch=100), expr=[a@0 ASC], preserve_partitioning=[true]
               PlaceholderRowExec
         "#);
