@@ -334,6 +334,8 @@ pub struct SelectBuilder {
     /// Added to with `note_clause_outer_references()` and read with
     /// `clause_outer_references()`.
     clause_outer_references: Vec<Expr>,
+    /// Emitted outer qualifiers that cleanup must preserve across an aggregate scope.
+    preserved_outer_qualifiers: Vec<String>,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -684,6 +686,15 @@ impl SelectBuilder {
         });
     }
 
+    /// Preserve an emitted outer qualifier during SQL identifier cleanup.
+    pub fn preserve_outer_qualifier(&mut self, qualifier: String) {
+        self.preserved_outer_qualifiers.push(qualifier);
+    }
+
+    pub fn preserved_outer_qualifiers(&self) -> &[String] {
+        &self.preserved_outer_qualifiers
+    }
+
     /// The outer references the clauses already on this SELECT read — see
     /// [`Self::note_clause_outer_references`].
     pub fn clause_outer_references(&self) -> &[Expr] {
@@ -912,6 +923,7 @@ impl SelectBuilder {
             input_predicates_stay_scoped: false,
             predicates_added: 0,
             clause_outer_references: Vec::new(),
+            preserved_outer_qualifiers: Vec::new(),
         }
     }
 }
