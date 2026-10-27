@@ -6410,6 +6410,8 @@ impl Unparser<'_> {
         // is moved below into a scope of its own, under the build side's name,
         // before the correlation is added. Unbounded, the order reaches nothing,
         // and the sort is left out.
+        // Name outputs before introducing the build alias, keeping scalar
+        // subqueries bound to the original scan relations inside the projection.
         let projected_scope = self.projected_exists_input(right_plan)?;
         let body_plan = projected_scope
             .as_ref()

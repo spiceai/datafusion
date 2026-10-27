@@ -7564,18 +7564,6 @@ fn test_exists_build_checks_nested_and_pushed_volatility() -> Result<()> {
     Ok(())
 }
 
-fn assert_volatile_exists_build_refused(
-    plan: &LogicalPlan,
-    dialect: &dyn UnparserDialect,
-) {
-    match Unparser::new(dialect).plan_to_sql(plan) {
-        Ok(sql) => panic!("volatile build needs independent materialization: {sql}"),
-        Err(error) => {
-            assert_contains!(error.to_string(), "volatile build");
-        }
-    }
-}
-
 fn unparse_with_dialect(sql: &str, dialect: &dyn UnparserDialect) -> Result<String> {
     let statement = Parser::new(&GenericDialect {})
         .try_with_sql(sql)?
@@ -9344,6 +9332,18 @@ fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
 /// The volatile call the cases below project.
 fn random() -> Expr {
     datafusion_functions::math::random().call(vec![])
+}
+
+fn assert_volatile_exists_build_refused(
+    plan: &LogicalPlan,
+    dialect: &dyn UnparserDialect,
+) {
+    match Unparser::new(dialect).plan_to_sql(plan) {
+        Ok(sql) => panic!("volatile build needs independent materialization: {sql}"),
+        Err(error) => {
+            assert_contains!(error.to_string(), "volatile build");
+        }
+    }
 }
 
 /// `Projection(<table>.a, random() AS r)` over a one-column scan of `table`: the
