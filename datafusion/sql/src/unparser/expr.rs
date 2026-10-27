@@ -333,20 +333,14 @@ impl Unparser<'_> {
                     })
                     .collect::<Result<Vec<CaseWhen>>>()?;
 
-                let operand = match expr.as_ref() {
-                    Some(e) => match self.expr_to_sql_inner(e) {
-                        Ok(sql_expr) => Some(Box::new(sql_expr)),
-                        Err(_) => None,
-                    },
-                    None => None,
-                };
-                let else_result = match else_expr.as_ref() {
-                    Some(e) => match self.expr_to_sql_inner(e) {
-                        Ok(sql_expr) => Some(Box::new(sql_expr)),
-                        Err(_) => None,
-                    },
-                    None => None,
-                };
+                let operand = expr
+                    .as_deref()
+                    .map(|expr| self.expr_to_sql_inner(expr).map(Box::new))
+                    .transpose()?;
+                let else_result = else_expr
+                    .as_deref()
+                    .map(|expr| self.expr_to_sql_inner(expr).map(Box::new))
+                    .transpose()?;
 
                 Ok(ast::Expr::Case {
                     operand,
