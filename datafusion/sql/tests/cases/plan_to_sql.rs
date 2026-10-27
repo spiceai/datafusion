@@ -19430,3 +19430,55 @@ fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
     );
     Ok(())
 }
+
+/// The items column of a `source` table, unnested.
+fn unnest_source_items() -> Result<LogicalPlanBuilder> {
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+    table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .unnest_column("__unnest_placeholder(items)")
+}
+
+/// Snowflake joins an unnest in as `LATERAL FLATTEN`. Under an empty projection
+/// the FLATTEN stays inside the derived table, next to the table it reads,
+/// instead of joining into the outer SELECT where the table is out of scope.
+#[test]
+fn test_snowflake_unnest_under_an_empty_projection_keeps_its_scope() -> Result<()> {
+    let plan = LogicalPlan::Projection(Projection::try_new(
+        vec![],
+        Arc::new(unnest_source_items()?.build()?),
+    )?);
+    let snowflake = SnowflakeDialect::new();
+    assert_snapshot!(
+        Unparser::new(&snowflake).plan_to_sql(&plan)?,
+        @r#"SELECT 1 FROM (SELECT "_unnest_1"."VALUE" FROM "source" CROSS JOIN LATERAL FLATTEN(INPUT => "source"."items", OUTER => true) AS "_unnest_1") AS "__unnest_rows""#
+    );
+    Ok(())
+}
+
+/// A Limit between the empty projection and the Unnest does not hide the
+/// Unnest: the derived table still unnests, and still applies the LIMIT to the
+/// unnested rows. (The generic dialect places that LIMIT the way it does for a
+/// non-empty projection over Limit and Unnest, so only Snowflake is snapshotted.)
+#[test]
+fn test_unnest_under_a_limit_under_an_empty_projection_keeps_its_rows() -> Result<()> {
+    let plan = LogicalPlan::Projection(Projection::try_new(
+        vec![],
+        Arc::new(unnest_source_items()?.limit(0, Some(5))?.build()?),
+    )?);
+    let generic = plan_to_sql(&plan)?.to_string();
+    assert!(
+        generic.contains("UNNEST(\"source\".\"items\")"),
+        "{generic}"
+    );
+    let snowflake = SnowflakeDialect::new();
+    assert_snapshot!(
+        Unparser::new(&snowflake).plan_to_sql(&plan)?,
+        @r#"SELECT 1 FROM (SELECT "_unnest_1"."VALUE" FROM "source" CROSS JOIN LATERAL FLATTEN(INPUT => "source"."items", OUTER => true) AS "_unnest_1" LIMIT 5) AS "__unnest_rows""#
+    );
+    Ok(())
+}

@@ -3014,32 +3014,39 @@ impl Unparser<'_> {
                 // multiplies the other side by the number of elements. Without a
                 // placeholder column to find, the Unnest below would be dropped and
                 // the projection unparsed as `SELECT 1`, a single row. The Unnest's
-                // own columns are projected inside a derived table, which keeps its
-                // rows, and the empty projection is unparsed over that table as any
-                // other is, so its outward shape (one placeholder column, or none)
-                // still matches every other empty projection, e.g. a UNION's.
+                // columns, with any Limit or Sort between, are projected in a
+                // derived table of their own, which keeps its rows and its scope
+                // (Snowflake's FLATTEN joins inside it, not into this SELECT). The
+                // empty projection's own select list is the same placeholder every
+                // other empty projection gets, so e.g. a UNION's operands match.
+                // A projection already started here derives this one below, and
+                // the guard fires there.
                 if p.expr.is_empty()
-                    && let LogicalPlan::Unnest(unnest) = p.input.as_ref()
+                    && !select.already_projected()
+                    && Self::reaches_unnest_through_modifiers(p.input.as_ref())
                 {
-                    let expr = unnest
-                        .schema
+                    let items = self
+                        .empty_projection_fallback()
+                        .iter()
+                        .map(|e| self.select_item_to_sql(e))
+                        .collect::<Result<Vec<_>>>()?;
+                    select.projection(items);
+                    let expr = p
+                        .input
+                        .schema()
                         .columns()
                         .into_iter()
                         .map(Expr::Column)
                         .collect();
-                    let rows = LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(
-                        Arc::new(LogicalPlan::Projection(Projection::try_new(
-                            expr,
-                            Arc::clone(&p.input),
-                        )?)),
-                        "__unnest_rows",
+                    let rows = LogicalPlan::Projection(Projection::try_new(
+                        expr,
+                        Arc::clone(&p.input),
                     )?);
-                    let projection = Projection::try_new(vec![], Arc::new(rows))?;
-                    return self.select_to_sql_recursively(
-                        &LogicalPlan::Projection(projection),
-                        query,
-                        select,
+                    return self.derive(
+                        &rows,
                         relation,
+                        Some(self.new_table_alias("__unnest_rows".to_string(), vec![])),
+                        false,
                     );
                 }
 
@@ -5011,6 +5018,21 @@ impl Unparser<'_> {
                 Self::peel_to_inner_projection(alias.input.as_ref())
             }
             _ => None,
+        }
+    }
+
+    /// Whether `plan` is an Unnest, or reaches one through the Limits and
+    /// Sorts [`Self::peel_to_unnest_with_modifiers`] looks through.
+    fn reaches_unnest_through_modifiers(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Unnest(_) => true,
+            LogicalPlan::Limit(limit) => {
+                Self::reaches_unnest_through_modifiers(limit.input.as_ref())
+            }
+            LogicalPlan::Sort(sort) => {
+                Self::reaches_unnest_through_modifiers(sort.input.as_ref())
+            }
+            _ => false,
         }
     }
 
