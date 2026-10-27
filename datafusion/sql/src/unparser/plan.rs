@@ -6380,6 +6380,30 @@ impl Unparser<'_> {
             );
         }
 
+        // A correlated EXISTS can execute its build once per probe row. A
+        // derived table only fixes values within each invocation, so volatile
+        // build expressions require independent materialization.
+        let mut volatile_build = false;
+        right_plan.apply_with_subqueries(|node| {
+            node.apply_expressions(|expr| {
+                if expr.is_volatile() {
+                    volatile_build = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            Ok(if volatile_build {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        })?;
+        if volatile_build {
+            return not_impl_err!(
+                "Unparsing an EXISTS-style join with a volatile build input requires independent materialization"
+            );
+        }
+
         // A sort key reading such an output is scoped only where a row bound
         // makes the sort's order observable (`sort_order_is_observable`), which
         // the body's SELECT is marked as an EXISTS body to decide; a bounded body
@@ -6390,11 +6414,7 @@ impl Unparser<'_> {
         let body_plan = projected_scope
             .as_ref()
             .map_or(right_plan, |(_, input)| input.as_ref());
-        let named = if projected_scope.is_some() {
-            name_derived_scope_outputs(body_plan)?
-        } else {
-            None
-        };
+        let named = name_derived_scope_outputs(body_plan)?;
         let body_plan = named.as_ref().unwrap_or(body_plan);
         let mut query_builder = Some(QueryBuilder::default());
         let mut body_select = SelectBuilder::default();
@@ -6423,9 +6443,8 @@ impl Unparser<'_> {
         // both the projection and `DISTINCT` still decide which rows survive
         // it, so neither is redundant there.
         //
-        // `bounds_rows()` is tested first so the scope name is only demanded
-        // when a bound actually has to be moved: naming it can refuse the plan
-        // outright, and an unbounded build side without renamed outputs needs no extra scope.
+        // Projected inputs retain their original alias. Other bounded inputs
+        // obtain the scope name from the correlation before it is appended.
         if query_builder.bounds_rows() || projected_scope.is_some() {
             let scope_name = match projected_scope {
                 Some((alias, _)) => alias.alias.table().to_string(),
