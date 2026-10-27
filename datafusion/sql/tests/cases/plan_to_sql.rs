@@ -1583,6 +1583,42 @@ fn test_unparser_preserves_filtered_set_operation_scope() -> Result<()> {
 }
 
 #[test]
+fn test_unparser_propagates_case_expression_errors() -> Result<()> {
+    let length = datafusion_expr::create_udf(
+        "length",
+        vec![DataType::Utf8],
+        DataType::Int32,
+        Volatility::Immutable,
+        Arc::new(|_| internal_err!("unparser fixture is not evaluated")),
+    )
+    .call(vec![col("s")]);
+    let dialect = UnparserMySqlDialect {};
+    let unparser = Unparser::new(&dialect);
+    for expr in [
+        Expr::Case(datafusion_expr::expr::Case {
+            expr: None,
+            when_then_expr: vec![(Box::new(lit(false)), Box::new(lit(0)))],
+            else_expr: Some(Box::new(length.clone())),
+        }),
+        Expr::Case(datafusion_expr::expr::Case {
+            expr: Some(Box::new(length)),
+            when_then_expr: vec![(Box::new(lit(0)), Box::new(lit(1)))],
+            else_expr: Some(Box::new(lit(2))),
+        }),
+    ] {
+        let err = unparser
+            .expr_to_sql(&expr)
+            .expect_err("unresolved CASE expressions must propagate their error");
+        assert!(
+            err.to_string()
+                .contains("requires a known string or binary argument type"),
+            "{err}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn test_unparser_preserves_mysql_length_units() -> Result<()> {
     let schema = Arc::new(DFSchema::try_from(Schema::new(vec![
         Field::new("s", DataType::Utf8, true),
