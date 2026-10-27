@@ -105,7 +105,7 @@ fn build_window_topn_plan(
     // FilterExec: rn op limit_value
     // The ROW_NUMBER column is at index 2 (after pk=0, val=1)
     let rn_col = Arc::new(Column::new("row_number", 2));
-    let limit_lit = lit(ScalarValue::UInt64(Some(limit_value as u64)));
+    let limit_lit = lit(ScalarValue::Int64(Some(limit_value)));
     let predicate = Arc::new(BinaryExpr::new(rn_col, op, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(predicate, window)?);
@@ -154,7 +154,7 @@ fn build_window_topn_no_partition(limit_value: i64) -> Result<Arc<dyn ExecutionP
     )?);
 
     let rn_col = Arc::new(Column::new("row_number", 2));
-    let limit_lit = lit(ScalarValue::UInt64(Some(limit_value as u64)));
+    let limit_lit = lit(ScalarValue::Int64(Some(limit_value)));
     let predicate = Arc::new(BinaryExpr::new(rn_col, Operator::LtEq, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(predicate, window)?);
@@ -218,7 +218,7 @@ fn basic_row_number_rn_lteq_3() -> Result<()> {
     let plan = build_window_topn_plan(3, Operator::LtEq)?;
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+    BoundedWindowAggExec: wdw=[row_number: Field { "row_number": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       PartitionedTopKExec: fn=row_number, fetch=3, partition=[pk@0], order=[val@1 ASC]
         PlaceholderRowExec
     "#);
@@ -230,7 +230,7 @@ fn rn_lt_3_becomes_fetch_2() -> Result<()> {
     let plan = build_window_topn_plan(3, Operator::Lt)?;
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+    BoundedWindowAggExec: wdw=[row_number: Field { "row_number": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       PartitionedTopKExec: fn=row_number, fetch=2, partition=[pk@0], order=[val@1 ASC]
         PlaceholderRowExec
     "#);
@@ -273,7 +273,7 @@ fn flipped_3_gteq_rn() -> Result<()> {
 
         // Flipped: 3 >= rn  (Literal GtEq Column)
         let rn_col = Arc::new(Column::new("row_number", 2));
-        let limit_lit = lit(ScalarValue::UInt64(Some(3)));
+        let limit_lit = lit(ScalarValue::Int64(Some(3)));
         let predicate = Arc::new(BinaryExpr::new(limit_lit, Operator::GtEq, rn_col));
         let filter: Arc<dyn ExecutionPlan> =
             Arc::new(FilterExec::try_new(predicate, window)?);
@@ -282,7 +282,7 @@ fn flipped_3_gteq_rn() -> Result<()> {
 
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+    BoundedWindowAggExec: wdw=[row_number: Field { "row_number": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       PartitionedTopKExec: fn=row_number, fetch=3, partition=[pk@0], order=[val@1 ASC]
         PlaceholderRowExec
     "#);
@@ -323,7 +323,7 @@ fn no_partition_by_no_change() -> Result<()> {
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
     FilterExec: row_number@2 <= 5
-      BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+      BoundedWindowAggExec: wdw=[row_number: Field { "row_number": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
         SortExec: expr=[val@1 ASC], preserve_partitioning=[true]
           PlaceholderRowExec
     "#);
@@ -383,7 +383,7 @@ fn with_projection_between() -> Result<()> {
 
     // rn column is still at index 2 in the projected schema
     let rn_col = Arc::new(Column::new("row_number", 2));
-    let limit_lit = lit(ScalarValue::UInt64(Some(3)));
+    let limit_lit = lit(ScalarValue::Int64(Some(3)));
     let predicate = Arc::new(BinaryExpr::new(rn_col, Operator::LtEq, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(predicate, projection)?);
@@ -391,7 +391,7 @@ fn with_projection_between() -> Result<()> {
     let optimized = optimize(filter)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
     ProjectionExec: expr=[pk@0 as pk, val@1 as val, row_number@2 as row_number]
-      BoundedWindowAggExec: wdw=[row_number: Field { "row_number": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+      BoundedWindowAggExec: wdw=[row_number: Field { "row_number": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
         PartitionedTopKExec: fn=row_number, fetch=3, partition=[pk@0], order=[val@1 ASC]
           PlaceholderRowExec
     "#);
@@ -441,7 +441,7 @@ fn build_ranking_topn_plan(
     )?);
 
     let rk_col = Arc::new(Column::new(udwf_name, 2));
-    let limit_lit = lit(ScalarValue::UInt64(Some(limit_value as u64)));
+    let limit_lit = lit(ScalarValue::Int64(Some(limit_value)));
     // Place column on whichever side matches the operator's expectation.
     let predicate: Arc<dyn datafusion_physical_expr::PhysicalExpr> = match op {
         Operator::LtEq | Operator::Lt => Arc::new(BinaryExpr::new(rk_col, op, limit_lit)),
@@ -487,7 +487,7 @@ fn build_rank_no_order_by_plan(limit_value: i64) -> Result<Arc<dyn ExecutionPlan
     )?);
 
     let rk_col = Arc::new(Column::new("rank", 2));
-    let limit_lit = lit(ScalarValue::UInt64(Some(limit_value as u64)));
+    let limit_lit = lit(ScalarValue::Int64(Some(limit_value)));
     let predicate = Arc::new(BinaryExpr::new(rk_col, Operator::LtEq, limit_lit));
     let filter: Arc<dyn ExecutionPlan> =
         Arc::new(FilterExec::try_new(predicate, window)?);
@@ -500,7 +500,7 @@ fn basic_rank_rk_lteq_3() -> Result<()> {
     let plan = build_ranking_topn_plan(rank_udwf, "rank", 3, Operator::LtEq)?;
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    BoundedWindowAggExec: wdw=[rank: Field { "rank": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+    BoundedWindowAggExec: wdw=[rank: Field { "rank": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       PartitionedTopKExec: fn=rank, fetch=3, partition=[pk@0], order=[val@1 ASC]
         PlaceholderRowExec
     "#);
@@ -512,7 +512,7 @@ fn rank_rk_lt_4_becomes_fetch_3() -> Result<()> {
     let plan = build_ranking_topn_plan(rank_udwf, "rank", 4, Operator::Lt)?;
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    BoundedWindowAggExec: wdw=[rank: Field { "rank": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+    BoundedWindowAggExec: wdw=[rank: Field { "rank": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       PartitionedTopKExec: fn=rank, fetch=3, partition=[pk@0], order=[val@1 ASC]
         PlaceholderRowExec
     "#);
@@ -524,7 +524,7 @@ fn rank_flipped_3_gteq_rk() -> Result<()> {
     let plan = build_ranking_topn_plan(rank_udwf, "rank", 3, Operator::GtEq)?;
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    BoundedWindowAggExec: wdw=[rank: Field { "rank": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+    BoundedWindowAggExec: wdw=[rank: Field { "rank": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       PartitionedTopKExec: fn=rank, fetch=3, partition=[pk@0], order=[val@1 ASC]
         PlaceholderRowExec
     "#);
@@ -536,7 +536,7 @@ fn rank_flipped_4_gt_rk_becomes_fetch_3() -> Result<()> {
     let plan = build_ranking_topn_plan(rank_udwf, "rank", 4, Operator::Gt)?;
     let optimized = optimize(plan)?;
     assert_snapshot!(plan_str(optimized.as_ref()), @r#"
-    BoundedWindowAggExec: wdw=[rank: Field { "rank": UInt64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
+    BoundedWindowAggExec: wdw=[rank: Field { "rank": Int64 }, frame: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW], mode=[Sorted]
       PartitionedTopKExec: fn=rank, fetch=3, partition=[pk@0], order=[val@1 ASC]
         PlaceholderRowExec
     "#);

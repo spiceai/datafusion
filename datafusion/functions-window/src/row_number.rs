@@ -19,7 +19,7 @@
 
 use arrow::datatypes::FieldRef;
 use datafusion_common::arrow::array::ArrayRef;
-use datafusion_common::arrow::array::UInt64Array;
+use datafusion_common::arrow::array::Int64Array;
 use datafusion_common::arrow::compute::SortOptions;
 use datafusion_common::arrow::datatypes::DataType;
 use datafusion_common::arrow::datatypes::Field;
@@ -106,7 +106,7 @@ impl WindowUDFImpl for RowNumber {
     }
 
     fn field(&self, field_args: WindowUDFFieldArgs) -> Result<FieldRef> {
-        Ok(Field::new(field_args.name(), DataType::UInt64, false).into())
+        Ok(Field::new(field_args.name(), DataType::Int64, false).into())
     }
 
     fn sort_options(&self) -> Option<SortOptions> {
@@ -128,7 +128,7 @@ impl WindowUDFImpl for RowNumber {
 /// State for the `row_number` built-in window function.
 #[derive(Debug, Default)]
 struct NumRowsEvaluator {
-    n_rows: usize,
+    n_rows: i64,
 }
 
 impl PartitionEvaluator for NumRowsEvaluator {
@@ -142,9 +142,10 @@ impl PartitionEvaluator for NumRowsEvaluator {
         _values: &[ArrayRef],
         num_rows: usize,
     ) -> Result<ArrayRef> {
-        Ok(Arc::new(UInt64Array::from_iter_values(
-            1..(num_rows as u64) + 1,
-        )))
+        let num_rows = i64::try_from(num_rows).map_err(|_| {
+            datafusion_common::exec_datafusion_err!("row_number exceeds BIGINT range")
+        })?;
+        Ok(Arc::new(Int64Array::from_iter_values(1..=num_rows)))
     }
 
     fn evaluate(
@@ -152,8 +153,10 @@ impl PartitionEvaluator for NumRowsEvaluator {
         _values: &[ArrayRef],
         _range: &Range<usize>,
     ) -> Result<ScalarValue> {
-        self.n_rows += 1;
-        Ok(ScalarValue::UInt64(Some(self.n_rows as u64)))
+        self.n_rows = self.n_rows.checked_add(1).ok_or_else(|| {
+            datafusion_common::exec_datafusion_err!("row_number exceeds BIGINT range")
+        })?;
+        Ok(ScalarValue::Int64(Some(self.n_rows)))
     }
 
     fn supports_bounded_execution(&self) -> bool {
@@ -165,9 +168,28 @@ impl PartitionEvaluator for NumRowsEvaluator {
 mod tests {
 
     use datafusion_common::arrow::array::{Array, BooleanArray};
-    use datafusion_common::cast::as_uint64_array;
+    use datafusion_common::cast::as_int64_array;
 
     use super::*;
+
+    #[test]
+    fn row_number_streaming_bigint_boundary() -> Result<()> {
+        let mut evaluator = NumRowsEvaluator {
+            n_rows: i64::MAX - 1,
+        };
+        assert_eq!(
+            evaluator.evaluate(&[], &(0..1))?,
+            ScalarValue::Int64(Some(i64::MAX))
+        );
+        assert!(evaluator.evaluate(&[], &(1..2)).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn row_number_batch_rejects_bigint_overflow() {
+        let mut evaluator = NumRowsEvaluator::default();
+        assert!(evaluator.evaluate_all(&[], i64::MAX as usize + 1).is_err());
+    }
 
     #[test]
     fn row_number_all_null() -> Result<()> {
@@ -179,7 +201,7 @@ mod tests {
         let actual = RowNumber::default()
             .partition_evaluator(PartitionEvaluatorArgs::default())?
             .evaluate_all(&[values], num_rows)?;
-        let actual = as_uint64_array(&actual)?;
+        let actual = as_int64_array(&actual)?;
 
         assert_eq!(vec![1, 2, 3, 4, 5, 6, 7, 8], *actual.values());
         Ok(())
@@ -195,7 +217,7 @@ mod tests {
         let actual = RowNumber::default()
             .partition_evaluator(PartitionEvaluatorArgs::default())?
             .evaluate_all(&[values], num_rows)?;
-        let actual = as_uint64_array(&actual)?;
+        let actual = as_int64_array(&actual)?;
 
         assert_eq!(vec![1, 2, 3, 4, 5, 6, 7, 8], *actual.values());
         Ok(())

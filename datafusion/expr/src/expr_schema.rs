@@ -167,14 +167,7 @@ impl ExprSchemable for Expr {
                 },
                 _ => expr.get_type(schema),
             },
-            Expr::Negative(expr) => {
-                crate::type_coercion::negation_coercion(&expr.get_type(schema)?)
-                    .ok_or_else(|| {
-                        plan_datafusion_err!(
-                            "Negation only supports numeric, interval and timestamp types"
-                        )
-                    })
-            }
+            Expr::Negative(expr) => expr.get_type(schema),
             Expr::Column(c) => Ok(schema.data_type(c)?.clone()),
             Expr::OuterReferenceColumn(field, _) => Ok(field.data_type().clone()),
             Expr::ScalarVariable(field, _) => Ok(field.data_type().clone()),
@@ -546,15 +539,7 @@ impl ExprSchemable for Expr {
                     .map(|(_, f)| f)?
                     .with_field_metadata(&combined_metadata))
             }
-            Expr::Negative(expr) => {
-                let (_, field) = expr.to_field(schema)?;
-                Ok(Arc::new(
-                    field
-                        .as_ref()
-                        .clone()
-                        .with_data_type(self.get_type(schema)?),
-                ))
-            }
+            Expr::Negative(expr) => expr.to_field(schema).map(|(_, f)| f),
             Expr::Column(c) => schema.field_from_column(c).map(Arc::clone),
             Expr::OuterReferenceColumn(field, _) => {
                 Ok(Arc::clone(field).renamed(&schema_name))
@@ -891,29 +876,6 @@ mod tests {
             Some(Box::new(lit(2_i64))),
         ));
         assert_eq!(expression.get_type(&schema)?, DataType::Int64);
-        Ok(())
-    }
-
-    #[test]
-    fn unsigned_negation_schema_has_a_lossless_signed_type() -> Result<()> {
-        let schema = DFSchema::empty();
-        for (value, expected) in [
-            (ScalarValue::UInt8(Some(u8::MAX)), DataType::Int16),
-            (ScalarValue::UInt16(Some(u16::MAX)), DataType::Int32),
-            (ScalarValue::UInt32(Some(u32::MAX)), DataType::Int64),
-            (
-                ScalarValue::UInt64(Some(u64::MAX)),
-                DataType::Decimal128(20, 0),
-            ),
-        ] {
-            let expression = Expr::Negative(Box::new(lit(value)));
-            assert_eq!(expression.get_type(&schema)?, expected);
-            assert_eq!(expression.to_field(&schema)?.1.data_type(), &expected);
-            let plan = LogicalPlanBuilder::empty(true)
-                .project(vec![expression])?
-                .build()?;
-            assert_eq!(plan.schema().field(0).data_type(), &expected);
-        }
         Ok(())
     }
 

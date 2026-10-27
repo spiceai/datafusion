@@ -20,7 +20,7 @@
 
 use arrow::datatypes::FieldRef;
 use datafusion_common::arrow::array::ArrayRef;
-use datafusion_common::arrow::array::{Float64Array, UInt64Array};
+use datafusion_common::arrow::array::{Float64Array, Int64Builder};
 use datafusion_common::arrow::compute::SortOptions;
 use datafusion_common::arrow::datatypes::DataType;
 use datafusion_common::arrow::datatypes::Field;
@@ -216,7 +216,7 @@ impl WindowUDFImpl for Rank {
 
     fn field(&self, field_args: WindowUDFFieldArgs) -> Result<FieldRef> {
         let return_type = match self.rank_type {
-            RankType::Basic | RankType::Dense => DataType::UInt64,
+            RankType::Basic | RankType::Dense => DataType::Int64,
             RankType::Percent => DataType::Float64,
         };
 
@@ -292,19 +292,48 @@ impl PartitionEvaluator for RankEvaluator {
             };
         if new_rank_encountered {
             self.state.last_rank_data = Some(last_rank_data);
-            self.state.last_rank_boundary += self.state.current_group_count;
+            self.state.last_rank_boundary = self
+                .state
+                .last_rank_boundary
+                .checked_add(self.state.current_group_count)
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("rank exceeds BIGINT range")
+                })?;
             self.state.current_group_count = 1;
-            self.state.n_rank += 1;
+            self.state.n_rank = self.state.n_rank.checked_add(1).ok_or_else(|| {
+                datafusion_common::exec_datafusion_err!("dense_rank exceeds BIGINT range")
+            })?;
         } else {
             // data is still in the same rank
-            self.state.current_group_count += 1;
+            self.state.current_group_count = self
+                .state
+                .current_group_count
+                .checked_add(1)
+                .ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("rank exceeds BIGINT range")
+                })?;
         }
 
         match self.rank_type {
-            RankType::Basic => Ok(ScalarValue::UInt64(Some(
-                self.state.last_rank_boundary as u64 + 1,
+            RankType::Basic => {
+                let boundary =
+                    i64::try_from(self.state.last_rank_boundary).map_err(|_| {
+                        datafusion_common::exec_datafusion_err!(
+                            "rank exceeds BIGINT range"
+                        )
+                    })?;
+                let rank = boundary.checked_add(1).ok_or_else(|| {
+                    datafusion_common::exec_datafusion_err!("rank exceeds BIGINT range")
+                })?;
+                Ok(ScalarValue::Int64(Some(rank)))
+            }
+            RankType::Dense => Ok(ScalarValue::Int64(Some(
+                i64::try_from(self.state.n_rank).map_err(|_| {
+                    datafusion_common::exec_datafusion_err!(
+                        "dense_rank exceeds BIGINT range"
+                    )
+                })?,
             ))),
-            RankType::Dense => Ok(ScalarValue::UInt64(Some(self.state.n_rank as u64))),
             RankType::Percent => {
                 exec_err!("Can not execute PERCENT_RANK in a streaming fashion")
             }
@@ -317,27 +346,28 @@ impl PartitionEvaluator for RankEvaluator {
         ranks_in_partition: &[Range<usize>],
     ) -> Result<ArrayRef> {
         let result: ArrayRef = match self.rank_type {
-            RankType::Basic => Arc::new(UInt64Array::from_iter_values(
-                ranks_in_partition
-                    .iter()
-                    .scan(1_u64, |acc, range| {
-                        let len = range.end - range.start;
-                        let result = iter::repeat_n(*acc, len);
-                        *acc += len as u64;
-                        Some(result)
-                    })
-                    .flatten(),
-            )),
-
-            RankType::Dense => Arc::new(UInt64Array::from_iter_values(
-                ranks_in_partition
-                    .iter()
-                    .zip(1u64..)
-                    .flat_map(|(range, rank)| {
-                        let len = range.end - range.start;
-                        iter::repeat_n(rank, len)
-                    }),
-            )),
+            RankType::Basic | RankType::Dense => {
+                i64::try_from(num_rows).map_err(|_| {
+                    datafusion_common::exec_datafusion_err!("rank exceeds BIGINT range")
+                })?;
+                let mut builder = Int64Builder::with_capacity(num_rows);
+                for (index, range) in ranks_in_partition.iter().enumerate() {
+                    let offset = match self.rank_type {
+                        RankType::Basic => range.start,
+                        _ => index,
+                    };
+                    let rank = i64::try_from(offset)
+                        .ok()
+                        .and_then(|n| n.checked_add(1))
+                        .ok_or_else(|| {
+                            datafusion_common::exec_datafusion_err!(
+                                "rank exceeds BIGINT range"
+                            )
+                        })?;
+                    builder.append_value_n(rank, range.end - range.start);
+                }
+                Arc::new(builder.finish())
+            }
 
             RankType::Percent => {
                 let denominator = num_rows as f64;
@@ -372,27 +402,27 @@ impl PartitionEvaluator for RankEvaluator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion_common::cast::{as_float64_array, as_uint64_array};
+    use datafusion_common::cast::{as_float64_array, as_int64_array};
 
-    fn test_with_rank(expr: &Rank, expected: Vec<u64>) -> Result<()> {
+    fn test_with_rank(expr: &Rank, expected: Vec<i64>) -> Result<()> {
         test_i32_result(expr, vec![0..2, 2..3, 3..6, 6..7, 7..8], expected)
     }
 
     #[expect(clippy::single_range_in_vec_init)]
-    fn test_without_rank(expr: &Rank, expected: Vec<u64>) -> Result<()> {
+    fn test_without_rank(expr: &Rank, expected: Vec<i64>) -> Result<()> {
         test_i32_result(expr, vec![0..8], expected)
     }
 
     fn test_i32_result(
         expr: &Rank,
         ranks: Vec<Range<usize>>,
-        expected: Vec<u64>,
+        expected: Vec<i64>,
     ) -> Result<()> {
         let args = PartitionEvaluatorArgs::default();
         let result = expr
             .partition_evaluator(args)?
             .evaluate_all_with_rank(8, &ranks)?;
-        let result = as_uint64_array(&result)?;
+        let result = as_int64_array(&result)?;
         let result = result.values();
         assert_eq!(expected, *result);
         Ok(())
@@ -411,6 +441,48 @@ mod tests {
         let result = as_float64_array(&result)?;
         let result = result.values();
         assert_eq!(expected, *result);
+        Ok(())
+    }
+
+    #[test]
+    fn signed_ranks_streaming_and_bigint_boundary() -> Result<()> {
+        use datafusion_common::arrow::array::Int32Array;
+        let values: ArrayRef = Arc::new(Int32Array::from(vec![1, 1, 2]));
+        for (rank_type, expected) in [
+            (RankType::Basic, vec![1_i64, 1, 3]),
+            (RankType::Dense, vec![1_i64, 1, 2]),
+        ] {
+            let mut evaluator = RankEvaluator {
+                state: RankState::default(),
+                rank_type,
+            };
+            for (index, rank) in expected.into_iter().enumerate() {
+                assert_eq!(
+                    evaluator.evaluate(&[Arc::clone(&values)], &(index..index + 1))?,
+                    ScalarValue::Int64(Some(rank))
+                );
+            }
+            assert!(
+                evaluator
+                    .evaluate_all_with_rank(i64::MAX as usize + 1, &[])
+                    .is_err()
+            );
+        }
+        for rank_type in [RankType::Basic, RankType::Dense] {
+            let mut evaluator = RankEvaluator {
+                state: RankState {
+                    last_rank_boundary: i64::MAX as usize - 1,
+                    n_rank: i64::MAX as usize - 1,
+                    ..Default::default()
+                },
+                rank_type,
+            };
+            assert_eq!(
+                evaluator.evaluate(&[Arc::clone(&values)], &(0..1))?,
+                ScalarValue::Int64(Some(i64::MAX))
+            );
+            assert!(evaluator.evaluate(&[Arc::clone(&values)], &(2..3)).is_err());
+        }
         Ok(())
     }
 
