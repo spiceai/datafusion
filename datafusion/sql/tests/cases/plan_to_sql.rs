@@ -19805,3 +19805,51 @@ fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_projected_exists_probe_set_comparison_repeatability_guard() -> Result<()> {
+    for quantifier in [
+        datafusion_expr::expr::SetQuantifier::Any,
+        datafusion_expr::expr::SetQuantifier::All,
+    ] {
+        let body = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+            .project(vec![random().alias("d")])?
+            .build()?;
+        let comparison = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+            Box::new(lit(0.5)),
+            datafusion_expr::Subquery {
+                subquery: Arc::new(body),
+                outer_ref_columns: vec![],
+                spans: datafusion_common::Spans::new(),
+            },
+            datafusion_expr::Operator::Gt,
+            quantifier,
+        ));
+        let projected = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+            .project(vec![comparison.alias("c")])?
+            .alias("q")?
+            .build()?;
+        let plain = table_scan(
+            Some("p"),
+            &Schema::new(vec![Field::new("c", DataType::Boolean, false)]),
+            Some(vec![0]),
+        )?
+        .build()?;
+        let (probe, build, probe_key, build_key) = (projected, plain, "q.c", "p.c");
+        let plan = LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (vec![probe_key], vec![build_key]),
+                None,
+            )?
+            .build()?;
+        let error = Unparser::new(&UnparserMySqlDialect {})
+            .plan_to_sql(&plan)
+            .expect_err(
+                "MySQL cannot promise one evaluation of derived subquery outputs",
+            );
+        assert_contains!(error.to_string(), "evaluates the expression again");
+    }
+    Ok(())
+}
