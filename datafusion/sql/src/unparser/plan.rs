@@ -32,11 +32,11 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        EnclosedRelations, enclosed_qualifiers, expr_contains_subquery, filter_stack,
-        filters_scope_their_projection, find_agg_node_within_select,
-        find_unnest_node_within_select, find_window_nodes_within_select,
-        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
-        name_scope_outputs, partition_subquery_filters,
+        EnclosedRelations, aggregate_outputs_can_be_scoped, enclosed_qualifiers,
+        expr_contains_subquery, filter_stack, filters_scope_their_projection,
+        find_agg_node_within_select, find_unnest_node_within_select,
+        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
+        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, scope_sort_keys, scope_sort_over_projection,
         select_list_wraps_a_grouping_expr, sort_keys_scope_their_projection,
@@ -1436,7 +1436,17 @@ impl Unparser<'_> {
         };
         let reads_no_columns = projection.expr.iter().all(|expr| {
             matches!(
-                expr.exists(|expr| Ok(matches!(expr, Expr::Column(_)))),
+                expr.exists(|expr| Ok(match expr {
+                    Expr::Column(_) => true,
+                    Expr::ScalarSubquery(subquery) =>
+                        !subquery.outer_ref_columns.is_empty(),
+                    Expr::Exists(exists) => !exists.subquery.outer_ref_columns.is_empty(),
+                    Expr::InSubquery(in_subquery) =>
+                        !in_subquery.subquery.outer_ref_columns.is_empty(),
+                    Expr::SetComparison(comparison) =>
+                        !comparison.subquery.outer_ref_columns.is_empty(),
+                    _ => false,
+                })),
                 Ok(false)
             )
         });
@@ -1446,6 +1456,9 @@ impl Unparser<'_> {
         let Some(agg) = find_agg_node_within_select(plan, true) else {
             return false;
         };
+        if !aggregate_outputs_can_be_scoped(agg) {
+            return false;
+        }
         // A projection that reads none of the aggregate's outputs still needs
         // its rows: one for a global aggregate, or one per group. Keep the
         // aggregate in its own scope so constants and an empty SELECT list
