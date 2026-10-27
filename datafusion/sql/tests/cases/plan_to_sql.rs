@@ -1539,23 +1539,31 @@ fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
 #[test]
 fn test_unparser_preserves_external_correlation_over_global_aggregate() -> Result<()> {
     let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
-    let correlated = scalar_subquery(Arc::new(
-        LogicalPlanBuilder::empty(true)
-            .project(vec![out_ref_col(DataType::Int32, "outer_t.id").alias("k")])?
-            .build()?,
-    ));
     let mut sql = Vec::new();
-    for predicate in [col("e.id").gt_eq(lit(0)), col("e.id").lt(lit(0))] {
-        let plan = table_scan(Some("e"), &schema, None)?
-            .filter(predicate)?
-            .aggregate(Vec::<Expr>::new(), vec![max(col("e.id"))])?
-            .project(vec![correlated.clone()])?
-            .build()?;
-        sql.push(
-            Unparser::new(&UnparserPostgreSqlDialect {})
-                .plan_to_sql(&plan)?
-                .to_string(),
-        );
+    for alias_reference in [true, false] {
+        let reference = out_ref_col(DataType::Int32, "outer_t.id");
+        let reference = if alias_reference {
+            reference.alias("k")
+        } else {
+            reference
+        };
+        let correlated = scalar_subquery(Arc::new(
+            LogicalPlanBuilder::empty(true)
+                .project(vec![reference])?
+                .build()?,
+        ));
+        for predicate in [col("e.id").gt_eq(lit(0)), col("e.id").lt(lit(0))] {
+            let plan = table_scan(Some("e"), &schema, None)?
+                .filter(predicate)?
+                .aggregate(Vec::<Expr>::new(), vec![max(col("e.id")).alias("id")])?
+                .project(vec![correlated.clone()])?
+                .build()?;
+            sql.push(
+                Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string(),
+            );
+        }
     }
     assert_snapshot!("external_correlation_global_aggregate", sql.join("\n"));
     Ok(())
