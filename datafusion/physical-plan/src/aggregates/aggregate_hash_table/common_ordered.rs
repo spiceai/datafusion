@@ -401,8 +401,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         let Some(emit_to) = self.buffer.group_ordering.emit_to() else {
             return Ok(None);
         };
-        let (emit_to, should_remove_groups) =
-            self.clamp_emit_to(emit_to);
+        let (emit_to, should_remove_groups) = self.clamp_emit_to(emit_to);
 
         let timer = self.group_by_metrics.emitting_time.timer();
         let mut output = self.buffer.group_values.emit(emit_to)?;

@@ -4547,7 +4547,8 @@ mod tests {
     /// Groups left at end of input are emitted in `batch_size` slices of one
     /// materialized output, by both the ordered partial and final streams.
     #[tokio::test]
-    async fn ordered_aggregate_drains_remaining_groups_in_batch_size_slices() -> Result<()> {
+    async fn ordered_aggregate_drains_remaining_groups_in_batch_size_slices() -> Result<()>
+    {
         let schema = Arc::new(Schema::new(vec![
             Field::new("sort_col", DataType::Int32, false),
             Field::new("group_col", DataType::Int32, false),
@@ -4600,12 +4601,9 @@ mod tests {
         let sizes: Vec<_> = partial_output.iter().map(RecordBatch::num_rows).collect();
         assert_eq!(sizes, vec![3, 3, 3, 1]);
 
-        let final_input = TestMemoryExec::try_new(
-            &[partial_output],
-            partial.schema(),
-            None,
-        )?
-        .try_with_sort_information(vec![ordering])?;
+        let final_input =
+            TestMemoryExec::try_new(&[partial_output], partial.schema(), None)?
+                .try_with_sort_information(vec![ordering])?;
         let final_input = Arc::new(TestMemoryExec::update_cache(&Arc::new(final_input)));
         let final_aggregate = AggregateExec::try_new(
             AggregateMode::Final,
