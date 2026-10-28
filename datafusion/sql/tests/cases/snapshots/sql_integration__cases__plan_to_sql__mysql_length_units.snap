@@ -1,0 +1,6 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: "sql.join(\"\\n\")"
+---
+character_length(`s`)
+length(`b`)

@@ -22,7 +22,7 @@ use datafusion_common::{DFSchema, Diagnostic, Result, not_impl_err, plan_err};
 use datafusion_expr::{
     Expr, ExprSchemable, Operator,
     binary::BinaryTypeCoercer,
-    type_coercion::{is_interval, is_signed_numeric, is_timestamp},
+    type_coercion::{is_interval, is_timestamp, negation_coercion},
 };
 use sqlparser::ast::{Expr as SQLExpr, UnaryOperator, Value, ValueWithSpan};
 
@@ -108,11 +108,7 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
                             self.sql_expr_to_logical_expr(expr, schema, planner_context)?;
                         let field = operand.to_field(schema)?.1;
                         let data_type = field.data_type();
-                        if data_type.is_null()
-                            || is_signed_numeric(data_type)
-                            || is_interval(data_type)
-                            || is_timestamp(data_type)
-                        {
+                        if negation_coercion(data_type).is_some() {
                             Ok(Expr::Negative(Box::new(operand)))
                         } else {
                             let span = operand.spans().and_then(|s| s.first());

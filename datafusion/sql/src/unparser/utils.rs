@@ -262,6 +262,25 @@ fn strip_aliases(expr: &Expr) -> &Expr {
     expr
 }
 
+/// Whether aggregate outputs can be named uniquely in a derived-table scope.
+/// Outputs distinguished only by qualifier would collide after aliasing.
+/// Grouping sets include an internal grouping-id field that cannot be paired
+/// positionally with the grouping expressions.
+pub(crate) fn aggregate_outputs_can_be_scoped(agg: &Aggregate) -> bool {
+    if agg
+        .group_expr
+        .iter()
+        .any(|expr| matches!(strip_aliases(expr), Expr::GroupingSet(_)))
+    {
+        return false;
+    }
+    let mut names = HashSet::new();
+    agg.schema
+        .fields()
+        .iter()
+        .all(|field| names.insert(field.name()))
+}
+
 /// Whether any select item *wraps* a computed grouping expression — reaches one
 /// through a wrapper rather than being that reference itself.
 ///
@@ -279,28 +298,7 @@ fn strip_aliases(expr: &Expr) -> &Expr {
 /// rescue a wrapped one, so this asks whether *any* item wraps, not whether all of
 /// them do.
 pub(crate) fn select_list_wraps_a_grouping_expr(exprs: &[Expr], agg: &Aggregate) -> bool {
-    // A `ROLLUP`/`CUBE`/`GROUPING SETS` is one `Expr::GroupingSet` covering several
-    // grouping outputs, and adds an internal grouping-id output of its own, so the
-    // positional pairing below does not describe it. Such a plan keeps the flat
-    // rendering it has today rather than being paired up wrongly.
-    if agg
-        .group_expr
-        .iter()
-        .any(|expr| matches!(strip_aliases(expr), Expr::GroupingSet(_)))
-    {
-        return false;
-    }
-    // The scope names its outputs by the name its schema reports, which drops the
-    // qualifier, so two outputs the schema tells apart only by qualifier — grouping
-    // a join by `left.id` and `right.id` — would collide into one name and the
-    // rewrite would fail to build. Leave that shape as it renders today.
-    let mut names = HashSet::new();
-    if !agg
-        .schema
-        .fields()
-        .iter()
-        .all(|field| names.insert(field.name()))
-    {
+    if !aggregate_outputs_can_be_scoped(agg) {
         return false;
     }
     // An Aggregate's schema reports its grouping outputs first, so zipping pairs

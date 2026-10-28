@@ -27,9 +27,9 @@ use super::{
     utils::sqlite_from_unixtime_to_sql,
 };
 use arrow::array::timezone::Tz;
-use arrow::datatypes::TimeUnit;
+use arrow::datatypes::{DataType, TimeUnit};
 use chrono::DateTime;
-use datafusion_common::{Result, ScalarValue, internal_err};
+use datafusion_common::{Result, ScalarValue, internal_err, not_impl_err};
 use datafusion_expr::{Expr, SortExpr};
 use regex::Regex;
 use sqlparser::tokenizer::Span;
@@ -1072,6 +1072,30 @@ impl Dialect for MySqlDialect {
         func_name: &str,
         args: &[Expr],
     ) -> Result<Option<ast::Expr>> {
+        if func_name == "length" && args.len() == 1 {
+            // Spark's length counts characters for strings and bytes for binary.
+            // MySQL's LENGTH counts bytes for both, while CHARACTER_LENGTH
+            // follows the connection character set even for a binary value.
+            return match unparser.resolved_data_type(&args[0]) {
+                Some(DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View) => {
+                    character_length_to_sql(
+                        unparser,
+                        CharacterLengthStyle::CharacterLength,
+                        args,
+                    )
+                }
+                Some(
+                    DataType::Binary
+                    | DataType::LargeBinary
+                    | DataType::BinaryView
+                    | DataType::FixedSizeBinary(_),
+                ) => Ok(None),
+                _ => not_impl_err!(
+                    "Unparsing MySQL length requires a known string or binary argument type"
+                ),
+            };
+        }
+
         if func_name == "date_part" {
             return date_part_to_sql(unparser, self.date_field_extract_style(), args);
         }

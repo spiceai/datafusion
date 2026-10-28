@@ -1235,7 +1235,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     // Now check what our filter looks like
     #[cfg(not(feature = "force_hash_collisions"))]
     insta::assert_snapshot!(
-        format!("{}", format_plan_for_test(&plan)),
+        format_plan_for_test(&plan).to_string(),
         @r"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
@@ -1253,7 +1253,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_partitioned() {
     // joins or any scenario where all build-side data naturally lands in one partition.
     #[cfg(feature = "force_hash_collisions")]
     insta::assert_snapshot!(
-        format!("{}", format_plan_for_test(&plan)),
+        format_plan_for_test(&plan).to_string(),
         @r"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
@@ -1451,7 +1451,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_range_partitioned() {
 
     // Now check what our filter looks like
     insta::assert_snapshot!(
-        format!("{}", format_plan_for_test(&plan)),
+        format_plan_for_test(&plan).to_string(),
         @r"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
@@ -1580,7 +1580,7 @@ async fn test_hashjoin_dynamic_filter_pushdown_collect_left() {
 
     // Now check what our filter looks like
     insta::assert_snapshot!(
-        format!("{}", format_plan_for_test(&plan)),
+        format_plan_for_test(&plan).to_string(),
         @r"
     - SortExec: expr=[a@0 DESC NULLS LAST], preserve_partitioning=[false]
     -   CoalescePartitionsExec
