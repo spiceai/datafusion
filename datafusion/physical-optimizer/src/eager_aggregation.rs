@@ -1133,7 +1133,9 @@ mod tests {
     use crate::PhysicalOptimizerRule;
 
     use crate::ensure_requirements::EnsureRequirements;
-    use arrow::array::{Decimal128Array, Float64Array, Int32Array, StringArray};
+    use arrow::array::{
+        Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::NullEquality;
@@ -2589,6 +2591,178 @@ mod tests {
             sorted_rows(&off_rows),
             "eager-on results must match eager-off"
         );
+    }
+
+    /// Runs `SELECT count(id), count(*), sum(qty) FROM t WHERE qty NOT IN
+    /// (SELECT n FROM sub)` — an ungrouped aggregate over a null-aware `LeftAnti`
+    /// join — with eager aggregation on and off, and returns both results.
+    async fn ungrouped_aggregate_over_null_aware_anti_join(
+        sub_n: Vec<Option<i32>>,
+    ) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+        // t(qty, id): real rows are tiny; stats claim 10M rows / qty NDV 100.
+        let t_schema = Arc::new(Schema::new(vec![
+            Field::new("qty", DataType::Int32, true),
+            Field::new("id", DataType::Int64, true),
+        ]));
+        let t_batch = RecordBatch::try_new(
+            Arc::clone(&t_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(2)])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            ],
+        )
+        .unwrap();
+        let t = Arc::new(DataStatsExec::new(
+            vec![t_batch],
+            stats_with(10_000_000, &[Some(100), None]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let sub_rows = sub_n.len();
+        let sub_schema =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+        let sub_batch = RecordBatch::try_new(
+            Arc::clone(&sub_schema),
+            vec![Arc::new(Int32Array::from(sub_n))],
+        )
+        .unwrap();
+        let sub = Arc::new(DataStatsExec::new(
+            vec![sub_batch],
+            stats_with(sub_rows, &[Some(sub_rows)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                t,
+                sub,
+                vec![(
+                    Arc::new(Column::new("qty", 0)),
+                    Arc::new(Column::new("n", 0)),
+                )],
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema(); // [qty, id]
+
+        let mk = |alias: &str, udaf: Arc<AggregateUDF>, arg: Arc<dyn PhysicalExpr>| {
+            Arc::new(
+                AggregateExprBuilder::new(udaf, vec![arg])
+                    .schema(Arc::clone(&join_schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let aggrs = vec![
+            mk("count(t.id)", count_udaf(), Arc::new(Column::new("id", 1))),
+            mk("count(*)", count_udaf(), lit(1_i64)),
+            mk("sum(t.qty)", sum_udaf(), Arc::new(Column::new("qty", 0))),
+        ];
+        let group = PhysicalGroupBy::new_single(vec![]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group,
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Final,
+                final_group,
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let eager_on = run_rule(Arc::clone(&plan));
+        assert!(
+            join_child_is_aggregate(&eager_on),
+            "eager aggregation should have fired:\n{}",
+            plan_str(&eager_on)
+        );
+        let on = enforce_distribution(eager_on);
+        let off = enforce_distribution(plan);
+
+        let ctx = Arc::new(TaskContext::default());
+        let on_rows = collect(on, Arc::clone(&ctx)).await.unwrap();
+        let off_rows = collect(off, ctx).await.unwrap();
+        (on_rows, off_rows)
+    }
+
+    // Regression: `count(id) ... WHERE qty NOT IN (SELECT n FROM sub)` with a NULL
+    // in `sub` returned NULL (and `count(*)` failed its non-null schema) once the
+    // count was pushed below the null-aware anti join, because the join emits no
+    // rows and the SUM merging the partial counts is NULL over none. An ungrouped
+    // COUNT is 0 there; SUM stays NULL.
+    #[tokio::test]
+    async fn ungrouped_count_over_an_empty_anti_join_is_zero() {
+        let (on, off) =
+            ungrouped_aggregate_over_null_aware_anti_join(vec![Some(7), None]).await;
+        let expected = vec![
+            "+-------------+----------+------------+",
+            "| count(t.id) | count(*) | sum(t.qty) |",
+            "+-------------+----------+------------+",
+            "| 0           | 0        |            |",
+            "+-------------+----------+------------+",
+        ];
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&off)
+                .unwrap()
+                .to_string()
+                .lines()
+                .collect::<Vec<_>>(),
+            expected,
+            "eager-off reference"
+        );
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&on)
+                .unwrap()
+                .to_string()
+                .lines()
+                .collect::<Vec<_>>(),
+            expected,
+            "eager-on must match eager-off"
+        );
+    }
+
+    // The same rewrite over an anti join that keeps rows still counts them.
+    #[tokio::test]
+    async fn ungrouped_count_over_a_non_empty_anti_join_is_unchanged() {
+        let (on, off) =
+            ungrouped_aggregate_over_null_aware_anti_join(vec![Some(1)]).await;
+        // qty 2 (ids 20 and 40) survives; the NULL qty does not (null-aware).
+        let expected = vec![
+            "+-------------+----------+------------+",
+            "| count(t.id) | count(*) | sum(t.qty) |",
+            "+-------------+----------+------------+",
+            "| 2           | 2        | 4          |",
+            "+-------------+----------+------------+",
+        ];
+        for (label, rows) in [("eager-off", &off), ("eager-on", &on)] {
+            assert_eq!(
+                arrow::util::pretty::pretty_format_batches(rows)
+                    .unwrap()
+                    .to_string()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     // Decimal SUM widens its input precision by +10. Eager aggregation rewrites
