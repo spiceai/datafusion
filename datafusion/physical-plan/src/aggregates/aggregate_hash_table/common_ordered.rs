@@ -427,6 +427,13 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), output)?;
         debug_assert!(batch.num_rows() > 0);
 
+        if emit_to == EmitTo::All {
+            // Every group is now in `batch`; release the emptied key and index
+            // buffers so the reservation covers only the output.
+            self.buffer.group_values.clear_shrink(0);
+            self.buffer.group_indices.clear();
+            self.buffer.group_indices.shrink_to_fit();
+        }
         if batch.num_rows() <= self.batch_size {
             return Ok(Some(batch));
         }
