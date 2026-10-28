@@ -38,7 +38,9 @@ use crate::aggregates::{
     evaluate_group_by,
 };
 
-use super::common::{AggregateAccumulator, EvaluatedAggregateBatch};
+use super::common::{
+    AggregateAccumulator, EvaluatedAggregateBatch, MaterializedAggregateOutput,
+};
 
 /// Aggregate table shared by the ordered partial and final paths.
 ///
@@ -93,6 +95,12 @@ pub(in crate::aggregates) struct OrderedAggregateTable<OrderedAggrMode> {
 
     /// Group keys, ordering state, and accumulator states.
     pub(super) buffer: OrderedAggregateTableBuffer,
+
+    /// Output of every remaining group, materialized once after the input is
+    /// done and handed out in `batch_size` slices. Emitting the remainder as
+    /// repeated `EmitTo::First(batch_size)` instead renumbers every group left
+    /// in `GroupValues` per batch, which is quadratic in the group count.
+    pub(super) drained: Option<MaterializedAggregateOutput>,
 
     _mode: PhantomData<OrderedAggrMode>,
 }
@@ -183,6 +191,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
                 group_indices: vec![],
                 accumulators,
             },
+            drained: None,
             _mode: PhantomData,
         })
     }
@@ -235,7 +244,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
 
     /// Check if there is zero groups accumulated so far.
     pub(in crate::aggregates) fn is_empty(&self) -> bool {
-        self.num_groups() == 0
+        self.num_groups() == 0 && self.drained.is_none()
     }
 
     /// All internal buffer's memory size.
@@ -248,6 +257,10 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
             + self.buffer.group_values.size()
             + self.buffer.group_ordering.size()
             + self.buffer.group_indices.allocated_size()
+            + self
+                .drained
+                .as_ref()
+                .map_or(0, MaterializedAggregateOutput::memory_size)
     }
 
     pub(in crate::aggregates) fn group_by_metrics(&self) -> GroupByMetrics {
@@ -264,6 +277,10 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
     pub(in crate::aggregates) fn take_state_batch(
         &mut self,
     ) -> Result<Option<RecordBatch>> {
+        debug_assert!(
+            self.drained.is_none(),
+            "state is only taken while input is still being read"
+        );
         if self.buffer.group_values.is_empty() {
             return Ok(None);
         }
@@ -287,21 +304,17 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         Ok(Some(batch))
     }
 
-    /// Returns the [`EmitTo`], clamped to the specified batch size
+    /// Returns the [`EmitTo`], with an early `EmitTo::First` clamped to the
+    /// batch size. `EmitTo::All` is emitted whole and sliced from `drained`.
     ///
     /// Returns `(emit_to, should_remove_groups)`, where `emit_to` is the number
     /// of groups to emit from `GroupValues` / accumulators, and
     /// `should_remove_groups` indicates whether `GroupOrdering` must also shift
     /// its tracked indexes.
-    pub(super) fn clamp_emit_to(
-        &self,
-        group_count: usize,
-        emit_to: EmitTo,
-    ) -> (EmitTo, bool) {
+    pub(super) fn clamp_emit_to(&self, emit_to: EmitTo) -> (EmitTo, bool) {
         match emit_to {
             EmitTo::First(n) => (EmitTo::First(n.min(self.batch_size)), true),
-            EmitTo::All if group_count <= self.batch_size => (EmitTo::All, false),
-            EmitTo::All => (EmitTo::First(self.batch_size), false),
+            EmitTo::All => (EmitTo::All, false),
         }
     }
     /// Aggregates one evaluated input batch.
@@ -371,6 +384,16 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         &mut self,
         is_final: bool,
     ) -> Result<Option<RecordBatch>> {
+        if let Some(drained) = &mut self.drained {
+            let batch = drained.next_batch(self.batch_size);
+            if drained.is_exhausted() {
+                self.drained = None;
+            }
+            if batch.is_some() {
+                return Ok(batch);
+            }
+        }
+
         if self.buffer.group_values.is_empty() {
             return Ok(None);
         }
@@ -379,7 +402,7 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
             return Ok(None);
         };
         let (emit_to, should_remove_groups) =
-            self.clamp_emit_to(self.buffer.group_values.len(), emit_to);
+            self.clamp_emit_to(emit_to);
 
         let timer = self.group_by_metrics.emitting_time.timer();
         let mut output = self.buffer.group_values.emit(emit_to)?;
@@ -405,6 +428,12 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), output)?;
         debug_assert!(batch.num_rows() > 0);
 
-        Ok(Some(batch))
+        if batch.num_rows() <= self.batch_size {
+            return Ok(Some(batch));
+        }
+        let mut drained = MaterializedAggregateOutput::new(batch);
+        let batch = drained.next_batch(self.batch_size);
+        self.drained = Some(drained);
+        Ok(batch)
     }
 }
