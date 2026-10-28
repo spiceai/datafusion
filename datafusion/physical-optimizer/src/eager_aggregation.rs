@@ -2693,7 +2693,17 @@ mod tests {
         let aggrs = vec![
             mk("count(t.id)", count_udaf(), Arc::new(Column::new("id", 1))),
             mk("count(*)", count_udaf(), lit(1_i64)),
-            mk("sum(t.qty)", sum_udaf(), Arc::new(Column::new("qty", 0))),
+            // SUM has no Int32 accumulator; the planner's coercion widens it.
+            mk(
+                "sum(t.qty)",
+                sum_udaf(),
+                cast(
+                    Arc::new(Column::new("qty", 0)),
+                    &join_schema,
+                    DataType::Int64,
+                )
+                .unwrap(),
+            ),
         ];
         let group = PhysicalGroupBy::new_single(vec![]);
         let partial = Arc::new(
