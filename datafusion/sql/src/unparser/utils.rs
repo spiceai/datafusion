@@ -1377,6 +1377,71 @@ pub(crate) fn scope_sort_over_projection(
     Ok((scoped, derived))
 }
 
+/// Whether a `Sort` with `keys` over `input` has to read `input`'s outputs from a
+/// `SELECT` above it, and if so whether a key reads an output that cannot be
+/// repeated: `input` is a `DISTINCT` over a [Projection] listing no wildcard,
+/// every column the keys read is one of its outputs, and some key is more than a
+/// bare reference to one. `None` when the sort leaves its input as it is.
+///
+/// The `DISTINCT` folds into the `SELECT` computing the projection, and the
+/// `ORDER BY` of a `SELECT DISTINCT` may name only what its list shows.
+/// `PostgreSQL` refuses any other expression ("for SELECT DISTINCT, ORDER BY
+/// expressions must appear in select list"), so a key cannot be inlined there the
+/// way [`unproject_sort_expr`] inlines one over a bare projection, and an output's
+/// alias inside an expression binds to nothing (`column "r" does not exist`). An
+/// engine that accepts the alias evaluates an output that cannot be repeated again
+/// for it, ordering the rows by a value the list never showed. Read from a
+/// `SELECT` above the `DISTINCT` one, every key names outputs, each computed once.
+///
+/// A key reading a column the projection does not output, or holding a subquery,
+/// is left as it is: carrying the column through the `DISTINCT` would change which
+/// rows are distinct.
+pub(crate) fn sort_keys_scope_their_distinct(
+    keys: &[SortExpr],
+    input: &LogicalPlan,
+) -> Option<bool> {
+    let LogicalPlan::Distinct(Distinct::All(distinct_input)) = input else {
+        return None;
+    };
+    let LogicalPlan::Projection(projection) = distinct_input.as_ref() else {
+        return None;
+    };
+    let computed_key = keys.iter().any(|key| !matches!(key.expr, Expr::Column(_)));
+    let reads_only_outputs = keys.iter().all(|key| {
+        !holds_subquery(&key.expr)
+            && key
+                .expr
+                .column_refs()
+                .into_iter()
+                .all(|column| projection.schema.has_column(column))
+    });
+    (computed_key && reads_only_outputs && !projection_holds_wildcard(projection))
+        .then(|| sort_keys_read_unrepeatable_output(keys, projection))
+}
+
+/// A `Sort` over a `DISTINCT`, as [`sort_keys_scope_their_distinct`] decides it,
+/// re-expressed so the `DISTINCT` is emitted as a derived table and the keys name
+/// its outputs from the `SELECT` that reads them. The fetch stays on the sort,
+/// above the scope, for the reason [`scope_sort_over_projection`] gives.
+pub(crate) fn scope_sort_over_distinct(sort: &Sort) -> Result<LogicalPlan> {
+    Ok(LogicalPlan::Sort(Sort {
+        expr: scope_sort_keys(&sort.expr)?,
+        input: Arc::new(identity_projection_over(
+            Arc::clone(&sort.input),
+            distinct_sort_key_refusal,
+        )?),
+        fetch: sort.fetch,
+    }))
+}
+
+/// The refusal for a sort over a `SELECT DISTINCT` whose keys
+/// [`scope_sort_over_distinct`] cannot read from a `SELECT` above it.
+pub(crate) fn distinct_sort_key_refusal<T>(detail: &str) -> Result<T> {
+    not_impl_err!(
+        "Unparsing a sort over a SELECT DISTINCT by a key that is not one of its outputs is not supported {detail}"
+    )
+}
+
 fn find_agg_expr<'a>(agg: &'a Aggregate, column: &Column) -> Result<Option<&'a Expr>> {
     if let Ok(index) = agg.schema.index_of_column(column) {
         if matches!(agg.group_expr.as_slice(), [Expr::GroupingSet(_)]) {

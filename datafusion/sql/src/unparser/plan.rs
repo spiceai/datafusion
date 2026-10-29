@@ -32,14 +32,16 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        EnclosedRelations, aggregate_outputs_can_be_scoped, enclosed_qualifiers,
-        expr_contains_subquery, filter_stack, filters_scope_their_projection,
-        find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
-        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
+        EnclosedRelations, aggregate_outputs_can_be_scoped, distinct_sort_key_refusal,
+        enclosed_qualifiers, expr_contains_subquery, filter_stack,
+        filters_scope_their_projection, find_agg_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
+        name_scope_outputs, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
-        scope_filters_over_projection, scope_sort_keys, scope_sort_over_projection,
-        select_list_wraps_a_grouping_expr, sort_keys_scope_their_projection,
+        scope_filters_over_projection, scope_sort_keys, scope_sort_over_distinct,
+        scope_sort_over_projection, select_list_wraps_a_grouping_expr,
+        sort_keys_scope_their_distinct, sort_keys_scope_their_projection,
         stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
@@ -3937,6 +3939,51 @@ impl Unparser<'_> {
                         unrepeatable_sort_key_refusal,
                     )?;
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;
+                    return self
+                        .select_to_sql_recursively(&scoped, query, select, relation);
+                }
+
+                // Over a DISTINCT the key is not resolved at all, and the ORDER BY of
+                // a SELECT DISTINCT may name only what its list shows, so a key that
+                // is more than an output's name reads the outputs from a SELECT
+                // above it (`sort_keys_scope_their_distinct`). A key reading an
+                // output that cannot be repeated takes the dialect gate the
+                // projection's scope above takes.
+                if let Some(reads_unrepeatable_output) =
+                    sort_keys_scope_their_distinct(&sort.expr, sort.input.as_ref())
+                {
+                    if !Self::sort_order_is_observable(sort.fetch, query, select) {
+                        return self.select_to_sql_recursively(
+                            sort.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
+                    if reads_unrepeatable_output {
+                        self.ensure_derived_table_fixes_volatile_sort_keys()?;
+                    }
+                    if select.within_join_input() {
+                        return distinct_sort_key_refusal(
+                            "when the sort's fetch bounds an input of a join",
+                        );
+                    }
+                    let derived = sort.input.schema();
+                    self.ensure_scope_captures_no_outer_reference(
+                        sort.expr.iter().map(|key| &key.expr),
+                        select,
+                        derived,
+                        distinct_sort_key_refusal,
+                    )?;
+                    self.repoint_clauses_onto_derived_table(
+                        &enclosed_qualifiers(derived, |name| {
+                            self.emitted_column_name(name)
+                        })?,
+                        query,
+                        select,
+                        distinct_sort_key_refusal,
+                    )?;
+                    let scoped = scope_sort_over_distinct(sort)?;
                     return self
                         .select_to_sql_recursively(&scoped, query, select, relation);
                 }
