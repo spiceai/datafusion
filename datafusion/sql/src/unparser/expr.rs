@@ -192,6 +192,30 @@ impl Unparser<'_> {
         }
     }
 
+    /// Keep nested IS and NOT operands explicit: their relative precedence
+    /// differs across dialects, and some reject chained IS predicates.
+    fn predicate_operand_to_sql(&self, expr: &Expr) -> Result<ast::Expr> {
+        let operand = self.expr_to_sql_inner(expr)?;
+        if matches!(
+            operand,
+            ast::Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                ..
+            } | ast::Expr::IsNull(_)
+                | ast::Expr::IsNotNull(_)
+                | ast::Expr::IsTrue(_)
+                | ast::Expr::IsNotTrue(_)
+                | ast::Expr::IsFalse(_)
+                | ast::Expr::IsNotFalse(_)
+                | ast::Expr::IsUnknown(_)
+                | ast::Expr::IsNotUnknown(_)
+        ) {
+            Ok(ast::Expr::Nested(Box::new(operand)))
+        } else {
+            Ok(operand)
+        }
+    }
+
     fn expr_to_sql_inner(&self, expr: &Expr) -> Result<ast::Expr> {
         crate::stack::maybe_grow(|| match expr {
             Expr::InList(InList {
@@ -309,20 +333,14 @@ impl Unparser<'_> {
                     })
                     .collect::<Result<Vec<CaseWhen>>>()?;
 
-                let operand = match expr.as_ref() {
-                    Some(e) => match self.expr_to_sql_inner(e) {
-                        Ok(sql_expr) => Some(Box::new(sql_expr)),
-                        Err(_) => None,
-                    },
-                    None => None,
-                };
-                let else_result = match else_expr.as_ref() {
-                    Some(e) => match self.expr_to_sql_inner(e) {
-                        Ok(sql_expr) => Some(Box::new(sql_expr)),
-                        Err(_) => None,
-                    },
-                    None => None,
-                };
+                let operand = expr
+                    .as_deref()
+                    .map(|expr| self.expr_to_sql_inner(expr).map(Box::new))
+                    .transpose()?;
+                let else_result = else_expr
+                    .as_deref()
+                    .map(|expr| self.expr_to_sql_inner(expr).map(Box::new))
+                    .transpose()?;
 
                 Ok(ast::Expr::Case {
                     operand,
@@ -509,20 +527,18 @@ impl Unparser<'_> {
                     return Ok(overridden);
                 }
 
-                let args_to_use;
-                let within_group;
-
                 // if this is a WITHIN GROUP aggregate, skip the prepended arg
-                if agg.func.supports_within_group_clause() && !order_by.is_empty() {
-                    args_to_use = self.function_args_to_sql(&args[1..])?;
-                    within_group = order_by
-                        .iter()
-                        .map(|sort_expr| self.sort_to_sql(sort_expr))
-                        .collect::<Result<Vec<ast::OrderByExpr>>>()?;
-                } else {
-                    args_to_use = self.function_args_to_sql(args)?;
-                    within_group = Vec::new();
-                }
+                let (args_to_use, within_group) =
+                    if agg.func.supports_within_group_clause() && !order_by.is_empty() {
+                        let args_to_use = self.function_args_to_sql(&args[1..])?;
+                        let within_group = order_by
+                            .iter()
+                            .map(|sort_expr| self.sort_to_sql(sort_expr))
+                            .collect::<Result<Vec<ast::OrderByExpr>>>()?;
+                        (args_to_use, within_group)
+                    } else {
+                        (self.function_args_to_sql(args)?, Vec::new())
+                    };
 
                 let filter = match filter {
                     Some(filter) => Some(Box::new(self.expr_to_sql_inner(filter)?)),
@@ -621,32 +637,38 @@ impl Unparser<'_> {
                     negated: *negated,
                 })
             }
-            Expr::IsNull(expr) => {
-                Ok(ast::Expr::IsNull(Box::new(self.expr_to_sql_inner(expr)?)))
-            }
+            Expr::IsNull(expr) => Ok(ast::Expr::IsNull(Box::new(
+                self.predicate_operand_to_sql(expr)?,
+            ))),
             Expr::IsNotNull(expr) => Ok(ast::Expr::IsNotNull(Box::new(
-                self.expr_to_sql_inner(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
-            Expr::IsTrue(expr) => {
-                Ok(ast::Expr::IsTrue(Box::new(self.expr_to_sql_inner(expr)?)))
-            }
+            Expr::IsTrue(expr) => Ok(ast::Expr::IsTrue(Box::new(
+                self.predicate_operand_to_sql(expr)?,
+            ))),
             Expr::IsNotTrue(expr) => Ok(ast::Expr::IsNotTrue(Box::new(
-                self.expr_to_sql_inner(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
-            Expr::IsFalse(expr) => {
-                Ok(ast::Expr::IsFalse(Box::new(self.expr_to_sql_inner(expr)?)))
-            }
+            Expr::IsFalse(expr) => Ok(ast::Expr::IsFalse(Box::new(
+                self.predicate_operand_to_sql(expr)?,
+            ))),
             Expr::IsNotFalse(expr) => Ok(ast::Expr::IsNotFalse(Box::new(
-                self.expr_to_sql_inner(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsUnknown(expr) => Ok(ast::Expr::IsUnknown(Box::new(
-                self.expr_to_sql_inner(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::IsNotUnknown(expr) => Ok(ast::Expr::IsNotUnknown(Box::new(
-                self.expr_to_sql_inner(expr)?,
+                self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::Not(expr) => {
-                let sql_parser_expr = self.expr_to_sql_inner(expr)?;
+                // NOT binds more tightly than predicates such as IN on some
+                // engines. Keep the entire operand inside its own parentheses.
+                let operand = self.expr_to_sql_inner(expr)?;
+                let sql_parser_expr = match operand {
+                    AstExpr::Nested(_) => operand,
+                    _ => AstExpr::Nested(Box::new(operand)),
+                };
                 Ok(AstExpr::UnaryOp {
                     op: UnaryOperator::Not,
                     expr: Box::new(sql_parser_expr),
@@ -868,7 +890,9 @@ impl Unparser<'_> {
         );
 
         let args = args
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 let key = match &chunk[0] {
                     Expr::Literal(ScalarValue::Utf8(Some(s)), _) => self.new_ident_quoted_if_needs(s.to_string()),
@@ -1148,6 +1172,25 @@ impl Unparser<'_> {
     /// comparison site.
     pub(crate) fn emitted_column_key(&self, name: &str) -> Result<String> {
         Ok(self.identifier_comparison_key(&self.emitted_column_name(name)?))
+    }
+
+    /// [`Self::emitted_column_key`] of only the bytes of the emitted name the
+    /// dialect's engine keeps ([`super::dialect::Dialect::identifier_max_length`]),
+    /// cut on a character boundary as PostgreSQL cuts it. Two outputs of one derived
+    /// table with the same key are one column to the query reading it by name.
+    ///
+    /// Only the check that a derived table's outputs can be told apart uses it.
+    /// Matching a reference to an output keeps comparing whole names, so a reference
+    /// is never bound to an output because the two share a prefix.
+    pub(crate) fn emitted_output_name_key(&self, name: &str) -> Result<String> {
+        let emitted = self.emitted_column_name(name)?;
+        let kept = match self.dialect.identifier_max_length() {
+            Some(max) if emitted.len() > max => {
+                &emitted[..emitted.floor_char_boundary(max)]
+            }
+            _ => emitted.as_str(),
+        };
+        Ok(self.identifier_comparison_key(kept))
     }
 
     pub fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
@@ -2577,6 +2620,17 @@ mod tests {
     }
 
     #[test]
+    fn not_preserves_membership_predicate_scope() -> Result<()> {
+        let predicate = col("a").in_list(vec![lit(1), lit(2)], false);
+        let expr = Expr::Not(Box::new(predicate));
+        for pretty in [false, true] {
+            let sql = Unparser::default().with_pretty(pretty).expr_to_sql(&expr)?;
+            assert_eq!(sql.to_string(), "NOT (a IN (1, 2))");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn expr_to_sql_ok() -> Result<()> {
         let dummy_schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         #[expect(deprecated)]
@@ -2874,7 +2928,7 @@ mod tests {
                 (col("a") + col("b")).gt(lit(4)).is_not_unknown(),
                 r#"((a + b) > 4) IS NOT UNKNOWN"#,
             ),
-            (not(col("a")), r#"NOT a"#),
+            (not(col("a")), r#"NOT (a)"#),
             (
                 Expr::between(col("a"), lit(1), lit(7)),
                 r#"(a BETWEEN 1 AND 7)"#,

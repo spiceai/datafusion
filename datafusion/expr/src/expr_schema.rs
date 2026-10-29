@@ -116,6 +116,26 @@ fn cast_output_field(
     Arc::new(f)
 }
 
+fn scalar_arguments_for_fields(
+    args: &[Expr],
+    arg_fields: &[FieldRef],
+) -> Vec<Option<ScalarValue>> {
+    args.iter()
+        .zip(arg_fields)
+        .map(|(expr, field)| scalar_argument_for_field(expr, field))
+        .collect()
+}
+
+fn scalar_argument_for_field(expr: &Expr, arg_field: &FieldRef) -> Option<ScalarValue> {
+    match expr {
+        Expr::Literal(sv, _) => Some(
+            sv.cast_to(arg_field.data_type())
+                .unwrap_or_else(|_| sv.clone()),
+        ),
+        _ => None,
+    }
+}
+
 impl ExprSchemable for Expr {
     /// Returns the [arrow::datatypes::DataType] of the expression
     /// based on [ExprSchema]
@@ -167,21 +187,36 @@ impl ExprSchemable for Expr {
                 },
                 _ => expr.get_type(schema),
             },
-            Expr::Negative(expr) => expr.get_type(schema),
+            Expr::Negative(expr) => {
+                crate::type_coercion::negation_coercion(&expr.get_type(schema)?)
+                    .ok_or_else(|| {
+                        plan_datafusion_err!(
+                            "Negation only supports numeric, interval and timestamp types"
+                        )
+                    })
+            }
             Expr::Column(c) => Ok(schema.data_type(c)?.clone()),
             Expr::OuterReferenceColumn(field, _) => Ok(field.data_type().clone()),
             Expr::ScalarVariable(field, _) => Ok(field.data_type().clone()),
             Expr::Literal(l, _) => Ok(l.data_type()),
             Expr::Case(case) => {
-                for (_, then_expr) in &case.when_then_expr {
-                    let then_type = then_expr.get_type(schema)?;
-                    if !then_type.is_null() {
-                        return Ok(then_type);
-                    }
-                }
-                case.else_expr
+                let then_types = case
+                    .when_then_expr
+                    .iter()
+                    .map(|(_, expr)| expr.get_type(schema))
+                    .collect::<Result<Vec<_>>>()?;
+                let else_type = case
+                    .else_expr
                     .as_ref()
-                    .map_or(Ok(DataType::Null), |e| e.get_type(schema))
+                    .map(|expr| expr.get_type(schema))
+                    .transpose()?;
+                crate::type_coercion::other::get_coerce_type_for_case_expression(
+                    &then_types,
+                    else_type.as_ref(),
+                )
+                .ok_or_else(|| {
+                    plan_datafusion_err!("CASE result branches have no common type")
+                })
             }
             Expr::Cast(Cast { field, .. }) | Expr::TryCast(TryCast { field, .. }) => {
                 Ok(field.data_type().clone())
@@ -531,7 +566,15 @@ impl ExprSchemable for Expr {
                     .map(|(_, f)| f)?
                     .with_field_metadata(&combined_metadata))
             }
-            Expr::Negative(expr) => expr.to_field(schema).map(|(_, f)| f),
+            Expr::Negative(expr) => {
+                let (_, field) = expr.to_field(schema)?;
+                Ok(Arc::new(
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_data_type(self.get_type(schema)?),
+                ))
+            }
             Expr::Column(c) => schema.field_from_column(c).map(Arc::clone),
             Expr::OuterReferenceColumn(field, _) => {
                 Ok(Arc::clone(field).renamed(&schema_name))
@@ -623,16 +666,12 @@ impl ExprSchemable for Expr {
                     .collect::<Result<Vec<_>>>()?;
                 let new_fields = verify_function_arguments(func.as_ref(), &fields)?;
 
-                let arguments = args
-                    .iter()
-                    .map(|e| match e {
-                        Expr::Literal(sv, _) => Some(sv),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
+                let arguments = scalar_arguments_for_fields(args, &new_fields);
+                let argument_refs =
+                    arguments.iter().map(Option::as_ref).collect::<Vec<_>>();
                 let args = ReturnFieldArgs {
                     arg_fields: &new_fields,
-                    scalar_arguments: &arguments,
+                    scalar_arguments: &argument_refs,
                 };
 
                 func.return_field_from_args(args)
@@ -849,6 +888,100 @@ mod tests {
             let expr = lit(ScalarValue::Null).$EXPR_TYPE();
             assert!(!expr.nullable(&MockExprSchema::new()).unwrap());
         }};
+    }
+
+    #[test]
+    fn issue_15538_case_schema_includes_all_result_branches() -> Result<()> {
+        let schema = DFSchema::empty();
+        for (then, otherwise) in [(lit(1_i32), lit(2_i64)), (lit(1_i64), lit(2_i32))] {
+            let expression = Expr::Case(crate::expr::Case::new(
+                None,
+                vec![(Box::new(lit(true)), Box::new(then))],
+                Some(Box::new(otherwise)),
+            ));
+            assert_eq!(expression.get_type(&schema)?, DataType::Int64);
+        }
+        let expression = Expr::Case(crate::expr::Case::new(
+            None,
+            vec![(Box::new(lit(true)), Box::new(lit(ScalarValue::Null)))],
+            Some(Box::new(lit(2_i64))),
+        ));
+        assert_eq!(expression.get_type(&schema)?, DataType::Int64);
+        Ok(())
+    }
+
+    #[test]
+    fn unsigned_negation_schema_has_a_signed_result_type() -> Result<()> {
+        let schema = DFSchema::empty();
+        for (value, expected) in [
+            (ScalarValue::UInt8(Some(u8::MAX)), DataType::Int16),
+            (ScalarValue::UInt16(Some(u16::MAX)), DataType::Int32),
+            (ScalarValue::UInt32(Some(u32::MAX)), DataType::Int64),
+            (ScalarValue::UInt64(Some(u64::MAX)), DataType::Int64),
+        ] {
+            let expression = Expr::Negative(Box::new(lit(value)));
+            assert_eq!(expression.get_type(&schema)?, expected);
+            assert_eq!(expression.to_field(&schema)?.1.data_type(), &expected);
+            let plan = LogicalPlanBuilder::empty(true)
+                .project(vec![expression])?
+                .build()?;
+            assert_eq!(plan.schema().field(0).data_type(), &expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_arguments_match_coerced_fields() {
+        let int16_field: FieldRef = Field::new("arg", DataType::Int16, true).into();
+
+        assert_eq!(
+            scalar_argument_for_field(&lit(1_i64), &int16_field),
+            Some(ScalarValue::Int16(Some(1)))
+        );
+        assert_eq!(
+            scalar_argument_for_field(&lit(ScalarValue::Null), &int16_field),
+            Some(ScalarValue::Int16(None))
+        );
+
+        let int32_list = ScalarValue::List(ScalarValue::new_list(
+            &[ScalarValue::Int32(Some(1))],
+            &DataType::Int32,
+            true,
+        ));
+        let int64_list_type = DataType::new_list(DataType::Int64, true);
+        let int64_list_field: FieldRef =
+            Field::new("arg", int64_list_type.clone(), true).into();
+        assert_eq!(
+            scalar_argument_for_field(&lit(int32_list.clone()), &int64_list_field),
+            Some(int32_list.cast_to(&int64_list_type).unwrap())
+        );
+    }
+
+    #[test]
+    fn scalar_arguments_exclude_expression_casts_and_preserve_invalid_values() {
+        let int16_field: FieldRef = Field::new("arg", DataType::Int16, true).into();
+        let int32_field: FieldRef = Field::new("arg", DataType::Int32, true).into();
+        let explicit_cast = Expr::Cast(Cast::new(Box::new(lit(1_i64)), DataType::Int16));
+        let explicit_try_cast =
+            Expr::TryCast(TryCast::new(Box::new(lit(1_i64)), DataType::Int16));
+        let out_of_i32_range = i64::from(i32::MAX) + 1;
+
+        assert_eq!(
+            scalar_argument_for_field(&explicit_cast, &int16_field),
+            None
+        );
+        assert_eq!(
+            scalar_argument_for_field(&explicit_try_cast, &int16_field),
+            None
+        );
+        assert_eq!(
+            scalar_argument_for_field(&lit("not an integer"), &int16_field),
+            Some(ScalarValue::Utf8(Some("not an integer".to_string())))
+        );
+        assert_eq!(
+            scalar_argument_for_field(&lit(out_of_i32_range), &int32_field),
+            Some(ScalarValue::Int64(Some(out_of_i32_range)))
+        );
     }
 
     #[test]

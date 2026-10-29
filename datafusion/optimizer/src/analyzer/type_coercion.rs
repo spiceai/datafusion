@@ -52,9 +52,7 @@ use datafusion_expr::type_coercion::other::{
     get_coerce_type_for_case_expression, get_coerce_type_for_case_when,
     get_coerce_type_for_list,
 };
-use datafusion_expr::type_coercion::{
-    is_datetime, is_interval, is_signed_numeric, is_timestamp,
-};
+use datafusion_expr::type_coercion::{is_datetime, negation_coercion};
 use datafusion_expr::utils::merge_schema;
 use datafusion_expr::{
     Cast, DmlStatement, Expr, ExprSchemable, Join, Limit, LogicalPlan, Operator,
@@ -669,16 +667,25 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
             ))),
             Expr::Negative(expr) => {
                 let data_type = expr.get_type(self.schema)?;
-                if data_type.is_null()
-                    || is_signed_numeric(&data_type)
-                    || is_interval(&data_type)
-                    || is_timestamp(&data_type)
-                {
-                    Ok(Transformed::no(Expr::Negative(expr)))
-                } else {
-                    plan_err!(
+                let target = negation_coercion(&data_type).ok_or_else(|| {
+                    plan_datafusion_err!(
                         "Negation only supports numeric, interval and timestamp types"
                     )
+                })?;
+                if target == data_type {
+                    Ok(Transformed::no(Expr::Negative(expr)))
+                } else {
+                    // UInt64's negated value may fit Int64 even when the positive
+                    // operand does not. Negate exactly before checking the result.
+                    let operand_type = if data_type == DataType::UInt64 {
+                        DataType::Decimal128(20, 0)
+                    } else {
+                        target.clone()
+                    };
+                    let negative = Expr::Negative(Box::new(
+                        (*expr).cast_to(&operand_type, self.schema)?,
+                    ));
+                    Ok(Transformed::yes(negative.cast_to(&target, self.schema)?))
                 }
             }
             Expr::Like(Like {
@@ -813,8 +820,11 @@ impl TreeNodeRewriter for TypeCoercionRewriter<'_> {
                 Ok(Transformed::yes(Expr::Case(case)))
             }
             Expr::ScalarFunction(ScalarFunction { func, args }) => {
-                let new_expr =
-                    coerce_arguments_for_signature(args, self.schema, func.as_ref())?;
+                let new_expr = coerce_scalar_function_arguments_for_signature(
+                    args,
+                    self.schema,
+                    func.as_ref(),
+                )?;
                 Ok(Transformed::yes(Expr::ScalarFunction(
                     ScalarFunction::new_udf(func, new_expr),
                 )))
@@ -1133,21 +1143,78 @@ fn coerce_arguments_for_signature<F: UDFCoercionExt>(
     schema: &DFSchema,
     func: &F,
 ) -> Result<Vec<Expr>> {
+    let coerced_types = coerced_argument_types(&expressions, schema, func)?;
+
+    expressions
+        .into_iter()
+        .zip(coerced_types)
+        .map(|(expr, data_type)| expr.cast_to(&data_type, schema))
+        .collect()
+}
+
+/// Coerces scalar function arguments while materializing successful implicit
+/// casts of literals. This preserves the literal for subsequent calls to
+/// `return_field_from_args` without treating user-written `Cast` or `TryCast`
+/// expressions as scalar arguments.
+fn coerce_scalar_function_arguments_for_signature<F: UDFCoercionExt>(
+    expressions: Vec<Expr>,
+    schema: &DFSchema,
+    func: &F,
+) -> Result<Vec<Expr>> {
+    let coerced_types = coerced_argument_types(&expressions, schema, func)?;
+
+    expressions
+        .into_iter()
+        .zip(coerced_types)
+        .map(|(expr, data_type)| {
+            coerce_scalar_function_argument(expr, &data_type, schema)
+        })
+        .collect()
+}
+
+fn coerced_argument_types<F: UDFCoercionExt>(
+    expressions: &[Expr],
+    schema: &DFSchema,
+    func: &F,
+) -> Result<Vec<DataType>> {
     let current_fields = expressions
         .iter()
         .map(|e| e.to_field(schema).map(|(_, f)| f))
         .collect::<Result<Vec<_>>>()?;
 
-    let coerced_types = fields_with_udf(&current_fields, func)?
-        .into_iter()
-        .map(|f| f.data_type().clone())
-        .collect::<Vec<_>>();
+    fields_with_udf(&current_fields, func).map(|fields| {
+        fields
+            .into_iter()
+            .map(|field| field.data_type().clone())
+            .collect()
+    })
+}
 
-    expressions
-        .into_iter()
-        .enumerate()
-        .map(|(i, expr)| expr.cast_to(&coerced_types[i], schema))
-        .collect()
+fn coerce_scalar_function_argument(
+    expr: Expr,
+    data_type: &DataType,
+    schema: &DFSchema,
+) -> Result<Expr> {
+    if matches!(&expr, Expr::Cast(_) | Expr::TryCast(_))
+        && expr.get_type(schema)? == *data_type
+    {
+        return Ok(expr);
+    }
+
+    let Expr::Literal(value, metadata) = expr else {
+        return expr.cast_to(data_type, schema);
+    };
+
+    if value.data_type() != *data_type
+        && let Ok(value) = value.cast_to(data_type)
+    {
+        return Ok(Expr::Literal(value, metadata));
+    }
+
+    // A failed value cast remains an expression cast so execution produces the
+    // same error as before. Since it is no longer a literal at the coerced type,
+    // it is reported as `None` in `ReturnFieldArgs::scalar_arguments`.
+    Expr::Literal(value, metadata).cast_to(data_type, schema)
 }
 
 fn coerce_case_expression(case: Case, schema: &DFSchema) -> Result<Case> {
@@ -2020,7 +2087,7 @@ mod test {
         assert_analyzed_plan_eq!(
             plan,
             @r"
-        Projection: TestScalarUDF(CAST(Int32(123) AS Float32))
+        Projection: TestScalarUDF(Float32(123)) AS TestScalarUDF(Int32(123))
           EmptyRelation: rows=0
         "
         )
@@ -2057,7 +2124,7 @@ mod test {
         assert_analyzed_plan_eq!(
             plan,
             @r"
-        Projection: TestScalarUDF(CAST(Int64(10) AS Float32))
+        Projection: TestScalarUDF(Float32(10)) AS TestScalarUDF(Int64(10))
           EmptyRelation: rows=0
         "
         )
@@ -2597,7 +2664,7 @@ mod test {
         assert_analyzed_plan_eq!(
             plan,
             @r#"
-        Projection: TestScalarUDF(a, Utf8("b"), CAST(Boolean(true) AS Utf8), CAST(Boolean(false) AS Utf8), CAST(Int32(13) AS Utf8))
+        Projection: TestScalarUDF(a, Utf8("b"), Utf8("true"), Utf8("false"), Utf8("13")) AS TestScalarUDF(a,Utf8("b"),Boolean(true),Boolean(false),Int32(13))
           EmptyRelation: rows=0
         "#
         )

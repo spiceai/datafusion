@@ -1455,6 +1455,235 @@ fn test_table_scan_with_empty_projection_and_filter_default_dialect() {
     );
 }
 
+#[test]
+fn test_unparser_preserves_is_predicate_operands() -> Result<()> {
+    let flag = col("flag");
+    let expressions = [
+        Expr::IsNull(Box::new(!flag.clone())),
+        Expr::IsNotNull(Box::new(!flag.clone())),
+        Expr::IsTrue(Box::new(!flag.clone())),
+        Expr::IsNotTrue(Box::new(!flag.clone())),
+        Expr::IsFalse(Box::new(!flag.clone())),
+        Expr::IsNotFalse(Box::new(!flag.clone())),
+        Expr::IsUnknown(Box::new(!flag.clone())),
+        Expr::IsNotUnknown(Box::new(!flag.clone())),
+        Expr::IsNull(Box::new(Expr::IsTrue(Box::new(flag.clone())))),
+        !Expr::IsNull(Box::new(Expr::IsNotNull(Box::new(flag.clone())))),
+        !Expr::IsNull(Box::new(Expr::IsNull(Box::new(flag)))),
+    ];
+    let mut sql = Vec::new();
+    for pretty in [false, true] {
+        let unparser = Unparser::new(&UnparserDefaultDialect {}).with_pretty(pretty);
+        for expr in &expressions {
+            sql.push(format!("pretty={pretty}: {}", unparser.expr_to_sql(expr)?));
+        }
+    }
+    assert_snapshot!("is_predicate_operands", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_aggregate_projection_scope_guards() -> Result<()> {
+    let mut sql = Vec::new();
+    for input in [
+        "SELECT (SELECT derived_aggregate_1.id FROM person e GROUP BY e.id) FROM person AS derived_aggregate_1",
+        "SELECT (SELECT derived_aggregate_1.id + derived_aggregate_2.id FROM person e GROUP BY e.id) FROM person AS derived_aggregate_1 CROSS JOIN person AS derived_aggregate_2",
+        "SELECT (SELECT outer_person.id FROM person e GROUP BY e.id) FROM person AS outer_person",
+        "SELECT (SELECT derived_aggregate_1.id FROM person e HAVING count(*) > 0) FROM person AS derived_aggregate_1",
+        "SELECT (SELECT derived_aggregate_1.id FROM person e WHERE e.id < 0 HAVING count(*) = 0) FROM person AS derived_aggregate_1",
+        "SELECT (SELECT derived_aggregate_1.id FROM person e WHERE e.id < 0 HAVING count(*) > 0) FROM person AS derived_aggregate_1",
+        "SELECT (SELECT person.age) AS age FROM person GROUP BY person.age",
+        "SELECT (SELECT person.age + 1) AS age FROM person GROUP BY person.age",
+        "SELECT (SELECT 42) AS k FROM person GROUP BY age",
+        "SELECT 42 AS k FROM person GROUP BY ROLLUP(age)",
+        "SELECT 42 AS k FROM person l JOIN person r ON l.age = r.age GROUP BY l.id, r.id",
+    ] {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(input)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default().with_aggregate_function(count_udaf()),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        sql.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+        );
+        if input.contains("ROLLUP") || input.contains("JOIN") {
+            if let LogicalPlan::Projection(projection) = &plan {
+                let limited = LogicalPlanBuilder::from(projection.input.as_ref().clone())
+                    .limit(0, Some(1))?
+                    .project(Vec::<Expr>::new())?
+                    .build()?;
+                sql.push(
+                    Unparser::new(&UnparserPostgreSqlDialect {})
+                        .plan_to_sql(&limited)?
+                        .to_string(),
+                );
+            }
+            let empty = LogicalPlanBuilder::from(plan)
+                .project(Vec::<Expr>::new())?
+                .build()?;
+            sql.push(
+                Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&empty)?
+                    .to_string(),
+            );
+        }
+    }
+    assert_snapshot!("aggregate_projection_scope_guards", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_external_correlation_over_global_aggregate() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, false)]);
+    let mut sql = Vec::new();
+    for alias_reference in [true, false] {
+        let reference = out_ref_col(DataType::Int32, "outer_t.id");
+        let reference = if alias_reference {
+            reference.alias("k")
+        } else {
+            reference
+        };
+        let correlated = scalar_subquery(Arc::new(
+            LogicalPlanBuilder::empty(true)
+                .project(vec![reference])?
+                .build()?,
+        ));
+        for predicate in [col("e.id").gt_eq(lit(0)), col("e.id").lt(lit(0))] {
+            let plan = table_scan(Some("e"), &schema, None)?
+                .filter(predicate)?
+                .aggregate(Vec::<Expr>::new(), vec![max(col("e.id")).alias("id")])?
+                .project(vec![correlated.clone()])?
+                .build()?;
+            sql.push(
+                Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string(),
+            );
+        }
+    }
+    assert_snapshot!("external_correlation_global_aggregate", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_pruned_aggregate_rows() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v", DataType::Int32, true),
+    ]);
+    let mut sql = Vec::new();
+    for group_expr in [vec![], vec![col("v")]] {
+        for projection in [Vec::<Expr>::new(), vec![lit(42)]] {
+            let plan = table_scan(Some("e"), &schema, None)?
+                .aggregate(group_expr.clone(), vec![max(col("id"))])?
+                .project(projection)?
+                .build()?;
+            sql.push(
+                Unparser::new(&UnparserDefaultDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string(),
+            );
+        }
+    }
+    assert_snapshot!("pruned_aggregate_rows", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_filtered_set_operation_scope() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("v", DataType::Int32, true),
+    ]);
+    let left = table_scan(Some("e"), &schema, Some(vec![1]))?
+        .project(vec![col("e.v")])?
+        .build()?;
+    let right = table_scan_with_filter_and_fetch(
+        Some("e"),
+        &schema,
+        Some(vec![1]),
+        vec![col("e.id").gt(lit(1))],
+        None,
+    )?
+    .project(vec![col("e.v")])?
+    .build()?;
+    let mut sql = Vec::new();
+    for plan in [
+        LogicalPlanBuilder::intersect(left.clone(), right.clone(), false)?,
+        LogicalPlanBuilder::except(left, right, false)?,
+    ] {
+        sql.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+        );
+    }
+    assert_snapshot!("filtered_set_operation_scope", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_unparser_propagates_case_expression_errors() -> Result<()> {
+    let length = datafusion_expr::create_udf(
+        "length",
+        vec![DataType::Utf8],
+        DataType::Int32,
+        Volatility::Immutable,
+        Arc::new(|_| internal_err!("unparser fixture is not evaluated")),
+    )
+    .call(vec![col("s")]);
+    let dialect = UnparserMySqlDialect {};
+    let unparser = Unparser::new(&dialect);
+    for expr in [
+        Expr::Case(datafusion_expr::expr::Case {
+            expr: None,
+            when_then_expr: vec![(Box::new(lit(false)), Box::new(lit(0)))],
+            else_expr: Some(Box::new(length.clone())),
+        }),
+        Expr::Case(datafusion_expr::expr::Case {
+            expr: Some(Box::new(length)),
+            when_then_expr: vec![(Box::new(lit(0)), Box::new(lit(1)))],
+            else_expr: Some(Box::new(lit(2))),
+        }),
+    ] {
+        let err = unparser
+            .expr_to_sql(&expr)
+            .expect_err("unresolved CASE expressions must propagate their error");
+        assert!(
+            err.to_string()
+                .contains("requires a known string or binary argument type"),
+            "{err}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_unparser_preserves_mysql_length_units() -> Result<()> {
+    let schema = Arc::new(DFSchema::try_from(Schema::new(vec![
+        Field::new("s", DataType::Utf8, true),
+        Field::new("b", DataType::Binary, true),
+    ]))?);
+    let dialect = UnparserMySqlDialect {};
+    let unparser = Unparser::new(&dialect).with_schema(schema);
+    let mut sql = Vec::new();
+    for name in ["s", "b"] {
+        let args = [col(name)];
+        let expr =
+            match dialect.scalar_function_to_sql_overrides(&unparser, "length", &args)? {
+                Some(expr) => expr,
+                None => unparser.scalar_function_to_sql("length", &args)?,
+            };
+        sql.push(expr.to_string());
+    }
+    assert_snapshot!("mysql_length_units", sql.join("\n"));
+    Ok(())
+}
+
 fn table_scan_with_empty_projection_and_none_projection_helper(
     table_name: &str,
     table_schema: Schema,
@@ -4980,9 +5209,7 @@ fn test_unparse_exists_join_refuses_build_key_bound_only_by_the_build_projection
         .build()?;
     refused(&plan, "a rename under the build relation's own qualifier");
 
-    // An alias pushed down onto the scan it wraps lifts the rename into the
-    // select list — `SELECT s.x AS c FROM (SELECT s.x FROM b AS s) AS s` on its
-    // own — which is the list `SELECT 1` replaces, so `s.c` binds nowhere.
+    // A named scope preserves the projection output read by the correlation.
     let aliased = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
         .project(vec![col("b.x").alias("c")])?
         .alias("s")?
@@ -4990,7 +5217,8 @@ fn test_unparse_exists_join_refuses_build_key_bound_only_by_the_build_projection
     let plan = LogicalPlanBuilder::from(probe.clone())
         .join(aliased, LeftSemi, (vec!["p.c"], vec!["s.c"]), None)?
         .build()?;
-    refused(&plan, "a rename behind an alias pushed down onto the scan");
+    let sql = plan_to_sql(&plan)?.to_string();
+    assert_contains!(sql, "AS s WHERE (p.c = s.c)");
 
     // An alias over an inline join renames its primary relation only —
     // `FROM b AS a CROSS JOIN t` — so a column of the relation beside it,
@@ -7036,6 +7264,379 @@ fn test_unparse_chained_intersect_build_side_is_self_contained() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_projected_exists_inputs_keep_subquery_repeatability_guard() -> Result<()> {
+    let body = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+        .project(vec![random().alias("d")])?
+        .build()?;
+    let comparison = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+        Box::new(lit(0.5)),
+        datafusion_expr::Subquery {
+            subquery: Arc::new(body),
+            outer_ref_columns: vec![],
+            spans: datafusion_common::Spans::new(),
+        },
+        datafusion_expr::Operator::Gt,
+        datafusion_expr::expr::SetQuantifier::All,
+    ));
+    let projected = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![comparison.alias("inner_c")])?
+        .alias("inner")?
+        .project(vec![col("inner.inner_c").alias("c")])?
+        .alias("q")?
+        .build()?;
+    let plain = table_scan(
+        Some("p"),
+        &Schema::new(vec![Field::new("c", DataType::Boolean, false)]),
+        Some(vec![0]),
+    )?
+    .build()?;
+    for (probe, build, probe_key, build_key) in [
+        (plain.clone(), projected.clone(), "p.c", "q.c"),
+        (projected, plain, "q.c", "p.c"),
+    ] {
+        let plan = LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (vec![probe_key], vec![build_key]),
+                None,
+            )?
+            .build()?;
+        let error = Unparser::new(&UnparserMySqlDialect {})
+            .plan_to_sql(&plan)
+            .expect_err(
+                "MySQL cannot promise one evaluation of derived subquery outputs",
+            );
+        assert_contains!(error.to_string(), "evaluates the expression again");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_unparse_projected_set_operation_scopes() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+    let input = |name: &str, shape: u8| -> Result<LogicalPlan> {
+        let scan = table_scan(Some("person"), &schema, Some(vec![0]))?;
+        let input = if shape == 3 {
+            scan.project(vec![col("person.id").alias("z")])?
+                .alias("inner")?
+                .project(vec![col("inner.z").alias("x")])?
+        } else {
+            scan.project(vec![col("person.id").alias("x")])?
+        };
+        let input = if shape == 2 {
+            input.project(vec![col("x")])?
+        } else {
+            input
+        };
+        let input = if shape > 0 {
+            input.filter(col("x").gt(lit(0)))?
+        } else {
+            input
+        };
+        input.alias(name)?.build()
+    };
+    for shape in [0, 1, 2, 3] {
+        for distinct in [false, true] {
+            for join_type in [
+                datafusion_expr::JoinType::LeftSemi,
+                datafusion_expr::JoinType::LeftAnti,
+            ] {
+                let probe = if distinct {
+                    LogicalPlanBuilder::from(input("left", shape)?)
+                        .distinct()?
+                        .build()?
+                } else {
+                    input("left", shape)?
+                };
+                let plan = LogicalPlanBuilder::from(probe)
+                    .join(
+                        input("right", shape)?,
+                        join_type,
+                        (vec!["left.x"], vec!["right.x"]),
+                        None,
+                    )?
+                    .build()?;
+                let output = Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string();
+                assert!(output.contains("AS \"left\""), "{output}");
+                assert!(output.contains("AS \"right\""), "{output}");
+                let statement = Parser::new(&GenericDialect {})
+                    .try_with_sql(&output)?
+                    .parse_statement()?;
+                let context = MockContextProvider {
+                    state: MockSessionState::default(),
+                };
+                SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_inputs_name_computed_outputs() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+    let input = |name: &str| -> Result<LogicalPlan> {
+        table_scan(Some("person"), &schema, Some(vec![0]))?
+            .project(vec![col("person.id") + lit(1)])?
+            .alias(name)?
+            .build()
+    };
+    let probe = input("left")?;
+    let build = input("right")?;
+    let field = probe.schema().field(0).name().clone();
+    let plan = LogicalPlanBuilder::from(probe)
+        .join(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            (
+                vec![Column::new(Some("left"), field.clone())],
+                vec![Column::new(Some("right"), field)],
+            ),
+            None,
+        )?
+        .build()?;
+    let output = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(&output)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    Ok(())
+}
+
+#[test]
+fn test_sql_unsigned_negation_uses_the_checked_signed_result_schema() -> Result<()> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql("SELECT -CAST('18446744073709551615' AS BIGINT UNSIGNED) AS n")?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+    assert_eq!(plan.schema().field(0).data_type(), &DataType::Int64);
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_build_expression_names() -> Result<()> {
+    let probe = table_scan(Some("p"), &int32_schema(&["c"]), Some(vec![0]))?.build()?;
+    let computed = table_scan(Some("b"), &int32_schema(&["x", "y"]), Some(vec![0, 1]))?
+        .project(vec![col("b.x") + col("b.y")])?
+        .alias("s")?
+        .build()?;
+    let scalar = scalar_subquery(Arc::new(
+        LogicalPlanBuilder::empty(true)
+            .project(vec![out_ref_col(DataType::Int32, "b.x").alias("v")])?
+            .build()?,
+    ));
+    let correlated = table_scan(Some("b"), &int32_schema(&["x", "y"]), Some(vec![0, 1]))?
+        .project(vec![scalar.alias("c")])?
+        .alias("s")?
+        .build()?;
+    let bounded = table_scan(Some("b"), &int32_schema(&["x", "y"]), Some(vec![0, 1]))?
+        .project(vec![col("b.x") + col("b.y"), col("b.x")])?
+        .sort(vec![col("b.x").sort(true, true)])?
+        .limit(0, Some(1))?
+        .alias("s")?
+        .build()?;
+    let mut sql = Vec::new();
+    for build in [computed, correlated, bounded] {
+        let name = build.schema().field(0).name().clone();
+        let plan = LogicalPlanBuilder::from(probe.clone())
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (
+                    vec![Column::new(Some("p"), "c")],
+                    vec![Column::new(Some("s"), name)],
+                ),
+                None,
+            )?
+            .build()?;
+        sql.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+        );
+    }
+    assert_snapshot!("projected_exists_build_expression_names", sql.join("\n"));
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_volatile_build_is_refused() -> Result<()> {
+    let probe_schema = Schema::new(vec![Field::new("c", DataType::Float64, false)]);
+    let probe = table_scan(Some("p"), &probe_schema, Some(vec![0]))?.build()?;
+    let build = table_scan(Some("b"), &int32_schema(&["x"]), Some(vec![0]))?
+        .project(vec![random().alias("r")])?
+        .alias("s")?
+        .build()?;
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftMark,
+            vec![col("p.c").lt(col("s.r"))],
+        )?
+        .filter(col("s.mark").or(col("p.c").lt(lit(0.0))))?
+        .project(vec![col("p.c")])?
+        .build()?;
+    match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+        Ok(sql) => panic!("unsafe SQL: {sql}"),
+        Err(error) => {
+            assert_contains!(error.to_string(), "volatile build");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_exists_build_checks_aggregate_and_window_signature_volatility() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("x", DataType::Float64, false)]);
+    let probe = table_scan(Some("p"), &schema, Some(vec![0]))?.build()?;
+    for volatility in [
+        Volatility::Volatile,
+        Volatility::Stable,
+        Volatility::Immutable,
+    ] {
+        let aggregate = Arc::new(datafusion_expr::create_udaf(
+            "signature_aggregate",
+            vec![DataType::Float64],
+            Arc::new(DataType::Float64),
+            volatility,
+            Arc::new(|_| internal_err!("unparser fixture is not executed")),
+            Arc::new(vec![DataType::Float64]),
+        ));
+        let window = Arc::new(datafusion_expr::create_udwf(
+            "signature_window",
+            DataType::Float64,
+            Arc::new(DataType::Float64),
+            volatility,
+            Arc::new(|| internal_err!("unparser fixture is not executed")),
+        ));
+        let aggregate_expr = aggregate.call(vec![col("b.x")]);
+        let aggregate_window = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::AggregateUDF(aggregate),
+            vec![col("b.x")],
+        )));
+        let window_expr = Expr::WindowFunction(Box::new(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(window),
+            vec![col("b.x")],
+        )));
+        let build_aggregate = table_scan(Some("b"), &schema, Some(vec![0]))?
+            .aggregate(Vec::<Expr>::new(), vec![aggregate_expr.alias("r")])?
+            .alias("s")?
+            .build()?;
+        let mut builds = vec![build_aggregate];
+        for expression in [aggregate_window, window_expr] {
+            builds.push(
+                table_scan(Some("b"), &schema, Some(vec![0]))?
+                    .window(vec![expression.alias("r")])?
+                    .project(vec![col("r")])?
+                    .alias("s")?
+                    .build()?,
+            );
+        }
+        for build in builds {
+            let plan = LogicalPlanBuilder::from(probe.clone())
+                .join_on(
+                    build,
+                    datafusion_expr::JoinType::LeftMark,
+                    vec![col("p.x").lt(col("s.r"))],
+                )?
+                .filter(col("s.mark").or(col("p.x").lt(lit(0.0))))?
+                .project(vec![col("p.x")])?
+                .build()?;
+            if volatility == Volatility::Volatile {
+                assert_volatile_exists_build_refused(
+                    &plan,
+                    &UnparserPostgreSqlDialect {},
+                );
+            } else {
+                let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+                    .plan_to_sql(&plan)?
+                    .to_string();
+                assert_contains!(sql, "EXISTS");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn test_exists_build_checks_nested_and_pushed_volatility() -> Result<()> {
+    let schema = int32_schema(&["a"]);
+    let probe = table_scan(Some("p"), &schema, Some(vec![0]))?.build()?;
+    let scalar = scalar_subquery(Arc::new(
+        LogicalPlanBuilder::empty(true)
+            .project(vec![random().alias("r")])?
+            .build()?,
+    ));
+    let nested = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .project(vec![col("b.a"), scalar.alias("r")])?
+        .build()?;
+    let pushed = table_scan_with_filters(
+        Some("b"),
+        &schema,
+        Some(vec![0]),
+        vec![random().lt(lit(0.5))],
+    )?
+    .build()?;
+    let comparison_body = table_scan(Some("v"), &schema, Some(vec![0]))?
+        .project(vec![random().alias("d")])?
+        .build()?;
+    let comparison = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+        Box::new(lit(0.5)),
+        datafusion_expr::Subquery {
+            subquery: Arc::new(comparison_body),
+            outer_ref_columns: vec![],
+            spans: datafusion_common::Spans::new(),
+        },
+        datafusion_expr::Operator::Gt,
+        datafusion_expr::expr::SetQuantifier::All,
+    ));
+    let nested_comparison = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .project(vec![col("b.a"), comparison.alias("r")])?
+        .build()?;
+    let aggregate = table_scan(Some("b"), &schema, Some(vec![0]))?
+        .aggregate(vec![col("b.a")], vec![max(random()).alias("r")])?
+        .build()?;
+    for build in [nested, pushed, nested_comparison, aggregate] {
+        let plan = LogicalPlanBuilder::from(probe.clone())
+            .join_on(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                vec![col("p.a").eq(col("b.a"))],
+            )?
+            .build()?;
+        assert_volatile_exists_build_refused(&plan, &UnparserPostgreSqlDialect {});
+    }
+    // Probe-side values are produced by the outer query, independently of the build.
+    let volatile_probe = volatile_projection("p")?.alias("p")?.build()?;
+    let build_schema = Schema::new(vec![Field::new("r", DataType::Float64, false)]);
+    let stable_build = table_scan(Some("b"), &build_schema, Some(vec![0]))?.build()?;
+    let plan = LogicalPlanBuilder::from(volatile_probe)
+        .join_on(
+            stable_build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("p.r").eq(col("b.r"))],
+        )?
+        .build()?;
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {})
+        .plan_to_sql(&plan)?
+        .to_string();
+    assert!(sql.contains("random()"), "{sql}");
+    assert!(sql.contains("EXISTS"), "{sql}");
+    Ok(())
+}
+
 fn unparse_with_dialect(sql: &str, dialect: &dyn UnparserDialect) -> Result<String> {
     let statement = Parser::new(&GenericDialect {})
         .try_with_sql(sql)?
@@ -8804,6 +9405,18 @@ fn test_stacked_filters_on_unnamed_projection_output() -> Result<()> {
 /// The volatile call the cases below project.
 fn random() -> Expr {
     datafusion_functions::math::random().call(vec![])
+}
+
+fn assert_volatile_exists_build_refused(
+    plan: &LogicalPlan,
+    dialect: &dyn UnparserDialect,
+) {
+    match Unparser::new(dialect).plan_to_sql(plan) {
+        Ok(sql) => panic!("volatile build needs independent materialization: {sql}"),
+        Err(error) => {
+            assert_contains!(error.to_string(), "volatile build");
+        }
+    }
 }
 
 /// `Projection(<table>.a, random() AS r)` over a one-column scan of `table`: the
@@ -14974,6 +15587,354 @@ fn test_sort_key_reading_a_volatile_output_keeps_its_fetch_above_the_scope() -> 
     Ok(())
 }
 
+/// Pairs of output names that differ only after the bytes PostgreSQL keeps of a
+/// name: past 63 ASCII bytes, and past a two-byte character that straddles byte 63,
+/// which PostgreSQL drops whole, keeping 62.
+fn names_postgresql_keeps_alike() -> [(String, String); 2] {
+    let ascii = "o".repeat(63);
+    let straddling = "o".repeat(62);
+    [
+        (format!("{ascii}_one"), format!("{ascii}_two")),
+        (format!("{straddling}é_one"), format!("{straddling}è_two")),
+    ]
+}
+
+#[test]
+fn test_sort_scope_refuses_outputs_postgresql_reads_as_one_name() -> Result<()> {
+    // PostgreSQL keeps the first 63 bytes of a name, so the derived table exposes
+    // both outputs under one name, and the SELECT reading it fails with `column
+    // reference ... is ambiguous`. Refused for PostgreSQL. A dialect that compares
+    // names whole scopes the sort as before.
+    for (one, two) in names_postgresql_keeps_alike() {
+        let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+            .project(vec![
+                col("t.a").alias(&one),
+                col("t.a").add(lit(1)).alias(&two),
+                random().alias("r"),
+            ])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+
+        match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+            Ok(sql) => panic!(
+                "PostgreSQL reads {one} and {two} as one name, so the scope must be refused: {sql}"
+            ),
+            Err(e) => assert_eq!(
+                e.strip_backtrace(),
+                format!(
+                    "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when two outputs the derived table exposes, {one} and {two}, become one name once the dialect shortens each to at most 63 bytes"
+                )
+            ),
+        }
+        assert!(
+            plan_to_sql(&plan).is_ok(),
+            "the default dialect compares names whole and scopes the sort"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_input_refuses_outputs_postgresql_reads_as_one_name() -> Result<()>
+{
+    // The correlation reads the build side's outputs by name from its derived
+    // table, so two that PostgreSQL shortens to one name make it ambiguous there.
+    for (one, two) in names_postgresql_keeps_alike() {
+        let probe =
+            table_scan(Some("p"), &int32_schema(&["id"]), Some(vec![0]))?.build()?;
+        let build = table_scan(Some("person"), &int32_schema(&["id"]), Some(vec![0]))?
+            .project(vec![
+                col("person.id").alias(&one),
+                col("person.id").add(lit(1)).alias(&two),
+            ])?
+            .alias("b")?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (
+                    vec![Column::new(Some("p"), "id")],
+                    vec![Column::new(Some("b"), one.as_str())],
+                ),
+                None,
+            )?
+            .build()?;
+
+        match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+            Ok(sql) => panic!(
+                "PostgreSQL reads {one} and {two} as one name, so the EXISTS input must be refused: {sql}"
+            ),
+            Err(e) => assert_eq!(
+                e.strip_backtrace(),
+                "This feature is not implemented: A projected EXISTS input requires unique output names"
+            ),
+        }
+        assert!(
+            plan_to_sql(&plan).is_ok(),
+            "the default dialect compares names whole and keeps the EXISTS input"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_reading_a_volatile_output_is_scoped() -> Result<()> {
+    // The DISTINCT folds into the SELECT computing the projection, where the key is
+    // not resolved through it: `ORDER BY (r + 1.0)` names an output alias inside an
+    // expression, which PostgreSQL rejects (`column "r" does not exist`) and DuckDB
+    // refuses for a volatile output, while SQLite evaluates `random()` again for it.
+    // The DISTINCT becomes a derived table, and the key reads its `r` from the
+    // SELECT above it.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT "a", "r" FROM (SELECT DISTINCT "t"."a", random() AS "r" FROM "t") AS "derived_distinct" ORDER BY ("r" + 1.0) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&plan)
+            .expect_err("SQLite cannot take the scope")
+            .to_string(),
+        VOLATILE_SORT_SCOPE_REFUSAL
+    );
+
+    // The fetch bounds the ordered rows, so it stays the LIMIT of the query above
+    // the derived table.
+    let fetched = volatile_projection("t")?
+        .distinct()?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&fetched)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_reads_an_output_by_its_declared_name() -> Result<()> {
+    // A projection built with a declared schema names an output apart from its
+    // expression, `random() AS z` declared as `r`. The SELECT above the DISTINCT
+    // reads `r`, so the derived table has to show the output under that name, or
+    // the key and the list bind to nothing.
+    let input = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?.build()?;
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("a", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("r", DataType::Float64, false))),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![col("t.a"), random().alias("z")],
+        Arc::new(input),
+        Arc::new(declared),
+    )?);
+    let plan = LogicalPlanBuilder::from(projection)
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_is_left_out_of_an_unbounded_exists_body() -> Result<()> {
+    // Under a list the body's own projection takes, the sort is derived with a
+    // builder of its own, which no longer knows it is in an EXISTS body. Its order
+    // reaches nothing there, so the sort is left out, as it is over a bare
+    // projection, rather than scoped, or refused on a dialect that cannot take the
+    // scope.
+    let body = volatile_projection("u")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![lit(1)])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .filter(exists(Arc::new(body)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT u.a, random() AS r FROM u))"
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        "SELECT `t`.`a` FROM `t` WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT `u`.`a`, random() AS `r` FROM `u`))"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_computed_sort_key_over_distinct_is_scoped() -> Result<()> {
+    // The ORDER BY of a SELECT DISTINCT may only name what its list shows, so a
+    // key over outputs that can be repeated is not inlined either: PostgreSQL
+    // rejects `ORDER BY ((t.a + 1) + 1)` there ("for SELECT DISTINCT, ORDER BY
+    // expressions must appear in select list"), and `ORDER BY (b + 1)` binds `b`
+    // to nothing. Read from a SELECT above the DISTINCT, each key names outputs,
+    // on every dialect, since repeating these outputs changes no value.
+    let schema = int32_schema(&["a"]);
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .build()?;
+    let direct = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a")])?
+        .distinct()?
+        .sort_with_limit(vec![col("t.a").add(lit(1)).sort(false, false)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&aliased)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    assert_snapshot!(
+        plan_to_sql(&direct)?,
+        @r#"SELECT a FROM (SELECT DISTINCT t.a FROM t) ORDER BY (a + 1) DESC NULLS LAST LIMIT 3"#
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&aliased)?
+            .to_string(),
+        r#"SELECT `a`, `b` FROM (SELECT DISTINCT `t`.`a`, (`t`.`a` + 1) AS `b` FROM `t`) ORDER BY (`b` + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_computed_sort_key_over_distinct_under_a_filter_is_scoped() -> Result<()> {
+    // A filter above the sort is lowered beneath it, so the sort no longer sits
+    // directly on the DISTINCT. Its key is read from a SELECT above the DISTINCT
+    // all the same, and so is the filter, which reads the same outputs by name.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)))?
+        .build()?;
+    let volatile = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) WHERE (b > 0) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT "a", "b" FROM (SELECT DISTINCT "t"."a", ("t"."a" + 1) AS "b" FROM "t") AS "derived_distinct" WHERE ("b" > 0) ORDER BY ("b" + 1) ASC NULLS FIRST"#
+    );
+    // The volatile output is computed once, in the DISTINCT's SELECT, and both
+    // the filter and the key read that value.
+    assert_snapshot!(
+        plan_to_sql(&volatile)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_over_a_scoped_distinct_reads_its_outputs_unqualified() -> Result<()> {
+    // The filters kept between the sort and the DISTINCT are emitted in the
+    // SELECT above it, where the relation inside the derived table is hidden, so
+    // a qualified reference loses its qualifier as the keys do.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)).and(col("t.a").gt(lit(0))))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) WHERE ((b > 0) AND (a > 0)) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_over_a_scoped_distinct_refuses_a_captured_outer_reference() -> Result<()> {
+    // A filter between a bounded sort and the DISTINCT that correlates against
+    // the enclosing query would bind to the derived table instead, through its
+    // alias or one of its outputs, and compare the row with itself.
+    let mut refusals = Vec::new();
+    for reference in ["derived_distinct.r", "r"] {
+        let body = volatile_projection("u")?
+            .distinct()?
+            .filter(col("r").gt(out_ref_col(DataType::Float64, reference)))?
+            .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(1))?
+            .project(vec![col("r")])?
+            .build()?;
+        let plan = table_scan(
+            Some("derived_distinct"),
+            &Schema::new(vec![Field::new("r", DataType::Float64, false)]),
+            None,
+        )?
+        .project(vec![scalar_subquery(Arc::new(body))])?
+        .build()?;
+        refusals.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)
+                .expect_err("a captured outer reference must be refused")
+                .to_string(),
+        );
+    }
+    assert_snapshot!(
+        refusals.join("\n"),
+        @r"
+    This feature is not implemented: Unparsing a sort over a SELECT DISTINCT by a key that is not one of its outputs is not supported when the outer reference derived_distinct.r carries a name the unparser gives a derived table
+    This feature is not implemented: Unparsing a sort over a SELECT DISTINCT by a key that is not one of its outputs is not supported when the outer reference r carries the name of an output the derived table exposes
+    "
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bare_sort_keys_over_distinct_stay_in_its_select() -> Result<()> {
+    // A key naming an output the list shows is emitted as that name, which every
+    // dialect binds in the SELECT carrying the DISTINCT, so no scope is built.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![
+            col("r").sort(true, true),
+            col("t.a").sort(false, false),
+        ])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT DISTINCT t.a, random() AS r FROM t ORDER BY r ASC NULLS FIRST, t.a DESC NULLS LAST"#
+    );
+    Ok(())
+}
+
 #[test]
 fn test_sort_key_reading_a_volatile_output_is_unqualified_with_its_neighbours()
 -> Result<()> {
@@ -15298,22 +16259,15 @@ fn test_sort_fold_is_declined_when_its_schema_would_collide() -> Result<()> {
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_build_side()
--> Result<()> {
-    // An EXISTS body's rows are only tested for existence, so without a row bound
-    // the order its sort produces reaches nothing, and the sort is left out: no
-    // second draw to order by, and no derived table hiding the `u` the correlation
-    // appended to the body names. Semi and anti joins alike, with the sort at the
-    // top of the build side, below a filter, and under a list the sort fold keeps
-    // `r` in.
+fn test_unbounded_exists_build_with_volatile_projection_is_refused() -> Result<()> {
     let schema = int32_schema(&["a"]);
     let key = || col("r").add(lit(1.0)).sort(true, true);
-    for (join_type, exists) in [
-        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
-        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
     ] {
         let sorted = volatile_projection("u")?.sort(vec![key()])?.build()?;
-        let filtered_above = table_scan(Some("u"), &schema, Some(vec![0]))?
+        let filtered = table_scan(Some("u"), &schema, Some(vec![0]))?
             .project(vec![col("u.a").alias("a"), random().alias("r")])?
             .sort(vec![key()])?
             .filter(col("a").gt(lit(0)))?
@@ -15322,84 +16276,38 @@ fn test_sort_key_reading_a_volatile_output_is_left_out_of_an_unbounded_exists_bu
             .sort(vec![key()])?
             .project(vec![col("u.a"), col("r")])?
             .build()?;
-        for (build, body_filter) in [
-            (sorted, ""),
-            (filtered_above, "(u.a > 0) AND "),
-            (folded, ""),
-        ] {
+        for build in [sorted, filtered, folded] {
             let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
                 .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
                 .build()?;
-            assert_eq!(
-                plan_to_sql(&plan)?.to_string(),
-                format!(
-                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM u WHERE {body_filter}(t.a = u.a))"
-                ),
-                "{join_type:?}"
-            );
+            assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
         }
     }
     Ok(())
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_below_an_unfolded_exists_projection_is_left_out()
--> Result<()> {
-    // The build side's own projection, `k, (k + 1) AS b`, computes an expression,
-    // so the sort fold leaves it in place and the sort below it is reached by a
-    // SELECT that is already projected, which unparses it as a derived table with
-    // a builder of its own. The body is still unbounded, so the sort's order
-    // reaches nothing and is left out there as it is everywhere else in an EXISTS
-    // body, rather than scoped (or, on a dialect that cannot take the scope,
-    // refused) as though its order could be observed. The correlation reads `k`,
-    // which the derived table exposes.
+fn test_unfolded_exists_build_with_volatile_projection_is_refused() -> Result<()> {
     let schema = int32_schema(&["a"]);
-    let build = || -> Result<LogicalPlan> {
-        table_scan(Some("u"), &schema, Some(vec![0]))?
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
+    ] {
+        let build = table_scan(Some("u"), &schema, Some(vec![0]))?
             .project(vec![col("u.a").alias("k"), random().alias("r")])?
             .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
             .project(vec![col("k"), col("k").add(lit(1)).alias("b")])?
-            .build()
-    };
-    for (join_type, exists) in [
-        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
-        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
-    ] {
-        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
-            .join_on(build()?, join_type, vec![col("t.a").eq(col("k"))])?
             .build()?;
-        let cases: [(&dyn UnparserDialect, String); 4] = [
-            (
-                &DefaultDialect {},
-                format!(
-                    "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM (SELECT u.a AS k, random() AS r FROM u) WHERE (t.a = k))"
-                ),
-            ),
-            (
-                &SqliteDialect {},
-                format!(
-                    "SELECT `t`.`a` FROM `t` WHERE {exists} (SELECT 1 FROM (SELECT `u`.`a` AS `k`, random() AS `r` FROM `u`) WHERE (`t`.`a` = `k`))"
-                ),
-            ),
-            (
-                &UnparserMySqlDialect {},
-                format!(
-                    "SELECT `t`.`a` FROM `t` WHERE {exists} (SELECT 1 FROM (SELECT `u`.`a` AS `k`, random() AS `r` FROM `u`) AS `derived_projection` WHERE (`t`.`a` = `k`))"
-                ),
-            ),
-            (
-                &UnparserPostgreSqlDialect {},
-                format!(
-                    r#"SELECT "t"."a" FROM "t" WHERE {exists} (SELECT 1 FROM (SELECT "u"."a" AS "k", random() AS "r" FROM "u") AS "derived_projection" WHERE ("t"."a" = "k"))"#
-                ),
-            ),
-        ];
-        for (dialect, expected) in cases {
-            assert_eq!(
-                Unparser::new(dialect).plan_to_sql(&plan)?.to_string(),
-                expected,
-                "{join_type:?}"
-            );
+        let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+            .join_on(build, join_type, vec![col("t.a").eq(col("k"))])?
+            .build()?;
+        for dialect in [
+            &DefaultDialect {} as &dyn UnparserDialect,
+            &SqliteDialect {},
+            &UnparserMySqlDialect {},
+            &UnparserPostgreSqlDialect {},
+        ] {
+            assert_volatile_exists_build_refused(&plan, dialect);
         }
     }
     Ok(())
@@ -15551,13 +16459,9 @@ fn test_sort_key_reading_a_volatile_output_in_a_join_input_is_left_out() -> Resu
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_under_a_limit_below_another_sort_is_scoped()
+fn test_volatile_sort_scope_is_allowed_for_projection_and_refused_for_exists_build()
 -> Result<()> {
-    // `Sort(t.a) → Limit(1) → Sort[(r + 1.0)] → Projection`: the LIMIT keeps the row
-    // the lower sort ranks first, so that sort's order can be observed although an
-    // ORDER BY sits above it, and its key reads `r` from a scope. Ordering the one
-    // row the LIMIT keeps by `t.a` changes nothing. The same on an EXISTS build
-    // side, where the bound moves the body under the build side's name.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let plan = volatile_projection("t")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
         .limit(0, Some(1))?
@@ -15580,10 +16484,7 @@ fn test_sort_key_reading_a_volatile_output_under_a_limit_below_another_sort_is_s
             vec![col("t.a").eq(col("u.a"))],
         )?
         .build()?;
-    assert_snapshot!(
-        plan_to_sql(&plan)?,
-        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 1) AS u WHERE (t.a = u.a))"#
-    );
+    assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     Ok(())
 }
 
@@ -15615,11 +16516,9 @@ fn test_fetched_sort_key_reading_a_volatile_output_in_a_join_input_is_refused()
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_scoped()
+fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_refused()
 -> Result<()> {
-    // A bounded build side is emitted as a derived table under the build side's
-    // own name, and the correlation binds to that alias, so the scope inside it
-    // is sound and is built.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let schema = int32_schema(&["a"]);
     let build = table_scan(Some("u"), &schema, Some(vec![0]))?
         .project(vec![col("u.a"), random().alias("r")])?
@@ -15634,26 +16533,18 @@ fn test_sort_key_reading_a_volatile_output_under_a_bounded_exists_build_side_is_
         )?
         .build()?;
 
-    assert_snapshot!(
-        plan_to_sql(&plan)?,
-        @r#"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"#
-    );
+    assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     Ok(())
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_side_is_scoped()
+fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_side_is_refused()
 -> Result<()> {
-    // A `Sort` carrying its own `fetch` bounds the build side exactly as a `Limit`
-    // above the sort does: the emitted `LIMIT` is what `bounds_rows()` reads, so the
-    // body moves into a derived table under the build side's own name and the
-    // correlation binds to that alias, outside the scope. The bound makes the sort's
-    // order observable, so the scope is built, and the emitted SQL is the one the
-    // `Limit` form of this plan produces.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let schema = int32_schema(&["a"]);
-    for (join_type, exists) in [
-        (datafusion_expr::JoinType::LeftSemi, "EXISTS"),
-        (datafusion_expr::JoinType::LeftAnti, "NOT EXISTS"),
+    for join_type in [
+        datafusion_expr::JoinType::LeftSemi,
+        datafusion_expr::JoinType::LeftAnti,
     ] {
         let build = volatile_projection("u")?
             .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(2))?
@@ -15662,24 +16553,15 @@ fn test_sort_key_reading_a_volatile_output_under_a_fetched_sort_exists_build_sid
             .join_on(build, join_type, vec![col("t.a").eq(col("u.a"))])?
             .build()?;
 
-        assert_eq!(
-            plan_to_sql(&plan)?.to_string(),
-            format!(
-                "SELECT t.a FROM t WHERE {exists} (SELECT 1 FROM (SELECT a, r FROM (SELECT u.a, random() AS r FROM u) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 2) AS u WHERE (t.a = u.a))"
-            ),
-            "{join_type:?}"
-        );
+        assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     }
     Ok(())
 }
 
 #[test]
-fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_scoped()
+fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_side_is_refused()
 -> Result<()> {
-    // The upper sort's fetch bounds the body, so the lower sort is reached with a
-    // row bound on it and its scope is built, inside the derived table the bound
-    // moves the body into. This pins where the correlation binds; the ORDER BY a
-    // sort directly over another sort emits is spiceai/spiceai#14733.
+    // A volatile EXISTS build requires materialization independent of probe rows.
     let schema = int32_schema(&["a"]);
     let build = volatile_projection("u")?
         .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
@@ -15693,11 +16575,7 @@ fn test_sort_key_reading_a_volatile_output_below_a_fetched_sort_exists_build_sid
         )?
         .build()?;
 
-    let sql = plan_to_sql(&plan)?.to_string();
-    assert!(
-        sql.ends_with(") AS u WHERE (t.a = u.a))"),
-        "correlation must bind to the bounded scope's alias: {sql}"
-    );
+    assert_volatile_exists_build_refused(&plan, &DefaultDialect {});
     Ok(())
 }
 
@@ -16528,7 +17406,7 @@ fn test_sort_key_reading_an_output_holding_a_set_comparison_is_scoped() -> Resul
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT a, r FROM (SELECT t.a, 0.5 < ANY(SELECT random() AS d FROM v) AS r FROM t) ORDER BY NOT r ASC NULLS FIRST"#
+        @r#"SELECT a, r FROM (SELECT t.a, 0.5 < ANY(SELECT random() AS d FROM v) AS r FROM t) ORDER BY NOT (r) ASC NULLS FIRST"#
     );
     Ok(())
 }
@@ -19802,5 +20680,194 @@ fn test_limit_fold_dropping_a_computed_output_is_not_folded() -> Result<()> {
         plan_to_sql(&plan)?,
         @r#"SELECT k FROM (SELECT t.k, (t.k + 1) AS "t.k + Int32(1)" FROM t ORDER BY "t.k + Int32(1)" ASC NULLS LAST LIMIT 1)"#
     );
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_probe_set_comparison_repeatability_guard() -> Result<()> {
+    for quantifier in [
+        datafusion_expr::expr::SetQuantifier::Any,
+        datafusion_expr::expr::SetQuantifier::All,
+    ] {
+        let body = table_scan(Some("v"), &int32_schema(&["a"]), None)?
+            .project(vec![random().alias("d")])?
+            .build()?;
+        let comparison = Expr::SetComparison(datafusion_expr::expr::SetComparison::new(
+            Box::new(lit(0.5)),
+            datafusion_expr::Subquery {
+                subquery: Arc::new(body),
+                outer_ref_columns: vec![],
+                spans: datafusion_common::Spans::new(),
+            },
+            datafusion_expr::Operator::Gt,
+            quantifier,
+        ));
+        let projected = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+            .project(vec![comparison.alias("c")])?
+            .alias("q")?
+            .build()?;
+        let plain = table_scan(
+            Some("p"),
+            &Schema::new(vec![Field::new("c", DataType::Boolean, false)]),
+            Some(vec![0]),
+        )?
+        .build()?;
+        let (probe, build, probe_key, build_key) = (projected, plain, "q.c", "p.c");
+        let plan = LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (vec![probe_key], vec![build_key]),
+                None,
+            )?
+            .build()?;
+        let error = Unparser::new(&UnparserMySqlDialect {})
+            .plan_to_sql(&plan)
+            .expect_err(
+                "MySQL cannot promise one evaluation of derived subquery outputs",
+            );
+        assert_contains!(error.to_string(), "evaluates the expression again");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_matching_an_output_that_reuses_its_input_name_is_scoped()
+-> Result<()> {
+    // Over an input `a`, the key `-a` reads the output `-a AS a` and so is `a`
+    // again, while the output computes `-a`. They look alike but read different
+    // values, so the key is not one the list shows. Left in the SELECT carrying the
+    // DISTINCT, `ORDER BY -"a"` reads the input there: PostgreSQL 17 returns -3 for
+    // the values 1, 2 and 3, where the plan's first row is -1. Each expected
+    // statement was run on PostgreSQL 17 and returned -1.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").alias("a")])?
+        .project(vec![(-col("a")).alias("a")])?
+        .distinct()?
+        .sort_with_limit(vec![(-col("a")).sort(true, true)], Some(1))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?,
+        @r#"SELECT "a" FROM (SELECT DISTINCT -"a" AS "a" FROM (SELECT "t"."a" AS "a" FROM "t") AS "derived_projection") AS "derived_distinct" ORDER BY -"a" ASC NULLS FIRST LIMIT 1"#
+    );
+
+    // The SQL that plans to the same shape: a derived table with no alias, whose
+    // computed output takes the name the SELECT above reuses.
+    assert_snapshot!(
+        unparse_with_dialect(
+            "SELECT DISTINCT -a AS a FROM (SELECT j1_id + 0 AS a FROM j1) ORDER BY -a LIMIT 1",
+            &UnparserPostgreSqlDialect {},
+        )?,
+        @r#"SELECT "a" FROM (SELECT DISTINCT -"a" AS "a" FROM (SELECT ("j1"."j1_id" + 0) AS "a" FROM "j1") AS "derived_projection") AS "derived_distinct" ORDER BY -"a" ASC NULLS LAST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_matching_an_output_over_a_passed_through_column_stays_listed()
+-> Result<()> {
+    // `a AS a` passes the input `a` through under its own name, so the key `-a`
+    // reads the same value as the output `-a AS b` computes: the list shows it, and
+    // it stays in the SELECT carrying the DISTINCT, as without the alias. PostgreSQL
+    // 17 returns 3 for the values 1, 2 and 3, which is the plan's first row.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![(col("t.a") + lit(0)).alias("a")])?
+        .project(vec![col("a").alias("a"), (-col("a")).alias("b")])?
+        .distinct()?
+        .sort_with_limit(vec![(-col("a")).sort(true, true)], Some(1))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?,
+        @r#"SELECT DISTINCT "a" AS "a", -"a" AS "b" FROM (SELECT ("t"."a" + 0) AS "a" FROM "t") AS "derived_projection" ORDER BY -"a" ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts() -> Result<()> {
+    // The shapes `SELECT DISTINCT … ORDER BY <computed key>` plans to, as Spice's
+    // federation unparses them, each checked by running the expected statement on
+    // PostgreSQL 17: before, every one was refused there, with `column "b" does
+    // not exist` or "for SELECT DISTINCT, ORDER BY expressions must appear in
+    // select list". A DISTINCT subquery bounding a join input keeps its scope
+    // inside the subquery, and a WHERE stays below the DISTINCT it filters.
+    let cases = [
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by b + 1 limit 3",
+            r#"SELECT "j1_id", "b" FROM (SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1") AS "derived_distinct" ORDER BY ("b" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by -b limit 3",
+            r#"SELECT "j1_id", "b" FROM (SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1") AS "derived_distinct" ORDER BY -"b" ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id from j1 where j1_id > 1 order by j1_id + 1 desc limit 3",
+            r#"SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1" WHERE ("j1"."j1_id" > 1)) AS "derived_distinct" ORDER BY ("j1_id" + 1) DESC NULLS FIRST LIMIT 3"#,
+        ),
+        // A key the list already shows, as an output's expression, is left where it
+        // is: PostgreSQL matches it to that output, and the scope would have two
+        // outputs named `j1_id` to tell apart.
+        (
+            "select distinct a.j1_id, b.j1_id, a.j1_id + b.j1_id as k from j1 a cross join j1 b order by a.j1_id + b.j1_id limit 3",
+            r#"SELECT DISTINCT "a"."j1_id", "b"."j1_id", ("a"."j1_id" + "b"."j1_id") AS "k" FROM "j1" AS "a" CROSS JOIN "j1" AS "b" ORDER BY ("a"."j1_id" + "b"."j1_id") ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by j1_id + 1 limit 3",
+            r#"SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1" ORDER BY ("j1"."j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select x.j1_id from (select distinct j1_id from j1 order by j1_id + 1 limit 3) x join j2 on x.j1_id = j2.j2_id",
+            r#"SELECT "x"."j1_id" FROM (SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3) AS "x" INNER JOIN "j2" ON ("x"."j1_id" = "j2"."j2_id")"#,
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(
+            unparse_with_dialect(sql, &UnparserPostgreSqlDialect {})?,
+            expected,
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sql_sort_key_over_distinct_names_aggregate_and_window_outputs() -> Result<()> {
+    // An unaliased aggregate or window output is a column the unparser renders as
+    // the call itself, so the derived table would leave it for the engine to name
+    // (`sum` on PostgreSQL) while the SELECT above reads `sum(j1.j1_id)`. Each is
+    // aliased to the name its schema reports. Every expected statement was run on
+    // PostgreSQL 17 and on SQLite (with backtick quoting).
+    let cases = [
+        (
+            "select distinct j1_id, sum(j1_id) from j1 group by j1_id order by j1_id + 1 limit 3",
+            r#"SELECT "j1_id", "sum(j1.j1_id)" FROM (SELECT DISTINCT "j1"."j1_id", sum("j1"."j1_id") AS "sum(j1.j1_id)" FROM "j1" GROUP BY "j1"."j1_id") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, sum(j1_id) from j1 group by j1_id order by sum(j1_id) + 1 limit 3",
+            r#"SELECT "j1_id", "sum(j1.j1_id)" FROM (SELECT DISTINCT "j1"."j1_id", sum("j1"."j1_id") AS "sum(j1.j1_id)" FROM "j1" GROUP BY "j1"."j1_id") AS "derived_distinct" ORDER BY ("sum(j1.j1_id)" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, row_number() over (order by j1_id) from j1 order by j1_id + 1 limit 3",
+            r#"SELECT "j1_id", "row_number() ORDER BY [j1.j1_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" FROM (SELECT DISTINCT "j1"."j1_id", row_number() OVER (ORDER BY "j1"."j1_id" ASC NULLS LAST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "row_number() ORDER BY [j1.j1_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" FROM "j1") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+    ];
+    for (sql, expected) in cases {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(sql)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default()
+                .with_aggregate_function(sum_udaf())
+                .with_window_function(row_number_udwf()),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        assert_eq!(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+            expected,
+            "{sql}"
+        );
+    }
     Ok(())
 }

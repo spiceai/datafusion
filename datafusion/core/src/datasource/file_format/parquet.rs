@@ -721,12 +721,11 @@ mod tests {
                 .num_rows,
             Precision::Exact(8)
         );
-        // TODO correct byte size: https://github.com/apache/datafusion/issues/14936
         assert_eq!(
             StatisticsContext::new()
                 .compute(exec.as_ref(), &StatisticsArgs::new())?
                 .total_byte_size,
-            Precision::Absent,
+            Precision::Inexact(513),
         );
 
         Ok(())
@@ -778,7 +777,7 @@ mod tests {
             StatisticsContext::new()
                 .compute(exec.as_ref(), &StatisticsArgs::new())?
                 .total_byte_size,
-            Precision::Absent,
+            Precision::Inexact(513),
         );
         let batches = collect(exec, task_ctx).await?;
         assert_eq!(1, batches.len());

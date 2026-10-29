@@ -138,6 +138,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_binary(
             if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
                 || is_date_narrowing_cast(&expr_type, field.data_type())
                 || is_decimal_scale_narrowing_cast(&expr_type, field.data_type())
+                || (expr_type.is_decimal() && field.data_type().is_integer())
             {
                 return false;
             }
@@ -184,6 +185,7 @@ pub(super) fn is_cast_expr_and_support_unwrap_cast_in_comparison_for_inlist(
     if is_timestamp_precision_narrowing_cast(&expr_type, field.data_type())
         || is_date_narrowing_cast(&expr_type, field.data_type())
         || is_decimal_scale_narrowing_cast(&expr_type, field.data_type())
+        || (expr_type.is_decimal() && field.data_type().is_integer())
     {
         return false;
     }
