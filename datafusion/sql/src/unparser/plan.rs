@@ -3899,8 +3899,17 @@ impl Unparser<'_> {
                     // or refuse it on a dialect that cannot take the scope. Decide
                     // here, as the scoping below does: where the order reaches
                     // nothing, the sort is left out.
-                    if sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
-                        .is_some()
+                    let scopes_its_input = sort_keys_scope_their_projection(
+                        &sort.expr,
+                        sort.input.as_ref(),
+                    )?
+                    .is_some()
+                        || sort_keys_scope_their_distinct(
+                            &sort.expr,
+                            sort.input.as_ref(),
+                        )
+                        .is_some();
+                    if scopes_its_input
                         && !Self::sort_order_is_observable(sort.fetch, query, select)
                     {
                         return self.select_to_sql_recursively(
