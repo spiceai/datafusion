@@ -1718,13 +1718,17 @@ impl Unparser<'_> {
     /// derived table names its outputs unqualified, so it could not tell them apart —
     /// `x*` and `x_42` both read as `x_42` — even though the plan's names differ and
     /// pass the check [`super::utils::scope_sort_over_projection`] makes on them. Two
-    /// outputs the plan already names alike are refused as that check words it.
+    /// outputs the plan already names alike are refused as that check words it. So
+    /// are two whose emitted names agree in every byte the dialect's engine keeps of
+    /// a name ([`Self::emitted_output_name_key`]): PostgreSQL keeps 63, and reading
+    /// either one fails as ambiguous.
     fn scope_output_keys(
         &self,
         scope: &DFSchema,
         refuse: fn(&str) -> Result<()>,
     ) -> Result<HashSet<String>> {
         let mut keys = HashMap::with_capacity(scope.fields().len());
+        let mut kept_keys = HashMap::with_capacity(scope.fields().len());
         for field in scope.fields() {
             let key = self.emitted_column_key(field.name())?;
             if let Some(first) = keys.insert(key, field.name()) {
@@ -1735,6 +1739,16 @@ impl Unparser<'_> {
                 }
                 refuse(&format!(
                     "when two outputs the derived table exposes are both emitted as {}",
+                    self.emitted_column_name(field.name())?
+                ))?;
+            }
+            let kept_key = self.emitted_output_name_key(field.name())?;
+            if let Some(first) = kept_keys.insert(kept_key, field.name())
+                && let Some(max) = self.dialect.identifier_max_length()
+            {
+                refuse(&format!(
+                    "when two outputs the derived table exposes, {} and {}, become one name once the dialect shortens each to at most {max} bytes",
+                    self.emitted_column_name(first)?,
                     self.emitted_column_name(field.name())?
                 ))?;
             }
@@ -6325,9 +6339,11 @@ impl Unparser<'_> {
                 "A projected EXISTS input requires an unqualified alias"
             );
         }
+        // Compared by the bytes the dialect keeps of a name, since the correlation
+        // reads these outputs by name.
         let mut names = HashSet::new();
         for field in alias.schema.fields() {
-            if !names.insert(self.emitted_column_key(field.name())?) {
+            if !names.insert(self.emitted_output_name_key(field.name())?) {
                 return not_impl_err!(
                     "A projected EXISTS input requires unique output names"
                 );
