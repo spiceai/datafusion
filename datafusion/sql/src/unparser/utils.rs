@@ -1406,17 +1406,20 @@ pub(crate) fn sort_keys_scope_their_distinct(
     let LogicalPlan::Projection(projection) = distinct_input.as_ref() else {
         return None;
     };
-    let computed_key = keys.iter().any(|key| !matches!(key.expr, Expr::Column(_)));
-    let reads_only_outputs = keys.iter().all(|key| {
-        !holds_subquery(&key.expr)
-            && key
-                .expr
-                .column_refs()
-                .into_iter()
-                .all(|column| projection.schema.has_column(column))
-    });
-    (computed_key && reads_only_outputs && !projection_holds_wildcard(projection))
-        .then(|| sort_keys_read_unrepeatable_output(keys, projection))
+    if projection_holds_wildcard(projection)
+        || keys.iter().all(|key| matches!(key.expr, Expr::Column(_)))
+        || keys.iter().any(|key| {
+            holds_subquery(&key.expr)
+                || key
+                    .expr
+                    .column_refs()
+                    .into_iter()
+                    .any(|column| !projection.schema.has_column(column))
+        })
+    {
+        return None;
+    }
+    Some(sort_keys_read_unrepeatable_output(keys, projection))
 }
 
 /// A `Sort` over a `DISTINCT`, as [`sort_keys_scope_their_distinct`] decides it,
@@ -1424,10 +1427,15 @@ pub(crate) fn sort_keys_scope_their_distinct(
 /// its outputs from the `SELECT` that reads them. The fetch stays on the sort,
 /// above the scope, for the reason [`scope_sort_over_projection`] gives.
 pub(crate) fn scope_sort_over_distinct(sort: &Sort) -> Result<LogicalPlan> {
+    // Named as declared, for the reason `scope_filters_over_projection` gives.
+    let distinct = match name_scoped_outputs_as_declared(&sort.input)? {
+        Some(named) => Arc::new(named),
+        None => Arc::clone(&sort.input),
+    };
     Ok(LogicalPlan::Sort(Sort {
         expr: scope_sort_keys(&sort.expr)?,
         input: Arc::new(identity_projection_over(
-            Arc::clone(&sort.input),
+            distinct,
             distinct_sort_key_refusal,
         )?),
         fetch: sort.fetch,

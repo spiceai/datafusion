@@ -15233,19 +15233,50 @@ fn test_sort_key_over_distinct_reading_a_volatile_output_is_scoped() -> Result<(
             .to_string(),
         VOLATILE_SORT_SCOPE_REFUSAL
     );
+
+    // The fetch bounds the ordered rows, so it stays the LIMIT of the query above
+    // the derived table.
+    let fetched = volatile_projection("t")?
+        .distinct()?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&fetched)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 3"#
+    );
     Ok(())
 }
 
 #[test]
-fn test_sort_key_over_distinct_keeps_its_fetch_above_the_scope() -> Result<()> {
-    let plan = volatile_projection("t")?
+fn test_sort_key_over_distinct_reads_an_output_by_its_declared_name() -> Result<()> {
+    // A projection built with a declared schema names an output apart from its
+    // expression, `random() AS z` declared as `r`. The SELECT above the DISTINCT
+    // reads `r`, so the derived table has to show the output under that name, or
+    // the key and the list bind to nothing.
+    let input = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?.build()?;
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("a", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("r", DataType::Float64, false))),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![col("t.a"), random().alias("z")],
+        Arc::new(input),
+        Arc::new(declared),
+    )?);
+    let plan = LogicalPlanBuilder::from(projection)
         .distinct()?
-        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(3))?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
         .build()?;
 
     assert_snapshot!(
         plan_to_sql(&plan)?,
-        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 3"#
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
     );
     Ok(())
 }
@@ -19708,18 +19739,8 @@ fn test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts() -> Result<
         ),
     ];
     for (sql, expected) in cases {
-        let statement = Parser::new(&GenericDialect {})
-            .try_with_sql(sql)?
-            .parse_statement()?;
-        let context = MockContextProvider {
-            state: MockSessionState::default()
-                .with_expr_planner(Arc::new(CoreFunctionPlanner::default())),
-        };
-        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
         assert_eq!(
-            Unparser::new(&UnparserPostgreSqlDialect {})
-                .plan_to_sql(&plan)?
-                .to_string(),
+            unparse_with_dialect(sql, &UnparserPostgreSqlDialect {})?,
             expected,
             "{sql}"
         );

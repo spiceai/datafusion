@@ -1749,11 +1749,23 @@ impl Unparser<'_> {
     /// output again, and inside a join input, which a sort reaches only with a
     /// fetch — see [`Self::sort_order_is_observable`].
     fn ensure_sort_key_scope_is_possible(&self, select: &SelectBuilder) -> Result<()> {
-        self.ensure_derived_table_fixes_volatile_sort_keys()?;
+        self.ensure_sort_scope_is_possible(select, true, unrepeatable_sort_key_refusal)
+    }
+
+    /// [`Self::ensure_sort_key_scope_is_possible`] for any scope a sort's keys
+    /// build, refused with `refuse`: the dialect gate applies only where a key
+    /// reads an output that cannot be repeated, and the join-input refusal always.
+    fn ensure_sort_scope_is_possible(
+        &self,
+        select: &SelectBuilder,
+        reads_unrepeatable_output: bool,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        if reads_unrepeatable_output {
+            self.ensure_derived_table_fixes_volatile_sort_keys()?;
+        }
         if select.within_join_input() {
-            return unrepeatable_sort_key_refusal(
-                "when the sort's fetch bounds an input of a join",
-            );
+            return refuse("when the sort's fetch bounds an input of a join");
         }
         Ok(())
     }
@@ -1768,12 +1780,31 @@ impl Unparser<'_> {
         query: &mut Option<QueryBuilder>,
         select: &mut SelectBuilder,
     ) -> Result<()> {
-        self.ensure_sort_key_scope_is_possible(select)?;
+        self.prepare_sort_scope(
+            hidden,
+            query,
+            select,
+            true,
+            unrepeatable_sort_key_refusal,
+        )
+    }
+
+    /// [`Self::prepare_sort_key_scope`] for any scope a sort's keys build, with
+    /// the refusals of [`Self::ensure_sort_scope_is_possible`].
+    fn prepare_sort_scope(
+        &self,
+        hidden: &DFSchema,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        reads_unrepeatable_output: bool,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        self.ensure_sort_scope_is_possible(select, reads_unrepeatable_output, refuse)?;
         self.repoint_clauses_onto_derived_table(
             &enclosed_qualifiers(hidden, |name| self.emitted_column_name(name))?,
             query,
             select,
-            unrepeatable_sort_key_refusal,
+            refuse,
         )
     }
 
@@ -3960,14 +3991,11 @@ impl Unparser<'_> {
                             relation,
                         );
                     }
-                    if reads_unrepeatable_output {
-                        self.ensure_derived_table_fixes_volatile_sort_keys()?;
-                    }
-                    if select.within_join_input() {
-                        return distinct_sort_key_refusal(
-                            "when the sort's fetch bounds an input of a join",
-                        );
-                    }
+                    self.ensure_sort_scope_is_possible(
+                        select,
+                        reads_unrepeatable_output,
+                        distinct_sort_key_refusal,
+                    )?;
                     let derived = sort.input.schema();
                     self.ensure_scope_captures_no_outer_reference(
                         sort.expr.iter().map(|key| &key.expr),
@@ -3975,12 +4003,11 @@ impl Unparser<'_> {
                         derived,
                         distinct_sort_key_refusal,
                     )?;
-                    self.repoint_clauses_onto_derived_table(
-                        &enclosed_qualifiers(derived, |name| {
-                            self.emitted_column_name(name)
-                        })?,
+                    self.prepare_sort_scope(
+                        derived,
                         query,
                         select,
+                        reads_unrepeatable_output,
                         distinct_sort_key_refusal,
                     )?;
                     let scoped = scope_sort_over_distinct(sort)?;
