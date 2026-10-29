@@ -1,0 +1,7 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: "sql.join(\"\\n\")"
+---
+SELECT "p"."c" FROM "p" WHERE EXISTS (SELECT 1 FROM (SELECT ("b"."x" + "b"."y") AS "b.x + b.y" FROM "b") AS "s" WHERE ("p"."c" = "s"."b.x + b.y"))
+SELECT "p"."c" FROM "p" WHERE EXISTS (SELECT 1 FROM (SELECT (SELECT "b"."x" AS "v") AS "c" FROM "b") AS "s" WHERE ("p"."c" = "s"."c"))
+SELECT "p"."c" FROM "p" WHERE EXISTS (SELECT 1 FROM (SELECT ("b"."x" + "b"."y") AS "b.x + b.y", "b"."x" FROM "b" ORDER BY "b"."x" ASC NULLS FIRST LIMIT 1) AS "s" WHERE ("p"."c" = "s"."b.x + b.y"))

@@ -662,7 +662,13 @@ impl Unparser<'_> {
                 self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::Not(expr) => {
-                let sql_parser_expr = self.predicate_operand_to_sql(expr)?;
+                // NOT binds more tightly than predicates such as IN on some
+                // engines. Keep the entire operand inside its own parentheses.
+                let operand = self.expr_to_sql_inner(expr)?;
+                let sql_parser_expr = match operand {
+                    AstExpr::Nested(_) => operand,
+                    _ => AstExpr::Nested(Box::new(operand)),
+                };
                 Ok(AstExpr::UnaryOp {
                     op: UnaryOperator::Not,
                     expr: Box::new(sql_parser_expr),
@@ -1166,6 +1172,25 @@ impl Unparser<'_> {
     /// comparison site.
     pub(crate) fn emitted_column_key(&self, name: &str) -> Result<String> {
         Ok(self.identifier_comparison_key(&self.emitted_column_name(name)?))
+    }
+
+    /// [`Self::emitted_column_key`] of only the bytes of the emitted name the
+    /// dialect's engine keeps ([`super::dialect::Dialect::identifier_max_length`]),
+    /// cut on a character boundary as PostgreSQL cuts it. Two outputs of one derived
+    /// table with the same key are one column to the query reading it by name.
+    ///
+    /// Only the check that a derived table's outputs can be told apart uses it.
+    /// Matching a reference to an output keeps comparing whole names, so a reference
+    /// is never bound to an output because the two share a prefix.
+    pub(crate) fn emitted_output_name_key(&self, name: &str) -> Result<String> {
+        let emitted = self.emitted_column_name(name)?;
+        let kept = match self.dialect.identifier_max_length() {
+            Some(max) if emitted.len() > max => {
+                &emitted[..emitted.floor_char_boundary(max)]
+            }
+            _ => emitted.as_str(),
+        };
+        Ok(self.identifier_comparison_key(kept))
     }
 
     pub fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
@@ -2595,6 +2620,17 @@ mod tests {
     }
 
     #[test]
+    fn not_preserves_membership_predicate_scope() -> Result<()> {
+        let predicate = col("a").in_list(vec![lit(1), lit(2)], false);
+        let expr = Expr::Not(Box::new(predicate));
+        for pretty in [false, true] {
+            let sql = Unparser::default().with_pretty(pretty).expr_to_sql(&expr)?;
+            assert_eq!(sql.to_string(), "NOT (a IN (1, 2))");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn expr_to_sql_ok() -> Result<()> {
         let dummy_schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         #[expect(deprecated)]
@@ -2892,7 +2928,7 @@ mod tests {
                 (col("a") + col("b")).gt(lit(4)).is_not_unknown(),
                 r#"((a + b) > 4) IS NOT UNKNOWN"#,
             ),
-            (not(col("a")), r#"NOT a"#),
+            (not(col("a")), r#"NOT (a)"#),
             (
                 Expr::between(col("a"), lit(1), lit(7)),
                 r#"(a BETWEEN 1 AND 7)"#,

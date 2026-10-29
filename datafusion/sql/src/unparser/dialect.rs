@@ -352,6 +352,18 @@ pub trait Dialect: Send + Sync {
         true
     }
 
+    /// How many bytes of a longer identifier the engine keeps, when it shortens the
+    /// identifier silently rather than refusing it.
+    ///
+    /// PostgreSQL keeps 63 (`NAMEDATALEN` - 1), so two output names that agree in
+    /// their first 63 bytes name one column: a derived table may expose both, but the
+    /// query reading it fails with `column reference ... is ambiguous`. The unparser
+    /// refuses a derived table whose outputs it would read by name when two of them
+    /// agree in this many bytes. `None`, the default, compares names whole.
+    fn identifier_max_length(&self) -> Option<usize> {
+        None
+    }
+
     /// The division operator for the dialect
     /// Most dialect uses ` BinaryOperator::Divide` (/)
     /// But DuckDB dialect uses `BinaryOperator::DuckIntegerDivide` (//)
@@ -767,6 +779,10 @@ impl Dialect for PostgreSqlDialect {
 
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('"')
+    }
+
+    fn identifier_max_length(&self) -> Option<usize> {
+        Some(63)
     }
 
     fn interval_style(&self) -> IntervalStyle {
@@ -1769,6 +1785,7 @@ pub struct CustomDialect {
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
     derived_table_evaluates_volatile_outputs_once: bool,
+    identifier_max_length: Option<usize>,
     division_operator: BinaryOperator,
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
@@ -1801,6 +1818,7 @@ impl Default for CustomDialect {
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
             derived_table_evaluates_volatile_outputs_once: true,
+            identifier_max_length: None,
             division_operator: BinaryOperator::Divide,
             window_func_support_window_frame: true,
             full_qualified_col: false,
@@ -1919,6 +1937,10 @@ impl Dialect for CustomDialect {
         self.derived_table_evaluates_volatile_outputs_once
     }
 
+    fn identifier_max_length(&self) -> Option<usize> {
+        self.identifier_max_length
+    }
+
     fn division_operator(&self) -> BinaryOperator {
         self.division_operator.clone()
     }
@@ -1978,6 +2000,7 @@ pub struct CustomDialectBuilder {
     supports_column_alias_in_table_alias: bool,
     requires_derived_table_alias: bool,
     derived_table_evaluates_volatile_outputs_once: bool,
+    identifier_max_length: Option<usize>,
     division_operator: BinaryOperator,
     window_func_support_window_frame: bool,
     full_qualified_col: bool,
@@ -2016,6 +2039,7 @@ impl CustomDialectBuilder {
             supports_column_alias_in_table_alias: true,
             requires_derived_table_alias: false,
             derived_table_evaluates_volatile_outputs_once: true,
+            identifier_max_length: None,
             division_operator: BinaryOperator::Divide,
             window_func_support_window_frame: true,
             full_qualified_col: false,
@@ -2047,6 +2071,7 @@ impl CustomDialectBuilder {
             requires_derived_table_alias: self.requires_derived_table_alias,
             derived_table_evaluates_volatile_outputs_once: self
                 .derived_table_evaluates_volatile_outputs_once,
+            identifier_max_length: self.identifier_max_length,
             division_operator: self.division_operator,
             window_func_support_window_frame: self.window_func_support_window_frame,
             full_qualified_col: self.full_qualified_col,
@@ -2194,6 +2219,16 @@ impl CustomDialectBuilder {
     ) -> Self {
         self.derived_table_evaluates_volatile_outputs_once =
             derived_table_evaluates_volatile_outputs_once;
+        self
+    }
+
+    /// Customize how many bytes of a longer identifier the dialect's engine keeps; see
+    /// [`Dialect::identifier_max_length`].
+    pub fn with_identifier_max_length(
+        mut self,
+        identifier_max_length: Option<usize>,
+    ) -> Self {
+        self.identifier_max_length = identifier_max_length;
         self
     }
 
