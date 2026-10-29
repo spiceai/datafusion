@@ -1431,6 +1431,13 @@ impl TreeNodeRewriter for Simplifier<'_> {
             //
             // Rules for Negative
             //
+            // Checked negation can fail on the minimum signed value. Removing
+            // nested negations would remove that error as well as the operators.
+            Expr::Negative(inner)
+                if inner.exists(|expr| Ok(matches!(expr, Expr::Negative(_))))? =>
+            {
+                Transformed::no(Expr::Negative(inner))
+            }
             Expr::Negative(inner) => Transformed::yes(distribute_negation(*inner)),
 
             //
@@ -3367,9 +3374,9 @@ mod tests {
         let expr = -bitwise_or(col("c3"), col("c4"));
         let expected = bitwise_and(-col("c3"), -col("c4"));
         assert_eq!(simplify(expr), expected);
-        // !(!c3) --> c3
+        // Checked arithmetic negation must retain a possible overflow.
         let expr = -(-col("c3"));
-        let expected = col("c3");
+        let expected = expr.clone();
         assert_eq!(simplify(expr), expected);
     }
 

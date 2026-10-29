@@ -1285,7 +1285,6 @@ mod tests {
     use std::hash::{BuildHasherDefault, Hasher};
     use std::sync::Arc;
 
-    use arrow::array::*;
     #[cfg(not(feature = "force_hash_collisions"))]
     use arrow::datatypes::*;
 

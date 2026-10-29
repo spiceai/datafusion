@@ -662,7 +662,13 @@ impl Unparser<'_> {
                 self.predicate_operand_to_sql(expr)?,
             ))),
             Expr::Not(expr) => {
-                let sql_parser_expr = self.predicate_operand_to_sql(expr)?;
+                // NOT binds more tightly than predicates such as IN on some
+                // engines. Keep the entire operand inside its own parentheses.
+                let operand = self.expr_to_sql_inner(expr)?;
+                let sql_parser_expr = match operand {
+                    AstExpr::Nested(_) => operand,
+                    _ => AstExpr::Nested(Box::new(operand)),
+                };
                 Ok(AstExpr::UnaryOp {
                     op: UnaryOperator::Not,
                     expr: Box::new(sql_parser_expr),
@@ -2595,6 +2601,17 @@ mod tests {
     }
 
     #[test]
+    fn not_preserves_membership_predicate_scope() -> Result<()> {
+        let predicate = col("a").in_list(vec![lit(1), lit(2)], false);
+        let expr = Expr::Not(Box::new(predicate));
+        for pretty in [false, true] {
+            let sql = Unparser::default().with_pretty(pretty).expr_to_sql(&expr)?;
+            assert_eq!(sql.to_string(), "NOT (a IN (1, 2))");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn expr_to_sql_ok() -> Result<()> {
         let dummy_schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
         #[expect(deprecated)]
@@ -2892,7 +2909,7 @@ mod tests {
                 (col("a") + col("b")).gt(lit(4)).is_not_unknown(),
                 r#"((a + b) > 4) IS NOT UNKNOWN"#,
             ),
-            (not(col("a")), r#"NOT a"#),
+            (not(col("a")), r#"NOT (a)"#),
             (
                 Expr::between(col("a"), lit(1), lit(7)),
                 r#"(a BETWEEN 1 AND 7)"#,

@@ -23,6 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::vec;
 
+use crate::coop::cooperative;
 use crate::execution_plan::{
     EmissionType, boundedness_from_children, has_same_children_properties,
     plan_contains_expression_id, stub_properties,
@@ -1619,7 +1620,9 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
             .map(|(_, right_expr)| Arc::clone(right_expr))
             .collect::<Vec<_>>();
 
-        Ok(Box::pin(HashJoinStream::new(
+        // The probe loop can emit many batches per input batch; let Tokio
+        // preempt it so the query stays cancellable (apache/datafusion#19358).
+        Ok(Box::pin(cooperative(HashJoinStream::new(
             partition,
             self.schema(),
             on_right,
@@ -1639,7 +1642,7 @@ impl<A: CollectLeftAccumulator + 'static> ExecutionPlan for HashJoinExec<A> {
             self.mode,
             self.null_aware,
             self.fetch,
-        )))
+        ))))
     }
 
     fn metrics(&self) -> Option<MetricsSet> {

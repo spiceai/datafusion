@@ -4544,6 +4544,100 @@ mod tests {
         Ok(())
     }
 
+    /// Groups left at end of input are emitted in `batch_size` slices of one
+    /// materialized output, by both the ordered partial and final streams.
+    #[tokio::test]
+    async fn ordered_aggregate_drains_remaining_groups_in_batch_size_slices() -> Result<()>
+    {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("sort_col", DataType::Int32, false),
+            Field::new("group_col", DataType::Int32, false),
+            Field::new("value_col", DataType::Int64, false),
+        ]));
+        let n = 10;
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int32Array::from(vec![1; n])),
+                Arc::new(Int32Array::from((0..n as i32).rev().collect::<Vec<_>>())),
+                Arc::new(Int64Array::from((0..n as i64).collect::<Vec<_>>())),
+            ],
+        )?;
+        let ordering = LexOrdering::new([PhysicalSortExpr::new_default(Arc::new(
+            Column::new("sort_col", 0),
+        ))])
+        .unwrap();
+        let input = TestMemoryExec::try_new(&[vec![batch]], Arc::clone(&schema), None)?
+            .try_with_sort_information(vec![ordering.clone()])?;
+        let input = Arc::new(TestMemoryExec::update_cache(&Arc::new(input)));
+
+        let group_by = PhysicalGroupBy::new_single(vec![
+            (col("sort_col", &schema)?, "sort_col".to_string()),
+            (col("group_col", &schema)?, "group_col".to_string()),
+        ]);
+        let aggr_expr = vec![Arc::new(
+            AggregateExprBuilder::new(sum_udaf(), vec![col("value_col", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("sum_value")
+                .build()?,
+        )];
+        let partial = AggregateExec::try_new(
+            AggregateMode::Partial,
+            group_by.clone(),
+            aggr_expr.clone(),
+            vec![None],
+            input,
+            Arc::clone(&schema),
+        )?;
+        assert!(matches!(
+            partial.input_order_mode(),
+            InputOrderMode::PartiallySorted(_)
+        ));
+
+        let task_ctx = new_migrated_hash_ctx(3);
+        let stream = partial.execute_typed(0, &task_ctx)?;
+        assert!(matches!(stream, StreamType::OrderedPartialAggregate(_)));
+        let partial_output = collect(stream.into()).await?;
+        let sizes: Vec<_> = partial_output.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(sizes, vec![3, 3, 3, 1]);
+
+        let final_input =
+            TestMemoryExec::try_new(&[partial_output], partial.schema(), None)?
+                .try_with_sort_information(vec![ordering])?;
+        let final_input = Arc::new(TestMemoryExec::update_cache(&Arc::new(final_input)));
+        let final_aggregate = AggregateExec::try_new(
+            AggregateMode::Final,
+            group_by.as_final(),
+            aggr_expr,
+            vec![None],
+            final_input,
+            Arc::clone(&schema),
+        )?;
+        let stream = final_aggregate.execute_typed(0, &task_ctx)?;
+        assert!(matches!(stream, StreamType::OrderedFinalAggregate(_)));
+        let output = collect(stream.into()).await?;
+        let sizes: Vec<_> = output.iter().map(RecordBatch::num_rows).collect();
+        assert_eq!(sizes, vec![3, 3, 3, 1]);
+        assert_snapshot!(batches_to_sort_string(&output), @r"
++----------+-----------+-----------+
+| sort_col | group_col | sum_value |
++----------+-----------+-----------+
+| 1        | 0         | 9         |
+| 1        | 1         | 8         |
+| 1        | 2         | 7         |
+| 1        | 3         | 6         |
+| 1        | 4         | 5         |
+| 1        | 5         | 4         |
+| 1        | 6         | 3         |
+| 1        | 7         | 2         |
+| 1        | 8         | 1         |
+| 1        | 9         | 0         |
++----------+-----------+-----------+
+");
+
+        Ok(())
+    }
+
     #[tokio::test]
     async fn ordered_partial_aggregate_partially_sorted_no_emit_panic() -> Result<()> {
         // Reproducer for #20445: emitting from PartiallySorted input must not
