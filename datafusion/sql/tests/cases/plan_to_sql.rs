@@ -19680,3 +19680,49 @@ fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts() -> Result<()> {
+    // The shapes `SELECT DISTINCT … ORDER BY <computed key>` plans to, as Spice's
+    // federation unparses them, each checked by running the expected statement on
+    // PostgreSQL 17: before, every one was refused there, with `column "b" does
+    // not exist` or "for SELECT DISTINCT, ORDER BY expressions must appear in
+    // select list". A DISTINCT subquery bounding a join input keeps its scope
+    // inside the subquery, and a WHERE stays below the DISTINCT it filters.
+    let cases = [
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by b + 1 limit 3",
+            r#"SELECT "j1_id", "b" FROM (SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1") AS "derived_distinct" ORDER BY ("b" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by -b limit 3",
+            r#"SELECT "j1_id", "b" FROM (SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1") AS "derived_distinct" ORDER BY -"b" ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id from j1 where j1_id > 1 order by j1_id + 1 desc limit 3",
+            r#"SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1" WHERE ("j1"."j1_id" > 1)) AS "derived_distinct" ORDER BY ("j1_id" + 1) DESC NULLS FIRST LIMIT 3"#,
+        ),
+        (
+            "select x.j1_id from (select distinct j1_id from j1 order by j1_id + 1 limit 3) x join j2 on x.j1_id = j2.j2_id",
+            r#"SELECT "x"."j1_id" FROM (SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3) AS "x" INNER JOIN "j2" ON ("x"."j1_id" = "j2"."j2_id")"#,
+        ),
+    ];
+    for (sql, expected) in cases {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(sql)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default()
+                .with_expr_planner(Arc::new(CoreFunctionPlanner::default())),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        assert_eq!(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+            expected,
+            "{sql}"
+        );
+    }
+    Ok(())
+}
