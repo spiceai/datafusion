@@ -1174,6 +1174,25 @@ impl Unparser<'_> {
         Ok(self.identifier_comparison_key(&self.emitted_column_name(name)?))
     }
 
+    /// [`Self::emitted_column_key`] of only the bytes of the emitted name the
+    /// dialect's engine keeps ([`super::dialect::Dialect::identifier_max_length`]),
+    /// cut on a character boundary as PostgreSQL cuts it. Two outputs of one derived
+    /// table with the same key are one column to the query reading it by name.
+    ///
+    /// Only the check that a derived table's outputs can be told apart uses it.
+    /// Matching a reference to an output keeps comparing whole names, so a reference
+    /// is never bound to an output because the two share a prefix.
+    pub(crate) fn emitted_output_name_key(&self, name: &str) -> Result<String> {
+        let emitted = self.emitted_column_name(name)?;
+        let kept = match self.dialect.identifier_max_length() {
+            Some(max) if emitted.len() > max => {
+                &emitted[..emitted.floor_char_boundary(max)]
+            }
+            _ => emitted.as_str(),
+        };
+        Ok(self.identifier_comparison_key(kept))
+    }
+
     pub fn col_to_sql(&self, col: &Column) -> Result<ast::Expr> {
         let col_name = self.emitted_column_name(&col.name)?;
 

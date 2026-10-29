@@ -15587,6 +15587,97 @@ fn test_sort_key_reading_a_volatile_output_keeps_its_fetch_above_the_scope() -> 
     Ok(())
 }
 
+/// Pairs of output names that differ only after the bytes PostgreSQL keeps of a
+/// name: past 63 ASCII bytes, and past a two-byte character that straddles byte 63,
+/// which PostgreSQL drops whole, keeping 62.
+fn names_postgresql_keeps_alike() -> [(String, String); 2] {
+    let ascii = "o".repeat(63);
+    let straddling = "o".repeat(62);
+    [
+        (format!("{ascii}_one"), format!("{ascii}_two")),
+        (format!("{straddling}é_one"), format!("{straddling}è_two")),
+    ]
+}
+
+#[test]
+fn test_sort_scope_refuses_outputs_postgresql_reads_as_one_name() -> Result<()> {
+    // PostgreSQL keeps the first 63 bytes of a name, so the derived table exposes
+    // both outputs under one name, and the SELECT reading it fails with `column
+    // reference ... is ambiguous`. Refused for PostgreSQL. A dialect that compares
+    // names whole scopes the sort as before.
+    for (one, two) in names_postgresql_keeps_alike() {
+        let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+            .project(vec![
+                col("t.a").alias(&one),
+                col("t.a").add(lit(1)).alias(&two),
+                random().alias("r"),
+            ])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+
+        match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+            Ok(sql) => panic!(
+                "PostgreSQL reads {one} and {two} as one name, so the scope must be refused: {sql}"
+            ),
+            Err(e) => assert_eq!(
+                e.strip_backtrace(),
+                format!(
+                    "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when two outputs the derived table exposes, {one} and {two}, become one name once the dialect shortens each to at most 63 bytes"
+                )
+            ),
+        }
+        assert!(
+            plan_to_sql(&plan).is_ok(),
+            "the default dialect compares names whole and scopes the sort"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_input_refuses_outputs_postgresql_reads_as_one_name() -> Result<()>
+{
+    // The correlation reads the build side's outputs by name from its derived
+    // table, so two that PostgreSQL shortens to one name make it ambiguous there.
+    for (one, two) in names_postgresql_keeps_alike() {
+        let probe =
+            table_scan(Some("p"), &int32_schema(&["id"]), Some(vec![0]))?.build()?;
+        let build = table_scan(Some("person"), &int32_schema(&["id"]), Some(vec![0]))?
+            .project(vec![
+                col("person.id").alias(&one),
+                col("person.id").add(lit(1)).alias(&two),
+            ])?
+            .alias("b")?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (
+                    vec![Column::new(Some("p"), "id")],
+                    vec![Column::new(Some("b"), one.as_str())],
+                ),
+                None,
+            )?
+            .build()?;
+
+        match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+            Ok(sql) => panic!(
+                "PostgreSQL reads {one} and {two} as one name, so the EXISTS input must be refused: {sql}"
+            ),
+            Err(e) => assert_eq!(
+                e.strip_backtrace(),
+                "This feature is not implemented: A projected EXISTS input requires unique output names"
+            ),
+        }
+        assert!(
+            plan_to_sql(&plan).is_ok(),
+            "the default dialect compares names whole and keeps the EXISTS input"
+        );
+    }
+    Ok(())
+}
+
 #[test]
 fn test_sort_key_over_distinct_reading_a_volatile_output_is_scoped() -> Result<()> {
     // The DISTINCT folds into the SELECT computing the projection, where the key is
