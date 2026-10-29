@@ -1435,11 +1435,34 @@ pub(crate) fn sort_keys_scope_their_distinct(
 /// as the expression one of its outputs computes. An `ORDER BY` of a `SELECT
 /// DISTINCT` may name either, and an engine reads the output it matches rather
 /// than evaluating the key again.
+///
+/// The key reads the projection's outputs, and an output's expression reads its
+/// input. The two are one expression only when every column the expression reads
+/// is also an output passed through unchanged: one that reads the column and
+/// keeps its name, with or without an alias. An output that reuses its input's
+/// name breaks that: over an input `a`, the key `-a` reads the output `-a AS a`,
+/// so it is `a` again, while the output computes `-a`.
 fn sort_key_is_listed(key: &Expr, projection: &Projection) -> bool {
+    fn computed(output: &Expr) -> &Expr {
+        match output {
+            Expr::Alias(alias) => alias.expr.as_ref(),
+            output => output,
+        }
+    }
+    let outputs = projection.schema.columns();
+    let passes_through = |column: &Column| {
+        projection.expr.iter().zip(&outputs).any(|(output, name)| {
+            name == column
+                && matches!(computed(output), Expr::Column(read) if read == column)
+        })
+    };
     matches!(key, Expr::Column(_))
-        || projection.expr.iter().any(|output| match output {
-            Expr::Alias(alias) => alias.expr.as_ref() == key,
-            output => output == key,
+        || projection.expr.iter().any(|output| {
+            computed(output) == key
+                && computed(output)
+                    .column_refs()
+                    .into_iter()
+                    .all(passes_through)
         })
 }
 
