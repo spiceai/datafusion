@@ -19733,6 +19733,17 @@ fn test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts() -> Result<
             "select distinct j1_id from j1 where j1_id > 1 order by j1_id + 1 desc limit 3",
             r#"SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1" WHERE ("j1"."j1_id" > 1)) AS "derived_distinct" ORDER BY ("j1_id" + 1) DESC NULLS FIRST LIMIT 3"#,
         ),
+        // A key the list already shows, as an output's expression, is left where it
+        // is: PostgreSQL matches it to that output, and the scope would have two
+        // outputs named `j1_id` to tell apart.
+        (
+            "select distinct a.j1_id, b.j1_id, a.j1_id + b.j1_id as k from j1 a cross join j1 b order by a.j1_id + b.j1_id limit 3",
+            r#"SELECT DISTINCT "a"."j1_id", "b"."j1_id", ("a"."j1_id" + "b"."j1_id") AS "k" FROM "j1" AS "a" CROSS JOIN "j1" AS "b" ORDER BY ("a"."j1_id" + "b"."j1_id") ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by j1_id + 1 limit 3",
+            r#"SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1" ORDER BY ("j1"."j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
         (
             "select x.j1_id from (select distinct j1_id from j1 order by j1_id + 1 limit 3) x join j2 on x.j1_id = j2.j2_id",
             r#"SELECT "x"."j1_id" FROM (SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3) AS "x" INNER JOIN "j2" ON ("x"."j1_id" = "j2"."j2_id")"#,
