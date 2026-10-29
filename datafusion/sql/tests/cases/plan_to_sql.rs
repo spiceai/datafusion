@@ -19836,6 +19836,58 @@ fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
 }
 
 #[test]
+fn test_sort_key_over_distinct_matching_an_output_that_reuses_its_input_name_is_scoped()
+-> Result<()> {
+    // Over an input `a`, the key `-a` reads the output `-a AS a` and so is `a`
+    // again, while the output computes `-a`. They look alike but read different
+    // values, so the key is not one the list shows. Left in the SELECT carrying the
+    // DISTINCT, `ORDER BY -"a"` reads the input there: PostgreSQL 17 returns -3 for
+    // the values 1, 2 and 3, where the plan's first row is -1. Each expected
+    // statement was run on PostgreSQL 17 and returned -1.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").alias("a")])?
+        .project(vec![(-col("a")).alias("a")])?
+        .distinct()?
+        .sort_with_limit(vec![(-col("a")).sort(true, true)], Some(1))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?,
+        @r#"SELECT "a" FROM (SELECT DISTINCT -"a" AS "a" FROM (SELECT "t"."a" AS "a" FROM "t") AS "derived_projection") AS "derived_distinct" ORDER BY -"a" ASC NULLS FIRST LIMIT 1"#
+    );
+
+    // The SQL that plans to the same shape: a derived table with no alias, whose
+    // computed output takes the name the SELECT above reuses.
+    assert_snapshot!(
+        unparse_with_dialect(
+            "SELECT DISTINCT -a AS a FROM (SELECT j1_id + 0 AS a FROM j1) ORDER BY -a LIMIT 1",
+            &UnparserPostgreSqlDialect {},
+        )?,
+        @r#"SELECT "a" FROM (SELECT DISTINCT -"a" AS "a" FROM (SELECT ("j1"."j1_id" + 0) AS "a" FROM "j1") AS "derived_projection") AS "derived_distinct" ORDER BY -"a" ASC NULLS LAST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_matching_an_output_over_a_passed_through_column_stays_listed()
+-> Result<()> {
+    // `a AS a` passes the input `a` through under its own name, so the key `-a`
+    // reads the same value as the output `-a AS b` computes: the list shows it, and
+    // it stays in the SELECT carrying the DISTINCT, as without the alias. PostgreSQL
+    // 17 returns 3 for the values 1, 2 and 3, which is the plan's first row.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![(col("t.a") + lit(0)).alias("a")])?
+        .project(vec![col("a").alias("a"), (-col("a")).alias("b")])?
+        .distinct()?
+        .sort_with_limit(vec![(-col("a")).sort(true, true)], Some(1))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?,
+        @r#"SELECT DISTINCT "a" AS "a", -"a" AS "b" FROM (SELECT ("t"."a" + 0) AS "a" FROM "t") AS "derived_projection" ORDER BY -"a" ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts() -> Result<()> {
     // The shapes `SELECT DISTINCT … ORDER BY <computed key>` plans to, as Spice's
     // federation unparses them, each checked by running the expected statement on
