@@ -43,6 +43,8 @@ mod symmetric_hash_join;
 pub mod utils;
 
 mod array_map;
+#[cfg(test)]
+mod cancellation_tests;
 mod join_filter;
 /// Hash map implementations for join operations.
 ///

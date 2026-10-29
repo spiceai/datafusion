@@ -15587,6 +15587,354 @@ fn test_sort_key_reading_a_volatile_output_keeps_its_fetch_above_the_scope() -> 
     Ok(())
 }
 
+/// Pairs of output names that differ only after the bytes PostgreSQL keeps of a
+/// name: past 63 ASCII bytes, and past a two-byte character that straddles byte 63,
+/// which PostgreSQL drops whole, keeping 62.
+fn names_postgresql_keeps_alike() -> [(String, String); 2] {
+    let ascii = "o".repeat(63);
+    let straddling = "o".repeat(62);
+    [
+        (format!("{ascii}_one"), format!("{ascii}_two")),
+        (format!("{straddling}é_one"), format!("{straddling}è_two")),
+    ]
+}
+
+#[test]
+fn test_sort_scope_refuses_outputs_postgresql_reads_as_one_name() -> Result<()> {
+    // PostgreSQL keeps the first 63 bytes of a name, so the derived table exposes
+    // both outputs under one name, and the SELECT reading it fails with `column
+    // reference ... is ambiguous`. Refused for PostgreSQL. A dialect that compares
+    // names whole scopes the sort as before.
+    for (one, two) in names_postgresql_keeps_alike() {
+        let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+            .project(vec![
+                col("t.a").alias(&one),
+                col("t.a").add(lit(1)).alias(&two),
+                random().alias("r"),
+            ])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .build()?;
+
+        match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+            Ok(sql) => panic!(
+                "PostgreSQL reads {one} and {two} as one name, so the scope must be refused: {sql}"
+            ),
+            Err(e) => assert_eq!(
+                e.strip_backtrace(),
+                format!(
+                    "This feature is not implemented: Unparsing a sort key reading a projection output that cannot be repeated is not supported when two outputs the derived table exposes, {one} and {two}, become one name once the dialect shortens each to at most 63 bytes"
+                )
+            ),
+        }
+        assert!(
+            plan_to_sql(&plan).is_ok(),
+            "the default dialect compares names whole and scopes the sort"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_projected_exists_input_refuses_outputs_postgresql_reads_as_one_name() -> Result<()>
+{
+    // The correlation reads the build side's outputs by name from its derived
+    // table, so two that PostgreSQL shortens to one name make it ambiguous there.
+    for (one, two) in names_postgresql_keeps_alike() {
+        let probe =
+            table_scan(Some("p"), &int32_schema(&["id"]), Some(vec![0]))?.build()?;
+        let build = table_scan(Some("person"), &int32_schema(&["id"]), Some(vec![0]))?
+            .project(vec![
+                col("person.id").alias(&one),
+                col("person.id").add(lit(1)).alias(&two),
+            ])?
+            .alias("b")?
+            .build()?;
+        let plan = LogicalPlanBuilder::from(probe)
+            .join(
+                build,
+                datafusion_expr::JoinType::LeftSemi,
+                (
+                    vec![Column::new(Some("p"), "id")],
+                    vec![Column::new(Some("b"), one.as_str())],
+                ),
+                None,
+            )?
+            .build()?;
+
+        match Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan) {
+            Ok(sql) => panic!(
+                "PostgreSQL reads {one} and {two} as one name, so the EXISTS input must be refused: {sql}"
+            ),
+            Err(e) => assert_eq!(
+                e.strip_backtrace(),
+                "This feature is not implemented: A projected EXISTS input requires unique output names"
+            ),
+        }
+        assert!(
+            plan_to_sql(&plan).is_ok(),
+            "the default dialect compares names whole and keeps the EXISTS input"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_reading_a_volatile_output_is_scoped() -> Result<()> {
+    // The DISTINCT folds into the SELECT computing the projection, where the key is
+    // not resolved through it: `ORDER BY (r + 1.0)` names an output alias inside an
+    // expression, which PostgreSQL rejects (`column "r" does not exist`) and DuckDB
+    // refuses for a volatile output, while SQLite evaluates `random()` again for it.
+    // The DISTINCT becomes a derived table, and the key reads its `r` from the
+    // SELECT above it.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT "a", "r" FROM (SELECT DISTINCT "t"."a", random() AS "r" FROM "t") AS "derived_distinct" ORDER BY ("r" + 1.0) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&plan)
+            .expect_err("SQLite cannot take the scope")
+            .to_string(),
+        VOLATILE_SORT_SCOPE_REFUSAL
+    );
+
+    // The fetch bounds the ordered rows, so it stays the LIMIT of the query above
+    // the derived table.
+    let fetched = volatile_projection("t")?
+        .distinct()?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(3))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&fetched)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_reads_an_output_by_its_declared_name() -> Result<()> {
+    // A projection built with a declared schema names an output apart from its
+    // expression, `random() AS z` declared as `r`. The SELECT above the DISTINCT
+    // reads `r`, so the derived table has to show the output under that name, or
+    // the key and the list bind to nothing.
+    let input = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?.build()?;
+    let declared = DFSchema::new_with_metadata(
+        vec![
+            (
+                Some(TableReference::bare("t")),
+                Arc::new(Field::new("a", DataType::Int32, false)),
+            ),
+            (None, Arc::new(Field::new("r", DataType::Float64, false))),
+        ],
+        std::collections::HashMap::new(),
+    )?;
+    let projection = LogicalPlan::Projection(Projection::try_new_with_schema(
+        vec![col("t.a"), random().alias("z")],
+        Arc::new(input),
+        Arc::new(declared),
+    )?);
+    let plan = LogicalPlanBuilder::from(projection)
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_is_left_out_of_an_unbounded_exists_body() -> Result<()> {
+    // Under a list the body's own projection takes, the sort is derived with a
+    // builder of its own, which no longer knows it is in an EXISTS body. Its order
+    // reaches nothing there, so the sort is left out, as it is over a bare
+    // projection, rather than scoped, or refused on a dialect that cannot take the
+    // scope.
+    let body = volatile_projection("u")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![lit(1)])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .filter(exists(Arc::new(body)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT u.a, random() AS r FROM u))"
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        "SELECT `t`.`a` FROM `t` WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT `u`.`a`, random() AS `r` FROM `u`))"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_computed_sort_key_over_distinct_is_scoped() -> Result<()> {
+    // The ORDER BY of a SELECT DISTINCT may only name what its list shows, so a
+    // key over outputs that can be repeated is not inlined either: PostgreSQL
+    // rejects `ORDER BY ((t.a + 1) + 1)` there ("for SELECT DISTINCT, ORDER BY
+    // expressions must appear in select list"), and `ORDER BY (b + 1)` binds `b`
+    // to nothing. Read from a SELECT above the DISTINCT, each key names outputs,
+    // on every dialect, since repeating these outputs changes no value.
+    let schema = int32_schema(&["a"]);
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .build()?;
+    let direct = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a")])?
+        .distinct()?
+        .sort_with_limit(vec![col("t.a").add(lit(1)).sort(false, false)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&aliased)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    assert_snapshot!(
+        plan_to_sql(&direct)?,
+        @r#"SELECT a FROM (SELECT DISTINCT t.a FROM t) ORDER BY (a + 1) DESC NULLS LAST LIMIT 3"#
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&aliased)?
+            .to_string(),
+        r#"SELECT `a`, `b` FROM (SELECT DISTINCT `t`.`a`, (`t`.`a` + 1) AS `b` FROM `t`) ORDER BY (`b` + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_computed_sort_key_over_distinct_under_a_filter_is_scoped() -> Result<()> {
+    // A filter above the sort is lowered beneath it, so the sort no longer sits
+    // directly on the DISTINCT. Its key is read from a SELECT above the DISTINCT
+    // all the same, and so is the filter, which reads the same outputs by name.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)))?
+        .build()?;
+    let volatile = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) WHERE (b > 0) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT "a", "b" FROM (SELECT DISTINCT "t"."a", ("t"."a" + 1) AS "b" FROM "t") AS "derived_distinct" WHERE ("b" > 0) ORDER BY ("b" + 1) ASC NULLS FIRST"#
+    );
+    // The volatile output is computed once, in the DISTINCT's SELECT, and both
+    // the filter and the key read that value.
+    assert_snapshot!(
+        plan_to_sql(&volatile)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_over_a_scoped_distinct_reads_its_outputs_unqualified() -> Result<()> {
+    // The filters kept between the sort and the DISTINCT are emitted in the
+    // SELECT above it, where the relation inside the derived table is hidden, so
+    // a qualified reference loses its qualifier as the keys do.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)).and(col("t.a").gt(lit(0))))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) WHERE ((b > 0) AND (a > 0)) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_over_a_scoped_distinct_refuses_a_captured_outer_reference() -> Result<()> {
+    // A filter between a bounded sort and the DISTINCT that correlates against
+    // the enclosing query would bind to the derived table instead, through its
+    // alias or one of its outputs, and compare the row with itself.
+    let mut refusals = Vec::new();
+    for reference in ["derived_distinct.r", "r"] {
+        let body = volatile_projection("u")?
+            .distinct()?
+            .filter(col("r").gt(out_ref_col(DataType::Float64, reference)))?
+            .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(1))?
+            .project(vec![col("r")])?
+            .build()?;
+        let plan = table_scan(
+            Some("derived_distinct"),
+            &Schema::new(vec![Field::new("r", DataType::Float64, false)]),
+            None,
+        )?
+        .project(vec![scalar_subquery(Arc::new(body))])?
+        .build()?;
+        refusals.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)
+                .expect_err("a captured outer reference must be refused")
+                .to_string(),
+        );
+    }
+    assert_snapshot!(
+        refusals.join("\n"),
+        @r"
+    This feature is not implemented: Unparsing a sort over a SELECT DISTINCT by a key that is not one of its outputs is not supported when the outer reference derived_distinct.r carries a name the unparser gives a derived table
+    This feature is not implemented: Unparsing a sort over a SELECT DISTINCT by a key that is not one of its outputs is not supported when the outer reference r carries the name of an output the derived table exposes
+    "
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bare_sort_keys_over_distinct_stay_in_its_select() -> Result<()> {
+    // A key naming an output the list shows is emitted as that name, which every
+    // dialect binds in the SELECT carrying the DISTINCT, so no scope is built.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![
+            col("r").sort(true, true),
+            col("t.a").sort(false, false),
+        ])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT DISTINCT t.a, random() AS r FROM t ORDER BY r ASC NULLS FIRST, t.a DESC NULLS LAST"#
+    );
+    Ok(())
+}
+
 #[test]
 fn test_sort_key_reading_a_volatile_output_is_unqualified_with_its_neighbours()
 -> Result<()> {
@@ -19923,6 +20271,147 @@ fn test_projected_exists_probe_set_comparison_repeatability_guard() -> Result<()
                 "MySQL cannot promise one evaluation of derived subquery outputs",
             );
         assert_contains!(error.to_string(), "evaluates the expression again");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_matching_an_output_that_reuses_its_input_name_is_scoped()
+-> Result<()> {
+    // Over an input `a`, the key `-a` reads the output `-a AS a` and so is `a`
+    // again, while the output computes `-a`. They look alike but read different
+    // values, so the key is not one the list shows. Left in the SELECT carrying the
+    // DISTINCT, `ORDER BY -"a"` reads the input there: PostgreSQL 17 returns -3 for
+    // the values 1, 2 and 3, where the plan's first row is -1. Each expected
+    // statement was run on PostgreSQL 17 and returned -1.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![col("t.a").alias("a")])?
+        .project(vec![(-col("a")).alias("a")])?
+        .distinct()?
+        .sort_with_limit(vec![(-col("a")).sort(true, true)], Some(1))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?,
+        @r#"SELECT "a" FROM (SELECT DISTINCT -"a" AS "a" FROM (SELECT "t"."a" AS "a" FROM "t") AS "derived_projection") AS "derived_distinct" ORDER BY -"a" ASC NULLS FIRST LIMIT 1"#
+    );
+
+    // The SQL that plans to the same shape: a derived table with no alias, whose
+    // computed output takes the name the SELECT above reuses.
+    assert_snapshot!(
+        unparse_with_dialect(
+            "SELECT DISTINCT -a AS a FROM (SELECT j1_id + 0 AS a FROM j1) ORDER BY -a LIMIT 1",
+            &UnparserPostgreSqlDialect {},
+        )?,
+        @r#"SELECT "a" FROM (SELECT DISTINCT -"a" AS "a" FROM (SELECT ("j1"."j1_id" + 0) AS "a" FROM "j1") AS "derived_projection") AS "derived_distinct" ORDER BY -"a" ASC NULLS LAST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_matching_an_output_over_a_passed_through_column_stays_listed()
+-> Result<()> {
+    // `a AS a` passes the input `a` through under its own name, so the key `-a`
+    // reads the same value as the output `-a AS b` computes: the list shows it, and
+    // it stays in the SELECT carrying the DISTINCT, as without the alias. PostgreSQL
+    // 17 returns 3 for the values 1, 2 and 3, which is the plan's first row.
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .project(vec![(col("t.a") + lit(0)).alias("a")])?
+        .project(vec![col("a").alias("a"), (-col("a")).alias("b")])?
+        .distinct()?
+        .sort_with_limit(vec![(-col("a")).sort(true, true)], Some(1))?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?,
+        @r#"SELECT DISTINCT "a" AS "a", -"a" AS "b" FROM (SELECT ("t"."a" + 0) AS "a" FROM "t") AS "derived_projection" ORDER BY -"a" ASC NULLS FIRST LIMIT 1"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts() -> Result<()> {
+    // The shapes `SELECT DISTINCT … ORDER BY <computed key>` plans to, as Spice's
+    // federation unparses them, each checked by running the expected statement on
+    // PostgreSQL 17: before, every one was refused there, with `column "b" does
+    // not exist` or "for SELECT DISTINCT, ORDER BY expressions must appear in
+    // select list". A DISTINCT subquery bounding a join input keeps its scope
+    // inside the subquery, and a WHERE stays below the DISTINCT it filters.
+    let cases = [
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by b + 1 limit 3",
+            r#"SELECT "j1_id", "b" FROM (SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1") AS "derived_distinct" ORDER BY ("b" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by -b limit 3",
+            r#"SELECT "j1_id", "b" FROM (SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1") AS "derived_distinct" ORDER BY -"b" ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id from j1 where j1_id > 1 order by j1_id + 1 desc limit 3",
+            r#"SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1" WHERE ("j1"."j1_id" > 1)) AS "derived_distinct" ORDER BY ("j1_id" + 1) DESC NULLS FIRST LIMIT 3"#,
+        ),
+        // A key the list already shows, as an output's expression, is left where it
+        // is: PostgreSQL matches it to that output, and the scope would have two
+        // outputs named `j1_id` to tell apart.
+        (
+            "select distinct a.j1_id, b.j1_id, a.j1_id + b.j1_id as k from j1 a cross join j1 b order by a.j1_id + b.j1_id limit 3",
+            r#"SELECT DISTINCT "a"."j1_id", "b"."j1_id", ("a"."j1_id" + "b"."j1_id") AS "k" FROM "j1" AS "a" CROSS JOIN "j1" AS "b" ORDER BY ("a"."j1_id" + "b"."j1_id") ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, j1_id + 1 as b from j1 order by j1_id + 1 limit 3",
+            r#"SELECT DISTINCT "j1"."j1_id", ("j1"."j1_id" + 1) AS "b" FROM "j1" ORDER BY ("j1"."j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select x.j1_id from (select distinct j1_id from j1 order by j1_id + 1 limit 3) x join j2 on x.j1_id = j2.j2_id",
+            r#"SELECT "x"."j1_id" FROM (SELECT "j1_id" FROM (SELECT DISTINCT "j1"."j1_id" FROM "j1") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3) AS "x" INNER JOIN "j2" ON ("x"."j1_id" = "j2"."j2_id")"#,
+        ),
+    ];
+    for (sql, expected) in cases {
+        assert_eq!(
+            unparse_with_dialect(sql, &UnparserPostgreSqlDialect {})?,
+            expected,
+            "{sql}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn test_sql_sort_key_over_distinct_names_aggregate_and_window_outputs() -> Result<()> {
+    // An unaliased aggregate or window output is a column the unparser renders as
+    // the call itself, so the derived table would leave it for the engine to name
+    // (`sum` on PostgreSQL) while the SELECT above reads `sum(j1.j1_id)`. Each is
+    // aliased to the name its schema reports. Every expected statement was run on
+    // PostgreSQL 17 and on SQLite (with backtick quoting).
+    let cases = [
+        (
+            "select distinct j1_id, sum(j1_id) from j1 group by j1_id order by j1_id + 1 limit 3",
+            r#"SELECT "j1_id", "sum(j1.j1_id)" FROM (SELECT DISTINCT "j1"."j1_id", sum("j1"."j1_id") AS "sum(j1.j1_id)" FROM "j1" GROUP BY "j1"."j1_id") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, sum(j1_id) from j1 group by j1_id order by sum(j1_id) + 1 limit 3",
+            r#"SELECT "j1_id", "sum(j1.j1_id)" FROM (SELECT DISTINCT "j1"."j1_id", sum("j1"."j1_id") AS "sum(j1.j1_id)" FROM "j1" GROUP BY "j1"."j1_id") AS "derived_distinct" ORDER BY ("sum(j1.j1_id)" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, row_number() over (order by j1_id) from j1 order by j1_id + 1 limit 3",
+            r#"SELECT "j1_id", "row_number() ORDER BY [j1.j1_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" FROM (SELECT DISTINCT "j1"."j1_id", row_number() OVER (ORDER BY "j1"."j1_id" ASC NULLS LAST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "row_number() ORDER BY [j1.j1_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" FROM "j1") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+    ];
+    for (sql, expected) in cases {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(sql)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default()
+                .with_aggregate_function(sum_udaf())
+                .with_window_function(row_number_udwf()),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        assert_eq!(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+            expected,
+            "{sql}"
+        );
     }
     Ok(())
 }
