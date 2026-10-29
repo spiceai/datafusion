@@ -4006,8 +4006,16 @@ impl Unparser<'_> {
                         distinct_sort_key_refusal,
                     )?;
                     let derived = sort.input.schema();
+                    // The filters between the sort and the `DISTINCT` are emitted
+                    // beside the keys, above the derived table, so their outer
+                    // references are exposed to it alike.
                     self.ensure_scope_captures_no_outer_reference(
-                        sort.expr.iter().map(|key| &key.expr),
+                        sort.expr.iter().map(|key| &key.expr).chain(
+                            filter_stack(sort.input.as_ref())
+                                .0
+                                .into_iter()
+                                .map(|filter| &filter.predicate),
+                        ),
                         select,
                         derived,
                         distinct_sort_key_refusal,

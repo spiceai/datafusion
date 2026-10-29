@@ -15385,6 +15385,63 @@ fn test_computed_sort_key_over_distinct_under_a_filter_is_scoped() -> Result<()>
 }
 
 #[test]
+fn test_filter_over_a_scoped_distinct_reads_its_outputs_unqualified() -> Result<()> {
+    // The filters kept between the sort and the DISTINCT are emitted in the
+    // SELECT above it, where the relation inside the derived table is hidden, so
+    // a qualified reference loses its qualifier as the keys do.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)).and(col("t.a").gt(lit(0))))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) WHERE ((b > 0) AND (a > 0)) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_filter_over_a_scoped_distinct_refuses_a_captured_outer_reference() -> Result<()> {
+    // A filter between a bounded sort and the DISTINCT that correlates against
+    // the enclosing query would bind to the derived table instead, through its
+    // alias or one of its outputs, and compare the row with itself.
+    let mut refusals = Vec::new();
+    for reference in ["derived_distinct.r", "r"] {
+        let body = volatile_projection("u")?
+            .distinct()?
+            .filter(col("r").gt(out_ref_col(DataType::Float64, reference)))?
+            .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(1))?
+            .project(vec![col("r")])?
+            .build()?;
+        let plan = table_scan(
+            Some("derived_distinct"),
+            &Schema::new(vec![Field::new("r", DataType::Float64, false)]),
+            None,
+        )?
+        .project(vec![scalar_subquery(Arc::new(body))])?
+        .build()?;
+        refusals.push(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)
+                .expect_err("a captured outer reference must be refused")
+                .to_string(),
+        );
+    }
+    assert_snapshot!(
+        refusals.join("\n"),
+        @r"
+    This feature is not implemented: Unparsing a sort over a SELECT DISTINCT by a key that is not one of its outputs is not supported when the outer reference derived_distinct.r carries a name the unparser gives a derived table
+    This feature is not implemented: Unparsing a sort over a SELECT DISTINCT by a key that is not one of its outputs is not supported when the outer reference r carries the name of an output the derived table exposes
+    "
+    );
+    Ok(())
+}
+
+#[test]
 fn test_bare_sort_keys_over_distinct_stay_in_its_select() -> Result<()> {
     // A key naming an output the list shows is emitted as that name, which every
     // dialect binds in the SELECT carrying the DISTINCT, so no scope is built.

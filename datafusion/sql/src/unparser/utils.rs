@@ -1446,11 +1446,25 @@ fn sort_key_is_listed(key: &Expr, projection: &Projection) -> bool {
 /// A `Sort` over a `DISTINCT`, as [`sort_keys_scope_their_distinct`] decides it,
 /// re-expressed so the `DISTINCT` is emitted as a derived table and the keys name
 /// its outputs from the `SELECT` that reads them. The fetch stays on the sort,
-/// above the scope, for the reason [`scope_sort_over_projection`] gives. A stack
-/// of filters between the sort and the `DISTINCT` stays between them, so it too
-/// reads the outputs by name from the `SELECT` above the `DISTINCT` one.
+/// above the scope, for the reason [`scope_sort_over_projection`] gives.
+///
+/// A stack of filters between the sort and the `DISTINCT` stays between them, so
+/// it is emitted in the `SELECT` above the `DISTINCT` one and reads its outputs by
+/// name there. Its references are unqualified as the keys are, since a qualifier
+/// naming a relation inside the derived table binds to nothing, and outer
+/// references are left as they are. A predicate holding a subquery is refused,
+/// for the reason [`scope_filters_over_projection`] gives. The caller checks the
+/// predicates' outer references for capture along with the keys'.
 pub(crate) fn scope_sort_over_distinct(sort: &Sort) -> Result<LogicalPlan> {
     let (filters, foot) = filter_stack(&sort.input);
+    if filters
+        .iter()
+        .any(|filter| holds_subquery(&filter.predicate))
+    {
+        return distinct_sort_key_refusal(
+            "when a filter between the sort and the DISTINCT holds a subquery",
+        );
+    }
     // Named as declared, for the reason `scope_filters_over_projection` gives.
     // Naming adds aliases and keeps every name, so the filters still bind.
     let distinct = match name_scoped_outputs_as_declared(foot)? {
@@ -1465,7 +1479,7 @@ pub(crate) fn scope_sort_over_distinct(sort: &Sort) -> Result<LogicalPlan> {
     // column back to its qualified form.
     for filter in filters.iter().rev() {
         scoped = Arc::new(LogicalPlan::Filter(Filter::try_new(
-            filter.predicate.clone(),
+            unqualify_columns(filter.predicate.clone())?,
             scoped,
         )?));
     }
