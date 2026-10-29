@@ -15348,6 +15348,43 @@ fn test_computed_sort_key_over_distinct_is_scoped() -> Result<()> {
 }
 
 #[test]
+fn test_computed_sort_key_over_distinct_under_a_filter_is_scoped() -> Result<()> {
+    // A filter above the sort is lowered beneath it, so the sort no longer sits
+    // directly on the DISTINCT. Its key is read from a SELECT above the DISTINCT
+    // all the same, and so is the filter, which reads the same outputs by name.
+    let schema = int32_schema(&["a"]);
+    let plan = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .filter(col("b").gt(lit(0)))?
+        .build()?;
+    let volatile = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .filter(col("r").gt(lit(0.5)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) WHERE (b > 0) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT "a", "b" FROM (SELECT DISTINCT "t"."a", ("t"."a" + 1) AS "b" FROM "t") AS "derived_distinct" WHERE ("b" > 0) ORDER BY ("b" + 1) ASC NULLS FIRST"#
+    );
+    // The volatile output is computed once, in the DISTINCT's SELECT, and both
+    // the filter and the key read that value.
+    assert_snapshot!(
+        plan_to_sql(&volatile)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) WHERE (r > 0.5) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_bare_sort_keys_over_distinct_stay_in_its_select() -> Result<()> {
     // A key naming an output the list shows is emitted as that name, which every
     // dialect binds in the SELECT carrying the DISTINCT, so no scope is built.

@@ -1397,11 +1397,17 @@ pub(crate) fn scope_sort_over_projection(
 /// A key reading a column the projection does not output, or holding a subquery,
 /// is left as it is: carrying the column through the `DISTINCT` would change which
 /// rows are distinct.
+///
+/// `input` may reach the `DISTINCT` through a stack of `Filter`s, which fold into
+/// the same `SELECT` as its `WHERE`, so the `ORDER BY` above them is that
+/// `SELECT`'s all the same. A filter above a sort is lowered beneath it
+/// ([`hoist_unfetched_sort_above_filters`]) and leaves this shape.
 pub(crate) fn sort_keys_scope_their_distinct(
     keys: &[SortExpr],
     input: &LogicalPlan,
 ) -> Option<bool> {
-    let LogicalPlan::Distinct(Distinct::All(distinct_input)) = input else {
+    let LogicalPlan::Distinct(Distinct::All(distinct_input)) = filter_stack(input).1
+    else {
         return None;
     };
     let LogicalPlan::Projection(projection) = distinct_input.as_ref() else {
@@ -1440,23 +1446,32 @@ fn sort_key_is_listed(key: &Expr, projection: &Projection) -> bool {
 /// A `Sort` over a `DISTINCT`, as [`sort_keys_scope_their_distinct`] decides it,
 /// re-expressed so the `DISTINCT` is emitted as a derived table and the keys name
 /// its outputs from the `SELECT` that reads them. The fetch stays on the sort,
-/// above the scope, for the reason [`scope_sort_over_projection`] gives.
+/// above the scope, for the reason [`scope_sort_over_projection`] gives. A stack
+/// of filters between the sort and the `DISTINCT` stays between them, so it too
+/// reads the outputs by name from the `SELECT` above the `DISTINCT` one.
 pub(crate) fn scope_sort_over_distinct(sort: &Sort) -> Result<LogicalPlan> {
+    let (filters, foot) = filter_stack(&sort.input);
     // Named as declared, for the reason `scope_filters_over_projection` gives.
-    let distinct = match name_scoped_outputs_as_declared(&sort.input)? {
+    // Naming adds aliases and keeps every name, so the filters still bind.
+    let distinct = match name_scoped_outputs_as_declared(foot)? {
         Some(named) => Arc::new(named),
-        None => Arc::clone(&sort.input),
+        None => Arc::new(foot.clone()),
     };
-    let distinct = match name_distinct_column_outputs(&distinct)? {
+    let mut scoped = match name_distinct_column_outputs(&distinct)? {
         Some(named) => Arc::new(named),
         None => distinct,
     };
+    // `Filter::try_new` rather than the builder, whose `filter` normalizes every
+    // column back to its qualified form.
+    for filter in filters.iter().rev() {
+        scoped = Arc::new(LogicalPlan::Filter(Filter::try_new(
+            filter.predicate.clone(),
+            scoped,
+        )?));
+    }
     Ok(LogicalPlan::Sort(Sort {
         expr: scope_sort_keys(&sort.expr)?,
-        input: Arc::new(identity_projection_over(
-            distinct,
-            distinct_sort_key_refusal,
-        )?),
+        input: Arc::new(identity_projection_over(scoped, distinct_sort_key_refusal)?),
         fetch: sort.fetch,
     }))
 }
