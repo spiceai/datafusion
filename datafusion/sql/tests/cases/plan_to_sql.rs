@@ -11050,6 +11050,46 @@ fn test_unparse_left_semi_join_refuses_probe_only_reserved_name_in_a_filter() ->
     Ok(())
 }
 
+/// The derived table an empty projection over an `Unnest` is emitted as is named
+/// by the unparser, like the `derived_*` aliases, so a probe-side reference that
+/// spells that name must be refused: inside the `EXISTS` body the reference
+/// would bind to the derived table's passthrough column instead of the probe.
+#[test]
+fn test_unparse_left_semi_join_refuses_probe_reference_an_unnest_rows_table_captures()
+-> Result<()> {
+    let probe =
+        table_scan(Some("__unnest_rows"), &exists_fetch_schema(), None)?.build()?;
+    let source = Schema::new(vec![
+        Field::new("c", DataType::Int32, false),
+        Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            true,
+        ),
+    ]);
+    let unnest = table_scan(Some("source"), &source, None)?
+        .project(vec![
+            col("source.c"),
+            col("source.items").alias("__unnest_placeholder(items)"),
+        ])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .build()?;
+    let build = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("__unnest_rows.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a probe-side reference the __unnest_rows derived table could shadow must be refused",
+    );
+    Ok(())
+}
+
 /// `LeftSemi` join whose build side is `build` behind the alias `a`, correlated
 /// by the unqualified reference `correlated_name`.
 fn aliased_build_side_unqualified_correlation(

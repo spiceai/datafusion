@@ -368,6 +368,7 @@ pub(crate) const DERIVED_SORT_ALIAS: &str = "derived_sort";
 pub(crate) const DERIVED_UNION_ALIAS: &str = "derived_union";
 pub(crate) const DERIVED_UNION_INPUT_ALIAS: &str = "derived_union_input";
 pub(crate) const DERIVED_UNNEST_ALIAS: &str = "derived_unnest";
+pub(crate) const DERIVED_UNNEST_ROWS_ALIAS: &str = "__unnest_rows";
 pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 
 /// Every one of those aliases, enumerated for code that has to recognise a name
@@ -379,7 +380,7 @@ pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 /// out of this list still compiles and still emits, and the guard reading it
 /// simply stops recognising the alias, which is the wrong-rows direction. Adding
 /// one here is the other half of adding one above.
-pub(crate) const DERIVED_TABLE_ALIASES: [&str; 8] = [
+pub(crate) const DERIVED_TABLE_ALIASES: [&str; 9] = [
     DERIVED_DISTINCT_ALIAS,
     DERIVED_LIMIT_ALIAS,
     DERIVED_PROJECTION_ALIAS,
@@ -387,6 +388,7 @@ pub(crate) const DERIVED_TABLE_ALIASES: [&str; 8] = [
     DERIVED_UNION_ALIAS,
     DERIVED_UNION_INPUT_ALIAS,
     DERIVED_UNNEST_ALIAS,
+    DERIVED_UNNEST_ROWS_ALIAS,
     DERIVED_WINDOW_INPUT_ALIAS,
 ];
 
@@ -1505,7 +1507,7 @@ mod tests {
     /// member so removing one fails here rather than silently un-guarding an alias
     /// the emitter still writes.
     ///
-    /// What it cannot catch is the other direction — an eighth `DERIVED_*_ALIAS`
+    /// What it cannot catch is the other direction — a tenth `DERIVED_*_ALIAS`
     /// added and left out of the list. Nothing short of the two being generated
     /// from one declaration can, which is why they sit in the same block.
     #[test]
@@ -1518,6 +1520,7 @@ mod tests {
             DERIVED_UNION_ALIAS,
             DERIVED_UNION_INPUT_ALIAS,
             DERIVED_UNNEST_ALIAS,
+            DERIVED_UNNEST_ROWS_ALIAS,
             DERIVED_WINDOW_INPUT_ALIAS,
         ] {
             assert!(

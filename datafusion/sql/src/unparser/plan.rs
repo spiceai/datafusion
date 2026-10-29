@@ -21,9 +21,9 @@ use super::{
         BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
         DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_TABLE_ALIASES,
         DERIVED_UNION_ALIAS, DERIVED_UNION_INPUT_ALIAS, DERIVED_UNNEST_ALIAS,
-        DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder, QueryBuilder,
-        RelationBuilder, SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
-        is_numbered_alias,
+        DERIVED_UNNEST_ROWS_ALIAS, DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder,
+        QueryBuilder, RelationBuilder, SelectBuilder, TableRelationBuilder,
+        TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
@@ -3215,7 +3215,10 @@ impl Unparser<'_> {
                     return self.derive(
                         &rows,
                         relation,
-                        Some(self.new_table_alias("__unnest_rows".to_string(), vec![])),
+                        Some(self.new_table_alias(
+                            DERIVED_UNNEST_ROWS_ALIAS.to_string(),
+                            vec![],
+                        )),
                         false,
                     );
                 }
@@ -6457,7 +6460,7 @@ impl Unparser<'_> {
     fn projected_exists_input<'a>(
         &self,
         plan: &'a LogicalPlan,
-    ) -> Result<Option<(&'a datafusion_expr::SubqueryAlias, Arc<LogicalPlan>)>> {
+    ) -> Result<Option<(&'a SubqueryAlias, Arc<LogicalPlan>)>> {
         if let LogicalPlan::Distinct(Distinct::All(input)) = plan {
             return Ok(self.projected_exists_input(input)?.map(|(alias, input)| {
                 (alias, Arc::new(LogicalPlan::Distinct(Distinct::All(input))))
