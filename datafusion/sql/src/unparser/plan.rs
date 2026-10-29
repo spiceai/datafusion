@@ -21,9 +21,9 @@ use super::{
         BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
         DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_TABLE_ALIASES,
         DERIVED_UNION_ALIAS, DERIVED_UNION_INPUT_ALIAS, DERIVED_UNNEST_ALIAS,
-        DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder, QueryBuilder,
-        RelationBuilder, SelectBuilder, TableRelationBuilder, TableWithJoinsBuilder,
-        is_numbered_alias,
+        DERIVED_UNNEST_ROWS_ALIAS, DERIVED_WINDOW_INPUT_ALIAS, DerivedRelationBuilder,
+        QueryBuilder, RelationBuilder, SelectBuilder, TableRelationBuilder,
+        TableWithJoinsBuilder, is_numbered_alias,
     },
     rewrite::{
         TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
@@ -68,8 +68,8 @@ use datafusion_expr::expr::{Cast, OUTER_REFERENCE_COLUMN_PREFIX, UNNEST_COLUMN_P
 use datafusion_expr::{
     Aggregate, BinaryExpr, Distinct, Expr, FetchType, Join, JoinConstraint, JoinType,
     LogicalPlan, LogicalPlanBuilder, Operator, Projection, SkipType, Sort, SortExpr,
-    Subquery, TableScan, Unnest, UserDefinedLogicalNode, Window, expr::Alias,
-    utils::split_conjunction,
+    Subquery, SubqueryAlias, TableScan, Unnest, UserDefinedLogicalNode, Window,
+    expr::Alias, utils::split_conjunction,
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{self, Ident, OrderByKind, SetExpr, TableAliasColumnDef};
@@ -1712,6 +1712,103 @@ impl Unparser<'_> {
         Ok(())
     }
 
+    /// Emits the empty projection `p` over an `Unnest` as the placeholder select
+    /// list over a derived table, [`DERIVED_UNNEST_ROWS_ALIAS`], that projects the
+    /// `Unnest`'s columns and so keeps its rows.
+    ///
+    /// Kept out of [`Self::select_to_sql_recursively`], whose stack frame every
+    /// level of a nested plan pays for.
+    fn derive_unnest_rows(
+        &self,
+        p: &Projection,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        self.ensure_unnest_rows_captures_no_outer_reference(select)?;
+        let items = self
+            .empty_projection_fallback()
+            .iter()
+            .map(|e| self.select_item_to_sql(e))
+            .collect::<Result<Vec<_>>>()?;
+        select.projection(items);
+        let expr = p
+            .input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
+        let rows =
+            LogicalPlan::Projection(Projection::try_new(expr, Arc::clone(&p.input))?);
+        self.derive(
+            &rows,
+            relation,
+            Some(self.new_table_alias(DERIVED_UNNEST_ROWS_ALIAS.to_string(), vec![])),
+            false,
+        )
+    }
+
+    /// Refuses the derived table an empty projection over an `Unnest` is emitted as
+    /// when an outer reference the clauses of this `SELECT` already carry, such as
+    /// the `WHERE` of an `EXISTS` body, could bind to it instead of the enclosing
+    /// query.
+    ///
+    /// - One qualified as [`DERIVED_UNNEST_ROWS_ALIAS`] is refused: that is the
+    ///   only relation name this `FROM` answers to, and it is written on every
+    ///   dialect, not only one that names every derived table as
+    ///   [`Self::ensure_scope_captures_no_outer_reference`] assumes.
+    /// - One with no qualifier is refused whatever its name, because the columns
+    ///   the derived table exposes are the ones the dialect renders the `Unnest`
+    ///   as, not the plan's: Snowflake's `FLATTEN` exposes `VALUE`, which no field
+    ///   of the plan is called.
+    /// - A subquery a clause holds is followed to every depth, since SQL resolves
+    ///   its outer references from the inside out and one no body in between binds
+    ///   reaches this `FROM` too. One a body in between would bind is refused as
+    ///   well, which costs that plan its pushdown and never a row.
+    ///
+    /// Any other qualified reference names a relation this `FROM` does not have, so
+    /// it reaches the enclosing query as the plan intends.
+    fn ensure_unnest_rows_captures_no_outer_reference(
+        &self,
+        select: &SelectBuilder,
+    ) -> Result<()> {
+        let alias =
+            self.emitted_qualifier_key(&TableReference::bare(DERIVED_UNNEST_ROWS_ALIAS));
+        let mut references = select.clause_outer_references().to_vec();
+        for held in select.clause_subqueries() {
+            let Some(subquery) = Self::subquery_of(held) else {
+                continue;
+            };
+            subquery.subquery.apply_with_subqueries(|plan| {
+                plan.apply_expressions(|expr| {
+                    expr.apply(|node| {
+                        if matches!(node, Expr::OuterReferenceColumn(..)) {
+                            references.push(node.clone());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })
+                })
+            })?;
+        }
+        for expr in &references {
+            let Expr::OuterReferenceColumn(_, column) = expr else {
+                continue;
+            };
+            let carries = match &column.relation {
+                None => "no qualifier, so a column the derived table exposes can take it",
+                Some(relation) if self.emitted_qualifier_key(relation) == alias => {
+                    "the name the unparser gives the derived table"
+                }
+                Some(_) => continue,
+            };
+            return not_impl_err!(
+                "Unparsing an empty projection over an UNNEST is not supported when the outer reference {} carries {carries}",
+                column.flat_name()
+            );
+        }
+        Ok(())
+    }
+
     /// The outputs `scope` exposes, as the statement spells them
     /// ([`Self::emitted_column_key`]): BigQuery writes an output `x*` as `x_42`, which
     /// an outer reference already named `x_42` would bind to.
@@ -2395,7 +2492,7 @@ impl Unparser<'_> {
     /// with its columns as that side's select items.
     fn derive_aliased_joined_right_input(
         &self,
-        plan_alias: &datafusion_expr::SubqueryAlias,
+        plan_alias: &SubqueryAlias,
         plan: &LogicalPlan,
         columns: Vec<Ident>,
         select: &mut SelectBuilder,
@@ -3174,6 +3271,28 @@ impl Unparser<'_> {
                 if let Some(new_plan) = rewrite_plan_for_sort_on_non_projected_fields(p) {
                     return self
                         .select_to_sql_recursively(&new_plan, query, select, relation);
+                }
+
+                // Projection pushdown leaves an empty projection over an Unnest
+                // nothing reads a column of. Its rows still count: a join with it
+                // multiplies the other side by the number of elements. Without a
+                // placeholder column to find, the Unnest below would be dropped and
+                // the projection unparsed as `SELECT 1`, a single row. The Unnest's
+                // columns, with any Limit or Sort between, are projected in a
+                // derived table of their own, which keeps its rows and its scope
+                // (Snowflake's FLATTEN joins inside it, not into this SELECT). The
+                // empty projection's own select list is the same placeholder every
+                // other empty projection gets, so e.g. a UNION's operands match.
+                // A projection already started here derives this one below, and
+                // the guard fires there. An Unnest with no output columns (a
+                // zero-field struct) has nothing to project, and deriving it would
+                // rebuild this same empty projection, so it is left alone.
+                if p.expr.is_empty()
+                    && !select.already_projected()
+                    && !p.input.schema().fields().is_empty()
+                    && Self::reaches_unnest_through_modifiers(p.input.as_ref())
+                {
+                    return self.derive_unnest_rows(p, select, relation);
                 }
 
                 // Projection can be top-level plan for unnest relation.
@@ -5254,6 +5373,21 @@ impl Unparser<'_> {
         }
     }
 
+    /// Whether `plan` is an Unnest, or reaches one through the Limits and
+    /// Sorts [`Self::peel_to_unnest_with_modifiers`] looks through.
+    fn reaches_unnest_through_modifiers(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Unnest(_) => true,
+            LogicalPlan::Limit(limit) => {
+                Self::reaches_unnest_through_modifiers(limit.input.as_ref())
+            }
+            LogicalPlan::Sort(sort) => {
+                Self::reaches_unnest_through_modifiers(sort.input.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     /// Walk through transparent nodes (Limit, Sort) between the outer
     /// Projection and the Unnest, applying their SQL modifiers (LIMIT,
     /// OFFSET, ORDER BY) to the query builder. Returns the `Unnest` node
@@ -6312,7 +6446,7 @@ impl Unparser<'_> {
     ///
     /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
     fn alias_columns_renamed_by_pushdown(
-        plan_alias: &datafusion_expr::SubqueryAlias,
+        plan_alias: &SubqueryAlias,
         rewritten: &LogicalPlan,
     ) -> Vec<Ident> {
         if !Self::exposes_projection_outputs(rewritten) {
@@ -6398,7 +6532,7 @@ impl Unparser<'_> {
     fn projected_exists_input<'a>(
         &self,
         plan: &'a LogicalPlan,
-    ) -> Result<Option<(&'a datafusion_expr::SubqueryAlias, Arc<LogicalPlan>)>> {
+    ) -> Result<Option<(&'a SubqueryAlias, Arc<LogicalPlan>)>> {
         if let LogicalPlan::Distinct(Distinct::All(input)) = plan {
             return Ok(self.projected_exists_input(input)?.map(|(alias, input)| {
                 (alias, Arc::new(LogicalPlan::Distinct(Distinct::All(input))))
@@ -7805,10 +7939,7 @@ impl Unparser<'_> {
     ///   beside the renamed one is not one the alias answers to.
     ///
     /// [`SubqueryAlias`]: datafusion_expr::SubqueryAlias
-    fn schema_an_alias_answers_to(
-        &self,
-        alias: &datafusion_expr::SubqueryAlias,
-    ) -> Option<SchemaRef> {
+    fn schema_an_alias_answers_to(&self, alias: &SubqueryAlias) -> Option<SchemaRef> {
         if Self::requires_derived_subquery(&alias.input) {
             return Some(Arc::clone(alias.schema.inner()));
         }
@@ -7856,9 +7987,7 @@ impl Unparser<'_> {
     /// no filter on the way carries a subquery, which the pushdown declines to
     /// rebase. Anything else leaves the alias emitted around its input as
     /// written.
-    fn scan_an_alias_is_pushed_onto(
-        alias: &datafusion_expr::SubqueryAlias,
-    ) -> Option<&TableScan> {
+    fn scan_an_alias_is_pushed_onto(alias: &SubqueryAlias) -> Option<&TableScan> {
         let mut wrapped = alias.input.as_ref();
         loop {
             match wrapped {
