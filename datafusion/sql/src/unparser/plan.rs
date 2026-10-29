@@ -1712,6 +1712,103 @@ impl Unparser<'_> {
         Ok(())
     }
 
+    /// Emits the empty projection `p` over an `Unnest` as the placeholder select
+    /// list over a derived table, [`DERIVED_UNNEST_ROWS_ALIAS`], that projects the
+    /// `Unnest`'s columns and so keeps its rows.
+    ///
+    /// Kept out of [`Self::select_to_sql_recursively`], whose stack frame every
+    /// level of a nested plan pays for.
+    fn derive_unnest_rows(
+        &self,
+        p: &Projection,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        self.ensure_unnest_rows_captures_no_outer_reference(select)?;
+        let items = self
+            .empty_projection_fallback()
+            .iter()
+            .map(|e| self.select_item_to_sql(e))
+            .collect::<Result<Vec<_>>>()?;
+        select.projection(items);
+        let expr = p
+            .input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
+        let rows =
+            LogicalPlan::Projection(Projection::try_new(expr, Arc::clone(&p.input))?);
+        self.derive(
+            &rows,
+            relation,
+            Some(self.new_table_alias(DERIVED_UNNEST_ROWS_ALIAS.to_string(), vec![])),
+            false,
+        )
+    }
+
+    /// Refuses the derived table an empty projection over an `Unnest` is emitted as
+    /// when an outer reference the clauses of this `SELECT` already carry, such as
+    /// the `WHERE` of an `EXISTS` body, could bind to it instead of the enclosing
+    /// query.
+    ///
+    /// - One qualified as [`DERIVED_UNNEST_ROWS_ALIAS`] is refused: that is the
+    ///   only relation name this `FROM` answers to, and it is written on every
+    ///   dialect, not only one that names every derived table as
+    ///   [`Self::ensure_scope_captures_no_outer_reference`] assumes.
+    /// - One with no qualifier is refused whatever its name, because the columns
+    ///   the derived table exposes are the ones the dialect renders the `Unnest`
+    ///   as, not the plan's: Snowflake's `FLATTEN` exposes `VALUE`, which no field
+    ///   of the plan is called.
+    /// - A subquery a clause holds is followed to every depth, since SQL resolves
+    ///   its outer references from the inside out and one no body in between binds
+    ///   reaches this `FROM` too. One a body in between would bind is refused as
+    ///   well, which costs that plan its pushdown and never a row.
+    ///
+    /// Any other qualified reference names a relation this `FROM` does not have, so
+    /// it reaches the enclosing query as the plan intends.
+    fn ensure_unnest_rows_captures_no_outer_reference(
+        &self,
+        select: &SelectBuilder,
+    ) -> Result<()> {
+        let alias =
+            self.emitted_qualifier_key(&TableReference::bare(DERIVED_UNNEST_ROWS_ALIAS));
+        let mut references = select.clause_outer_references().to_vec();
+        for held in select.clause_subqueries() {
+            let Some(subquery) = Self::subquery_of(held) else {
+                continue;
+            };
+            subquery.subquery.apply_with_subqueries(|plan| {
+                plan.apply_expressions(|expr| {
+                    expr.apply(|node| {
+                        if matches!(node, Expr::OuterReferenceColumn(..)) {
+                            references.push(node.clone());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })
+                })
+            })?;
+        }
+        for expr in &references {
+            let Expr::OuterReferenceColumn(_, column) = expr else {
+                continue;
+            };
+            let carries = match &column.relation {
+                None => "no qualifier, so a column the derived table exposes can take it",
+                Some(relation) if self.emitted_qualifier_key(relation) == alias => {
+                    "the name the unparser gives the derived table"
+                }
+                Some(_) => continue,
+            };
+            return not_impl_err!(
+                "Unparsing an empty projection over an UNNEST is not supported when the outer reference {} carries {carries}",
+                column.flat_name()
+            );
+        }
+        Ok(())
+    }
+
     /// The outputs `scope` exposes, as the statement spells them
     /// ([`Self::emitted_column_key`]): BigQuery writes an output `x*` as `x_42`, which
     /// an outer reference already named `x_42` would bind to.
@@ -3195,32 +3292,7 @@ impl Unparser<'_> {
                     && !p.input.schema().fields().is_empty()
                     && Self::reaches_unnest_through_modifiers(p.input.as_ref())
                 {
-                    let items = self
-                        .empty_projection_fallback()
-                        .iter()
-                        .map(|e| self.select_item_to_sql(e))
-                        .collect::<Result<Vec<_>>>()?;
-                    select.projection(items);
-                    let expr = p
-                        .input
-                        .schema()
-                        .columns()
-                        .into_iter()
-                        .map(Expr::Column)
-                        .collect();
-                    let rows = LogicalPlan::Projection(Projection::try_new(
-                        expr,
-                        Arc::clone(&p.input),
-                    )?);
-                    return self.derive(
-                        &rows,
-                        relation,
-                        Some(self.new_table_alias(
-                            DERIVED_UNNEST_ROWS_ALIAS.to_string(),
-                            vec![],
-                        )),
-                        false,
-                    );
+                    return self.derive_unnest_rows(p, select, relation);
                 }
 
                 // Projection can be top-level plan for unnest relation.

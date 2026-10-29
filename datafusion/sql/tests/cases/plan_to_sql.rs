@@ -11090,6 +11090,140 @@ fn test_unparse_left_semi_join_refuses_probe_reference_an_unnest_rows_table_capt
     Ok(())
 }
 
+/// The plan an explicit `EXISTS` test reads: `__unnest_rows` (columns `c`, `d`)
+/// filtered by `EXISTS (body)`, where `body` is `wrap` applied to an empty
+/// projection over an `Unnest` of `source.items` that keeps `source.c`.
+fn exists_over_empty_unnest(
+    wrap: impl FnOnce(LogicalPlan) -> Result<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    let source = Schema::new(vec![
+        Field::new("c", DataType::Int32, false),
+        Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            true,
+        ),
+    ]);
+    let unnest = table_scan(Some("source"), &source, None)?
+        .project(vec![
+            col("source.c"),
+            col("source.items").alias("__unnest_placeholder(items)"),
+        ])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .build()?;
+    let empty = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    table_scan(Some("__unnest_rows"), &exists_fetch_schema(), None)?
+        .filter(exists(Arc::new(wrap(empty)?)))?
+        .build()
+}
+
+/// Asserts `plan` is refused for `reference` on a dialect that names every
+/// derived table, one that does not, and Snowflake, whose `FLATTEN` exposes a
+/// column, `VALUE`, the plan has no field for.
+#[track_caller]
+fn assert_exists_over_empty_unnest_refused(
+    plan: &LogicalPlan,
+    reference: &str,
+    carries: &str,
+) {
+    let snowflake = SnowflakeDialect::new();
+    for unparser in [
+        Unparser::new(&UnparserPostgreSqlDialect {}),
+        Unparser::new(&UnparserDefaultDialect {}),
+        Unparser::new(&snowflake),
+    ] {
+        let err = unparser
+            .plan_to_sql(plan)
+            .map(|sql| sql.to_string())
+            .expect_err(reference);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "This feature is not implemented: Unparsing an empty projection over an UNNEST is not supported when the outer reference {reference} carries {carries}"
+            )
+        );
+    }
+}
+
+/// An explicit `EXISTS` reaches the derived table an empty projection over an
+/// `Unnest` is emitted as through a `Filter`, not a semi join, so its outer
+/// reference must meet a guard of its own. Before the guard, the PostgreSQL
+/// unparse of the qualified case was
+/// `SELECT * FROM "__unnest_rows" WHERE EXISTS (SELECT FROM (SELECT "source"."c", UNNEST("source"."items") FROM "source") AS "__unnest_rows" WHERE ("__unnest_rows"."c" > 0))`,
+/// whose `"__unnest_rows"."c"` binds to the derived table's passthrough column
+/// instead of the enclosing query's. The derived table is named on every
+/// dialect, so the qualified reference is refused on one that does not name
+/// every derived table as well. An unqualified reference is refused whatever its
+/// name: `c` is a column the derived table exposes, and on Snowflake so is
+/// `VALUE`, which the plan never names.
+#[test]
+fn test_unparse_exists_refuses_outer_reference_an_unnest_rows_table_captures()
+-> Result<()> {
+    for reference in ["__unnest_rows.c", "c", "VALUE"] {
+        // Built unnormalized, so `VALUE` keeps the spelling Snowflake gives it.
+        let column = if reference.contains('.') {
+            Column::from(reference)
+        } else {
+            Column::new_unqualified(reference)
+        };
+        let plan = exists_over_empty_unnest(|empty| {
+            LogicalPlanBuilder::from(empty)
+                .filter(out_ref_col(DataType::Int32, column).gt(lit(0)))?
+                .build()
+        })?;
+        let carries = if reference.contains('.') {
+            "the name the unparser gives the derived table"
+        } else {
+            "no qualifier, so a column the derived table exposes can take it"
+        };
+        assert_exists_over_empty_unnest_refused(&plan, reference, carries);
+    }
+    Ok(())
+}
+
+/// The same capture one subquery further down. SQL resolves the inner body's
+/// outer reference from the inside out, so it reaches the `__unnest_rows`
+/// derived table before the enclosing query. Before the guard followed the
+/// subqueries a clause holds, the PostgreSQL unparse was
+/// `SELECT * FROM "__unnest_rows" WHERE EXISTS (SELECT FROM (SELECT "source"."c", UNNEST("source"."items") FROM "source") AS "__unnest_rows" WHERE EXISTS (SELECT * FROM "z" WHERE ("z"."k" = "__unnest_rows"."c")))`.
+#[test]
+fn test_unparse_exists_refuses_nested_outer_reference_an_unnest_rows_table_captures()
+-> Result<()> {
+    let plan = exists_over_empty_unnest(|empty| {
+        let inner = table_scan(Some("z"), &int32_schema(&["k"]), None)?
+            .filter(col("z.k").eq(out_ref_col(DataType::Int32, "__unnest_rows.c")))?
+            .build()?;
+        LogicalPlanBuilder::from(empty)
+            .filter(exists(Arc::new(inner)))?
+            .build()
+    })?;
+    assert_exists_over_empty_unnest_refused(
+        &plan,
+        "__unnest_rows.c",
+        "the name the unparser gives the derived table",
+    );
+    Ok(())
+}
+
+/// The guard refuses only a reference the derived table can take: one qualified
+/// with a relation this `FROM` does not have reaches the enclosing query, so the
+/// body keeps its rows in the derived table and the plan unparses.
+#[test]
+fn test_unparse_exists_keeps_outer_reference_to_another_relation_over_unnest_rows()
+-> Result<()> {
+    let plan = exists_over_empty_unnest(|empty| {
+        LogicalPlanBuilder::from(empty)
+            .filter(out_ref_col(DataType::Int32, "outer_t.c").gt(lit(0)))?
+            .build()
+    })?;
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?;
+    assert_eq!(
+        sql.to_string(),
+        r#"SELECT * FROM "__unnest_rows" WHERE EXISTS (SELECT FROM (SELECT "source"."c", UNNEST("source"."items") FROM "source") AS "__unnest_rows" WHERE ("outer_t"."c" > 0))"#
+    );
+    Ok(())
+}
+
 /// `LeftSemi` join whose build side is `build` behind the alias `a`, correlated
 /// by the unqualified reference `correlated_name`.
 fn aliased_build_side_unqualified_correlation(

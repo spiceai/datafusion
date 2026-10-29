@@ -334,6 +334,14 @@ pub struct SelectBuilder {
     /// Added to with `note_clause_outer_references()` and read with
     /// `clause_outer_references()`.
     clause_outer_references: Vec<Expr>,
+    /// The subqueries the clauses already on this SELECT hold. An outer
+    /// reference one of them reads, at any depth, resolves outward through this
+    /// SELECT's `FROM` too, so a derived table built later under those clauses
+    /// can capture it the same way.
+    ///
+    /// Added to with `note_clause_outer_references()` and read with
+    /// `clause_subqueries()`.
+    clause_subqueries: Vec<Expr>,
     /// Emitted outer qualifiers that cleanup must preserve across an aggregate scope.
     preserved_outer_qualifiers: Vec<String>,
 }
@@ -676,13 +684,23 @@ impl SelectBuilder {
     }
 
     /// Records the outer references `expr` reads, for a clause it is emitted into
-    /// on this SELECT. A subquery in `expr` is not entered: its outer references
-    /// are resolved inside it.
+    /// on this SELECT, and the subqueries it holds. A subquery is not entered
+    /// here: it is kept whole in `clause_subqueries`, for a guard that has to
+    /// follow its outer references out through this SELECT.
     pub fn note_clause_outer_references(&mut self, expr: &Expr) {
         // The visitor never fails, so there is no error to keep.
         let _ = expr.apply(|node| {
-            if matches!(node, Expr::OuterReferenceColumn(..)) {
-                self.clause_outer_references.push(node.clone());
+            match node {
+                Expr::OuterReferenceColumn(..) => {
+                    self.clause_outer_references.push(node.clone());
+                }
+                Expr::Exists(_)
+                | Expr::InSubquery(_)
+                | Expr::ScalarSubquery(_)
+                | Expr::SetComparison(_) => {
+                    self.clause_subqueries.push(node.clone());
+                }
+                _ => {}
             }
             Ok(TreeNodeRecursion::Continue)
         });
@@ -701,6 +719,12 @@ impl SelectBuilder {
     /// [`Self::note_clause_outer_references`].
     pub fn clause_outer_references(&self) -> &[Expr] {
         &self.clause_outer_references
+    }
+
+    /// The subqueries the clauses already on this SELECT hold — see
+    /// [`Self::note_clause_outer_references`].
+    pub fn clause_subqueries(&self) -> &[Expr] {
+        &self.clause_subqueries
     }
 
     fn and_selection(&mut self, value: Option<ast::Expr>) -> &mut Self {
@@ -925,6 +949,7 @@ impl SelectBuilder {
             input_predicates_stay_scoped: false,
             predicates_added: 0,
             clause_outer_references: Vec::new(),
+            clause_subqueries: Vec::new(),
             preserved_outer_qualifiers: Vec::new(),
         }
     }
