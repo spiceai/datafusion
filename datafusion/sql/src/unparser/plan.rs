@@ -32,11 +32,11 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        EnclosedRelations, enclosed_qualifiers, expr_contains_subquery, filter_stack,
-        filters_scope_their_projection, find_agg_node_within_select,
-        find_unnest_node_within_select, find_window_nodes_within_select,
-        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
-        name_scope_outputs, partition_subquery_filters,
+        EnclosedRelations, aggregate_outputs_can_be_scoped, enclosed_qualifiers,
+        expr_contains_subquery, filter_stack, filters_scope_their_projection,
+        find_agg_node_within_select, find_unnest_node_within_select,
+        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
+        name_derived_scope_outputs, name_scope_outputs, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, scope_sort_keys, scope_sort_over_projection,
         select_list_wraps_a_grouping_expr, sort_keys_scope_their_projection,
@@ -1073,7 +1073,7 @@ impl Unparser<'_> {
         }
 
         // Construct a list of all the identifiers present in query sources
-        let mut all_idents = Vec::new();
+        let mut all_idents = select_builder.preserved_outer_qualifiers().to_vec();
         if let Some(source_alias) = relation_builder.get_alias() {
             all_idents.push(source_alias);
         } else if let Some(source_name) = relation_builder.table_name() {
@@ -1176,6 +1176,13 @@ impl Unparser<'_> {
                 .map(|e| self.select_item_to_sql(e))
                 .collect::<Result<Vec<_>>>()?;
             select.projection(items);
+            if fully_absorbed && let Some(agg) = find_agg_node_within_select(plan, true) {
+                select.group_by(ast::GroupByExpr::Expressions(
+                    self.group_by_keys(agg, &UnparserAggScope::new(agg))?,
+                    vec![],
+                ));
+                return Ok(true);
+            }
             return Ok(false);
         }
 
@@ -1364,8 +1371,9 @@ impl Unparser<'_> {
         // expressions go out as they stand: no unprojection, which is what would
         // substitute the grouping expression back into the select item, and no
         // GROUP BY on this SELECT, which now groups nothing.
-        let items = p
-            .expr
+        let fallback = p.expr.is_empty().then(|| self.empty_projection_fallback());
+        let exprs = fallback.as_deref().unwrap_or(&p.expr);
+        let items = exprs
             .iter()
             .map(|expr| self.select_item_to_sql(expr))
             .collect::<Result<Vec<_>>>()?;
@@ -1380,7 +1388,75 @@ impl Unparser<'_> {
         // scope numbers its own: a join walks both of its sides with one builder,
         // and each side requalifies its own references onto its own alias.
         let named_input = name_scope_outputs(p.input.as_ref())?;
-        let alias_name = select.next_derived_aggregate_alias();
+        // The derived alias must not shadow a correlated reference. Preserve
+        // the emitted outer qualifiers through SQL cleanup as well.
+        let mut outer_columns = Vec::new();
+        for expr in p.expr.iter().chain(select.clause_outer_references()) {
+            expr.apply(|node| {
+                if let Expr::OuterReferenceColumn(_, column) = node {
+                    outer_columns.push(column.clone());
+                }
+                let nested = match node {
+                    Expr::ScalarSubquery(subquery) => Some(&subquery.outer_ref_columns),
+                    Expr::Exists(exists) => Some(&exists.subquery.outer_ref_columns),
+                    Expr::InSubquery(subquery) => {
+                        Some(&subquery.subquery.outer_ref_columns)
+                    }
+                    Expr::SetComparison(comparison) => {
+                        Some(&comparison.subquery.outer_ref_columns)
+                    }
+                    _ => None,
+                };
+                if let Some(references) = nested {
+                    for reference in references {
+                        if let Expr::OuterReferenceColumn(_, column) = reference {
+                            outer_columns.push(column.clone());
+                        }
+                    }
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+        }
+        let mut outer_qualifiers = HashSet::new();
+        let outputs = self.scope_output_keys(p.input.schema(), |reason| {
+            not_impl_err!("Cannot scope aggregate projection {reason}")
+        })?;
+        for column in &outer_columns {
+            if let Some(relation) = &column.relation {
+                let key = self.emitted_qualifier_key(relation);
+                if p.input.schema().iter().any(|(qualifier, _)| {
+                    qualifier.is_some_and(|qualifier| {
+                        self.emitted_qualifier_key(qualifier) == key
+                    })
+                }) {
+                    return not_impl_err!(
+                        "Cannot scope aggregate projection when outer reference {} shares an input qualifier",
+                        column.flat_name()
+                    );
+                }
+                outer_qualifiers.insert(key);
+                select.preserve_outer_qualifier(
+                    self.emitted_qualifier(relation)
+                        .iter()
+                        .map(|part| {
+                            self.new_ident_quoted_if_needs(part.clone()).to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("."),
+                );
+            } else if outputs.contains(&self.emitted_column_key(&column.name)?) {
+                return not_impl_err!(
+                    "Cannot scope aggregate projection when unqualified outer reference {} matches a derived output",
+                    column.name
+                );
+            }
+        }
+        let alias_name = loop {
+            let candidate = select.next_derived_aggregate_alias();
+            if !outer_qualifiers.contains(&vec![self.emitted_column_key(&candidate)?]) {
+                break candidate;
+            }
+        };
         let alias = self.new_ident_quoted_if_needs(alias_name.clone());
         self.derive(
             &named_input,
@@ -1397,11 +1473,18 @@ impl Unparser<'_> {
             enclosed_qualifiers(p.input.schema(), |name| self.emitted_column_name(name))?;
         select.visit_expressions_in_clauses_mut(|expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
-                requalify_column_onto_derived_table(
-                    idents,
-                    &derived_qualifiers,
-                    Some(&alias),
-                );
+                let qualifier = idents
+                    .iter()
+                    .take(idents.len().saturating_sub(1))
+                    .map(|ident| ident.value.clone())
+                    .collect::<Vec<_>>();
+                if !outer_qualifiers.contains(&self.qualifier_key(&qualifier)) {
+                    requalify_column_onto_derived_table(
+                        idents,
+                        &derived_qualifiers,
+                        Some(&alias),
+                    );
+                }
             }
         });
 
@@ -1421,16 +1504,53 @@ impl Unparser<'_> {
         plan: &LogicalPlan,
         select: &SelectBuilder,
     ) -> bool {
-        if self.dialect.group_by_matches_select_subexpressions()
-            || select.has_grouped_predicate()
-        {
+        if select.has_grouped_predicate() {
             return false;
         }
         let LogicalPlan::Projection(projection) = plan else {
             return false;
         };
-        find_agg_node_within_select(plan, true)
-            .is_some_and(|agg| select_list_wraps_a_grouping_expr(&projection.expr, agg))
+        // A subquery can correlate either to this input's outputs or to an
+        // enclosing query. Only the former depends on keeping this input flat.
+        let reads_input = |references: &[Expr]| {
+            references.iter().any(|reference| match reference {
+                Expr::OuterReferenceColumn(_, column) | Expr::Column(column) => {
+                    projection.input.schema().has_column(column)
+                }
+                _ => true,
+            })
+        };
+        let reads_no_columns = projection.expr.iter().all(|expr| {
+            matches!(
+                expr.exists(|expr| Ok(match expr {
+                    Expr::Column(_) => true,
+                    Expr::ScalarSubquery(subquery) =>
+                        reads_input(&subquery.outer_ref_columns),
+                    Expr::Exists(exists) =>
+                        reads_input(&exists.subquery.outer_ref_columns),
+                    Expr::InSubquery(in_subquery) =>
+                        reads_input(&in_subquery.subquery.outer_ref_columns),
+                    Expr::SetComparison(comparison) =>
+                        reads_input(&comparison.subquery.outer_ref_columns),
+                    _ => false,
+                })),
+                Ok(false)
+            )
+        });
+        if self.dialect.group_by_matches_select_subexpressions() && !reads_no_columns {
+            return false;
+        }
+        let Some(agg) = find_agg_node_within_select(plan, true) else {
+            return false;
+        };
+        if !aggregate_outputs_can_be_scoped(agg) {
+            return false;
+        }
+        // A projection that reads none of the aggregate's outputs still needs
+        // its rows: one for a global aggregate, or one per group. Keep the
+        // aggregate in its own scope so constants and an empty SELECT list
+        // cannot turn it into a scan of its input.
+        reads_no_columns || select_list_wraps_a_grouping_expr(&projection.expr, agg)
     }
 
     fn derive(
@@ -3138,6 +3258,28 @@ impl Unparser<'_> {
                     }
                     _ => (plan, p),
                 };
+                // Direct outer references belong to this SELECT even when it
+                // has no aggregate. Keep their qualifiers through SQL cleanup;
+                // nested SELECTs register their own references.
+                for expr in &p.expr {
+                    expr.apply(|node| {
+                        if let Expr::OuterReferenceColumn(_, column) = node
+                            && let Some(relation) = &column.relation
+                        {
+                            select.preserve_outer_qualifier(
+                                self.emitted_qualifier(relation)
+                                    .iter()
+                                    .map(|part| {
+                                        self.new_ident_quoted_if_needs(part.clone())
+                                            .to_string()
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                            );
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })?;
+                }
                 // For Snowflake FLATTEN: when the outer Projection has
                 // UNNEST(...) display-name columns (from SELECT * / SELECT
                 // UNNEST(...)), generate a flatten alias now so that
@@ -5656,6 +5798,28 @@ impl Unparser<'_> {
                     builder = builder.alias(alias.clone())?;
                 }
 
+                let filter_expr: Result<Option<Expr>> = table_scan
+                    .filters
+                    .iter()
+                    .cloned()
+                    .map(|expr| {
+                        if let Some(ref mut rewriter) = filter_alias_rewriter {
+                            expr.rewrite(rewriter).data()
+                        } else {
+                            Ok(expr)
+                        }
+                    })
+                    .reduce(|acc, expr_result| {
+                        acc.and_then(|acc_expr| {
+                            expr_result.map(|expr| acc_expr.and(expr))
+                        })
+                    })
+                    .transpose();
+
+                if let Some(filter) = filter_expr? {
+                    builder = builder.filter(filter)?;
+                }
+
                 // Avoid creating a duplicate Projection node, which would result in an additional subquery if a projection already exists.
                 // For example, if the `optimize_projection` rule is applied, there will be a Projection node, and duplicate projection
                 // information included in the TableScan node.
@@ -5681,28 +5845,6 @@ impl Unparser<'_> {
                             .collect::<Vec<_>>();
                         builder = builder.project(project_columns)?;
                     };
-                }
-
-                let filter_expr: Result<Option<Expr>> = table_scan
-                    .filters
-                    .iter()
-                    .cloned()
-                    .map(|expr| {
-                        if let Some(ref mut rewriter) = filter_alias_rewriter {
-                            expr.rewrite(rewriter).data()
-                        } else {
-                            Ok(expr)
-                        }
-                    })
-                    .reduce(|acc, expr_result| {
-                        acc.and_then(|acc_expr| {
-                            expr_result.map(|expr| acc_expr.and(expr))
-                        })
-                    })
-                    .transpose();
-
-                if let Some(filter) = filter_expr? {
-                    builder = builder.filter(filter)?;
                 }
 
                 if let Some(fetch) = table_scan.fetch {

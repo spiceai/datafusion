@@ -1,0 +1,8 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: "sql.join(\"\\n\")"
+---
+SELECT 1 FROM (SELECT max(e.id) AS "max(e.id)" FROM e) AS derived_aggregate_1
+SELECT 42 FROM (SELECT max(e.id) AS "max(e.id)" FROM e) AS derived_aggregate_1
+SELECT 1 FROM (SELECT e.v AS v, max(e.id) AS "max(e.id)" FROM e GROUP BY e.v) AS derived_aggregate_1
+SELECT 42 FROM (SELECT e.v AS v, max(e.id) AS "max(e.id)" FROM e GROUP BY e.v) AS derived_aggregate_1

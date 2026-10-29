@@ -1,0 +1,6 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: "sql.join(\"\\n\")"
+---
+SELECT DISTINCT "left"."v" FROM (SELECT "left"."v" FROM "e" AS "left") AS "left" WHERE EXISTS (SELECT 1 FROM (SELECT "right"."v" FROM "e" AS "right" WHERE ("right"."id" > 1)) AS "right" WHERE ("left"."v" IS NOT DISTINCT FROM "right"."v"))
+SELECT DISTINCT "left"."v" FROM (SELECT "left"."v" FROM "e" AS "left") AS "left" WHERE NOT EXISTS (SELECT 1 FROM (SELECT "right"."v" FROM "e" AS "right" WHERE ("right"."id" > 1)) AS "right" WHERE ("left"."v" IS NOT DISTINCT FROM "right"."v"))

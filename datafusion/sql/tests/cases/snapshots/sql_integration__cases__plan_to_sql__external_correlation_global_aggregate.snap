@@ -1,0 +1,8 @@
+---
+source: datafusion/sql/tests/cases/plan_to_sql.rs
+expression: "sql.join(\"\\n\")"
+---
+SELECT (SELECT "outer_t"."id" AS "k") FROM (SELECT max("e"."id") AS "id" FROM "e" WHERE ("e"."id" >= 0)) AS "derived_aggregate_1"
+SELECT (SELECT "outer_t"."id" AS "k") FROM (SELECT max("e"."id") AS "id" FROM "e" WHERE ("e"."id" < 0)) AS "derived_aggregate_1"
+SELECT (SELECT "outer_t"."id") FROM (SELECT max("e"."id") AS "id" FROM "e" WHERE ("e"."id" >= 0)) AS "derived_aggregate_1"
+SELECT (SELECT "outer_t"."id") FROM (SELECT max("e"."id") AS "id" FROM "e" WHERE ("e"."id" < 0)) AS "derived_aggregate_1"
