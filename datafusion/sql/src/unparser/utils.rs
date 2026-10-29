@@ -1447,6 +1447,10 @@ pub(crate) fn scope_sort_over_distinct(sort: &Sort) -> Result<LogicalPlan> {
         Some(named) => Arc::new(named),
         None => Arc::clone(&sort.input),
     };
+    let distinct = match name_distinct_column_outputs(&distinct)? {
+        Some(named) => Arc::new(named),
+        None => distinct,
+    };
     Ok(LogicalPlan::Sort(Sort {
         expr: scope_sort_keys(&sort.expr)?,
         input: Arc::new(identity_projection_over(
@@ -1455,6 +1459,44 @@ pub(crate) fn scope_sort_over_distinct(sort: &Sort) -> Result<LogicalPlan> {
         )?),
         fetch: sort.fetch,
     }))
+}
+
+/// `distinct`, a `DISTINCT` over a [Projection], with each output that is an
+/// unqualified column aliased to the name its schema reports, or `None` where it
+/// has none.
+///
+/// Such a column names an aggregate's or a window's output, and the unparser
+/// renders it as the call itself, which the derived table leaves for the engine to
+/// name: `sum(t.b)` is `sum` on PostgreSQL, not the `sum(t.b)` the `SELECT` above
+/// the `DISTINCT` reads. A qualified column keeps the name it already has.
+fn name_distinct_column_outputs(distinct: &LogicalPlan) -> Result<Option<LogicalPlan>> {
+    let LogicalPlan::Distinct(Distinct::All(input)) = distinct else {
+        return Ok(None);
+    };
+    let LogicalPlan::Projection(projection) = input.as_ref() else {
+        return Ok(None);
+    };
+    let unqualified_column =
+        |expr: &Expr| matches!(expr, Expr::Column(Column { relation: None, .. }));
+    if !projection.expr.iter().any(unqualified_column) {
+        return Ok(None);
+    }
+    let exprs = projection
+        .expr
+        .iter()
+        .zip(projection.schema.fields())
+        .map(|(expr, field)| {
+            if unqualified_column(expr) {
+                expr.clone().alias(field.name().clone())
+            } else {
+                expr.clone()
+            }
+        })
+        .collect();
+    let named = Projection::try_new(exprs, Arc::clone(&projection.input))?;
+    Ok(Some(LogicalPlan::Distinct(Distinct::All(Arc::new(
+        LogicalPlan::Projection(named),
+    )))))
 }
 
 /// The refusal for a sort over a `SELECT DISTINCT` whose keys

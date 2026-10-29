@@ -19758,3 +19758,45 @@ fn test_sql_sort_keys_over_distinct_unparse_to_sql_postgres_accepts() -> Result<
     }
     Ok(())
 }
+
+#[test]
+fn test_sql_sort_key_over_distinct_names_aggregate_and_window_outputs() -> Result<()> {
+    // An unaliased aggregate or window output is a column the unparser renders as
+    // the call itself, so the derived table would leave it for the engine to name
+    // (`sum` on PostgreSQL) while the SELECT above reads `sum(j1.j1_id)`. Each is
+    // aliased to the name its schema reports. Every expected statement was run on
+    // PostgreSQL 17 and on SQLite (with backtick quoting).
+    let cases = [
+        (
+            "select distinct j1_id, sum(j1_id) from j1 group by j1_id order by j1_id + 1 limit 3",
+            r#"SELECT "j1_id", "sum(j1.j1_id)" FROM (SELECT DISTINCT "j1"."j1_id", sum("j1"."j1_id") AS "sum(j1.j1_id)" FROM "j1" GROUP BY "j1"."j1_id") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, sum(j1_id) from j1 group by j1_id order by sum(j1_id) + 1 limit 3",
+            r#"SELECT "j1_id", "sum(j1.j1_id)" FROM (SELECT DISTINCT "j1"."j1_id", sum("j1"."j1_id") AS "sum(j1.j1_id)" FROM "j1" GROUP BY "j1"."j1_id") AS "derived_distinct" ORDER BY ("sum(j1.j1_id)" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+        (
+            "select distinct j1_id, row_number() over (order by j1_id) from j1 order by j1_id + 1 limit 3",
+            r#"SELECT "j1_id", "row_number() ORDER BY [j1.j1_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" FROM (SELECT DISTINCT "j1"."j1_id", row_number() OVER (ORDER BY "j1"."j1_id" ASC NULLS LAST RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS "row_number() ORDER BY [j1.j1_id ASC NULLS LAST] RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW" FROM "j1") AS "derived_distinct" ORDER BY ("j1_id" + 1) ASC NULLS LAST LIMIT 3"#,
+        ),
+    ];
+    for (sql, expected) in cases {
+        let statement = Parser::new(&GenericDialect {})
+            .try_with_sql(sql)?
+            .parse_statement()?;
+        let context = MockContextProvider {
+            state: MockSessionState::default()
+                .with_aggregate_function(sum_udaf())
+                .with_window_function(row_number_udwf()),
+        };
+        let plan = SqlToRel::new(&context).sql_statement_to_plan(statement)?;
+        assert_eq!(
+            Unparser::new(&UnparserPostgreSqlDialect {})
+                .plan_to_sql(&plan)?
+                .to_string(),
+            expected,
+            "{sql}"
+        );
+    }
+    Ok(())
+}
