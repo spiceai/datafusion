@@ -15282,6 +15282,35 @@ fn test_sort_key_over_distinct_reads_an_output_by_its_declared_name() -> Result<
 }
 
 #[test]
+fn test_sort_key_over_distinct_is_left_out_of_an_unbounded_exists_body() -> Result<()> {
+    // Under a list the body's own projection takes, the sort is derived with a
+    // builder of its own, which no longer knows it is in an EXISTS body. Its order
+    // reaches nothing there, so the sort is left out, as it is over a bare
+    // projection, rather than scoped, or refused on a dialect that cannot take the
+    // scope.
+    let body = volatile_projection("u")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .project(vec![lit(1)])?
+        .build()?;
+    let plan = table_scan(Some("t"), &int32_schema(&["a"]), Some(vec![0]))?
+        .filter(exists(Arc::new(body)))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT t.a FROM t WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT u.a, random() AS r FROM u))"
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        "SELECT `t`.`a` FROM `t` WHERE EXISTS (SELECT 1 FROM (SELECT DISTINCT `u`.`a`, random() AS `r` FROM `u`))"
+    );
+    Ok(())
+}
+
+#[test]
 fn test_computed_sort_key_over_distinct_is_scoped() -> Result<()> {
     // The ORDER BY of a SELECT DISTINCT may only name what its list shows, so a
     // key over outputs that can be repeated is not inlined either: PostgreSQL
