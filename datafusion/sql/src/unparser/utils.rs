@@ -641,7 +641,7 @@ pub(crate) fn unproject_projection_exprs(
 /// the two apart means reading the plan, and re-running one is never free — so a
 /// subquery is treated as the volatile case and evaluated once, in a scope of its
 /// own.
-fn output_is_repeatable(expr: &Expr) -> bool {
+pub(crate) fn output_is_repeatable(expr: &Expr) -> bool {
     !expr.is_volatile() && !holds_subquery(expr)
 }
 

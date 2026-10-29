@@ -37,7 +37,7 @@ use super::{
         filters_scope_their_projection, find_agg_node_within_select,
         find_unnest_node_within_select, find_window_nodes_within_select,
         hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
-        name_scope_outputs, partition_subquery_filters,
+        name_scope_outputs, output_is_repeatable, partition_subquery_filters,
         predicate_reads_unrepeatable_output, projection_below_filters,
         scope_filters_over_projection, scope_sort_keys, scope_sort_over_distinct,
         scope_sort_over_projection, select_list_wraps_a_grouping_expr,
@@ -4327,18 +4327,34 @@ impl Unparser<'_> {
                 let is_right_join_input = select.in_right_join_input();
                 Self::refuse_mark_join_on_null_extended_input(select, join.join_type)?;
 
+                let scoped_probe = if matches!(
+                    join.join_type,
+                    JoinType::LeftSemi
+                        | JoinType::LeftAnti
+                        | JoinType::LeftMark
+                        | JoinType::RightSemi
+                        | JoinType::RightAnti
+                        | JoinType::RightMark
+                ) {
+                    self.projected_exists_input(left_plan)?
+                } else {
+                    None
+                };
                 let mut left_scan_fetch = None;
                 let mut left_scan_only_filters = vec![];
-                let left_plan =
-                    match try_transform_to_simple_table_scan_with_filters(left_plan)? {
-                        Some(scan) => {
-                            left_scan_filters.extend(scan.filters);
-                            left_scan_only_filters = scan.scan_filters;
-                            left_scan_fetch = scan.fetch;
-                            Arc::new(scan.plan)
-                        }
-                        None => Arc::clone(left_plan),
-                    };
+                let left_plan = match if scoped_probe.is_some() {
+                    None
+                } else {
+                    try_transform_to_simple_table_scan_with_filters(left_plan)?
+                } {
+                    Some(scan) => {
+                        left_scan_filters.extend(scan.filters);
+                        left_scan_only_filters = scan.scan_filters;
+                        left_scan_fetch = scan.fetch;
+                        Arc::new(scan.plan)
+                    }
+                    None => Arc::clone(left_plan),
+                };
                 // A qualified pass-through projection over a join is flattened
                 // into this already-projected SELECT rather than derived, so
                 // the join condition above can still name the aliases inside it.
@@ -4387,13 +4403,24 @@ impl Unparser<'_> {
                 let left_joins_from = select.last_from_join_count();
                 // A RIGHT JOIN null-extends its left input, a FULL JOIN both of
                 // its inputs: a mark join reached there is refused (see above).
-                self.walk_possibly_null_extended_join_input(
-                    matches!(join.join_type, JoinType::Right | JoinType::Full),
-                    left_plan.as_ref(),
-                    query,
-                    select,
-                    relation,
-                )?;
+                if let Some((alias, input)) = scoped_probe {
+                    self.derive(
+                        input.as_ref(),
+                        relation,
+                        Some(
+                            self.new_table_alias(alias.alias.table().to_string(), vec![]),
+                        ),
+                        false,
+                    )?;
+                } else {
+                    self.walk_possibly_null_extended_join_input(
+                        matches!(join.join_type, JoinType::Right | JoinType::Full),
+                        left_plan.as_ref(),
+                        query,
+                        select,
+                        relation,
+                    )?;
+                }
                 Self::refuse_scoped_subquery_on_joined_input(
                     &left_scoped,
                     left_plan.as_ref(),
@@ -6352,6 +6379,65 @@ impl Unparser<'_> {
         }
     }
 
+    /// A renamed projection used as a join input must expose its output
+    /// names in a derived scope before a correlation reads those names.
+    fn projected_exists_input<'a>(
+        &self,
+        plan: &'a LogicalPlan,
+    ) -> Result<Option<(&'a datafusion_expr::SubqueryAlias, Arc<LogicalPlan>)>> {
+        if let LogicalPlan::Distinct(Distinct::All(input)) = plan {
+            return Ok(self.projected_exists_input(input)?.map(|(alias, input)| {
+                (alias, Arc::new(LogicalPlan::Distinct(Distinct::All(input))))
+            }));
+        }
+        let LogicalPlan::SubqueryAlias(alias) = plan else {
+            return Ok(None);
+        };
+        let mut node = alias.input.as_ref();
+        let mut renamed = false;
+        loop {
+            match node {
+                LogicalPlan::Projection(projection) => {
+                    renamed |= projection
+                        .expr
+                        .iter()
+                        .any(|expr| !matches!(expr, Expr::Column(_)));
+                    node = projection.input.as_ref();
+                }
+                LogicalPlan::Filter(filter) => node = filter.input.as_ref(),
+                _ => break,
+            }
+        }
+        if !renamed {
+            return Ok(None);
+        }
+        if !matches!(alias.alias, TableReference::Bare { .. }) {
+            return not_impl_err!(
+                "A projected EXISTS input requires an unqualified alias"
+            );
+        }
+        let mut names = HashSet::new();
+        for field in alias.schema.fields() {
+            if !names.insert(self.emitted_column_key(field.name())?) {
+                return not_impl_err!(
+                    "A projected EXISTS input requires unique output names"
+                );
+            }
+        }
+        alias.input.apply_with_subqueries(|node| {
+            if let LogicalPlan::Projection(projection) = node
+                && projection
+                    .expr
+                    .iter()
+                    .any(|expr| !output_is_repeatable(expr))
+            {
+                self.ensure_derived_table_fixes_volatile_outputs()?;
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        Ok(Some((alias, Arc::clone(&alias.input))))
+    }
+
     /// Builds the body of an `EXISTS` subquery for a semi/anti/mark join.
     ///
     /// The build (right) side is unparsed as a complete, self-contained
@@ -6385,17 +6471,49 @@ impl Unparser<'_> {
             );
         }
 
+        // A correlated EXISTS can execute its build once per probe row. A
+        // derived table only fixes values within each invocation, so volatile
+        // build expressions require independent materialization.
+        let mut volatile_build = false;
+        right_plan.apply_with_subqueries(|node| {
+            node.apply_expressions(|expr| {
+                if expr.is_volatile() {
+                    volatile_build = true;
+                    return Ok(TreeNodeRecursion::Stop);
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })?;
+            Ok(if volatile_build {
+                TreeNodeRecursion::Stop
+            } else {
+                TreeNodeRecursion::Continue
+            })
+        })?;
+        if volatile_build {
+            return not_impl_err!(
+                "Unparsing an EXISTS-style join with a volatile build input requires independent materialization"
+            );
+        }
+
         // A sort key reading such an output is scoped only where a row bound
         // makes the sort's order observable (`sort_order_is_observable`), which
         // the body's SELECT is marked as an EXISTS body to decide; a bounded body
         // is moved below into a scope of its own, under the build side's name,
         // before the correlation is added. Unbounded, the order reaches nothing,
         // and the sort is left out.
+        // Name outputs before introducing the build alias, keeping scalar
+        // subqueries bound to the original scan relations inside the projection.
+        let projected_scope = self.projected_exists_input(right_plan)?;
+        let body_plan = projected_scope
+            .as_ref()
+            .map_or(right_plan, |(_, input)| input.as_ref());
+        let named = name_derived_scope_outputs(body_plan)?;
+        let body_plan = named.as_ref().unwrap_or(body_plan);
         let mut query_builder = Some(QueryBuilder::default());
         let mut body_select = SelectBuilder::default();
         body_select.mark_exists_body();
         let body =
-            self.select_to_sql_expr_with(right_plan, &mut query_builder, body_select)?;
+            self.select_to_sql_expr_with(body_plan, &mut query_builder, body_select)?;
         let mut query_builder = query_builder.unwrap();
 
         // Reduce the build side to a single SELECT to use as the EXISTS body.
@@ -6418,11 +6536,13 @@ impl Unparser<'_> {
         // both the projection and `DISTINCT` still decide which rows survive
         // it, so neither is redundant there.
         //
-        // `bounds_rows()` is tested first so the scope name is only demanded
-        // when a bound actually has to be moved: naming it can refuse the plan
-        // outright, and an unbounded build side has nothing to get wrong.
-        if query_builder.bounds_rows() {
-            let scope_name = self.exists_scope_name(join)?;
+        // Projected inputs retain their original alias. Other bounded inputs
+        // obtain the scope name from the correlation before it is appended.
+        if query_builder.bounds_rows() || projected_scope.is_some() {
+            let scope_name = match projected_scope {
+                Some((alias, _)) => alias.alias.table().to_string(),
+                None => self.exists_scope_name(join)?,
+            };
             query_builder.body(Box::new(SetExpr::Select(select)));
             let bounded = query_builder.build()?;
             let alias = self.new_table_alias(scope_name, vec![]);
@@ -7574,11 +7694,23 @@ impl Unparser<'_> {
         let EmittedScope::Readable { exposed, .. } = build_scope else {
             return Ok(true);
         };
-        for column in build_half.column_refs() {
+        'columns: for column in build_half.column_refs() {
             let Some(relation) = column.relation.as_ref() else {
                 continue;
             };
             if !self.scope_answers(build_scope, column)? {
+                return Ok(false);
+            }
+            if let Some((alias, _)) = self.projected_exists_input(build_plan)?
+                && self.emitted_qualifier_key(relation)
+                    == vec![self.identifier_comparison_key(alias.alias.table())]
+            {
+                let name = self.emitted_column_key(&column.name)?;
+                for field in alias.schema.fields() {
+                    if self.emitted_column_key(field.name())? == name {
+                        continue 'columns;
+                    }
+                }
                 return Ok(false);
             }
             // The relation is introduced; whether it has the column is only
