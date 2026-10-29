@@ -1380,8 +1380,9 @@ pub(crate) fn scope_sort_over_projection(
 /// Whether a `Sort` with `keys` over `input` has to read `input`'s outputs from a
 /// `SELECT` above it, and if so whether a key reads an output that cannot be
 /// repeated: `input` is a `DISTINCT` over a [Projection] listing no wildcard,
-/// every column the keys read is one of its outputs, and some key is more than a
-/// bare reference to one. `None` when the sort leaves its input as it is.
+/// every column the keys read is one of its outputs, and some key is one the list
+/// does not show ([`sort_key_is_listed`]). `None` when the sort leaves its input
+/// as it is.
 ///
 /// The `DISTINCT` folds into the `SELECT` computing the projection, and the
 /// `ORDER BY` of a `SELECT DISTINCT` may name only what its list shows.
@@ -1407,7 +1408,9 @@ pub(crate) fn sort_keys_scope_their_distinct(
         return None;
     };
     if projection_holds_wildcard(projection)
-        || keys.iter().all(|key| matches!(key.expr, Expr::Column(_)))
+        || keys
+            .iter()
+            .all(|key| sort_key_is_listed(&key.expr, projection))
         || keys.iter().any(|key| {
             holds_subquery(&key.expr)
                 || key
@@ -1420,6 +1423,18 @@ pub(crate) fn sort_keys_scope_their_distinct(
         return None;
     }
     Some(sort_keys_read_unrepeatable_output(keys, projection))
+}
+
+/// Whether the `SELECT` list of `projection` shows `key`: as an output's name, or
+/// as the expression one of its outputs computes. An `ORDER BY` of a `SELECT
+/// DISTINCT` may name either, and an engine reads the output it matches rather
+/// than evaluating the key again.
+fn sort_key_is_listed(key: &Expr, projection: &Projection) -> bool {
+    matches!(key, Expr::Column(_))
+        || projection.expr.iter().any(|output| match output {
+            Expr::Alias(alias) => alias.expr.as_ref() == key,
+            output => output == key,
+        })
 }
 
 /// A `Sort` over a `DISTINCT`, as [`sort_keys_scope_their_distinct`] decides it,
