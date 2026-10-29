@@ -15204,6 +15204,109 @@ fn test_sort_key_reading_a_volatile_output_keeps_its_fetch_above_the_scope() -> 
 }
 
 #[test]
+fn test_sort_key_over_distinct_reading_a_volatile_output_is_scoped() -> Result<()> {
+    // The DISTINCT folds into the SELECT computing the projection, where the key is
+    // not resolved through it: `ORDER BY (r + 1.0)` names an output alias inside an
+    // expression, which PostgreSQL rejects (`column "r" does not exist`) and DuckDB
+    // refuses for a volatile output, while SQLite evaluates `random()` again for it.
+    // The DISTINCT becomes a derived table, and the key reads its `r` from the
+    // SELECT above it.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&UnparserPostgreSqlDialect {})
+            .plan_to_sql(&plan)?
+            .to_string(),
+        r#"SELECT "a", "r" FROM (SELECT DISTINCT "t"."a", random() AS "r" FROM "t") AS "derived_distinct" ORDER BY ("r" + 1.0) ASC NULLS FIRST"#
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&plan)
+            .expect_err("SQLite cannot take the scope")
+            .to_string(),
+        VOLATILE_SORT_SCOPE_REFUSAL
+    );
+    Ok(())
+}
+
+#[test]
+fn test_sort_key_over_distinct_keeps_its_fetch_above_the_scope() -> Result<()> {
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .sort_with_limit(vec![col("r").add(lit(1.0)).sort(true, true)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT a, r FROM (SELECT DISTINCT t.a, random() AS r FROM t) ORDER BY (r + 1.0) ASC NULLS FIRST LIMIT 3"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_computed_sort_key_over_distinct_is_scoped() -> Result<()> {
+    // The ORDER BY of a SELECT DISTINCT may only name what its list shows, so a
+    // key over outputs that can be repeated is not inlined either: PostgreSQL
+    // rejects `ORDER BY ((t.a + 1) + 1)` there ("for SELECT DISTINCT, ORDER BY
+    // expressions must appear in select list"), and `ORDER BY (b + 1)` binds `b`
+    // to nothing. Read from a SELECT above the DISTINCT, each key names outputs,
+    // on every dialect, since repeating these outputs changes no value.
+    let schema = int32_schema(&["a"]);
+    let aliased = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a"), col("t.a").add(lit(1)).alias("b")])?
+        .distinct()?
+        .sort(vec![col("b").add(lit(1)).sort(true, true)])?
+        .build()?;
+    let direct = table_scan(Some("t"), &schema, Some(vec![0]))?
+        .project(vec![col("t.a")])?
+        .distinct()?
+        .sort_with_limit(vec![col("t.a").add(lit(1)).sort(false, false)], Some(3))?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&aliased)?,
+        @r#"SELECT a, b FROM (SELECT DISTINCT t.a, (t.a + 1) AS b FROM t) ORDER BY (b + 1) ASC NULLS FIRST"#
+    );
+    assert_snapshot!(
+        plan_to_sql(&direct)?,
+        @r#"SELECT a FROM (SELECT DISTINCT t.a FROM t) ORDER BY (a + 1) DESC NULLS LAST LIMIT 3"#
+    );
+    assert_eq!(
+        Unparser::new(&SqliteDialect {})
+            .plan_to_sql(&aliased)?
+            .to_string(),
+        r#"SELECT `a`, `b` FROM (SELECT DISTINCT `t`.`a`, (`t`.`a` + 1) AS `b` FROM `t`) ORDER BY (`b` + 1) ASC NULLS FIRST"#
+    );
+    Ok(())
+}
+
+#[test]
+fn test_bare_sort_keys_over_distinct_stay_in_its_select() -> Result<()> {
+    // A key naming an output the list shows is emitted as that name, which every
+    // dialect binds in the SELECT carrying the DISTINCT, so no scope is built.
+    let plan = volatile_projection("t")?
+        .distinct()?
+        .sort(vec![
+            col("r").sort(true, true),
+            col("t.a").sort(false, false),
+        ])?
+        .build()?;
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT DISTINCT t.a, random() AS r FROM t ORDER BY r ASC NULLS FIRST, t.a DESC NULLS LAST"#
+    );
+    Ok(())
+}
+
+#[test]
 fn test_sort_key_reading_a_volatile_output_is_unqualified_with_its_neighbours()
 -> Result<()> {
     // Every reference in the key reads from the derived table, so one still
