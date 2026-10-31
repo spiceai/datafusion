@@ -48,7 +48,7 @@ impl PriorityMap {
             map: new_hash_table(capacity, key_type)?,
             heap: new_heap(capacity, descending, val_type.clone())?,
             capacity,
-            mapper: Vec::with_capacity(capacity),
+            mapper: Vec::new(),
             val_type,
             null_count: 0,
         })
