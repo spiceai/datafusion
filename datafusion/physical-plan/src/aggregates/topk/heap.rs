@@ -328,7 +328,7 @@ impl<VAL: ValueType> TopKHeap<VAL> {
             desc,
             capacity: limit,
             len: 0,
-            heap: (0..=limit).map(|_| None).collect::<Vec<_>>(),
+            heap: Vec::new(),
         }
     }
 
@@ -339,7 +339,11 @@ impl<VAL: ValueType> TopKHeap<VAL> {
     }
 
     pub fn worst_map_idx(&self) -> usize {
-        self.heap[0].as_ref().map(|hi| hi.map_idx).unwrap_or(0)
+        self.heap
+            .first()
+            .and_then(|hi| hi.as_ref())
+            .map(|hi| hi.map_idx)
+            .unwrap_or(0)
     }
 
     pub fn is_full(&self) -> bool {
@@ -365,7 +369,11 @@ impl<VAL: ValueType> TopKHeap<VAL> {
 
     fn append(&mut self, new_val: VAL, map_idx: usize, mapper: &mut Vec<(usize, usize)>) {
         let hi = HeapItem::new(new_val, map_idx);
-        self.heap[self.len] = Some(hi);
+        if self.len < self.heap.len() {
+            self.heap[self.len] = Some(hi);
+        } else {
+            self.heap.push(Some(hi));
+        }
         self.heapify_up(self.len, mapper);
         self.len += 1;
     }
@@ -656,6 +664,28 @@ mod tests {
 
         let actual = heap.to_string();
         assert_snapshot!(actual, @"val=1 idx=0, bucket=1");
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_grow_heap_lazily_for_large_limit() -> Result<()> {
+        let mut map = vec![];
+        let mut heap = TopKHeap::new(usize::MAX, false);
+        assert_eq!(heap.heap.capacity(), 0);
+
+        for val in [3, 1, 2] {
+            heap.append_or_replace(val, val as usize, &mut map);
+        }
+        assert!(!heap.is_full());
+        let (vals, map_idxs) = heap.drain();
+        assert_eq!(vals, vec![1, 2, 3]);
+        assert_eq!(map_idxs, vec![1, 2, 3]);
+
+        // Slots freed by draining are reused
+        heap.append_or_replace(5, 5, &mut map);
+        let (vals, _) = heap.drain();
+        assert_eq!(vals, vec![5]);
 
         Ok(())
     }

@@ -48,7 +48,7 @@ impl PriorityMap {
             map: new_hash_table(capacity, key_type)?,
             heap: new_heap(capacity, descending, val_type.clone())?,
             capacity,
-            mapper: Vec::with_capacity(capacity),
+            mapper: Vec::new(),
             val_type,
             null_count: 0,
         })
@@ -76,7 +76,10 @@ impl PriorityMap {
     pub fn insert_with_null_groups(&mut self, row_idx: usize) -> Result<()> {
         // valued groups are capped at `capacity`; up to `capacity` additional
         // all-NULL groups may be tracked alongside them
-        assert!(self.map.len() <= 2 * self.capacity, "Overflow");
+        assert!(
+            self.map.len() <= self.capacity.saturating_mul(2),
+            "Overflow"
+        );
 
         if self.heap.is_worse(row_idx) {
             // A group that was registered as all-NULL now has a value that
@@ -125,7 +128,10 @@ impl PriorityMap {
     /// must still appear in the aggregation output; such groups all tie on the
     /// sort key, so tracking up to `capacity` of them preserves top-k semantics.
     pub fn insert_null(&mut self, row_idx: usize) {
-        assert!(self.map.len() <= 2 * self.capacity, "Overflow");
+        assert!(
+            self.map.len() <= self.capacity.saturating_mul(2),
+            "Overflow"
+        );
         if self.map.insert_null(row_idx) {
             self.null_count += 1;
         }
@@ -634,6 +640,23 @@ mod tests {
         +----------+--------------+
         "
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_track_null_and_valued_groups_with_max_limit() -> Result<()> {
+        let ids: ArrayRef = Arc::new(StringArray::from(vec!["1", "2"]));
+        let vals: ArrayRef = Arc::new(Int64Array::from(vec![None, Some(7)]));
+        let mut agg =
+            PriorityMap::new(DataType::Utf8, DataType::Int64, usize::MAX, false)?;
+        agg.set_batch(ids, vals);
+        agg.insert_null(0);
+        agg.insert_with_null_groups(1)?;
+
+        let cols = agg.emit()?;
+        let batch = RecordBatch::try_new(test_schema(), cols)?;
+        assert_eq!(batch.num_rows(), 2);
 
         Ok(())
     }
