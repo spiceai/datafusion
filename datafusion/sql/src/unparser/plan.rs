@@ -32,15 +32,17 @@ use super::{
         subquery_alias_inner_query_and_columns,
     },
     utils::{
-        EnclosedRelations, aggregate_outputs_can_be_scoped, enclosed_qualifiers,
-        expr_contains_subquery, filter_stack, filters_scope_their_projection,
-        find_agg_node_within_select, find_unnest_node_within_select,
-        find_window_nodes_within_select, hoist_unfetched_sort_above_filters,
-        name_derived_scope_outputs, name_scope_outputs, output_is_repeatable,
-        partition_subquery_filters, predicate_reads_unrepeatable_output,
-        projection_below_filters, scope_filters_over_projection, scope_sort_keys,
+        EnclosedRelations, aggregate_outputs_can_be_scoped, distinct_sort_key_refusal,
+        enclosed_qualifiers, expr_contains_subquery, filter_stack,
+        filters_scope_their_projection, find_agg_node_within_select,
+        find_unnest_node_within_select, find_window_nodes_within_select,
+        hoist_unfetched_sort_above_filters, name_derived_scope_outputs,
+        name_scope_outputs, output_is_repeatable, partition_subquery_filters,
+        predicate_reads_unrepeatable_output, projection_below_filters,
+        scope_filters_over_projection, scope_sort_keys, scope_sort_over_distinct,
         scope_sort_over_projection, select_list_wraps_a_grouping_expr,
-        sort_keys_scope_their_projection, stacked_filters_read_unrepeatable_output,
+        sort_keys_scope_their_distinct, sort_keys_scope_their_projection,
+        stacked_filters_read_unrepeatable_output,
         try_transform_to_simple_table_scan_with_filters, unproject_projection_exprs,
         unproject_sort_expr, unproject_unnest_expr,
         unproject_unnest_expr_as_flatten_value, unproject_window_exprs,
@@ -1747,11 +1749,23 @@ impl Unparser<'_> {
     /// output again, and inside a join input, which a sort reaches only with a
     /// fetch — see [`Self::sort_order_is_observable`].
     fn ensure_sort_key_scope_is_possible(&self, select: &SelectBuilder) -> Result<()> {
-        self.ensure_derived_table_fixes_volatile_sort_keys()?;
+        self.ensure_sort_scope_is_possible(select, true, unrepeatable_sort_key_refusal)
+    }
+
+    /// [`Self::ensure_sort_key_scope_is_possible`] for any scope a sort's keys
+    /// build, refused with `refuse`: the dialect gate applies only where a key
+    /// reads an output that cannot be repeated, and the join-input refusal always.
+    fn ensure_sort_scope_is_possible(
+        &self,
+        select: &SelectBuilder,
+        reads_unrepeatable_output: bool,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        if reads_unrepeatable_output {
+            self.ensure_derived_table_fixes_volatile_sort_keys()?;
+        }
         if select.within_join_input() {
-            return unrepeatable_sort_key_refusal(
-                "when the sort's fetch bounds an input of a join",
-            );
+            return refuse("when the sort's fetch bounds an input of a join");
         }
         Ok(())
     }
@@ -1766,12 +1780,31 @@ impl Unparser<'_> {
         query: &mut Option<QueryBuilder>,
         select: &mut SelectBuilder,
     ) -> Result<()> {
-        self.ensure_sort_key_scope_is_possible(select)?;
+        self.prepare_sort_scope(
+            hidden,
+            query,
+            select,
+            true,
+            unrepeatable_sort_key_refusal,
+        )
+    }
+
+    /// [`Self::prepare_sort_key_scope`] for any scope a sort's keys build, with
+    /// the refusals of [`Self::ensure_sort_scope_is_possible`].
+    fn prepare_sort_scope(
+        &self,
+        hidden: &DFSchema,
+        query: &mut Option<QueryBuilder>,
+        select: &mut SelectBuilder,
+        reads_unrepeatable_output: bool,
+        refuse: fn(&str) -> Result<()>,
+    ) -> Result<()> {
+        self.ensure_sort_scope_is_possible(select, reads_unrepeatable_output, refuse)?;
         self.repoint_clauses_onto_derived_table(
             &enclosed_qualifiers(hidden, |name| self.emitted_column_name(name))?,
             query,
             select,
-            unrepeatable_sort_key_refusal,
+            refuse,
         )
     }
 
@@ -3866,8 +3899,17 @@ impl Unparser<'_> {
                     // or refuse it on a dialect that cannot take the scope. Decide
                     // here, as the scoping below does: where the order reaches
                     // nothing, the sort is left out.
-                    if sort_keys_scope_their_projection(&sort.expr, sort.input.as_ref())?
-                        .is_some()
+                    let scopes_its_input = sort_keys_scope_their_projection(
+                        &sort.expr,
+                        sort.input.as_ref(),
+                    )?
+                    .is_some()
+                        || sort_keys_scope_their_distinct(
+                            &sort.expr,
+                            sort.input.as_ref(),
+                        )
+                        .is_some();
+                    if scopes_its_input
                         && !Self::sort_order_is_observable(sort.fetch, query, select)
                     {
                         return self.select_to_sql_recursively(
@@ -3937,6 +3979,55 @@ impl Unparser<'_> {
                         unrepeatable_sort_key_refusal,
                     )?;
                     self.prepare_sort_key_scope(&projection.schema, query, select)?;
+                    return self
+                        .select_to_sql_recursively(&scoped, query, select, relation);
+                }
+
+                // Over a DISTINCT the key is not resolved at all, and the ORDER BY of
+                // a SELECT DISTINCT may name only what its list shows, so a key that
+                // is more than an output's name reads the outputs from a SELECT
+                // above it (`sort_keys_scope_their_distinct`). A key reading an
+                // output that cannot be repeated takes the dialect gate the
+                // projection's scope above takes.
+                if let Some(reads_unrepeatable_output) =
+                    sort_keys_scope_their_distinct(&sort.expr, sort.input.as_ref())
+                {
+                    if !Self::sort_order_is_observable(sort.fetch, query, select) {
+                        return self.select_to_sql_recursively(
+                            sort.input.as_ref(),
+                            query,
+                            select,
+                            relation,
+                        );
+                    }
+                    self.ensure_sort_scope_is_possible(
+                        select,
+                        reads_unrepeatable_output,
+                        distinct_sort_key_refusal,
+                    )?;
+                    let derived = sort.input.schema();
+                    // The filters between the sort and the `DISTINCT` are emitted
+                    // beside the keys, above the derived table, so their outer
+                    // references are exposed to it alike.
+                    self.ensure_scope_captures_no_outer_reference(
+                        sort.expr.iter().map(|key| &key.expr).chain(
+                            filter_stack(sort.input.as_ref())
+                                .0
+                                .into_iter()
+                                .map(|filter| &filter.predicate),
+                        ),
+                        select,
+                        derived,
+                        distinct_sort_key_refusal,
+                    )?;
+                    self.prepare_sort_scope(
+                        derived,
+                        query,
+                        select,
+                        reads_unrepeatable_output,
+                        distinct_sort_key_refusal,
+                    )?;
+                    let scoped = scope_sort_over_distinct(sort)?;
                     return self
                         .select_to_sql_recursively(&scoped, query, select, relation);
                 }
