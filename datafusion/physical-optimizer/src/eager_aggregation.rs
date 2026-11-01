@@ -139,7 +139,9 @@ use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_functions_aggregate::sum::sum_udaf;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
-use datafusion_physical_expr::expressions::{Column, binary, case, cast, is_null, lit};
+use datafusion_physical_expr::expressions::{
+    Column, binary, case, cast, is_not_null, lit,
+};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::aggregates::{
@@ -879,13 +881,22 @@ fn try_push_aggregate(
             let expr = match plan.out {
                 OutKind::Passthrough => col(&plan.merges[0].2)?,
                 OutKind::CountOrZero => {
+                    // `CASE WHEN merged IS NOT NULL THEN merged ELSE 0 END`, which
+                    // `CaseExpr::nullable` proves non-null: its `THEN` is never
+                    // reached with a NULL, and its `ELSE` is a literal. The output
+                    // therefore keeps COUNT's non-null field. Written as `WHEN
+                    // merged IS NULL THEN 0 ELSE merged` it reports nullable, and a
+                    // `ProjectionExec` above the aggregate, such as the one naming
+                    // `count(Int64(1))` as `count(*)`, keeps the non-null field it
+                    // was built with; `ProjectionPushdown` then rebuilds it as
+                    // nullable and fails its schema check.
                     let merged = col(&plan.merges[0].2)?;
                     let merged_type = merged.data_type(final_schema.as_ref())?;
                     let zero = cast(lit(0_i64), final_schema.as_ref(), merged_type)?;
                     case(
                         None,
-                        vec![(is_null(Arc::clone(&merged))?, zero)],
-                        Some(merged),
+                        vec![(is_not_null(Arc::clone(&merged))?, merged)],
+                        Some(zero),
                     )?
                 }
                 OutKind::AvgDiv => {
@@ -2736,6 +2747,20 @@ mod tests {
             "eager aggregation should have fired:\n{}",
             plan_str(&eager_on)
         );
+        // Each COUNT keeps its non-null field. A nullable one changes the plan's
+        // schema, and a projection above the aggregate that was built against
+        // the non-null field then fails `ProjectionPushdown`'s schema check.
+        for name in ["count(t.id)", "count(*)"] {
+            assert!(
+                !eager_on
+                    .schema()
+                    .field_with_name(name)
+                    .unwrap()
+                    .is_nullable(),
+                "{name} became nullable:\n{}",
+                plan_str(&eager_on)
+            );
+        }
         let on = enforce_distribution(eager_on);
         let off = enforce_distribution(plan);
 
