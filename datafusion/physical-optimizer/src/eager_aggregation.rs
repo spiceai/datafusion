@@ -139,7 +139,7 @@ use datafusion_functions_aggregate::count::count_udaf;
 use datafusion_functions_aggregate::sum::sum_udaf;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::aggregate::{AggregateExprBuilder, AggregateFunctionExpr};
-use datafusion_physical_expr::expressions::{Column, binary, cast};
+use datafusion_physical_expr::expressions::{Column, binary, case, cast, is_null, lit};
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::aggregates::{
@@ -171,10 +171,11 @@ impl PhysicalOptimizerRule for EagerAggregation {
         // The rewrite preserves column types and order, but COUNT decomposes to
         // SUM(partial_count), and SUM is nullable while COUNT is not — a
         // non-null -> nullable widening that the framework's schema check
-        // forbids (it only permits the reverse). The widening is value-safe
-        // (every final group has >= 1 partial, so the merged count is never
-        // actually NULL), so we opt out of the check, as the trait docs sanction
-        // for rules that change nullability.
+        // forbids (it only permits the reverse). The widening is value-safe: a
+        // grouped final group has >= 1 partial, so its merged count is never
+        // NULL, and an ungrouped COUNT (one output row even over no input) maps
+        // its NULL merge back to 0 in a top projection. So we opt out of the
+        // check, as the trait docs sanction for rules that change nullability.
         false
     }
 
@@ -627,8 +628,17 @@ fn try_push_aggregate(
     // Decompose each aggregate into the partial(s) to push and how to recombine
     // them above the join. AVG splits into SUM(x)+COUNT(x) and needs a top
     // projection (the division); SUM/MIN/MAX/COUNT each produce a single merged
-    // column that *is* the output, so no projection is added then.
+    // column that *is* the output, so no projection is added then — except for
+    // COUNT under an ungrouped aggregate. With no GROUP BY the aggregate emits
+    // one row even when the join emits none, and the SUM that merges COUNT's
+    // partials is NULL over no rows where COUNT is 0 (a null-aware anti join
+    // whose subquery has a NULL is the usual way to get there), so its merged
+    // column is mapped back to 0 in the top projection.
     let has_avg = aggrs.iter().any(|a| a.fun().name() == "avg");
+    let ungrouped = group.expr().is_empty();
+    let has_ungrouped_count =
+        ungrouped && aggrs.iter().any(|a| a.fun().name() == "count");
+    let needs_projection = has_avg || has_ungrouped_count;
 
     /// Per-input-aggregate plan: how to merge each pushed partial and how to
     /// recombine the merged columns into the aggregate's output value.
@@ -656,7 +666,7 @@ fn try_push_aggregate(
                 reassign_expr_columns(remap_to_raw(e)?, push_schema.as_ref())
             })
             .collect::<Result<Vec<_>>>()?;
-        let Decomp { partials, out } = decompose(agg);
+        let Decomp { partials, out } = decompose(agg, ungrouped);
         let mut merges = Vec::with_capacity(partials.len());
         for (p, partial) in partials.into_iter().enumerate() {
             let PartialAgg {
@@ -671,9 +681,9 @@ fn try_push_aggregate(
                 .build()?;
             pushed_aggrs.push(Arc::new(built));
             // The merged column gets an internal alias when a projection will
-            // remap it; with no AVG the single passthrough merge is aliased
+            // remap it; without one the single passthrough merge is aliased
             // straight to the output name (no projection, unchanged shape).
-            let merged_alias = if has_avg {
+            let merged_alias = if needs_projection {
                 format!("__eager_m{i}_{p}")
             } else {
                 agg.name().to_string()
@@ -852,8 +862,9 @@ fn try_push_aggregate(
     // For AVG, the top aggregate produces internal SUM/COUNT columns; add a
     // projection that passes group columns through and divides SUM/COUNT (as
     // Float64) back into the AVG output, restoring the original output schema.
-    // Without AVG the merged columns already carry the output names and order.
-    let result: Arc<dyn ExecutionPlan> = if has_avg {
+    // The same projection maps an ungrouped COUNT's NULL merge back to 0.
+    // Otherwise the merged columns already carry the output names and order.
+    let result: Arc<dyn ExecutionPlan> = if needs_projection {
         let final_schema = new_top_final.schema();
         let col = |name: &str| -> Result<Arc<dyn PhysicalExpr>> {
             let idx = final_schema.index_of(name)?;
@@ -867,6 +878,16 @@ fn try_push_aggregate(
         for plan in &agg_plans {
             let expr = match plan.out {
                 OutKind::Passthrough => col(&plan.merges[0].2)?,
+                OutKind::CountOrZero => {
+                    let merged = col(&plan.merges[0].2)?;
+                    let merged_type = merged.data_type(final_schema.as_ref())?;
+                    let zero = cast(lit(0_i64), final_schema.as_ref(), merged_type)?;
+                    case(
+                        None,
+                        vec![(is_null(Arc::clone(&merged))?, zero)],
+                        Some(merged),
+                    )?
+                }
                 OutKind::AvgDiv => {
                     let sum_f = cast(
                         col(&plan.merges[0].2)?,
@@ -932,15 +953,22 @@ struct PartialAgg {
 
 /// How an aggregate's merged partial column(s) recombine into its output.
 enum OutKind {
-    /// Output is the single merged column (SUM/MIN/MAX/COUNT).
+    /// Output is the single merged column (SUM/MIN/MAX, and grouped COUNT).
     Passthrough,
+    /// Output is the merged column with NULL read as 0: an ungrouped COUNT,
+    /// whose merging SUM sees no rows when the join emits none.
+    CountOrZero,
     /// Output is `merged_sum / merged_count`, cast to Float64 (AVG).
     AvgDiv,
 }
 
 /// Decompose `agg` into the partial(s) to push and the recombination kind. All
 /// inputs are pre-validated by [`is_decomposable`] (+ the AVG Float64 gate).
-fn decompose(agg: &AggregateFunctionExpr) -> Decomp {
+///
+/// `ungrouped` is whether the aggregate has no GROUP BY: an ungrouped COUNT
+/// recombines as [`OutKind::CountOrZero`], because its merging SUM is NULL when
+/// the join emits no rows.
+fn decompose(agg: &AggregateFunctionExpr, ungrouped: bool) -> Decomp {
     match agg.fun().name() {
         // COUNT's per-group partial counts must be summed, not re-counted.
         "count" => Decomp {
@@ -949,7 +977,11 @@ fn decompose(agg: &AggregateFunctionExpr) -> Decomp {
                 merge_udaf: sum_udaf(),
                 merge_return_field: None,
             }],
-            out: OutKind::Passthrough,
+            out: if ungrouped {
+                OutKind::CountOrZero
+            } else {
+                OutKind::Passthrough
+            },
         },
         // AVG(x) = SUM(x) / COUNT(x); both partials merge with SUM.
         "avg" => Decomp {
@@ -1133,7 +1165,9 @@ mod tests {
     use crate::PhysicalOptimizerRule;
 
     use crate::ensure_requirements::EnsureRequirements;
-    use arrow::array::{Decimal128Array, Float64Array, Int32Array, StringArray};
+    use arrow::array::{
+        Decimal128Array, Float64Array, Int32Array, Int64Array, StringArray,
+    };
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use arrow::record_batch::RecordBatch;
     use datafusion_common::NullEquality;
@@ -2589,6 +2623,188 @@ mod tests {
             sorted_rows(&off_rows),
             "eager-on results must match eager-off"
         );
+    }
+
+    /// Runs `SELECT count(id), count(*), sum(qty) FROM t WHERE qty NOT IN
+    /// (SELECT n FROM sub)` — an ungrouped aggregate over a null-aware `LeftAnti`
+    /// join — with eager aggregation on and off, and returns both results.
+    async fn ungrouped_aggregate_over_null_aware_anti_join(
+        sub_n: Vec<Option<i32>>,
+    ) -> (Vec<RecordBatch>, Vec<RecordBatch>) {
+        // t(qty, id): real rows are tiny; stats claim 10M rows / qty NDV 100.
+        let t_schema = Arc::new(Schema::new(vec![
+            Field::new("qty", DataType::Int32, true),
+            Field::new("id", DataType::Int64, true),
+        ]));
+        let t_batch = RecordBatch::try_new(
+            Arc::clone(&t_schema),
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), None, Some(2)])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40])),
+            ],
+        )
+        .unwrap();
+        let t = Arc::new(DataStatsExec::new(
+            vec![t_batch],
+            stats_with(10_000_000, &[Some(100), None]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let sub_rows = sub_n.len();
+        let sub_schema =
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, true)]));
+        let sub_batch = RecordBatch::try_new(
+            Arc::clone(&sub_schema),
+            vec![Arc::new(Int32Array::from(sub_n))],
+        )
+        .unwrap();
+        let sub = Arc::new(DataStatsExec::new(
+            vec![sub_batch],
+            stats_with(sub_rows, &[Some(sub_rows)]),
+        )) as Arc<dyn ExecutionPlan>;
+
+        let join = Arc::new(
+            HashJoinExec::try_new(
+                t,
+                sub,
+                vec![(
+                    Arc::new(Column::new("qty", 0)),
+                    Arc::new(Column::new("n", 0)),
+                )],
+                None,
+                &JoinType::LeftAnti,
+                None,
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                true,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+        let join_schema = join.schema(); // [qty, id]
+
+        let mk = |alias: &str, udaf: Arc<AggregateUDF>, arg: Arc<dyn PhysicalExpr>| {
+            Arc::new(
+                AggregateExprBuilder::new(udaf, vec![arg])
+                    .schema(Arc::clone(&join_schema))
+                    .alias(alias.to_string())
+                    .build()
+                    .unwrap(),
+            )
+        };
+        let aggrs = vec![
+            mk("count(t.id)", count_udaf(), Arc::new(Column::new("id", 1))),
+            mk("count(*)", count_udaf(), lit(1_i64)),
+            // SUM has no Int32 accumulator; the planner's coercion widens it.
+            mk(
+                "sum(t.qty)",
+                sum_udaf(),
+                cast(
+                    Arc::new(Column::new("qty", 0)),
+                    &join_schema,
+                    DataType::Int64,
+                )
+                .unwrap(),
+            ),
+        ];
+        let group = PhysicalGroupBy::new_single(vec![]);
+        let partial = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Partial,
+                group,
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                join,
+                Arc::clone(&join_schema),
+            )
+            .unwrap(),
+        );
+        let final_group = partial.group_expr().as_final();
+        let plan = Arc::new(
+            AggregateExec::try_new(
+                AggregateMode::Final,
+                final_group,
+                aggrs.clone(),
+                vec![None; aggrs.len()],
+                partial,
+                join_schema,
+            )
+            .unwrap(),
+        ) as Arc<dyn ExecutionPlan>;
+
+        let eager_on = run_rule(Arc::clone(&plan));
+        assert!(
+            join_child_is_aggregate(&eager_on),
+            "eager aggregation should have fired:\n{}",
+            plan_str(&eager_on)
+        );
+        let on = enforce_distribution(eager_on);
+        let off = enforce_distribution(plan);
+
+        let ctx = Arc::new(TaskContext::default());
+        let on_rows = collect(on, Arc::clone(&ctx)).await.unwrap();
+        let off_rows = collect(off, ctx).await.unwrap();
+        (on_rows, off_rows)
+    }
+
+    // Regression: `count(id) ... WHERE qty NOT IN (SELECT n FROM sub)` with a NULL
+    // in `sub` returned NULL (and `count(*)` failed its non-null schema) once the
+    // count was pushed below the null-aware anti join, because the join emits no
+    // rows and the SUM merging the partial counts is NULL over none. An ungrouped
+    // COUNT is 0 there; SUM stays NULL.
+    #[tokio::test]
+    async fn ungrouped_count_over_an_empty_anti_join_is_zero() {
+        let (on, off) =
+            ungrouped_aggregate_over_null_aware_anti_join(vec![Some(7), None]).await;
+        let expected = vec![
+            "+-------------+----------+------------+",
+            "| count(t.id) | count(*) | sum(t.qty) |",
+            "+-------------+----------+------------+",
+            "| 0           | 0        |            |",
+            "+-------------+----------+------------+",
+        ];
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&off)
+                .unwrap()
+                .to_string()
+                .lines()
+                .collect::<Vec<_>>(),
+            expected,
+            "eager-off reference"
+        );
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&on)
+                .unwrap()
+                .to_string()
+                .lines()
+                .collect::<Vec<_>>(),
+            expected,
+            "eager-on must match eager-off"
+        );
+    }
+
+    // The same rewrite over an anti join that keeps rows still counts them.
+    #[tokio::test]
+    async fn ungrouped_count_over_a_non_empty_anti_join_is_unchanged() {
+        let (on, off) =
+            ungrouped_aggregate_over_null_aware_anti_join(vec![Some(1)]).await;
+        // qty 2 (ids 20 and 40) survives; the NULL qty does not (null-aware).
+        let expected = vec![
+            "+-------------+----------+------------+",
+            "| count(t.id) | count(*) | sum(t.qty) |",
+            "+-------------+----------+------------+",
+            "| 2           | 2        | 4          |",
+            "+-------------+----------+------------+",
+        ];
+        for (label, rows) in [("eager-off", &off), ("eager-on", &on)] {
+            assert_eq!(
+                arrow::util::pretty::pretty_format_batches(rows)
+                    .unwrap()
+                    .to_string()
+                    .lines()
+                    .collect::<Vec<_>>(),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     // Decimal SUM widens its input precision by +10. Eager aggregation rewrites
