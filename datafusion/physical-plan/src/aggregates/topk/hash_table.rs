@@ -56,7 +56,8 @@ pub struct HashTableItem<ID: KeyType> {
 
 /// A custom wrapper around `hashbrown::HashTable` that:
 /// 1. limits the number of entries to the top K
-/// 2. Allocates a capacity greater than top K to maintain a low-fill factor and prevent resizing
+/// 2. Allocates a capacity greater than top K, up to [`MAX_INITIAL_CAPACITY`], to maintain a
+///    low fill factor
 /// 3. Tracks indexes to allow corresponding heap to refer to entries by index vs hash
 struct TopKHashTable<ID: KeyType> {
     map: HashTable<usize>,
@@ -119,6 +120,14 @@ pub fn is_supported_hash_key_type(kt: &DataType) -> bool {
         )
 }
 
+/// Upper bound on the entries preallocated up front, so a large `LIMIT` does not reserve memory
+/// before any group arrives. The table grows on demand past this size.
+const MAX_INITIAL_CAPACITY: usize = 1024;
+
+fn initial_capacity(limit: usize) -> usize {
+    limit.saturating_mul(10).min(MAX_INITIAL_CAPACITY)
+}
+
 // An implementation of ArrowHashTable for String keys
 pub struct StringHashTable {
     owned: ArrayRef,
@@ -150,7 +159,7 @@ impl StringHashTable {
 
         Self {
             owned,
-            map: TopKHashTable::new(limit, limit * 10),
+            map: TopKHashTable::new(limit, initial_capacity(limit)),
             rnd: RandomState::default(),
             data_type,
         }
@@ -266,7 +275,7 @@ where
         );
         Self {
             owned,
-            map: TopKHashTable::new(limit, limit * 10),
+            map: TopKHashTable::new(limit, initial_capacity(limit)),
             rnd: RandomState::default(),
             kt,
         }
@@ -450,7 +459,7 @@ impl<ID: KeyType + PartialEq> TopKHashTable<ID> {
         // Reserve space if needed
         let hasher = |idx: &usize| self.store[*idx].as_ref().unwrap().hash;
         if self.map.len() == self.map.capacity() {
-            self.map.reserve(self.limit, hasher);
+            self.map.reserve(1, hasher);
         }
 
         // Insert without checking again since we already confirmed it doesn't exist
@@ -495,7 +504,7 @@ impl<ID: KeyType + PartialEq> TopKHashTable<ID> {
 
         let hasher = |idx: &usize| self.store[*idx].as_ref().unwrap().hash;
         if self.map.len() == self.map.capacity() {
-            self.map.reserve(self.limit, hasher);
+            self.map.reserve(1, hasher);
         }
         self.map.insert_unique(hash, store_idx, hasher);
         self.null_count += 1;
@@ -660,6 +669,31 @@ mod tests {
             r#"[Some("1"), Some("2"), Some("3"), Some("4"), Some("5")]"#
         );
         assert_eq!(map.len(), 0, "Map should have been cleared!");
+
+        Ok(())
+    }
+
+    #[test]
+    fn should_bound_initial_capacity_for_large_limit() -> Result<()> {
+        let ht = PrimitiveHashTable::<arrow::datatypes::Int64Type>::new(
+            usize::MAX,
+            DataType::Int64,
+        );
+        assert!(ht.map.map.capacity() <= 2 * MAX_INITIAL_CAPACITY);
+        assert!(ht.map.store.capacity() <= MAX_INITIAL_CAPACITY);
+        let ht = StringHashTable::new(usize::MAX, DataType::Utf8);
+        assert!(ht.map.map.capacity() <= 2 * MAX_INITIAL_CAPACITY);
+        assert!(ht.map.store.capacity() <= MAX_INITIAL_CAPACITY);
+
+        // Growth past the initial capacity stays proportional to the entries inserted
+        let mut map = TopKHashTable::<Option<String>>::new(usize::MAX, 3);
+        for i in 0..100u64 {
+            let value = Some(i.to_string());
+            let (_, kind) = map.find_or_insert(i, value.clone(), 0, |v| *v == value);
+            assert_eq!(kind, InsertKind::New);
+        }
+        assert_eq!(map.len(), 100);
+        assert!(map.map.capacity() < 1000);
 
         Ok(())
     }
