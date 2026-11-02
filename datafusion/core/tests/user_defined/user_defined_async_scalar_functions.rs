@@ -16,8 +16,9 @@
 // under the License.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use arrow::array::{Int32Array, RecordBatch, StringArray};
+use arrow::array::{BooleanArray, Int32Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, FieldRef, Schema};
 use async_trait::async_trait;
 use datafusion::prelude::*;
@@ -213,6 +214,103 @@ async fn test_async_udf_preserves_result_field_metadata() -> Result<()> {
             "+--------+",
         ],
         &result
+    );
+
+    Ok(())
+}
+
+/// Rows passed to `CountingAsyncUDF`. Only `test_async_udf_limit_stops_early` uses it.
+static COUNTING_UDF_ROWS: AtomicUsize = AtomicUsize::new(0);
+
+/// An async UDF that returns `true` for each row and counts the rows it gets,
+/// like a UDF that calls a remote service for each row.
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+struct CountingAsyncUDF {
+    signature: Signature,
+}
+
+impl ScalarUDFImpl for CountingAsyncUDF {
+    fn name(&self) -> &str {
+        "counting_async_udf"
+    }
+
+    fn signature(&self) -> &Signature {
+        &self.signature
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        panic!("Call invoke_async_with_args instead")
+    }
+}
+
+#[async_trait]
+impl AsyncScalarUDFImpl for CountingAsyncUDF {
+    fn ideal_batch_size(&self) -> Option<usize> {
+        Some(10)
+    }
+
+    async fn invoke_async_with_args(
+        &self,
+        args: ScalarFunctionArgs,
+    ) -> Result<ColumnarValue> {
+        COUNTING_UDF_ROWS.fetch_add(args.number_rows, Ordering::SeqCst);
+        Ok(ColumnarValue::Array(Arc::new(BooleanArray::from(vec![
+            true;
+            args.number_rows
+        ]))))
+    }
+}
+
+// A LIMIT above a filter on an async UDF must stop after the first
+// `ideal_batch_size` rows, not evaluate the whole input batch.
+#[tokio::test]
+async fn test_async_udf_limit_stops_early() -> Result<()> {
+    let num_rows = 1000;
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("prompt", DataType::Utf8, false),
+    ]));
+    // One input batch that is larger than the UDF's ideal batch size
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int32Array::from((0..num_rows).collect::<Vec<i32>>())),
+            Arc::new(StringArray::from(
+                (0..num_rows)
+                    .map(|i| format!("prompt{i}"))
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+
+    let ctx =
+        SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.register_batch("test_table", batch)?;
+    ctx.register_udf(
+        AsyncScalarUDF::new(Arc::new(CountingAsyncUDF {
+            signature: Signature::exact(vec![DataType::Utf8], Volatility::Volatile),
+        }))
+        .into_scalar_udf(),
+    );
+
+    let result = ctx
+        .sql("SELECT id FROM test_table WHERE counting_async_udf(prompt) LIMIT 3")
+        .await?
+        .collect()
+        .await?;
+
+    let output_rows: usize = result.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(output_rows, 3);
+
+    let evaluated = COUNTING_UDF_ROWS.load(Ordering::SeqCst);
+    assert!(
+        evaluated <= 10,
+        "expected the async UDF to see at most 10 rows (its ideal batch size), \
+         but it saw {evaluated} of {num_rows} rows"
     );
 
     Ok(())
