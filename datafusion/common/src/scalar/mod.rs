@@ -5008,8 +5008,7 @@ impl ScalarValue {
     /// Container types (`List`, `LargeList`, `FixedSizeList`, `ListView`,
     /// `LargeListView`, `Struct`, `Map`) are handled by recursing into their
     /// child / values arrays and reconstructing the parent with the compacted
-    /// children. A `Dictionary` keeps only the values its keys reference.
-    /// All other types are returned unchanged.
+    /// children.  All other types are returned unchanged.
     fn compact_view_buffers(array: ArrayRef) -> ArrayRef {
         // Macro for the i32/i64-offset list pair (List / LargeList).
         macro_rules! gc_list {
@@ -5095,74 +5094,8 @@ impl ScalarValue {
                     *ordered,
                 ))
             }
-            DataType::Dictionary(key_type, _) => match key_type.as_ref() {
-                DataType::Int8 => {
-                    Self::compact_dictionary(array.as_dictionary::<Int8Type>())
-                }
-                DataType::Int16 => {
-                    Self::compact_dictionary(array.as_dictionary::<Int16Type>())
-                }
-                DataType::Int32 => {
-                    Self::compact_dictionary(array.as_dictionary::<Int32Type>())
-                }
-                DataType::Int64 => {
-                    Self::compact_dictionary(array.as_dictionary::<Int64Type>())
-                }
-                DataType::UInt8 => {
-                    Self::compact_dictionary(array.as_dictionary::<UInt8Type>())
-                }
-                DataType::UInt16 => {
-                    Self::compact_dictionary(array.as_dictionary::<UInt16Type>())
-                }
-                DataType::UInt32 => {
-                    Self::compact_dictionary(array.as_dictionary::<UInt32Type>())
-                }
-                DataType::UInt64 => {
-                    Self::compact_dictionary(array.as_dictionary::<UInt64Type>())
-                }
-                _ => array,
-            },
             _ => array,
         }
-    }
-
-    /// Rebuilds `dict` with only the dictionary values its keys reference.
-    ///
-    /// Copying a dictionary array's data (as [`copy_array_data`] does for a
-    /// dictionary nested in a struct or list) keeps the whole dictionary, so a
-    /// single value read from a batch would still hold every value of that
-    /// batch's dictionary. Keys are remapped in first-seen order; null keys stay
-    /// null.
-    fn compact_dictionary<K: ArrowDictionaryKeyType>(
-        dict: &DictionaryArray<K>,
-    ) -> ArrayRef {
-        let mut remap: HashMap<usize, K::Native> = HashMap::new();
-        let mut referenced: Vec<u64> = Vec::new();
-        let keys: PrimitiveArray<K> = dict
-            .keys()
-            .iter()
-            .map(|key| {
-                key.map(|key| {
-                    *remap.entry(key.as_usize()).or_insert_with(|| {
-                        referenced.push(key.as_usize() as u64);
-                        // There are no more distinct keys than the key type
-                        // indexes, so the new key fits.
-                        K::Native::from_usize(referenced.len() - 1)
-                            .expect("a remapped dictionary key fits its key type")
-                    })
-                })
-            })
-            .collect();
-        let values = arrow::compute::take(
-            dict.values().as_ref(),
-            &UInt64Array::from(referenced),
-            None,
-        )
-        .expect("taking in-bounds dictionary keys");
-        Arc::new(
-            DictionaryArray::<K>::try_new(keys, Self::compact_view_buffers(values))
-                .expect("remapped keys index the compacted values"),
-        )
     }
 
     /// Returns the minimum value for the given numeric `DataType`.
@@ -11715,68 +11648,6 @@ mod tests {
         assert_eq!(arr.num_columns(), 0);
         assert_eq!(arr.null_count(), 1);
         assert!(arr.is_null(0));
-    }
-
-    #[test]
-    fn test_compact_nested_dictionary_keeps_only_referenced_values() {
-        // A struct field dictionary-encoded over 1,000 distinct 64-byte strings.
-        let strings: Vec<String> = (0..1000).map(|i| format!("{i:064}")).collect();
-        let dict: DictionaryArray<Int32Type> = DictionaryArray::try_new(
-            Int32Array::from_iter_values(0..1000),
-            Arc::new(StringArray::from(strings)),
-        )
-        .unwrap();
-        let dict_type = dict.data_type().clone();
-        let structs: ArrayRef = Arc::new(StructArray::new(
-            Fields::from(vec![Field::new("d", dict_type.clone(), true)]),
-            vec![Arc::new(dict) as ArrayRef],
-            None,
-        ));
-
-        let scalar = ScalarValue::try_from_array(&structs, 5).unwrap();
-        let compacted = scalar.clone().compacted();
-        assert_eq!(compacted, scalar);
-        let ScalarValue::Struct(arr) = &compacted else {
-            panic!("expected Struct")
-        };
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr.column(0).data_type(), &dict_type);
-        let d = arr.column(0).as_dictionary::<Int32Type>();
-        // Before the fix the copied struct kept all 1,000 dictionary values.
-        assert_eq!(d.values().len(), 1);
-        assert_eq!(d.values().as_string::<i32>().value(0), format!("{:064}", 5));
-        assert!(
-            compacted.size() < 1024,
-            "compacted struct reports {} bytes",
-            compacted.size()
-        );
-
-        // In a list: repeated keys share one value and null keys stay null.
-        let list_values: DictionaryArray<Int32Type> = DictionaryArray::try_new(
-            Int32Array::from(vec![Some(7), None, Some(7), Some(3)]),
-            Arc::new(StringArray::from_iter_values(
-                (0..1000).map(|i| i.to_string()),
-            )),
-        )
-        .unwrap();
-        let list = ListArray::new(
-            Arc::new(Field::new_list_field(dict_type, true)),
-            OffsetBuffer::from_lengths([4]),
-            Arc::new(list_values),
-            None,
-        );
-        let scalar = ScalarValue::List(Arc::new(list));
-        let compacted = scalar.clone().compacted();
-        assert_eq!(compacted, scalar);
-        let ScalarValue::List(arr) = &compacted else {
-            panic!("expected List")
-        };
-        let d = arr.values().as_dictionary::<Int32Type>();
-        assert_eq!(d.values().len(), 2);
-        assert_eq!(
-            d.keys(),
-            &Int32Array::from(vec![Some(0), None, Some(0), Some(1)])
-        );
     }
 
     #[test]
