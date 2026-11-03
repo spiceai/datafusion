@@ -1440,7 +1440,11 @@ mod test {
             Arc::clone(&schema),
             vec![
                 Arc::new(Int64Array::from(vec![0, 1, 2])),
-                Arc::new(StructArray::new(struct_fields, vec![Arc::new(map) as _], None)),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(map) as _],
+                    None,
+                )),
             ],
         )
         .unwrap();
@@ -1467,8 +1471,7 @@ mod test {
         let expr = logical2physical(&predicate, &file_schema);
 
         let metrics = ExecutionPlanMetricsSet::new();
-        let file_metrics =
-            ParquetFileMetrics::new(0, "struct_map_key.parquet", &metrics);
+        let file_metrics = ParquetFileMetrics::new(0, "struct_map_key.parquet", &metrics);
         let row_filter =
             build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
                 .expect("building row filter")
