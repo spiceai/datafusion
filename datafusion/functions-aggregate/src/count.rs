@@ -1167,7 +1167,9 @@ mod tests {
             arrow::datatypes::Int64Type,
             _,
             _,
-        >((0..NESTED_ROWS).map(|i| Some(vec![Some(i), Some(i + 1), Some(i % 7)]))))
+        >(
+            (0..NESTED_ROWS).map(|i| Some(vec![Some(i), Some(i + 1), Some(i % 7)])),
+        ))
     }
 
     fn assert_nested_size_is_bounded(size: usize) {
@@ -1249,8 +1251,63 @@ mod tests {
             .collect::<Result<Vec<_>>>()?;
         let mut merged = SlidingDistinctCountAccumulator::try_new(lists.data_type())?;
         merged.merge_batch(&state)?;
-        assert_eq!(merged.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS - 10)));
+        assert_eq!(
+            merged.evaluate()?,
+            ScalarValue::Int64(Some(NESTED_ROWS - 10))
+        );
         assert_nested_size_is_bounded(merged.size());
+        Ok(())
+    }
+
+    /// Zero-width fixed-size lists: compacting one must keep its single row,
+    /// or a stored key stops matching the value it was made from.
+    fn zero_width_fixed_size_lists() -> ArrayRef {
+        use arrow::array::FixedSizeListArray;
+        use arrow::buffer::NullBuffer;
+        let field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        Arc::new(
+            FixedSizeListArray::try_new_with_length(
+                field,
+                0,
+                Arc::new(Int32Array::from(Vec::<i32>::new())),
+                Some(NullBuffer::from(vec![true, true, false])),
+                3,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn distinct_count_zero_width_fixed_size_list() -> Result<()> {
+        let values = zero_width_fixed_size_lists();
+        let mut acc = DistinctCountAccumulator {
+            values: HashSet::default(),
+            state_data_type: values.data_type().clone(),
+        };
+        acc.update_batch(&[Arc::clone(&values)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(1)));
+        let state = acc
+            .state()?
+            .into_iter()
+            .map(|sv| sv.to_array())
+            .collect::<Result<Vec<_>>>()?;
+        let mut merged = DistinctCountAccumulator {
+            values: HashSet::default(),
+            state_data_type: values.data_type().clone(),
+        };
+        merged.merge_batch(&state)?;
+        assert_eq!(merged.evaluate()?, ScalarValue::Int64(Some(1)));
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_distinct_count_zero_width_fixed_size_list_retracts() -> Result<()> {
+        let values = zero_width_fixed_size_lists();
+        let mut acc = SlidingDistinctCountAccumulator::try_new(values.data_type())?;
+        acc.update_batch(&[Arc::clone(&values)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(1)));
+        acc.retract_batch(&[Arc::clone(&values)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(0)));
         Ok(())
     }
 }
