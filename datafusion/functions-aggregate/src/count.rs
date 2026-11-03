@@ -1080,7 +1080,7 @@ mod tests {
     /// `[i, i + 1, i % 7]` for `i` in `0..NESTED_ROWS`: every row distinct.
     fn distinct_int_lists() -> ArrayRef {
         Arc::new(arrow::array::ListArray::from_iter_primitive::<
-            arrow::datatypes::Int64Type,
+            Int64Type,
             _,
             _,
         >(
