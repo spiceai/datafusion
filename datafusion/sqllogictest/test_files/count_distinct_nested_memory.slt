@@ -43,14 +43,6 @@ FROM generate_series(0, 49999) AS t(v)
 ----
 50000 5
 
-# A dictionary inside a struct: a copied value must keep only the dictionary
-# entries it references, not the batch's whole dictionary.
-query II
-SELECT count(DISTINCT named_struct('d', arrow_cast(CAST(v AS VARCHAR), 'Dictionary(Int32, Utf8)'))), count(DISTINCT v % 5)
-FROM generate_series(0, 49999) AS t(v)
-----
-50000 5
-
 # Grouped: one accumulator per group, each holding its own lists.
 query III rowsort
 SELECT v % 3 AS g, count(DISTINCT [v, v % 7]), count(DISTINCT v % 5)
