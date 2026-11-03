@@ -1837,7 +1837,8 @@ mod test {
     fn write_struct_with_map_file() -> (NamedTempFile, SchemaRef, Arc<ParquetMetaData>) {
         use arrow::array::{Array, Int64Array, Int64Builder, MapBuilder, StringBuilder};
 
-        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        let mut map_builder =
+            MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
         map_builder.keys().append_value("k");
         map_builder.values().append_value(1);
         map_builder.append(true).unwrap();
@@ -1859,7 +1860,10 @@ mod test {
                 Arc::new(Int64Array::from(vec![0, 1])),
                 Arc::new(StructArray::new(
                     struct_fields,
-                    vec![Arc::new(map) as _, Arc::new(Int64Array::from(vec![5, 6])) as _],
+                    vec![
+                        Arc::new(map) as _,
+                        Arc::new(Int64Array::from(vec![5, 6])) as _,
+                    ],
                     None,
                 )),
             ],
