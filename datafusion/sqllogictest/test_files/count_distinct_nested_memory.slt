@@ -1,0 +1,60 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+
+# Several COUNT(DISTINCT) over nested values, under a memory limit.
+#
+# With more than one DISTINCT argument the plan keeps the generic
+# ScalarValue-set accumulator instead of rewriting to a GROUP BY. A list or
+# struct value read from a batch is a one-row slice of that batch, so unless
+# the accumulator copies it out, each distinct value is charged the whole
+# batch's buffers: 50,000 three-element lists were charged tens of GB and the
+# query failed with ResourcesExhausted. The real state is a few MB.
+
+statement ok
+SET datafusion.execution.target_partitions = 1
+
+statement ok
+SET datafusion.runtime.memory_limit = '256M'
+
+query II
+SELECT count(DISTINCT [v, v + 1, v % 7]), count(DISTINCT v % 5)
+FROM generate_series(0, 49999) AS t(v)
+----
+50000 5
+
+query II
+SELECT count(DISTINCT named_struct('a', v, 'b', v % 7)), count(DISTINCT v % 5)
+FROM generate_series(0, 49999) AS t(v)
+----
+50000 5
+
+# Grouped: one accumulator per group, each holding its own lists.
+query III rowsort
+SELECT v % 3 AS g, count(DISTINCT [v, v % 7]), count(DISTINCT v % 5)
+FROM generate_series(0, 29999) AS t(v)
+GROUP BY v % 3
+----
+0 10000 5
+1 10000 5
+2 10000 5
+
+statement ok
+RESET datafusion.runtime.memory_limit
+
+statement ok
+RESET datafusion.execution.target_partitions
