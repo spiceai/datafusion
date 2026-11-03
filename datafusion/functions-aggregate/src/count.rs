@@ -502,6 +502,16 @@ impl SlidingDistinctCountAccumulator {
             data_type: data_type.clone(),
         })
     }
+
+    /// Counts one more occurrence of `v`, storing a compacted copy the first
+    /// time `v` is seen. See [`DistinctCountAccumulator::insert`] for why.
+    fn add(&mut self, v: ScalarValue) {
+        if let Some(count) = self.counts.get_mut(&v) {
+            *count += 1;
+        } else {
+            self.counts.insert(v.compacted(), 1);
+        }
+    }
 }
 
 impl Accumulator for SlidingDistinctCountAccumulator {
@@ -518,7 +528,7 @@ impl Accumulator for SlidingDistinctCountAccumulator {
         for i in 0..arr.len() {
             let v = ScalarValue::try_from_array(arr, i)?;
             if !v.is_null() {
-                *self.counts.entry(v).or_default() += 1;
+                self.add(v);
             }
         }
         Ok(())
@@ -545,7 +555,7 @@ impl Accumulator for SlidingDistinctCountAccumulator {
         for inner in list_arr.iter().flatten() {
             for j in 0..inner.len() {
                 let v = ScalarValue::try_from_array(&*inner, j)?;
-                *self.counts.entry(v).or_default() += 1;
+                self.add(v);
             }
         }
         Ok(())
@@ -819,6 +829,22 @@ struct DistinctCountAccumulator {
 }
 
 impl DistinctCountAccumulator {
+    /// Adds `scalar` to the set, storing a compacted copy when it is new.
+    ///
+    /// A nested scalar (list, struct, map) read with
+    /// [`ScalarValue::try_from_array`] is a one-row slice that shares the whole
+    /// input array's buffers. Kept as is, every distinct value would hold its
+    /// batch alive, and [`Self::size`] would charge the full batch buffers once
+    /// per distinct value, so a few thousand rows of short lists report
+    /// gigabytes and the aggregate fails with `ResourcesExhausted`.
+    /// Compacting copies just the value's own rows; for every other type it is
+    /// a no-op. Values already in the set are not copied.
+    fn insert(&mut self, scalar: ScalarValue) {
+        if !self.values.contains(&scalar) {
+            self.values.insert(scalar.compacted());
+        }
+    }
+
     // calculating the size for fixed length values, taking first batch size *
     // number of batches This method is faster than .full_size(), however it is
     // not suitable for variable length values like strings or complex types
@@ -870,7 +896,7 @@ impl Accumulator for DistinctCountAccumulator {
         (0..arr.len()).try_for_each(|index| {
             let scalar = ScalarValue::try_from_array(arr, index)?;
             if !scalar.is_null() {
-                self.values.insert(scalar);
+                self.insert(scalar);
             }
             Ok(())
         })
@@ -1124,6 +1150,107 @@ mod tests {
         merged.merge_batch(&state_arr2)?;
         // Expect distinct {1,2,3} → count = 3
         assert_eq!(merged.evaluate()?, ScalarValue::Int64(Some(3)));
+        Ok(())
+    }
+
+    /// Rows in the batch the nested-value size tests feed in: a full default
+    /// batch, the size at which over-charging made the aggregate fail.
+    const NESTED_ROWS: i64 = 8192;
+    /// What one stored distinct value may charge. A compacted three-element
+    /// list or one-field struct is a few hundred bytes; a slice that still
+    /// shares the batch's buffers is charged the whole batch (~230 KB here).
+    const NESTED_BYTES_PER_VALUE: usize = 1024;
+
+    /// `[i, i + 1, i % 7]` for `i` in `0..NESTED_ROWS`: every row distinct.
+    fn distinct_int_lists() -> ArrayRef {
+        Arc::new(arrow::array::ListArray::from_iter_primitive::<
+            arrow::datatypes::Int64Type,
+            _,
+            _,
+        >((0..NESTED_ROWS).map(|i| Some(vec![Some(i), Some(i + 1), Some(i % 7)]))))
+    }
+
+    fn assert_nested_size_is_bounded(size: usize) {
+        let bound = NESTED_ROWS as usize * NESTED_BYTES_PER_VALUE;
+        assert!(
+            size < bound,
+            "distinct state for {NESTED_ROWS} small nested values reports {size} bytes, \
+             over {bound}: values still share the input batch's buffers"
+        );
+    }
+
+    #[test]
+    fn distinct_count_list_size_charges_each_value_once() -> Result<()> {
+        let lists = distinct_int_lists();
+        let mut acc = DistinctCountAccumulator {
+            values: HashSet::default(),
+            state_data_type: lists.data_type().clone(),
+        };
+        acc.update_batch(&[Arc::clone(&lists)])?;
+        // The same values again add nothing.
+        acc.update_batch(&[Arc::clone(&lists)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS)));
+        assert_nested_size_is_bounded(acc.size());
+
+        // The partial state, merged into a final accumulator, is a list of
+        // lists; its values are slices of that state array and must be
+        // compacted too.
+        let state = acc
+            .state()?
+            .into_iter()
+            .map(|sv| sv.to_array())
+            .collect::<Result<Vec<_>>>()?;
+        let mut merged = DistinctCountAccumulator {
+            values: HashSet::default(),
+            state_data_type: lists.data_type().clone(),
+        };
+        merged.merge_batch(&state)?;
+        assert_eq!(merged.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS)));
+        assert_nested_size_is_bounded(merged.size());
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_count_struct_size_charges_each_value_once() -> Result<()> {
+        let field = Arc::new(Field::new("a", DataType::Int64, false));
+        let structs: ArrayRef = Arc::new(arrow::array::StructArray::from(vec![(
+            field,
+            Arc::new(Int64Array::from_iter_values(0..NESTED_ROWS)) as ArrayRef,
+        )]));
+        let mut acc = DistinctCountAccumulator {
+            values: HashSet::default(),
+            state_data_type: structs.data_type().clone(),
+        };
+        acc.update_batch(&[structs])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS)));
+        assert_nested_size_is_bounded(acc.size());
+        Ok(())
+    }
+
+    #[test]
+    fn sliding_distinct_count_list_size_charges_each_value_once() -> Result<()> {
+        let lists = distinct_int_lists();
+        let mut acc = SlidingDistinctCountAccumulator::try_new(lists.data_type())?;
+        acc.update_batch(&[Arc::clone(&lists)])?;
+        acc.update_batch(&[Arc::clone(&lists)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS)));
+        assert_nested_size_is_bounded(acc.size());
+
+        // Retracting by an uncompacted slice still finds the compacted key.
+        acc.retract_batch(&[Arc::clone(&lists)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS)));
+        acc.retract_batch(&[lists.slice(0, 10)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS - 10)));
+
+        let state = acc
+            .state()?
+            .into_iter()
+            .map(|sv| sv.to_array())
+            .collect::<Result<Vec<_>>>()?;
+        let mut merged = SlidingDistinctCountAccumulator::try_new(lists.data_type())?;
+        merged.merge_batch(&state)?;
+        assert_eq!(merged.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS - 10)));
+        assert_nested_size_is_bounded(merged.size());
         Ok(())
     }
 }
