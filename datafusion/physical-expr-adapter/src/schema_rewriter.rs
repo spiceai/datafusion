@@ -309,6 +309,20 @@ fn resolve_field_path<'a>(
     }
 }
 
+/// The Map field a `get_field` key path reaches through struct steps alone,
+/// when keys remain after it: `['m', 'k']` over `Struct<m: Map<..>>` gives
+/// `m`. `None` when the path ends before a Map, a key is missing, or a step
+/// is neither a struct nor a Map.
+fn map_under_struct_path<'a>(fields: &'a Fields, path: &[&str]) -> Option<&'a FieldRef> {
+    let (first, rest) = path.split_first()?;
+    let field = fields.iter().find(|f| f.name() == *first)?;
+    match field.data_type() {
+        DataType::Map(_, _) if !rest.is_empty() => Some(field),
+        DataType::Struct(nested) => map_under_struct_path(nested, rest),
+        _ => None,
+    }
+}
+
 impl DefaultPhysicalExprAdapterRewriter {
     fn rewrite_expr(
         &self,
@@ -406,11 +420,19 @@ impl DefaultPhysicalExprAdapterRewriter {
         else {
             return Ok(None);
         };
-        let FieldPathResolution::Found(logical_struct_field) =
-            resolve_field_path(logical_struct_fields, first_key, rest_keys)
-        else {
-            return Ok(None);
-        };
+        let logical_struct_field =
+            match resolve_field_path(logical_struct_fields, first_key, rest_keys) {
+                FieldPathResolution::Found(field) => field,
+                FieldPathResolution::NotAStruct => {
+                    return self.try_narrow_struct_cast_to_map(
+                        get_field_expr,
+                        cast,
+                        logical_struct_fields,
+                        &field_path,
+                    );
+                }
+                FieldPathResolution::Missing => return Ok(None),
+            };
 
         let inner = cast.expr();
         let DataType::Struct(physical_struct_fields) =
@@ -456,6 +478,57 @@ impl DefaultPhysicalExprAdapterRewriter {
             Arc::clone(logical_struct_field),
             Some(cast.cast_options().clone()),
         ))))
+    }
+
+    /// The map arm of [`Self::try_narrow_struct_cast`]: a key path whose
+    /// struct steps lead to a Map, as in `s['m']['k']`, simplified to
+    /// `get_field(s, 'm', 'k')`. The keys after the map are runtime lookups,
+    /// so the path cannot be resolved to a leaf field. When the map has the
+    /// same type in the file as in the table, the cast changes nothing the
+    /// lookup reads, and `get_field(cast(s), 'm', 'k')` is rewritten to
+    /// `get_field(s, 'm', 'k')`.
+    ///
+    /// This keeps the column visible to the Parquet scan when the struct has
+    /// gained a field the file lacks. The scan accepts such a predicate as a
+    /// row filter at planning time, against the table schema. If the cast is
+    /// left in, it cannot evaluate the predicate for this file and drops it,
+    /// so rows the predicate rejects are returned.
+    fn try_narrow_struct_cast_to_map(
+        &self,
+        get_field_expr: &ScalarFunctionExpr,
+        cast: &CastExpr,
+        logical_struct_fields: &Fields,
+        field_path: &[&str],
+    ) -> Result<Option<Arc<dyn PhysicalExpr>>> {
+        let Some(logical_map) = map_under_struct_path(logical_struct_fields, field_path)
+        else {
+            return Ok(None);
+        };
+        let inner = cast.expr();
+        let DataType::Struct(physical_struct_fields) =
+            inner.data_type(&self.physical_file_schema)?
+        else {
+            return Ok(None);
+        };
+        let Some(physical_map) =
+            map_under_struct_path(&physical_struct_fields, field_path)
+        else {
+            return Ok(None);
+        };
+        if physical_map.data_type() != logical_map.data_type() {
+            return Ok(None);
+        }
+
+        let mut args = Vec::with_capacity(get_field_expr.args().len());
+        args.push(Arc::clone(inner));
+        args.extend(get_field_expr.args()[1..].iter().map(Arc::clone));
+        let extracted = Arc::new(ScalarFunctionExpr::try_new(
+            Arc::new(get_field_expr.fun().clone()),
+            args,
+            &self.physical_file_schema,
+            Arc::new(get_field_expr.config_options().clone()),
+        )?) as Arc<dyn PhysicalExpr>;
+        Ok(Some(extracted))
     }
 
     /// Attempt to rewrite struct field access expressions to return null if the field does not exist in the physical schema.
@@ -1835,6 +1908,97 @@ mod tests {
         assert!(
             get_field.args()[0].downcast_ref::<Column>().is_some(),
             "the struct column must not be hidden behind a cast, got: {rewritten}"
+        );
+    }
+
+    fn string_int_map(value_type: DataType) -> DataType {
+        DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", value_type, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        )
+    }
+
+    fn map_key_lookup(schema: &SchemaRef) -> Arc<dyn PhysicalExpr> {
+        Arc::new(
+            ScalarFunctionExpr::try_new(
+                Arc::new(datafusion_expr::ScalarUDF::from(GetFieldFunc::new())),
+                vec![
+                    Arc::new(Column::new("s", 0)),
+                    Arc::new(Literal::new(ScalarValue::from("mm"))),
+                    Arc::new(Literal::new(ScalarValue::from("k"))),
+                ],
+                schema,
+                Arc::new(datafusion_common::config::ConfigOptions::default()),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// `s['mm']['k']` over a map `mm` whose struct gained a field the file
+    /// lacks: the map itself is unchanged, so the cast is dropped and the
+    /// struct column stays visible under the `get_field`.
+    #[test]
+    fn test_narrow_struct_cast_map_key_under_evolved_struct() {
+        let map = string_int_map(DataType::Int64);
+        let (logical_schema, physical_schema) = struct_schemas(
+            vec![Field::new("mm", map.clone(), true)],
+            vec![
+                Field::new("mm", map, true),
+                Field::new("n", DataType::Int64, true),
+            ],
+        );
+        let adapter = DefaultPhysicalExprAdapterFactory
+            .create(Arc::clone(&logical_schema), physical_schema)
+            .unwrap();
+
+        let rewritten = adapter.rewrite(map_key_lookup(&logical_schema)).unwrap();
+
+        let get_field = rewritten
+            .downcast_ref::<ScalarFunctionExpr>()
+            .unwrap_or_else(|| panic!("Expected get_field, got: {rewritten}"));
+        assert_eq!(get_field.return_type(), &DataType::Int64);
+        assert_eq!(get_field.args().len(), 3, "got: {rewritten}");
+        assert!(
+            get_field.args()[0].downcast_ref::<Column>().is_some(),
+            "the struct column must not be hidden behind a cast, got: {rewritten}"
+        );
+    }
+
+    /// When the map's own type differs between file and table, the lookup
+    /// keeps reading the cast struct: narrowing would change the type the
+    /// key lookup returns.
+    #[test]
+    fn test_narrow_struct_cast_map_key_keeps_cast_when_map_type_differs() {
+        let (logical_schema, physical_schema) = struct_schemas(
+            vec![Field::new("mm", string_int_map(DataType::Int32), true)],
+            vec![
+                Field::new("mm", string_int_map(DataType::Int64), true),
+                Field::new("n", DataType::Int64, true),
+            ],
+        );
+        let adapter = DefaultPhysicalExprAdapterFactory
+            .create(Arc::clone(&logical_schema), physical_schema)
+            .unwrap();
+
+        let rewritten = adapter.rewrite(map_key_lookup(&logical_schema)).unwrap();
+
+        let get_field = rewritten
+            .downcast_ref::<ScalarFunctionExpr>()
+            .unwrap_or_else(|| panic!("Expected get_field, got: {rewritten}"));
+        assert_eq!(get_field.return_type(), &DataType::Int64);
+        assert!(
+            get_field.args()[0].downcast_ref::<CastExpr>().is_some(),
+            "a changed map type must keep the struct cast, got: {rewritten}"
         );
     }
 

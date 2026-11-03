@@ -630,3 +630,69 @@ set datafusion.execution.parquet.pushdown_filters = false;
 
 statement ok
 DROP TABLE struct_map;
+
+##########
+# The same lookup when one file's struct lacks a field the table has (`n`),
+# so the scan casts that file's struct to the table's. The predicate must
+# still filter that file, with and without filter pushdown.
+##########
+
+statement ok
+COPY (
+  SELECT id, named_struct('mm', mm, 'n', n) AS som
+  FROM (VALUES
+    (0, MAP {'k': 1}, 5),
+    (1, MAP {'j': 2}, 6)
+  ) AS t(id, mm, n)
+) TO 'test_files/scratch/parquet_nested_schema_pruning/struct_map_evolved/a.parquet'
+STORED AS PARQUET;
+
+statement ok
+COPY (
+  SELECT id, named_struct('mm', mm) AS som
+  FROM (VALUES
+    (2, MAP {'k': 1}),
+    (3, MAP {'k': 3})
+  ) AS t(id, mm)
+) TO 'test_files/scratch/parquet_nested_schema_pruning/struct_map_evolved/b.parquet'
+STORED AS PARQUET;
+
+statement ok
+CREATE EXTERNAL TABLE struct_map_evolved
+STORED AS PARQUET
+LOCATION 'test_files/scratch/parquet_nested_schema_pruning/struct_map_evolved/';
+
+query II
+SELECT id, som['mm']['k'] AS v FROM struct_map_evolved ORDER BY id;
+----
+0 1
+1 NULL
+2 1
+3 3
+
+query I
+SELECT id FROM struct_map_evolved WHERE som['mm']['k'] = 1 ORDER BY id;
+----
+0
+2
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = true;
+
+query I
+SELECT id FROM struct_map_evolved WHERE som['mm']['k'] = 1 ORDER BY id;
+----
+0
+2
+
+query II
+SELECT id, som['n'] FROM struct_map_evolved WHERE som['mm']['k'] = 1 ORDER BY id;
+----
+0 5
+2 NULL
+
+statement ok
+set datafusion.execution.parquet.pushdown_filters = false;
+
+statement ok
+DROP TABLE struct_map_evolved;
