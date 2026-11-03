@@ -232,12 +232,27 @@ impl<'schema> PushdownChecker<'schema> {
     fn check_struct_field_column(
         &mut self,
         column_name: &str,
-        field_path: Vec<String>,
+        mut field_path: Vec<String>,
     ) -> Option<TreeNodeRecursion> {
         let Ok(idx) = self.file_schema.index_of(column_name) else {
             self.projected_columns = true;
             return Some(TreeNodeRecursion::Jump);
         };
+
+        // Only the struct steps of a `get_field` key path name Parquet groups.
+        // A key applied to a Map (e.g. `s['m']['k']`, simplified to
+        // `get_field(s, 'm', 'k')`) is a runtime key lookup, not a schema
+        // field, so it has no leaves of its own. Keep the path up to the
+        // first non-struct step, which reads that whole subtree (the map
+        // keys and values) instead of resolving no leaves and pruning the
+        // root out of the projected schema.
+        let struct_steps =
+            struct_field_path_len(self.file_schema.field(idx).data_type(), &field_path);
+        if struct_steps == 0 {
+            // Not a struct field access at all: read the whole root.
+            return self.check_single_column(column_name);
+        }
+        field_path.truncate(struct_steps);
 
         self.struct_field_accesses.push(StructFieldAccess {
             root_index: idx,
@@ -445,6 +460,26 @@ impl TreeNodeVisitor<'_> for PushdownChecker<'_> {
 
         Ok(TreeNodeRecursion::Continue)
     }
+}
+
+/// Number of leading keys in `field_path` that name a field of a struct, walking
+/// down from `data_type`.
+///
+/// Stops at the first key whose parent is not a struct (a Map key lookup, for
+/// instance). A key that names no field of its struct parent is counted, so a
+/// path to a field missing from the file keeps its existing handling.
+fn struct_field_path_len(data_type: &DataType, field_path: &[String]) -> usize {
+    let mut current = data_type;
+    for (steps, key) in field_path.iter().enumerate() {
+        let DataType::Struct(fields) = current else {
+            return steps;
+        };
+        let Some((_, field)) = fields.find(key) else {
+            return field_path.len();
+        };
+        current = field.data_type();
+    }
+    field_path.len()
 }
 
 /// Result of checking which columns are required for filter pushdown.
@@ -1793,5 +1828,120 @@ mod test {
             read_plan.projection_mask, expected_mask,
             "whole-root reference must select every leaf under the root"
         );
+    }
+
+    /// Writes `id: Int64, som: Struct{mm: Map<Utf8, Int64>, n: Int64}` with
+    /// rows `(0, {mm: {k: 1}, n: 5})` and `(1, {mm: NULL, n: 6})`.
+    ///
+    /// Parquet leaves: id=0, som.mm.key=1, som.mm.value=2, som.n=3.
+    fn write_struct_with_map_file() -> (NamedTempFile, SchemaRef, Arc<ParquetMetaData>) {
+        use arrow::array::{Array, Int64Array, Int64Builder, MapBuilder, StringBuilder};
+
+        let mut map_builder = MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        map_builder.keys().append_value("k");
+        map_builder.values().append_value(1);
+        map_builder.append(true).unwrap();
+        map_builder.append(false).unwrap();
+        let map = map_builder.finish();
+
+        let struct_fields: Fields = vec![
+            Arc::new(Field::new("mm", map.data_type().clone(), true)),
+            Arc::new(Field::new("n", DataType::Int64, true)),
+        ]
+        .into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("som", DataType::Struct(struct_fields.clone()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1])),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(map) as _, Arc::new(Int64Array::from(vec![5, 6])) as _],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+            .expect("reader builder");
+        let (schema, metadata) = (builder.schema().clone(), builder.metadata().clone());
+        (file, schema, metadata)
+    }
+
+    /// `som['mm']['k']` is simplified to `get_field(som, 'mm', 'k')`, but only
+    /// `mm` is a struct field: `k` is a runtime key lookup into a Map. The
+    /// read plan must keep `som.mm` (its key and value leaves) instead of
+    /// resolving no leaves and dropping `som` from the projected schema,
+    /// which made the projection fail with "PhysicalExpr Column references
+    /// column 'som' ... but input schema only has 1 columns".
+    #[test]
+    fn build_projection_read_plan_keeps_map_under_struct_for_key_lookup() {
+        use arrow::array::Array;
+
+        let (file, file_schema, metadata) = write_struct_with_map_file();
+        let schema_descr = metadata.file_metadata().schema_descr();
+
+        let som_mm_k = |schema: &Schema| {
+            logical2physical(
+                &get_field().call(vec![
+                    col("som"),
+                    Expr::Literal(ScalarValue::Utf8(Some("mm".to_string())), None),
+                    Expr::Literal(ScalarValue::Utf8(Some("k".to_string())), None),
+                ]),
+                schema,
+            )
+        };
+        let exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+            Arc::new(PhysicalColumn::new("id", 0)),
+            som_mm_k(&file_schema),
+        ];
+
+        let read_plan = build_projection_read_plan(exprs, &file_schema, schema_descr);
+
+        // id plus both leaves of som.mm; som.n is still pruned.
+        assert_eq!(
+            read_plan.projection_mask,
+            ProjectionMask::leaves(schema_descr, [0, 1, 2])
+        );
+        let DataType::Struct(som_fields) = file_schema.field(1).data_type() else {
+            unreachable!()
+        };
+        let som = read_plan.projected_schema.field_with_name("som").unwrap();
+        assert_eq!(
+            som.data_type(),
+            &DataType::Struct(vec![Arc::clone(&som_fields[0])].into())
+        );
+
+        // Decode with the plan and evaluate the access over what was read.
+        let batch = ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+            .unwrap()
+            .with_projection(read_plan.projection_mask.clone())
+            .build()
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(batch.schema().fields(), read_plan.projected_schema.fields());
+        let values = som_mm_k(&batch.schema())
+            .evaluate(&batch)
+            .unwrap()
+            .into_array(batch.num_rows())
+            .unwrap();
+        let values = values
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(values.iter().collect::<Vec<_>>(), vec![Some(1), None]);
     }
 }
