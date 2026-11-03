@@ -9187,4 +9187,58 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_compact_zero_width_fixed_size_list_keeps_its_row() {
+        // A valid one-row FixedSizeList of size 0 has no null buffer, so its
+        // length is not derived from its values. Compacting must keep the row.
+        let field = Arc::new(Field::new_list_field(DataType::Int32, true));
+        let empty = FixedSizeListArray::try_new_with_length(
+            Arc::clone(&field),
+            0,
+            Arc::new(Int32Array::from(Vec::<i32>::new())),
+            None,
+            1,
+        )
+        .unwrap();
+        let scalar = ScalarValue::FixedSizeList(Arc::new(empty));
+        let compacted = scalar.clone().compacted();
+        let ScalarValue::FixedSizeList(arr) = &compacted else {
+            panic!("expected FixedSizeList")
+        };
+        assert_eq!(arr.len(), 1);
+        assert_eq!(compacted, scalar);
+
+        // Beside an ordinary field in a struct, a lost row would make the
+        // children's lengths disagree.
+        let fsl_type = DataType::FixedSizeList(Arc::clone(&field), 0);
+        let outer = StructArray::new(
+            Fields::from(vec![
+                Field::new("a", DataType::Int32, true),
+                Field::new("e", fsl_type, true),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+                Arc::new(
+                    FixedSizeListArray::try_new_with_length(
+                        field,
+                        0,
+                        Arc::new(Int32Array::from(Vec::<i32>::new())),
+                        None,
+                        1,
+                    )
+                    .unwrap(),
+                ) as ArrayRef,
+            ],
+            None,
+        );
+        let scalar = ScalarValue::Struct(Arc::new(outer));
+        let compacted = scalar.clone().compacted();
+        let ScalarValue::Struct(arr) = &compacted else {
+            panic!("expected Struct")
+        };
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr.column(1).len(), 1);
+        assert_eq!(compacted, scalar);
+    }
 }
