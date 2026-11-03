@@ -1259,6 +1259,57 @@ mod tests {
         Ok(())
     }
 
+    /// One-field structs over a dictionary of `NESTED_ROWS` distinct strings:
+    /// every row distinct, and an uncompacted value holds the whole dictionary.
+    fn distinct_dictionary_structs() -> ArrayRef {
+        use arrow::array::{DictionaryArray, StringArray, StructArray};
+        use arrow::datatypes::Int32Type;
+        let dict: DictionaryArray<Int32Type> = DictionaryArray::try_new(
+            Int32Array::from_iter_values(0..NESTED_ROWS as i32),
+            Arc::new(StringArray::from_iter_values(
+                (0..NESTED_ROWS).map(|i| format!("{i:032}")),
+            )),
+        )
+        .unwrap();
+        let field = Arc::new(Field::new("d", dict.data_type().clone(), true));
+        Arc::new(StructArray::from(vec![(field, Arc::new(dict) as ArrayRef)]))
+    }
+
+    #[test]
+    fn distinct_count_dictionary_struct_size_charges_each_value_once() -> Result<()> {
+        let structs = distinct_dictionary_structs();
+        let mut acc = DistinctCountAccumulator {
+            values: HashSet::default(),
+            state_data_type: structs.data_type().clone(),
+        };
+        acc.update_batch(&[Arc::clone(&structs)])?;
+        assert_eq!(acc.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS)));
+        assert_nested_size_is_bounded(acc.size());
+
+        let state = acc
+            .state()?
+            .into_iter()
+            .map(|sv| sv.to_array())
+            .collect::<Result<Vec<_>>>()?;
+        let mut merged = DistinctCountAccumulator {
+            values: HashSet::default(),
+            state_data_type: structs.data_type().clone(),
+        };
+        merged.merge_batch(&state)?;
+        assert_eq!(merged.evaluate()?, ScalarValue::Int64(Some(NESTED_ROWS)));
+        assert_nested_size_is_bounded(merged.size());
+
+        let mut sliding = SlidingDistinctCountAccumulator::try_new(structs.data_type())?;
+        sliding.update_batch(&[Arc::clone(&structs)])?;
+        assert_nested_size_is_bounded(sliding.size());
+        sliding.retract_batch(&[structs.slice(0, 10)])?;
+        assert_eq!(
+            sliding.evaluate()?,
+            ScalarValue::Int64(Some(NESTED_ROWS - 10))
+        );
+        Ok(())
+    }
+
     /// Zero-width fixed-size lists: compacting one must keep its single row,
     /// or a stored key stops matching the value it was made from.
     fn zero_width_fixed_size_lists() -> ArrayRef {
