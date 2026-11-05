@@ -668,6 +668,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         &self,
         sql_type: &SQLDataType,
     ) -> Result<FieldRef> {
+        self.convert_nested_data_type_to_field(sql_type, 0)
+    }
+
+    fn convert_nested_data_type_to_field(
+        &self,
+        sql_type: &SQLDataType,
+        depth: usize,
+    ) -> Result<FieldRef> {
+        check_data_type_nesting_depth(depth)?;
+
         // First check if any of the registered type_planner can handle this type
         if let Some(type_planner) = self.context_provider.get_type_planner()
             && let Some(data_type) = type_planner.plan_type_field(sql_type)?
@@ -679,13 +689,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         match sql_type {
             SQLDataType::Array(ArrayElemTypeDef::AngleBracket(inner_sql_type)) => {
                 // Arrays may be multi-dimensional.
-                Ok(self.convert_data_type_to_field(inner_sql_type)?.into_list())
+                Ok(self
+                    .convert_nested_data_type_to_field(inner_sql_type, depth + 1)?
+                    .into_list())
             }
             SQLDataType::Array(ArrayElemTypeDef::SquareBracket(
                 inner_sql_type,
                 maybe_array_size,
             )) => {
-                let inner_field = self.convert_data_type_to_field(inner_sql_type)?;
+                let inner_field =
+                    self.convert_nested_data_type_to_field(inner_sql_type, depth + 1)?;
                 if let Some(array_size) = maybe_array_size {
                     let array_size: i32 = (*array_size).try_into().map_err(|_| {
                         plan_datafusion_err!(
@@ -701,12 +714,16 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                 not_impl_err!("Arrays with unspecified type is not supported")
             }
             other => Ok(self
-                .convert_simple_data_type(other)?
+                .convert_simple_data_type(other, depth)?
                 .into_nullable_field_ref()),
         }
     }
 
-    fn convert_simple_data_type(&self, sql_type: &SQLDataType) -> Result<DataType> {
+    fn convert_simple_data_type(
+        &self,
+        sql_type: &SQLDataType,
+        depth: usize,
+    ) -> Result<DataType> {
         match sql_type {
             SQLDataType::Boolean | SQLDataType::Bool => Ok(DataType::Boolean),
             SQLDataType::TinyInt(_) => Ok(DataType::Int8),
@@ -816,7 +833,10 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     .iter()
                     .enumerate()
                     .map(|(idx, sql_struct_field)| {
-                        let field = self.convert_data_type_to_field(&sql_struct_field.field_type)?;
+                        let field = self.convert_nested_data_type_to_field(
+                            &sql_struct_field.field_type,
+                            depth + 1,
+                        )?;
                         let field_name = match &sql_struct_field.field_name {
                             Some(ident) => ident.clone(),
                             None => Ident::new(format!("c{idx}")),
@@ -923,6 +943,18 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             self.options.enable_ident_normalization,
         )
     }
+}
+
+/// Maximum nesting depth of array and struct types in a SQL data type.
+const MAX_DATA_TYPE_NESTING_DEPTH: usize = 64;
+
+fn check_data_type_nesting_depth(depth: usize) -> Result<()> {
+    if depth > MAX_DATA_TYPE_NESTING_DEPTH {
+        return plan_err!(
+            "SQL data type nesting depth exceeds the maximum of {MAX_DATA_TYPE_NESTING_DEPTH}"
+        );
+    }
+    Ok(())
 }
 
 /// Create a [`TableReference`] after normalizing the specified ObjectName
@@ -1060,4 +1092,24 @@ pub fn object_name_to_qualifier(
         })
         .collect::<Result<Vec<_>>>()
         .map(|parts| parts.join(" AND "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn data_type_nesting_depth_limit() {
+        assert!(check_data_type_nesting_depth(0).is_ok());
+        assert!(check_data_type_nesting_depth(MAX_DATA_TYPE_NESTING_DEPTH).is_ok());
+        let err = check_data_type_nesting_depth(MAX_DATA_TYPE_NESTING_DEPTH + 1)
+            .unwrap_err()
+            .strip_backtrace();
+        assert_eq!(
+            err,
+            format!(
+                "Error during planning: SQL data type nesting depth exceeds the maximum of {MAX_DATA_TYPE_NESTING_DEPTH}"
+            )
+        );
+    }
 }
