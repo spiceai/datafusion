@@ -26,8 +26,10 @@ use super::{
         is_numbered_alias,
     },
     rewrite::{
-        TableAliasRewriter, inject_column_aliases_into_subquery, normalize_union_schema,
-        remove_dangling_qualifier, requalify_column_onto_derived_table,
+        EmittedKey, TableAliasRewriter, inject_column_aliases_into_subquery,
+        normalize_union_schema, remove_dangling_qualifier,
+        requalify_column_onto_derived_table,
+        rewrite_plan_for_projection_over_limited_sort,
         rewrite_plan_for_sort_on_non_projected_fields,
         subquery_alias_inner_query_and_columns,
     },
@@ -3171,7 +3173,35 @@ impl Unparser<'_> {
                 Ok(())
             }
             LogicalPlan::Projection(p) => {
-                if let Some(new_plan) = rewrite_plan_for_sort_on_non_projected_fields(p) {
+                // Folding a rename removes the inner name the rename reads, and a
+                // clause a node above put on this query may read it: a filter on
+                // an aliased output is inlined into the `WHERE` as the inner name.
+                // So renames are folded only where this projection opens its own
+                // query: no list taken, no clause (`DISTINCT`, `WHERE`, …) from a
+                // node above, no `ORDER BY` or row bound a limit moved up here
+                // would be reordered under or overwrite, and not a join input,
+                // whose limit needs a derived table of its own.
+                let opens_its_own_query = !select.already_projected()
+                    && select.holds_no_clause_before_limit()
+                    && !select.within_join_input()
+                    && query.as_ref().is_some_and(|query| {
+                        query.get_order_by().is_none() && !query.has_row_bound()
+                    });
+                let emitted_key = |name: &str| self.emitted_column_key(name);
+                let renames =
+                    opens_its_own_query.then_some(&emitted_key as EmittedKey<'_>);
+                if let Some(new_plan) =
+                    rewrite_plan_for_sort_on_non_projected_fields(p, renames, true)
+                {
+                    return self
+                        .select_to_sql_recursively(&new_plan, query, select, relation);
+                }
+                // The same fold, for a projection above the limit of the sorted
+                // projection, which only a fresh query can take.
+                if let Some(renames) = renames
+                    && let Some(new_plan) =
+                        rewrite_plan_for_projection_over_limited_sort(p, renames)
+                {
                     return self
                         .select_to_sql_recursively(&new_plan, query, select, relation);
                 }

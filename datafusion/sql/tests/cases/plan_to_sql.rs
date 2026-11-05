@@ -20227,6 +20227,462 @@ fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
     Ok(())
 }
 
+/// A projection that renames the outputs of an ordered, limited aggregate sits
+/// above the `Limit`, as a Substrait plan's root names do. A projection maps each
+/// row on its own, so it reads the same rows whether it is applied before or
+/// after the limit, and the statement folds into one `SELECT`. Left above the
+/// limit, the chain under it was derived as an unnamed table, and the select
+/// list kept qualifiers (`t.k`) and an aggregate's display name (`"sum(t.v)"`)
+/// that no column of that table carries.
+#[test]
+fn test_projection_over_limit_over_sorted_projection_folds() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![col("t.k")], vec![sum(col("t.v"))])?
+        .project(vec![col("t.k"), col("sum(t.v)")])?
+        .sort(vec![col("sum(t.v)").sort(false, true)])?
+        .limit(0, Some(10))?
+        .project(vec![col("t.k").alias("K"), col("sum(t.v)").alias("S")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.k AS "K", sum(t.v) AS "S" FROM t GROUP BY t.k ORDER BY sum(t.v) DESC NULLS FIRST LIMIT 10"#
+    );
+    Ok(())
+}
+
+/// The same fold without a limit: a projection renaming the outputs of a sorted
+/// projection over a join folds into one `SELECT`, with the `ORDER BY` at its top
+/// level, instead of leaving the sort in a derived table whose order the
+/// enclosing query does not have to keep.
+#[test]
+fn test_renaming_projection_over_sorted_projection_folds() -> Result<()> {
+    let t1 = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Utf8, false),
+    ]);
+    let t2 = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("c", DataType::Utf8, false),
+    ]);
+    let plan = table_scan(Some("t1"), &t1, None)?
+        .join(
+            table_scan(Some("t2"), &t2, None)?.build()?,
+            datafusion_expr::JoinType::Inner,
+            (vec!["t1.a"], vec!["t2.a"]),
+            None,
+        )?
+        .project(vec![col("t1.b"), col("t2.c")])?
+        .sort(vec![col("t1.b").sort(true, false)])?
+        .project(vec![col("t1.b").alias("B"), col("t2.c").alias("C")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t1.b AS "B", t2.c AS "C" FROM t1 INNER JOIN t2 ON t1.a = t2.a ORDER BY t1.b ASC NULLS LAST"#
+    );
+    Ok(())
+}
+
+/// A rename that takes the name of a different column a sort key reads is not
+/// folded: in one `SELECT`, an engine that resolves a bare `ORDER BY` name to the
+/// output alias first (DuckDB, PostgreSQL) would order by the renamed output
+/// instead of the column. The plan is unparsed as it was before the fold.
+#[test]
+fn test_rename_capturing_a_sort_key_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .sort(vec![col("t.k").sort(true, false)])?
+        .project(vec![col("t.v").alias("K")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.v AS "K" FROM (SELECT t.k, t.v FROM t ORDER BY t.k ASC NULLS LAST)"#
+    );
+    Ok(())
+}
+
+/// A filter above the projection reads the limited rows, and a `WHERE` in the
+/// `SELECT` the limit lands in would run before it. The limit is not moved
+/// under the projection there, and the plan is unparsed as it was before.
+#[test]
+fn test_filter_over_projection_over_limit_keeps_the_limit_scoped() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .sort(vec![col("t.v").sort(true, false)])?
+        .limit(0, Some(3))?
+        .project(vec![col("t.k").alias("K")])?
+        .filter(col("K").gt(lit(1)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.k AS "K" FROM (SELECT t.k, t.v FROM t ORDER BY t.v ASC NULLS LAST LIMIT 3) WHERE (t.k > 1)"#
+    );
+    Ok(())
+}
+
+/// A sort above the projection orders the limited rows. Folding the limit into
+/// the query that sort's `ORDER BY` is on would pick the rows by the outer order
+/// instead, so the limit is not moved under the projection there either.
+#[test]
+fn test_sort_over_projection_over_limit_keeps_the_limit_scoped() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("k", DataType::Int32, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.k"), col("t.v")])?
+        .sort(vec![col("t.v").sort(true, false)])?
+        .limit(0, Some(3))?
+        .project(vec![col("t.k").alias("K")])?
+        .sort(vec![col("K").sort(false, false)])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "K" FROM (SELECT t.k AS "K", k FROM (SELECT t.k, t.v FROM t ORDER BY t.v ASC NULLS LAST LIMIT 3) ORDER BY k DESC NULLS LAST)"#
+    );
+    Ok(())
+}
+
+/// The capture is judged by the names the dialect writes. BigQuery writes the
+/// alias `x*` as `x_42`, the name of the column the sort key reads, so the
+/// rename is not folded there although the two plan names differ. The default
+/// dialect writes them apart and folds it.
+#[test]
+fn test_rename_capturing_a_sort_key_is_judged_by_emitted_names() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("x_42", DataType::Int32, false),
+        Field::new("v", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.x_42"), col("t.v")])?
+        .sort(vec![col("t.x_42").sort(true, false)])?
+        .project(vec![col("t.v").alias("x*")])?
+        .build()?;
+    assert_snapshot!(
+        Unparser::new(&BigQueryDialect {}).plan_to_sql(&plan)?,
+        @"SELECT `t`.`v` AS `x_42` FROM (SELECT `t`.`x_42`, `t`.`v` FROM `t` ORDER BY `t`.`x_42` ASC NULLS LAST)"
+    );
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT t.v AS "x*" FROM t ORDER BY t.x_42 ASC NULLS LAST"#
+    );
+    Ok(())
+}
+
+/// A `DISTINCT` above the projection deduplicates the limited rows. Folding the
+/// limit into the `SELECT DISTINCT` would deduplicate first and limit after, so
+/// over `[1, 1, 2]` with `LIMIT 2` the statement would return two rows where the
+/// plan returns one. The limit stays in its derived table.
+#[test]
+fn test_distinct_over_projection_over_limit_keeps_the_limit_scoped() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.k")])?
+        .sort(vec![col("t.k").sort(true, false)])?
+        .limit(0, Some(2))?
+        .project(vec![col("t.k").alias("s")])?
+        .distinct()?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT DISTINCT t.k AS s FROM (SELECT t.k FROM t ORDER BY t.k ASC NULLS LAST LIMIT 2)"
+    );
+    Ok(())
+}
+
+/// A rename of a sorted projection's output drops the inner alias, so a sort key
+/// reading the alias would take its expression instead. Over `random() AS r`
+/// that orders by a second draw, not by the value the row shows, so the fold is
+/// declined and the plan is unparsed as it was before.
+#[test]
+fn test_rename_over_a_volatile_sort_key_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![random().alias("r")])?
+        .sort(vec![(col("r") + lit(1)).sort(true, false)])?
+        .limit(0, Some(10))?
+        .project(vec![col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r AS s FROM (SELECT r FROM (SELECT random() AS r FROM t) ORDER BY (r + 1) ASC NULLS LAST LIMIT 10)"
+    );
+    Ok(())
+}
+
+/// A computed inner output with no alias of its own is named by its display
+/// name, which a sort key reads it by. Renaming it leaves no output under that
+/// name, so the key would read a column the folded `SELECT` does not have. The
+/// fold is declined, with and without a limit, and the plan is unparsed as it
+/// was before.
+#[test]
+fn test_rename_of_an_unaliased_computed_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let sorted = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &schema, None)?
+            .project(vec![col("t.k") + lit(1)])?
+            .sort(vec![col("t.k + Int32(1)").sort(true, false)])
+    };
+    let plan = sorted()?
+        .project(vec![col("t.k + Int32(1)").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.k + Int32(1)" AS s FROM (SELECT (t.k + 1) AS "t.k + Int32(1)" FROM t ORDER BY "t.k + Int32(1)" ASC NULLS LAST)"#
+    );
+    let plan = sorted()?
+        .limit(0, Some(10))?
+        .project(vec![col("t.k + Int32(1)").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT "t.k + Int32(1)" AS s FROM (SELECT (t.k + 1) AS "t.k + Int32(1)" FROM t ORDER BY "t.k + Int32(1)" ASC NULLS LAST LIMIT 10)"#
+    );
+    Ok(())
+}
+
+/// A rename next to the output it renames would have the folded `SELECT`
+/// evaluate that output twice, once per name. Over `random() AS r`, `r` and `s`
+/// would be two draws where the plan shows one value under both names, so the
+/// fold is declined, with and without a limit.
+#[test]
+fn test_rename_beside_a_volatile_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let sorted = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &schema, None)?
+            .project(vec![random().alias("r")])?
+            .sort(vec![col("r").sort(true, false)])
+    };
+    let plan = sorted()?
+        .project(vec![col("r"), col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r, r AS s FROM (SELECT random() AS r FROM t ORDER BY r ASC NULLS LAST)"
+    );
+    let plan = sorted()?
+        .limit(0, Some(10))?
+        .project(vec![col("r"), col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT r, r AS s FROM (SELECT random() AS r FROM t ORDER BY r ASC NULLS LAST LIMIT 10)"
+    );
+    Ok(())
+}
+
+/// A filter above a renaming projection reads the renamed output, and the
+/// `WHERE` it puts on the query reads the inner name the rename removes once
+/// folded. Over a table that has a column of that name the predicate would bind
+/// to the column: rows `(a, x) = (0, 20), (20, 0)` would return `s = 1` instead
+/// of `s = 21`. Renames are only folded where the projection opens its own
+/// query, so the plan is unparsed as it was before.
+#[test]
+fn test_filter_over_a_renaming_projection_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("x", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![(col("t.a") + lit(1)).alias("x")])?
+        .sort(vec![col("x").sort(true, false)])?
+        .project(vec![col("x").alias("s")])?
+        .filter(col("s").gt(lit(10)))?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x AS s FROM (SELECT (t.a + 1) AS x FROM t ORDER BY x ASC NULLS LAST) WHERE (x > 10)"
+    );
+    Ok(())
+}
+
+/// A sort key reading an alias the fold drops takes the aliased expression. An
+/// alias that reads the input column it shadows (`(x + 1) AS x`) is substituted
+/// once: the column inside the replacement belongs to the input, not to the
+/// alias. Before, the substitution descended into its own replacement until the
+/// stack overflowed, on `spiceai-55` too, for an alias the outer list does not
+/// read. A rename of that alias, with and without a limit, is not folded at all,
+/// since a fold with a rename drops no alias.
+#[test]
+fn test_a_self_referencing_dropped_alias_is_substituted_once() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let shadowed = || -> Result<LogicalPlanBuilder> {
+        table_scan(Some("t"), &schema, None)?
+            .project(vec![col("t.a").alias("x"), col("t.a").alias("y")])?
+            .project(vec![(col("x") + lit(1)).alias("x"), col("y")])?
+            .sort(vec![col("x").sort(true, false)])
+    };
+    let plan = shadowed()?.project(vec![col("y")])?.build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY (x + 1) ASC NULLS LAST"
+    );
+    let plan = shadowed()?
+        .project(vec![col("x").alias("s"), col("y")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x AS s, y FROM (SELECT (x + 1) AS x, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY x ASC NULLS LAST)"
+    );
+    let plan = shadowed()?
+        .limit(0, Some(10))?
+        .project(vec![col("x").alias("s"), col("y")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x AS s, y FROM (SELECT (x + 1) AS x, y FROM (SELECT t.a AS x, t.a AS y FROM t) ORDER BY x ASC NULLS LAST LIMIT 10)"
+    );
+    Ok(())
+}
+
+/// A rename that drops an inner alias would have a sort key reading the alias
+/// take the aliased expression. A constant is then a bare number in `ORDER BY`,
+/// which SQL reads as an output ordinal: `2 AS x` renamed to `s` and sorted on
+/// `x` would order by the second output instead. A fold with a rename takes no
+/// alias out of the inner list, so the plan is unparsed as it was before.
+#[test]
+fn test_rename_dropping_a_constant_alias_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![lit(2).alias("x"), col("t.a")])?
+        .sort(vec![
+            col("x").sort(true, false),
+            col("t.a").sort(false, false),
+        ])?
+        .limit(0, Some(1))?
+        .project(vec![col("x").alias("s"), col("t.a")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT x AS s, a FROM (SELECT 2 AS x, t.a FROM t ORDER BY x ASC NULLS LAST, t.a DESC NULLS LAST LIMIT 1)"
+    );
+    Ok(())
+}
+
+/// A correlated reference in a sort key names a value of the enclosing query,
+/// and the unparser writes it as a plain column. A rename taking its name would
+/// capture it in the folded `SELECT`: `ORDER BY s` would read the new output
+/// instead of the enclosing query's `s`. The fold is declined, and the plan is
+/// unparsed as it was before.
+#[test]
+fn test_rename_capturing_a_correlated_sort_key_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new("b", DataType::Int32, false),
+    ]);
+    let plan = table_scan(Some("u"), &schema, None)?
+        .project(vec![col("u.a"), col("u.b")])?
+        .sort(vec![
+            out_ref_col(DataType::Int32, "s").sort(true, false),
+            col("u.b").sort(true, false),
+        ])?
+        .limit(0, Some(1))?
+        .project(vec![col("u.a").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT u.a AS s FROM (SELECT u.a, u.b FROM u ORDER BY s ASC NULLS LAST, u.b ASC NULLS LAST LIMIT 1)"
+    );
+    Ok(())
+}
+
+/// The limit fold drops no inner alias either, renamed or not: a sort key that
+/// reads a dropped `1 AS x` would take the bare constant, which `ORDER BY`
+/// reads as the first output's ordinal, and the limit would keep a different
+/// row. The plan is unparsed as it was before.
+#[test]
+fn test_limit_fold_dropping_a_constant_alias_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("a", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![lit(1).alias("x"), col("t.a")])?
+        .sort(vec![
+            col("x").sort(true, false),
+            col("t.a").sort(false, false),
+        ])?
+        .limit(0, Some(1))?
+        .project(vec![col("t.a")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT a FROM (SELECT 1 AS x, t.a FROM t ORDER BY x ASC NULLS LAST, t.a DESC NULLS LAST LIMIT 1)"
+    );
+    Ok(())
+}
+
+/// A volatile aggregate behind a plain column: `r` reads `sum(random())`, and the
+/// folded `SELECT` would unproject both `r` and `s` into separate
+/// `sum(random())` calls where the plan shows one value under both names. The
+/// fold is declined.
+#[test]
+fn test_rename_beside_a_volatile_aggregate_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .aggregate(vec![] as Vec<Expr>, vec![sum(random()).alias("r")])?
+        .project(vec![col("r")])?
+        .sort(vec![col("r").sort(true, false)])?
+        .project(vec![col("r"), col("r").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT r, r AS s FROM (SELECT sum(random()) AS r FROM t ORDER BY sum(random()) ASC NULLS LAST)"#
+    );
+    Ok(())
+}
+
+/// A window output renamed: the sort key reads it by its own name, which only
+/// the projection the fold removes defines. The fold is declined.
+#[test]
+fn test_rename_of_a_window_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .window(vec![
+            Expr::from(WindowFunction::new(
+                WindowFunctionDefinition::WindowUDF(row_number_udwf()),
+                vec![],
+            ))
+            .alias("w"),
+        ])?
+        .project(vec![col("w")])?
+        .sort(vec![col("w").sort(false, false)])?
+        .project(vec![col("w").alias("s")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT w AS s FROM (SELECT row_number() OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS w FROM t ORDER BY w DESC NULLS LAST)"#
+    );
+    Ok(())
+}
+
+/// The limit fold drops no computed inner output either: a sort key reading
+/// `t.k + 1` by its display name would read a column the folded `SELECT` does
+/// not have. The fold is declined.
+#[test]
+fn test_limit_fold_dropping_a_computed_output_is_not_folded() -> Result<()> {
+    let schema = Schema::new(vec![Field::new("k", DataType::Int32, false)]);
+    let plan = table_scan(Some("t"), &schema, None)?
+        .project(vec![col("t.k"), col("t.k") + lit(1)])?
+        .sort(vec![col("t.k + Int32(1)").sort(true, false)])?
+        .limit(0, Some(1))?
+        .project(vec![col("t.k")])?
+        .build()?;
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @r#"SELECT k FROM (SELECT t.k, (t.k + 1) AS "t.k + Int32(1)" FROM t ORDER BY "t.k + Int32(1)" ASC NULLS LAST LIMIT 1)"#
+    );
+    Ok(())
+}
+
 #[test]
 fn test_projected_exists_probe_set_comparison_repeatability_guard() -> Result<()> {
     for quantifier in [
