@@ -25,7 +25,7 @@ use arrow::array::{
 };
 use arrow::compute::{SortOptions, take};
 use arrow::datatypes::{DataType, Field, FieldRef, UnionMode};
-use arrow_buffer::{ArrowNativeType, NullBuffer};
+use arrow_buffer::{ArrowNativeType, NullBuffer, ScalarBuffer};
 
 use datafusion_common::cast::{as_map_array, as_struct_array};
 use datafusion_common::{
@@ -279,125 +279,124 @@ fn apply_parent_struct_nulls(parent: &StructArray, child: &ArrayRef) -> Result<A
         return Ok(Arc::clone(child));
     }
 
-    match child.data_type() {
+    let parent_nulls = parent
+        .nulls()
+        .expect("parent with null_count > 0 must have a null buffer");
+    mask_array_with_nulls(child, parent_nulls)
+}
+
+/// Apply `nulls` onto `array` using a layout-aware strategy.
+///
+/// Types that cannot carry a top-level validity bitmap (`Null`, `Union`,
+/// `RunEndEncoded`) are handled recursively / by rebuilding rather than by
+/// attaching a bitmap. Nested `Union` / `RunEndEncoded` variants inside a
+/// sparse union are therefore safe: each variant is dispatched on its own
+/// layout instead of assuming bitmap support.
+fn mask_array_with_nulls(array: &ArrayRef, nulls: &NullBuffer) -> Result<ArrayRef> {
+    debug_assert_eq!(
+        array.len(),
+        nulls.len(),
+        "mask length must match array length"
+    );
+    if nulls.null_count() == 0 {
+        return Ok(Arc::clone(array));
+    }
+    match array.data_type() {
         // Null arrays are already all-null and reject a validity bitmap in
         // `ArrayData::build()`.
-        DataType::Null => Ok(Arc::clone(child)),
-        DataType::Union(_, mode) => mask_union_with_parent_nulls(child, parent, *mode),
-        DataType::RunEndEncoded(_, _) => {
-            mask_run_end_encoded_with_parent_nulls(child, parent)
-        }
+        DataType::Null => Ok(Arc::clone(array)),
+        DataType::Union(_, mode) => mask_union_with_nulls(array, nulls, *mode),
+        DataType::RunEndEncoded(_, _) => mask_run_end_encoded_with_nulls(array, nulls),
         _ => {
-            let nulls = NullBuffer::union(parent.nulls(), child.nulls());
+            let combined = NullBuffer::union(array.nulls(), Some(nulls));
             Ok(make_array(
-                child.to_data().into_builder().nulls(nulls).build()?,
+                array.to_data().into_builder().nulls(combined).build()?,
             ))
         }
     }
 }
 
-/// Union top-level nulls onto an array that supports a physical validity bitmap.
-///
-/// `Null` children are returned unchanged. Callers must not pass `Union` or
-/// `RunEndEncoded` here — those need layout-aware masking.
-fn union_nulls_onto_array(
-    array: &ArrayRef,
-    extra_nulls: &NullBuffer,
-) -> Result<ArrayRef> {
-    if matches!(array.data_type(), DataType::Null) {
-        return Ok(Arc::clone(array));
-    }
-    let nulls = NullBuffer::union(array.nulls(), Some(extra_nulls));
-    Ok(make_array(
-        array.to_data().into_builder().nulls(nulls).build()?,
-    ))
-}
-
-/// Null selected positions on an array that supports a physical validity bitmap.
-fn null_out_positions(array: &ArrayRef, positions: &[usize]) -> Result<ArrayRef> {
-    if positions.is_empty() {
-        return Ok(Arc::clone(array));
-    }
-    if matches!(array.data_type(), DataType::Null) {
-        return Ok(Arc::clone(array));
-    }
-    let mut is_valid: Vec<bool> = match array.nulls() {
-        Some(nulls) => (0..array.len()).map(|i| nulls.is_valid(i)).collect(),
-        None => vec![true; array.len()],
-    };
-    for &p in positions {
-        is_valid[p] = false;
-    }
-    let nulls = NullBuffer::from(is_valid);
-    Ok(make_array(
-        array.to_data().into_builder().nulls(Some(nulls)).build()?,
-    ))
-}
-
-fn mask_union_with_parent_nulls(
+fn mask_union_with_nulls(
     child: &ArrayRef,
-    parent: &StructArray,
+    parent_nulls: &NullBuffer,
     mode: UnionMode,
 ) -> Result<ArrayRef> {
     let union = child
         .as_any()
         .downcast_ref::<UnionArray>()
         .expect("UnionArray downcast");
-    // Parent is known to have nulls (caller checked null_count > 0).
-    let parent_nulls = parent
-        .nulls()
-        .expect("parent with null_count > 0 must have a null buffer");
     let fields = union.fields().clone();
 
-    let children = match mode {
-        UnionMode::Sparse => fields
-            .iter()
-            .map(|(type_id, _)| {
-                union_nulls_onto_array(union.child(type_id), parent_nulls)
-            })
-            .collect::<Result<Vec<_>>>()?,
+    match mode {
+        UnionMode::Sparse => {
+            // Sparse children have the same length as the union / parent.
+            // Recurse so nested Union / REE variants are handled correctly
+            // instead of attaching a physical validity bitmap.
+            let children = fields
+                .iter()
+                .map(|(type_id, _)| {
+                    mask_array_with_nulls(union.child(type_id), parent_nulls)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(UnionArray::try_new(
+                fields,
+                union.type_ids().clone(),
+                None,
+                children,
+            )?))
+        }
         UnionMode::Dense => {
-            let mut positions: Vec<Vec<usize>> =
-                fields.iter().map(|_| Vec::new()).collect();
+            // Dense rows can share a child offset. Nulling a shared slot would
+            // also null valid rows that point at it, so rebuild children and
+            // offsets together: valid rows keep their value via `take`;
+            // parent-null rows get a fresh null slot. `take` is layout-aware
+            // for nested Union / RunEndEncoded children.
             let tid_to_idx: std::collections::HashMap<i8, usize> = fields
                 .iter()
                 .enumerate()
                 .map(|(idx, (type_id, _))| (type_id, idx))
                 .collect();
-            for i in 0..parent.len() {
+            let mut per_child_indices: Vec<Vec<Option<u32>>> =
+                fields.iter().map(|_| Vec::new()).collect();
+            let mut new_offsets = Vec::with_capacity(parent_nulls.len());
+
+            for i in 0..parent_nulls.len() {
+                let type_id = union.type_id(i);
+                let child_idx = tid_to_idx[&type_id];
+                let old_offset = union.value_offset(i) as u32;
+                new_offsets.push(per_child_indices[child_idx].len() as i32);
                 if parent_nulls.is_null(i) {
-                    let type_id = union.type_id(i);
-                    let offset = union.value_offset(i);
-                    positions[tid_to_idx[&type_id]].push(offset);
+                    per_child_indices[child_idx].push(None);
+                } else {
+                    per_child_indices[child_idx].push(Some(old_offset));
                 }
             }
-            fields
-                .iter()
-                .enumerate()
-                .map(|(idx, (type_id, _))| {
-                    null_out_positions(union.child(type_id), &positions[idx])
-                })
-                .collect::<Result<Vec<_>>>()?
-        }
-    };
 
-    Ok(Arc::new(UnionArray::try_new(
-        fields,
-        union.type_ids().clone(),
-        union.offsets().cloned(),
-        children,
-    )?))
+            let mut children = Vec::with_capacity(fields.len());
+            for ((type_id, _), indices) in fields.iter().zip(per_child_indices) {
+                let index_array = UInt32Array::from(indices);
+                children.push(take(union.child(type_id).as_ref(), &index_array, None)?);
+            }
+
+            Ok(Arc::new(UnionArray::try_new(
+                fields,
+                union.type_ids().clone(),
+                Some(ScalarBuffer::from(new_offsets)),
+                children,
+            )?))
+        }
+    }
 }
 
-fn mask_run_end_encoded_with_parent_nulls(
+fn mask_run_end_encoded_with_nulls(
     child: &ArrayRef,
-    parent: &StructArray,
+    nulls: &NullBuffer,
 ) -> Result<ArrayRef> {
     match child.data_type() {
         DataType::RunEndEncoded(run_ends_field, _) => match run_ends_field.data_type() {
-            DataType::Int16 => mask_ree_impl::<Int16Type>(child, parent),
-            DataType::Int32 => mask_ree_impl::<Int32Type>(child, parent),
-            DataType::Int64 => mask_ree_impl::<Int64Type>(child, parent),
+            DataType::Int16 => mask_ree_impl::<Int16Type>(child, nulls),
+            DataType::Int32 => mask_ree_impl::<Int32Type>(child, nulls),
+            DataType::Int64 => mask_ree_impl::<Int64Type>(child, nulls),
             other => {
                 internal_err!("unsupported run-end index type for get_field: {other}")
             }
@@ -406,22 +405,22 @@ fn mask_run_end_encoded_with_parent_nulls(
     }
 }
 
-/// Rebuild a `RunEndEncoded` child so parent-null logical slots become null
+/// Rebuild a `RunEndEncoded` child so masked logical slots become null
 /// values. Uses one physical value per logical row so mixed validity within a
 /// former run is represented correctly without attaching a top-level bitmap.
 fn mask_ree_impl<R: RunEndIndexType>(
     child: &ArrayRef,
-    parent: &StructArray,
+    nulls: &NullBuffer,
 ) -> Result<ArrayRef> {
     let run = child
         .as_any()
         .downcast_ref::<RunArray<R>>()
         .expect("RunArray downcast");
-    let len = parent.len();
+    let len = nulls.len();
     let logical: Vec<u32> = (0..len as u32).collect();
     let physical = run.get_physical_indices(&logical)?;
     let value_indices = UInt32Array::from_iter(
-        (0..len).map(|i| parent.is_valid(i).then_some(physical[i] as u32)),
+        (0..len).map(|i| nulls.is_valid(i).then_some(physical[i] as u32)),
     );
     let new_values = take(run.values().as_ref(), &value_indices, None)?;
     let run_ends = PrimitiveArray::<R>::from_iter_values(
@@ -1016,6 +1015,139 @@ mod tests {
         assert!(logical.is_valid(0));
         assert!(logical.is_null(1));
         assert!(logical.is_valid(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_nested_union_child_with_nullable_parent() -> Result<()> {
+        // Sparse-union variants can themselves be Union. Masking must recurse
+        // on the nested layout instead of attaching a parent validity bitmap
+        // (which Arrow rejects on Union during build()).
+        let inner_fields =
+            UnionFields::try_new(vec![0], vec![Field::new("i", DataType::Int32, true)])?;
+        let inner = UnionArray::try_new(
+            inner_fields,
+            ScalarBuffer::from(vec![0_i8, 0, 0]),
+            None,
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef],
+        )?;
+        let outer_fields = UnionFields::try_new(
+            vec![7],
+            vec![Field::new("nested", inner.data_type().clone(), true)],
+        )?;
+        let outer = UnionArray::try_new(
+            outer_fields,
+            ScalarBuffer::from(vec![7_i8, 7, 7]),
+            None,
+            vec![Arc::new(inner) as ArrayRef],
+        )?;
+        let outer: ArrayRef = Arc::new(outer);
+
+        let fields: Fields =
+            vec![Field::new("u", outer.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&outer)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert!(matches!(result_array.data_type(), DataType::Union(_, _)));
+        let logical = result_array
+            .logical_nulls()
+            .expect("nested union with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+        assert!(logical.is_valid(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_union_of_ree_child_with_nullable_parent() -> Result<()> {
+        // Sparse-union variants can be RunEndEncoded. Masking must use the REE
+        // path rather than attaching a parent validity bitmap.
+        let run_ends = Int32Array::from(vec![2, 3]);
+        let values = Int32Array::from(vec![Some(7), Some(8)]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values)?;
+        let union_fields = UnionFields::try_new(
+            vec![1],
+            vec![Field::new("r", ree.data_type().clone(), true)],
+        )?;
+        let union = UnionArray::try_new(
+            union_fields,
+            ScalarBuffer::from(vec![1_i8, 1, 1]),
+            None,
+            vec![Arc::new(ree) as ArrayRef],
+        )?;
+        let union: ArrayRef = Arc::new(union);
+
+        let fields: Fields =
+            vec![Field::new("u", union.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&union)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert!(matches!(result_array.data_type(), DataType::Union(_, _)));
+        let logical = result_array
+            .logical_nulls()
+            .expect("union-of-REE with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+        assert!(logical.is_valid(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_dense_union_shared_offset_with_nullable_parent() -> Result<()> {
+        // Dense-union rows can share a child offset. Parent-null masking must
+        // not null a slot still referenced by a valid row.
+        // type_ids=[0,0], offsets=[0,0], child=[10], parent validity=[true,false]
+        // must yield [10, NULL], not [NULL, NULL].
+        let union_fields = UnionFields::try_new(
+            vec![0],
+            vec![Field::new("int", DataType::Int32, true)],
+        )?;
+        let type_ids = ScalarBuffer::from(vec![0_i8, 0]);
+        let offsets = ScalarBuffer::from(vec![0_i32, 0]);
+        let children: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![Some(10)]))];
+        let union = UnionArray::try_new(union_fields, type_ids, Some(offsets), children)?;
+        let union: ArrayRef = Arc::new(union);
+
+        let fields: Fields =
+            vec![Field::new("u", union.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&union)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(2)?;
+        assert!(matches!(result_array.data_type(), DataType::Union(_, _)));
+        let logical = result_array
+            .logical_nulls()
+            .expect("dense union with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+
+        let result_union = result_array
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("UnionArray");
+        let slot = result_union.value(0);
+        let child = slot
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 slot");
+        assert_eq!(child.value(0), 10);
         Ok(())
     }
 
