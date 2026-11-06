@@ -136,6 +136,12 @@ fn process_map_array(
     let matches = keys.values();
 
     for entry in 0..map_array.len() {
+        // A null map slot hides its entries even when the offsets still point
+        // at populated key/value rows.
+        if map_array.is_null(entry) {
+            mutable.try_extend_nulls(1)?;
+            continue;
+        }
         let start = offsets[entry] as usize;
         let end = offsets[entry + 1] as usize;
 
@@ -171,6 +177,10 @@ fn process_map_with_nested_key(
         MutableArrayData::with_capacities(vec![&original_data], true, capacity);
 
     for entry in 0..map_array.len() {
+        if map_array.is_null(entry) {
+            mutable.try_extend_nulls(1)?;
+            continue;
+        }
         let start = map_array.value_offsets()[entry] as usize;
         let end = map_array.value_offsets()[entry + 1] as usize;
 
@@ -238,7 +248,15 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
             let as_struct_array = as_struct_array(&array)?;
             match as_struct_array.column_by_name(&k) {
                 None => exec_err!("Field {k} not found in struct"),
-                Some(col) => Ok(ColumnarValue::Array(Arc::clone(col))),
+                Some(col) => {
+                    // A null parent struct hides its children even when the
+                    // child arrays still hold values. Union the parent's null
+                    // bitmap onto the extracted field so `s['f']` is null
+                    // whenever `s` is.
+                    let nulls = NullBuffer::union(as_struct_array.nulls(), col.nulls());
+                    let data = col.to_data().into_builder().nulls(nulls).build()?;
+                    Ok(ColumnarValue::Array(make_array(data)))
+                }
             }
         }
         (DataType::Struct(_), name, _) => exec_err!(
@@ -694,6 +712,29 @@ mod tests {
     use super::*;
     use arrow::array::{ArrayRef, Int32Array, StructArray};
     use arrow::datatypes::Fields;
+
+    #[test]
+    fn test_get_field_applies_parent_struct_nulls() -> Result<()> {
+        // Arrow allows a null struct slot whose children still hold values.
+        // Field access must return null for that slot, not the hidden child.
+        let a_values = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+        let fields: Fields = vec![Field::new("a", DataType::Int32, true)].into();
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array = StructArray::new(
+            fields,
+            vec![Arc::new(a_values) as ArrayRef],
+            Some(nulls),
+        );
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("a".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        let expected = Int32Array::from(vec![Some(1), None, Some(3)]);
+        assert_eq!(result_array.as_ref(), &expected as &dyn Array);
+        Ok(())
+    }
 
     #[test]
     fn test_get_field_utf8view_key() -> Result<()> {

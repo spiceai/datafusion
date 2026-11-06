@@ -868,9 +868,12 @@ impl BatchAdapter {
 mod tests {
     use super::*;
     use arrow::array::{
-        Array, BooleanArray, GenericListArray, Int32Array, Int64Array, RecordBatch,
-        RecordBatchOptions, StringArray, StringViewArray, StructArray, record_batch,
+        Array, BooleanArray, GenericListArray, Int32Array, Int64Array, MapArray,
+        RecordBatch, RecordBatchOptions, StringArray, StringViewArray, StructArray,
+        record_batch,
     };
+    use arrow::buffer::{NullBuffer, OffsetBuffer};
+    use arrow::array::ArrayRef;
     use arrow::datatypes as arrow_schema;
     use arrow::datatypes::{Field, Fields, Schema};
     use datafusion_common::assert_contains;
@@ -1524,7 +1527,7 @@ mod tests {
             true,
         ));
         let offsets =
-            arrow::buffer::OffsetBuffer::from_lengths(vec![1usize; struct_array.len()]);
+            OffsetBuffer::from_lengths(vec![1usize; struct_array.len()]);
         let list_array = GenericListArray::<i32>::new(
             item_field,
             offsets,
@@ -1972,6 +1975,67 @@ mod tests {
             get_field.args()[0].downcast_ref::<Column>().is_some(),
             "the struct column must not be hidden behind a cast, got: {rewritten}"
         );
+    }
+
+    /// A null parent struct whose child map still holds values must yield
+    /// null for `s['mm']['k']` after the cast is narrowed away. Regression
+    /// for the get_field parent-null hole the cast used to mask.
+    #[test]
+    fn test_narrow_struct_cast_map_key_honours_null_parent() {
+        use arrow::datatypes::DataType;
+
+        let map = string_int_map(DataType::Int64);
+        // physical first, logical second: file has only mm; table gained sibling n.
+        let (logical_schema, physical_schema) = struct_schemas(
+            vec![Field::new("mm", map.clone(), true)],
+            vec![
+                Field::new("mm", map.clone(), true),
+                Field::new("n", DataType::Int64, true),
+            ],
+        );
+        let adapter = DefaultPhysicalExprAdapterFactory
+            .create(Arc::clone(&logical_schema), Arc::clone(&physical_schema))
+            .unwrap();
+        let rewritten = adapter.rewrite(map_key_lookup(&logical_schema)).unwrap();
+
+        // One-row batch: parent struct is null, but the map child has {'k': 1}.
+        let keys = Arc::new(StringArray::from(vec!["k"])) as ArrayRef;
+        let values = Arc::new(Int64Array::from(vec![1])) as ArrayRef;
+        let entries = StructArray::new(
+            vec![
+                Field::new("keys", DataType::Utf8, false),
+                Field::new("values", DataType::Int64, true),
+            ]
+            .into(),
+            vec![keys, values],
+            None,
+        );
+        let map_array = MapArray::new(
+            Arc::new(Field::new(
+                "entries",
+                entries.data_type().clone(),
+                false,
+            )),
+            OffsetBuffer::from_lengths([1]),
+            entries,
+            None,
+            false,
+        );
+        let struct_array = StructArray::new(
+            vec![Field::new("mm", map, true)].into(),
+            vec![Arc::new(map_array) as ArrayRef],
+            Some(NullBuffer::from(vec![false])),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::clone(&physical_schema),
+            vec![Arc::new(struct_array) as ArrayRef],
+        )
+        .unwrap();
+
+        let result = rewritten.evaluate(&batch).unwrap();
+        let arr = result.into_array(1).unwrap();
+        let ints = arr.as_any().downcast_ref::<Int64Array>().unwrap();
+        assert!(ints.is_null(0), "null parent must yield null, got {ints:?}");
     }
 
     /// When the map's own type differs between file and table, the lookup
