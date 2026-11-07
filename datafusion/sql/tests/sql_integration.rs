@@ -459,6 +459,28 @@ fn cast_to_invalid_decimal_type_precision_lt_scale() {
 }
 
 #[test]
+fn cast_to_nested_type_depth_limit() {
+    // Each wrapper adds one level around `INT` and 63 `[]` levels.
+    let inner = format!("INT{}", "[]".repeat(63));
+    for wrapper in ["{}[]", "ARRAY<{}>", "STRUCT<a {}>"] {
+        let at_limit = wrapper.replace("{}", &inner);
+        let sql = format!("SELECT CAST(NULL AS {at_limit})");
+        logical_plan(&sql).expect("64 levels should plan");
+
+        let sql = format!(
+            "SELECT CAST(NULL AS {})",
+            wrapper.replace("{}", &format!("{inner}[]"))
+        );
+        let err = logical_plan(&sql).expect_err("65 levels should fail");
+        assert_eq!(
+            err.strip_backtrace(),
+            "Error during planning: SQL data type nesting depth exceeds the maximum of 64",
+            "{wrapper}"
+        );
+    }
+}
+
+#[test]
 fn plan_create_table_with_pk() {
     let sql = "create table person (id int, name string, primary key(id))";
     let plan = logical_plan(sql).unwrap();
