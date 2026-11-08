@@ -53,13 +53,7 @@ GROUP BY v % 3
 1 10000 5
 2 10000 5
 
-statement ok
-RESET datafusion.runtime.memory_limit
-
-# The SLT runner uses 4 partitions rather than the default.
+# The SLT runner uses 4 partitions rather than the default. Each file gets
+# its own session, so the memory limit does not reach other files.
 statement ok
 SET datafusion.execution.target_partitions = 4
-
-# Setting memory_limit rebuilds the runtime and flips this flag; restore it.
-statement ok
-RESET datafusion.catalog.create_default_catalog_and_schema
