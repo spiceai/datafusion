@@ -264,24 +264,24 @@ inherits = "release"
 debug = true
 strip = false
 
-# spiceai patch section for arrow-rs with ObjectVersionType support
+# spiceai patch section for arrow-rs (branch spiceai-57.2-release-1.11)
 [patch.crates-io]
-arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
-parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "62c223aca64d5f6cfbf5f14591aae4171c74998e" }
+arrow = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-arith = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-array = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-buffer = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-cast = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-csv = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-data = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-flight = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-ipc = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-json = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-ord = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-row = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-schema = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-select = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+arrow-string = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
+parquet = { git = "https://github.com/spiceai/arrow-rs.git", rev = "9fa643d1889a6d7bf4ca9d98e498c39fc426e6fc" }
 
 # Patch datafusion crates so vortex-datafusion uses our local workspace versions
 datafusion = { path = "datafusion/core" }
