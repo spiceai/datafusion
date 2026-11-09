@@ -21,11 +21,19 @@ use arrow::datatypes::DataType;
 use datafusion_common::tree_node::TreeNodeContainer;
 use datafusion_common::{
     Column, DFSchema, HashMap, Result, TableReference,
-    tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRewriter},
+    tree_node::{
+        Transformed, TransformedResult, TreeNode, TreeNodeRecursion, TreeNodeRewriter,
+    },
 };
 use datafusion_expr::expr::{Alias, UNNEST_COLUMN_PREFIX};
-use datafusion_expr::{Distinct, Expr, LogicalPlan, Projection, Sort, SortExpr};
+use datafusion_expr::{Distinct, Expr, Limit, LogicalPlan, Projection, Sort, SortExpr};
 use sqlparser::ast::{self, Ident};
+
+use super::utils::{expr_contains_subquery, find_agg_node_within_select};
+
+/// The form the unparser compares two emitted column names by: see
+/// [`rewrite_plan_for_sort_on_non_projected_fields`].
+pub(super) type EmittedKey<'a> = &'a dyn Fn(&str) -> Result<String>;
 
 /// Normalize the schema of a union plan to remove qualifiers from the schema fields and sort expressions.
 ///
@@ -218,8 +226,23 @@ pub(super) fn rewrite_qualify(plan: LogicalPlan) -> Result<LogicalPlan> {
 /// A sort key does not have to *be* one of the inner Projection's outputs for the
 /// hoist to be valid -- it only has to be computable from them, as `age + 1` is from
 /// `age`.
+///
+/// An outer expression that only renames an inner output (`t.k AS K`, as a root
+/// projection naming a plan's outputs does) is folded only when `renames` is
+/// given. Folding it removes the inner name the rename reads, so the caller
+/// gives it only where nothing outside this projection can read that name.
+/// `renames` is then the form the unparser compares two emitted column names by
+/// ([`super::Unparser::emitted_column_key`]): the dialect may rename a column as
+/// it writes it, and a rename the fold lets into the `SELECT` is judged by what
+/// the statement will contain.
+///
+/// `drops_aliases` says whether the fold may take an inner alias out of the
+/// list and substitute its expression into the keys that read it, which it
+/// always did; a fold with a rename never does.
 pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     p: &Projection,
+    renames: Option<EmittedKey<'_>>,
+    drops_aliases: bool,
 ) -> Option<LogicalPlan> {
     let LogicalPlan::Sort(sort) = p.input.as_ref() else {
         return None;
@@ -272,7 +295,22 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
         .map(Expr::to_string)
         .collect::<HashSet<_>>();
 
-    let mut collects = p.expr.clone();
+    // An outer expression that only renames one of the inner outputs reads that
+    // output, where renames are folded at all.
+    fn renamed<'a>(e: &'a Expr, inner_collects: &HashSet<String>) -> Option<&'a Alias> {
+        match e {
+            Expr::Alias(alias) if inner_collects.contains(&alias.expr.to_string()) => {
+                Some(alias)
+            }
+            _ => None,
+        }
+    }
+    let renamed_output = |e| renames.and_then(|_| renamed(e, &inner_collects));
+    let mut collects = p
+        .expr
+        .iter()
+        .map(|e| renamed_output(e).map_or_else(|| e.clone(), |a| (*a.expr).clone()))
+        .collect::<Vec<_>>();
     for sort in &sort.expr {
         // Strip aliases from sort expressions so the comparison matches
         // the inner Projection's raw expressions. The optimizer may add
@@ -299,12 +337,62 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     let outer_collects = collects.iter().map(Expr::to_string).collect::<HashSet<_>>();
 
     if outer_collects == inner_collects {
+        // The folds this function did not always make, one with a rename and
+        // one the caller does not let drop aliases (the limit fold), are held to
+        // a subset that keeps every value and name the plan reads:
+        // - Every inner output is a column. An alias would be dropped by its
+        //   rename, and a computed output the outer list does not read leaves a
+        //   key that reads it by display name with no such column.
+        // - The outer list reads each inner output once. A column can stand for
+        //   an aggregate the `SELECT` evaluates per reference
+        //   (`sum(random())`), so reading it under two names draws twice.
+        // - No window sits anywhere below the inner projection, and no aggregate
+        //   folding into it is volatile: a key reading a window output by name
+        //   is not resolved against the window, and an `ORDER BY` over a
+        //   volatile aggregate evaluates it again.
+        let renamed_outputs =
+            p.expr.iter().filter_map(renamed_output).collect::<Vec<_>>();
+        if !drops_aliases || !renamed_outputs.is_empty() {
+            let all_columns = inner_p
+                .expr
+                .iter()
+                .all(|expr| matches!(expr, Expr::Column(_)));
+            let mut read = HashSet::new();
+            let read_once = p.expr.iter().all(|e| {
+                let underlying = renamed_output(e).map_or(e, |alias| &*alias.expr);
+                read.insert(underlying.to_string())
+            });
+            let no_window = !inner_p
+                .input
+                .exists(|node| Ok(matches!(node, LogicalPlan::Window(_))))
+                .unwrap_or(true);
+            let no_volatile_aggregate =
+                find_agg_node_within_select(&inner_p.input, false).is_none_or(|agg| {
+                    agg.aggr_expr
+                        .iter()
+                        .chain(&agg.group_expr)
+                        .all(|expr| !expr.is_volatile() && !expr_contains_subquery(expr))
+                });
+            if !all_columns || !read_once || !no_window || !no_volatile_aggregate {
+                return None;
+            }
+        }
+
         let mut sort = sort.clone();
 
         let new_exprs = p
             .expr
             .iter()
-            .map(|e| map.get(e).unwrap_or(e).clone())
+            .map(|e| match renamed_output(e) {
+                // The renamed output's expression, under the outer name.
+                Some(alias) => map
+                    .get(&*alias.expr)
+                    .unwrap_or(&alias.expr)
+                    .clone()
+                    .unalias()
+                    .alias_qualified(alias.relation.clone(), alias.name.clone()),
+                None => map.get(e).unwrap_or(e).clone(),
+            })
             .collect::<Vec<_>>();
 
         // The inner Projection may define aliases that the Sort references
@@ -335,6 +423,16 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
             })
             .collect();
 
+        // The aliased expression a key takes in place of a dropped alias can mean
+        // something else there: a constant is an output ordinal in `ORDER BY`,
+        // and a volatile call is drawn again. A rename drops the alias it
+        // renames, so a fold with a rename, and a fold the caller does not let
+        // drop aliases, takes none out of the inner list.
+        if (!drops_aliases || !renamed_outputs.is_empty()) && !dropped_aliases.is_empty()
+        {
+            return None;
+        }
+
         if !dropped_aliases.is_empty() {
             for sort_expr in &mut sort.expr {
                 let mut expr = sort_expr.expr.clone();
@@ -353,9 +451,16 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                             // dropped alias happens to share the name.
                             Expr::Column(col) if col.relation.is_none() => {
                                 match dropped_aliases.get(col.name()) {
-                                    Some(underlying) => {
-                                        Transformed::yes(underlying.clone())
-                                    }
+                                    // The replacement's columns belong to the
+                                    // input, so it is not walked again: an alias
+                                    // reading the column it shadows
+                                    // (`(x + 1) AS x`) would be substituted into
+                                    // itself without end.
+                                    Some(underlying) => Transformed::new(
+                                        underlying.clone(),
+                                        true,
+                                        TreeNodeRecursion::Jump,
+                                    ),
                                     None => Transformed::no(e),
                                 }
                             }
@@ -363,6 +468,53 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
                         })
                     })
                     .map_or(expr, |transformed| transformed.data);
+            }
+        }
+
+        // A rename now lands in the `SELECT` whose `ORDER BY` the keys are emitted
+        // in, and an engine resolves a bare key name to an output alias before a
+        // column (DuckDB, PostgreSQL). Whether a key keeps its qualifier is only
+        // decided later (an aggregate over a derived input drops it), so a rename
+        // taking the name of any other column a key reads declines the fold. A
+        // correlated reference counts too: it names a value of the enclosing
+        // query, is written as a plain column, and is never the column a rename
+        // reads.
+        let mut key_columns = vec![];
+        for sort_expr in &sort.expr {
+            sort_expr
+                .expr
+                .apply(|e| {
+                    match e {
+                        Expr::Column(column) => key_columns.push((column, false)),
+                        Expr::OuterReferenceColumn(_, column) => {
+                            key_columns.push((column, true))
+                        }
+                        _ => {}
+                    }
+                    Ok(TreeNodeRecursion::Continue)
+                })
+                .ok()?;
+        }
+        for e in &p.expr {
+            let Some(alias) = renamed_output(e) else {
+                continue;
+            };
+            let renamed_column = match alias.expr.as_ref() {
+                Expr::Column(column) => Some(column),
+                _ => None,
+            };
+            let emitted_key = renames?;
+            let Ok(alias_key) = emitted_key(&alias.name) else {
+                return None;
+            };
+            for &(column, correlated) in &key_columns {
+                if !correlated && Some(column) == renamed_column {
+                    continue;
+                }
+                match emitted_key(column.name()) {
+                    Ok(column_key) if column_key != alias_key => {}
+                    _ => return None,
+                }
             }
         }
 
@@ -412,6 +564,42 @@ pub(super) fn rewrite_plan_for_sort_on_non_projected_fields(
     } else {
         None
     }
+}
+
+/// Applies [`rewrite_plan_for_sort_on_non_projected_fields`] to a projection that
+/// sits above a `Limit` over the `Sort`, and puts the `Limit` back on top.
+///
+/// A Substrait plan names its root's outputs with a projection above everything
+/// else, so an ordered, limited query arrives as
+/// `Projection -> Limit -> Sort -> Projection` rather than the
+/// `Limit -> Projection -> Sort -> Projection` the SQL planner builds. A
+/// projection maps each row on its own, so it keeps the same rows whether the
+/// limit is applied before it or after it, and moving it under the limit
+/// changes nothing but where the unparser meets it.
+///
+/// Only one `Limit` is looked through: the caller sets its bound on the query
+/// being built, and a second one directly below it would overwrite that bound.
+/// The fold drops no inner alias, so no key takes an expression in its place.
+pub(super) fn rewrite_plan_for_projection_over_limited_sort(
+    p: &Projection,
+    renames: EmittedKey<'_>,
+) -> Option<LogicalPlan> {
+    let LogicalPlan::Limit(limit) = p.input.as_ref() else {
+        return None;
+    };
+    let below = Projection::try_new_with_schema(
+        p.expr.clone(),
+        Arc::clone(&limit.input),
+        Arc::clone(&p.schema),
+    )
+    .ok()?;
+    let rewritten =
+        rewrite_plan_for_sort_on_non_projected_fields(&below, Some(renames), false)?;
+    Some(LogicalPlan::Limit(Limit {
+        skip: limit.skip.clone(),
+        fetch: limit.fetch.clone(),
+        input: Arc::new(rewritten),
+    }))
 }
 
 /// This logic is to work out the columns and inner query for SubqueryAlias plan for some types of
