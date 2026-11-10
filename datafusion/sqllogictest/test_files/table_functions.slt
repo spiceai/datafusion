@@ -620,12 +620,19 @@ LIMIT 10;
 1
 1
 
+# A named argument is kept: its name goes into the literal's field metadata
+# (`spice.parameter_name`). generate_series does not read names, so it uses
+# the arguments in order.
+query I
+SELECT * FROM generate_series(start => 1, stop => 3)
+----
+1
+2
+3
+
 # Test that unsupported function argument types are properly reported
 # rather than being silently dropped (which previously caused a misleading
 # "requires 1 to 3 arguments" error instead)
-
-statement error DataFusion error: Error during planning: Unsupported function argument type: start => 1
-SELECT * FROM generate_series(start => 1, stop => 5)
 
 statement error DataFusion error: Error during planning: Unsupported function argument type: \*
 SELECT * FROM generate_series(*)
