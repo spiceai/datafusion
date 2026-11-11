@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::vec;
 
 use super::Unparser;
-use super::dialect::{DistinctFromStyle, IntervalStyle};
+use super::dialect::{DistinctFromStyle, FloatLiteralStyle, IntervalStyle};
 use arrow::array::{
     ArrayRef, Date32Array, Date64Array, PrimitiveArray,
     types::{
@@ -51,7 +51,8 @@ use datafusion_common::{
 };
 use datafusion_expr::type_coercion::binary::comparison_coercion;
 use datafusion_expr::{
-    Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator, TryCast,
+    AggregateUDF, Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator,
+    TryCast, WindowFunctionDefinition,
     expr::{Alias, Exists, InList, ScalarFunction, SetQuantifier, Sort, WindowFunction},
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -308,6 +309,13 @@ impl Unparser<'_> {
                     return Ok(difference);
                 }
 
+                if matches!(op, Operator::StringConcat)
+                    && let Some(concatenated) =
+                        self.dialect.string_concat_to_sql(l.clone(), r.clone())
+                {
+                    return Ok(concatenated);
+                }
+
                 // A comparison whose two sides the dialect will not coerce itself
                 // has to be made to agree.
                 if let Some(agreed) = self.agree_on_comparison(left, op, right)? {
@@ -439,9 +447,16 @@ impl Unparser<'_> {
                     window_frame,
                 }));
 
+                let sql_name = match fun {
+                    WindowFunctionDefinition::AggregateUDF(func) => {
+                        aggregate_sql_name(func)
+                    }
+                    WindowFunctionDefinition::WindowUDF(_) => func_name,
+                };
+
                 Ok(ast::Expr::Function(Function {
                     name: ObjectName::from(vec![Ident {
-                        value: func_name.to_string(),
+                        value: sql_name.to_string(),
                         quote_style: None,
                         span: Span::empty(),
                     }]),
@@ -546,7 +561,7 @@ impl Unparser<'_> {
                 };
                 Ok(ast::Expr::Function(Function {
                     name: ObjectName::from(vec![Ident {
-                        value: func_name.to_string(),
+                        value: aggregate_sql_name(&agg.func).to_string(),
                         quote_style: None,
                         span: Span::empty(),
                     }]),
@@ -1787,22 +1802,30 @@ impl Unparser<'_> {
                 Ok(ast::Expr::value(ast::Value::Boolean(b.to_owned())))
             }
             ScalarValue::Boolean(None) => Ok(ast::Expr::value(ast::Value::Null)),
+            // `{:E}`, like `{}`, prints the fewest digits that read back as the
+            // same value.
             ScalarValue::Float16(Some(f)) => {
-                Ok(ast::Expr::value(ast::Value::Number(f.to_string(), false)))
+                let f_val = match self.dialect.float_literal_style() {
+                    FloatLiteralStyle::Scientific => format!("{f:E}"),
+                    FloatLiteralStyle::Decimal => f.to_string(),
+                };
+                Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
             ScalarValue::Float16(None) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Float32(Some(f)) => {
-                let f_val = match f.fract() {
-                    0.0 => format!("{f:.1}"),
-                    _ => format!("{f}"),
+                let f_val = match (self.dialect.float_literal_style(), f.fract()) {
+                    (FloatLiteralStyle::Scientific, _) => format!("{f:E}"),
+                    (FloatLiteralStyle::Decimal, 0.0) => format!("{f:.1}"),
+                    (FloatLiteralStyle::Decimal, _) => format!("{f}"),
                 };
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
             ScalarValue::Float32(None) => Ok(ast::Expr::value(ast::Value::Null)),
             ScalarValue::Float64(Some(f)) => {
-                let f_val = match f.fract() {
-                    0.0 => format!("{f:.1}"),
-                    _ => format!("{f}"),
+                let f_val = match (self.dialect.float_literal_style(), f.fract()) {
+                    (FloatLiteralStyle::Scientific, _) => format!("{f:E}"),
+                    (FloatLiteralStyle::Decimal, 0.0) => format!("{f:.1}"),
+                    (FloatLiteralStyle::Decimal, _) => format!("{f}"),
                 };
                 Ok(ast::Expr::value(ast::Value::Number(f_val, false)))
             }
@@ -2420,6 +2443,30 @@ impl Unparser<'_> {
                 not_impl_err!("Unsupported DataType: conversion: {data_type}")
             }
         }
+    }
+}
+
+/// The name to write for an aggregate, which is its DataFusion name except
+/// where another engine reads that name differently or not at all. DataFusion
+/// names sample standard deviation `stddev` and sample variance `var`, but
+/// MySQL's `STDDEV` is the population figure, and neither PostgreSQL nor MySQL
+/// has a `var`. `stddev_samp` and `var_samp` are the SQL standard's names for
+/// the sample figures, and the built-in aggregates carry them as aliases.
+///
+/// The standard name is written only when this aggregate carries it as an
+/// alias. A user-registered `stddev` or `var` without it keeps its own name,
+/// since the standard name would plan back to the built-in instead.
+fn aggregate_sql_name(func: &AggregateUDF) -> &str {
+    let name = func.name();
+    let standard = match name {
+        "stddev" => "stddev_samp",
+        "var" => "var_samp",
+        _ => return name,
+    };
+    if func.aliases().iter().any(|alias| alias == standard) {
+        standard
+    } else {
+        name
     }
 }
 
@@ -4672,6 +4719,224 @@ mod tests {
         assert_eq!(sql, "(c1 IS NOT DISTINCT FROM true)");
         let sql = mysql_unparser.expr_to_sql(&expr).unwrap().to_string();
         assert_eq!(sql, "(`c1` <=> true)");
+    }
+
+    /// MySQL reads `||` as logical `OR` under its default `sql_mode`, so `||`
+    /// reaches it as `CONCAT`; every other built-in dialect keeps `||`.
+    #[test]
+    fn test_string_concat() -> Result<()> {
+        let concat = |l: Expr, r: Expr| {
+            Expr::BinaryExpr(BinaryExpr::new(
+                Box::new(l),
+                Operator::StringConcat,
+                Box::new(r),
+            ))
+        };
+        let projected = concat(concat(col("last"), lit(", ")), col("first"));
+        let compared = concat(col("last"), col("first")).eq(lit("ab"));
+
+        let mysql = Unparser::new(&MySqlDialect {});
+        assert_eq!(
+            mysql.expr_to_sql(&projected)?.to_string(),
+            "CONCAT(CONCAT(`last`, ', '), `first`)"
+        );
+        assert_eq!(
+            mysql.expr_to_sql(&compared)?.to_string(),
+            "(CONCAT(`last`, `first`) = 'ab')"
+        );
+
+        let dialects: [(&dyn Dialect, &str); 5] = [
+            (&DefaultDialect {}, "((\"last\" || ', ') || \"first\")"),
+            (&PostgreSqlDialect {}, "((\"last\" || ', ') || \"first\")"),
+            (&SqliteDialect {}, "((`last` || ', ') || `first`)"),
+            (&DuckDBDialect::new(), "((\"last\" || ', ') || \"first\")"),
+            (&BigQueryDialect::new(), "((`last` || ', ') || `first`)"),
+        ];
+        for (dialect, expected) in dialects {
+            assert_eq!(
+                Unparser::new(dialect).expr_to_sql(&projected)?.to_string(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    /// MySQL's `/` divides integers exactly, so an integer quotient reaches it
+    /// as `DIV`, which truncates toward zero as the plan does. A quotient of
+    /// another type, or one whose type cannot be resolved without a schema,
+    /// keeps `/`.
+    #[test]
+    fn test_mysql_integer_division() -> Result<()> {
+        let schema = Arc::new(datafusion_common::DFSchema::try_from(Schema::new(vec![
+            Field::new("a", DataType::Int32, true),
+            Field::new("b", DataType::Int64, true),
+            Field::new("f", DataType::Float64, true),
+        ]))?);
+        let mysql = Unparser::new(&MySqlDialect {}).with_schema(Arc::clone(&schema));
+        for (expr, expected) in [
+            (col("a") / col("b"), "(`a` DIV `b`)"),
+            (col("a") / lit(2_i32), "(`a` DIV 2)"),
+            (
+                (col("a") / col("b")) / lit(3_i64) * lit(100_i64),
+                "(((`a` DIV `b`) DIV 3) * 100)",
+            ),
+            (col("f") / lit(2_f64), "(`f` / 2E0)"),
+        ] {
+            assert_eq!(mysql.expr_to_sql(&expr)?.to_string(), expected);
+        }
+
+        let unresolved = Unparser::new(&MySqlDialect {});
+        assert_eq!(
+            unresolved.expr_to_sql(&(col("a") / col("b")))?.to_string(),
+            "(`a` / `b`)"
+        );
+        let default = Unparser::new(&DefaultDialect {}).with_schema(schema);
+        assert_eq!(
+            default.expr_to_sql(&(col("a") / col("b")))?.to_string(),
+            "(a / b)"
+        );
+        Ok(())
+    }
+
+    /// MySQL reads `3.0` as an exact `DECIMAL`, so its float literals carry an
+    /// exponent; every other built-in dialect keeps decimal notation.
+    #[test]
+    fn test_float_literal_style() -> Result<()> {
+        let mysql = Unparser::new(&MySqlDialect {});
+        for (value, expected) in [
+            (ScalarValue::Float64(Some(3.0)), "3E0"),
+            (ScalarValue::Float64(Some(30000.0)), "3E4"),
+            (ScalarValue::Float64(Some(0.25)), "2.5E-1"),
+            (ScalarValue::Float64(Some(-1e-7)), "-1E-7"),
+            (
+                ScalarValue::Float64(Some(0.1 + 0.2)),
+                "3.0000000000000004E-1",
+            ),
+            (
+                ScalarValue::Float64(Some(f64::MAX)),
+                "1.7976931348623157E308",
+            ),
+            (ScalarValue::Float32(Some(-2.989)), "-2.989E0"),
+            (
+                ScalarValue::Float32(Some(1.5)).cast_to(&DataType::Float16)?,
+                "1.5E0",
+            ),
+            (ScalarValue::Float64(None), "NULL"),
+        ] {
+            assert_eq!(
+                mysql.expr_to_sql(&Expr::Literal(value, None))?.to_string(),
+                expected
+            );
+        }
+        assert_eq!(
+            mysql.expr_to_sql(&(col("a") / lit(30000_f64)))?.to_string(),
+            "(`a` / 3E4)"
+        );
+
+        let scientific = CustomDialectBuilder::new()
+            .with_float_literal_style(FloatLiteralStyle::Scientific)
+            .build();
+        let decimal: [(&dyn Dialect, &str); 5] = [
+            (&DefaultDialect {}, "3.0"),
+            (&PostgreSqlDialect {}, "3.0"),
+            (&SqliteDialect {}, "3.0"),
+            (&DuckDBDialect::new(), "3.0"),
+            (&CustomDialectBuilder::new().build(), "3.0"),
+        ];
+        for (dialect, expected) in decimal
+            .into_iter()
+            .chain([(&scientific as &dyn Dialect, "3E0")])
+        {
+            assert_eq!(
+                Unparser::new(dialect).expr_to_sql(&lit(3_f64))?.to_string(),
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    /// DataFusion names sample standard deviation `stddev` and sample variance
+    /// `var`. MySQL's `STDDEV` is the population figure and neither MySQL nor
+    /// PostgreSQL has a `var`, so every dialect writes the standard names, as an
+    /// aggregate and as a window function.
+    #[test]
+    fn test_sample_stddev_variance_names() -> Result<()> {
+        use datafusion_functions_aggregate::stddev::{stddev_pop_udaf, stddev_udaf};
+        use datafusion_functions_aggregate::variance::{var_pop_udaf, var_samp_udaf};
+
+        let cases = [
+            (stddev_udaf(), "stddev_samp"),
+            (var_samp_udaf(), "var_samp"),
+            (stddev_pop_udaf(), "stddev_pop"),
+            (var_pop_udaf(), "var_pop"),
+        ];
+        let dialects: [&dyn Dialect; 4] = [
+            &DefaultDialect {},
+            &MySqlDialect {},
+            &PostgreSqlDialect {},
+            &DuckDBDialect::new(),
+        ];
+        for dialect in dialects {
+            let unparser = Unparser::new(dialect);
+            let x = unparser.expr_to_sql(&col("x"))?.to_string();
+            let g = unparser.expr_to_sql(&col("g"))?.to_string();
+            for (udaf, name) in &cases {
+                let aggregate = udaf.call(vec![col("x")]);
+                assert_eq!(
+                    unparser.expr_to_sql(&aggregate)?.to_string(),
+                    format!("{name}({x})")
+                );
+
+                let distinct = udaf.call(vec![col("x")]).distinct().build()?;
+                assert_eq!(
+                    unparser.expr_to_sql(&distinct)?.to_string(),
+                    format!("{name}(DISTINCT {x})")
+                );
+
+                let mut window = WindowFunction::new(
+                    WindowFunctionDefinition::AggregateUDF(Arc::clone(udaf)),
+                    vec![col("x")],
+                );
+                window.params.partition_by = vec![col("g")];
+                let window = unparser.expr_to_sql(&Expr::from(window))?.to_string();
+                assert!(
+                    window.starts_with(&format!("{name}({x}) OVER (PARTITION BY {g}")),
+                    "{window}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// A user-registered `stddev` or `var` that does not carry the standard
+    /// name as an alias keeps its own name: `stddev_samp` would plan back to the
+    /// built-in, a different function.
+    #[test]
+    fn test_user_stddev_variance_keep_their_names() -> Result<()> {
+        for name in ["stddev", "var"] {
+            let udaf = Arc::new(datafusion_expr::create_udaf(
+                name,
+                vec![DataType::Float64],
+                Arc::new(DataType::Float64),
+                Volatility::Immutable,
+                Arc::new(|_| not_impl_err!("not evaluated")),
+                Arc::new(vec![DataType::Float64]),
+            ));
+            let unparser = Unparser::new(&DefaultDialect {});
+            assert_eq!(
+                unparser
+                    .expr_to_sql(&udaf.call(vec![col("x")]))?
+                    .to_string(),
+                format!("{name}(x)")
+            );
+            let window = WindowFunction::new(
+                WindowFunctionDefinition::AggregateUDF(Arc::clone(&udaf)),
+                vec![col("x")],
+            );
+            let window = unparser.expr_to_sql(&Expr::from(window))?.to_string();
+            assert!(window.starts_with(&format!("{name}(x) OVER (")), "{window}");
+        }
+        Ok(())
     }
 
     #[test]
