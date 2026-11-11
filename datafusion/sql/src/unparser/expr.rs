@@ -51,8 +51,8 @@ use datafusion_common::{
 };
 use datafusion_expr::type_coercion::binary::comparison_coercion;
 use datafusion_expr::{
-    Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator, TryCast,
-    WindowFunctionDefinition,
+    AggregateUDF, Between, BinaryExpr, Case, Cast, Expr, GroupingSet, Like, Operator,
+    TryCast, WindowFunctionDefinition,
     expr::{Alias, Exists, InList, ScalarFunction, SetQuantifier, Sort, WindowFunction},
 };
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -448,8 +448,8 @@ impl Unparser<'_> {
                 }));
 
                 let sql_name = match fun {
-                    WindowFunctionDefinition::AggregateUDF(_) => {
-                        aggregate_sql_name(func_name)
+                    WindowFunctionDefinition::AggregateUDF(func) => {
+                        aggregate_sql_name(func)
                     }
                     WindowFunctionDefinition::WindowUDF(_) => func_name,
                 };
@@ -561,7 +561,7 @@ impl Unparser<'_> {
                 };
                 Ok(ast::Expr::Function(Function {
                     name: ObjectName::from(vec![Ident {
-                        value: aggregate_sql_name(func_name).to_string(),
+                        value: aggregate_sql_name(&agg.func).to_string(),
                         quote_style: None,
                         span: Span::empty(),
                     }]),
@@ -2446,26 +2446,36 @@ impl Unparser<'_> {
     }
 }
 
+/// The name to write for an aggregate, which is its DataFusion name except
+/// where another engine reads that name differently or not at all. DataFusion
+/// names sample standard deviation `stddev` and sample variance `var`, but
+/// MySQL's `STDDEV` is the population figure, and neither PostgreSQL nor MySQL
+/// has a `var`. `stddev_samp` and `var_samp` are the SQL standard's names for
+/// the sample figures, and the built-in aggregates carry them as aliases.
+///
+/// The standard name is written only when this aggregate carries it as an
+/// alias. A user-registered `stddev` or `var` without it keeps its own name,
+/// since the standard name would plan back to the built-in instead.
+fn aggregate_sql_name(func: &AggregateUDF) -> &str {
+    let name = func.name();
+    let standard = match name {
+        "stddev" => "stddev_samp",
+        "var" => "var_samp",
+        _ => return name,
+    };
+    if func.aliases().iter().any(|alias| alias == standard) {
+        standard
+    } else {
+        name
+    }
+}
+
 /// Whether an engine that splits these two types is known to refuse the pair
 /// outright rather than coerce it.
 ///
 /// Restricted to the two pairs that have been observed refused, so a mismatch an
 /// engine handles happily — `INT64` against `FLOAT64`, say — is left alone rather
 /// than dressed up in a cast it never needed.
-/// The name to write for an aggregate, which is its DataFusion name except
-/// where another engine reads that name differently or not at all. DataFusion
-/// names sample standard deviation `stddev` and sample variance `var`, but
-/// MySQL's `STDDEV` is the population figure, and neither PostgreSQL nor MySQL
-/// has a `var`. `stddev_samp` and `var_samp` are the SQL standard's names for
-/// the sample figures, and DataFusion reads them as aliases.
-fn aggregate_sql_name(name: &str) -> &str {
-    match name {
-        "stddev" => "stddev_samp",
-        "var" => "var_samp",
-        other => other,
-    }
-}
-
 fn refuses_this_pair(left: &DataType, right: &DataType) -> bool {
     let timestamp_zone_disagreement = matches!(
         (left, right),
@@ -4894,6 +4904,37 @@ mod tests {
                     "{window}"
                 );
             }
+        }
+        Ok(())
+    }
+
+    /// A user-registered `stddev` or `var` that does not carry the standard
+    /// name as an alias keeps its own name: `stddev_samp` would plan back to the
+    /// built-in, a different function.
+    #[test]
+    fn test_user_stddev_variance_keep_their_names() -> Result<()> {
+        for name in ["stddev", "var"] {
+            let udaf = Arc::new(datafusion_expr::create_udaf(
+                name,
+                vec![DataType::Float64],
+                Arc::new(DataType::Float64),
+                Volatility::Immutable,
+                Arc::new(|_| not_impl_err!("not evaluated")),
+                Arc::new(vec![DataType::Float64]),
+            ));
+            let unparser = Unparser::new(&DefaultDialect {});
+            assert_eq!(
+                unparser
+                    .expr_to_sql(&udaf.call(vec![col("x")]))?
+                    .to_string(),
+                format!("{name}(x)")
+            );
+            let window = WindowFunction::new(
+                WindowFunctionDefinition::AggregateUDF(Arc::clone(&udaf)),
+                vec![col("x")],
+            );
+            let window = unparser.expr_to_sql(&Expr::from(window))?.to_string();
+            assert!(window.starts_with(&format!("{name}(x) OVER (")), "{window}");
         }
         Ok(())
     }
