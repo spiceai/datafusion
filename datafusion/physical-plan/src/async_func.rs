@@ -252,9 +252,9 @@ impl ExecutionPlan for AsyncFuncExec {
                 Arc::clone(&self.input.schema()),
                 target_batch_size,
                 None,
-            ),
-            max_batch_rows: target_batch_size,
-            oversized_batch: None,
+            )
+            // Split large input batches too, so no batch exceeds the target
+            .with_biggest_coalesce_batch_size(None),
         };
 
         let stream_with_async_functions = coalesced_input_stream.then(move |batch| {
@@ -385,27 +385,6 @@ impl AsyncFuncExec {
 struct CoalesceInputStream {
     input_stream: Pin<Box<dyn RecordBatchStream + Send>>,
     batch_coalescer: LimitedBatchCoalescer,
-    /// Upper bound on the rows in each emitted batch. The coalescer passes
-    /// large input batches through unchanged, so they are sliced here.
-    max_batch_rows: usize,
-    /// Rows of a sliced batch that are not emitted yet
-    oversized_batch: Option<RecordBatch>,
-}
-
-impl CoalesceInputStream {
-    /// Returns the next ready batch, with at most `max_batch_rows` rows
-    fn next_output_batch(&mut self) -> Option<RecordBatch> {
-        let batch = self
-            .oversized_batch
-            .take()
-            .or_else(|| self.batch_coalescer.next_completed_batch())?;
-        if batch.num_rows() <= self.max_batch_rows {
-            return Some(batch);
-        }
-        let rest = batch.num_rows() - self.max_batch_rows;
-        self.oversized_batch = Some(batch.slice(self.max_batch_rows, rest));
-        Some(batch.slice(0, self.max_batch_rows))
-    }
 }
 
 impl Stream for CoalesceInputStream {
@@ -418,7 +397,7 @@ impl Stream for CoalesceInputStream {
         let mut completed = false;
 
         loop {
-            if let Some(batch) = self.next_output_batch() {
+            if let Some(batch) = self.batch_coalescer.next_completed_batch() {
                 return Poll::Ready(Some(Ok(batch)));
             }
 
