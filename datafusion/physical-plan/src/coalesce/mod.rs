@@ -68,6 +68,13 @@ impl LimitedBatchCoalescer {
         }
     }
 
+    /// Set the size above which an input batch bypasses coalescing.
+    /// See [`BatchCoalescer::with_biggest_coalesce_batch_size`].
+    pub fn with_biggest_coalesce_batch_size(mut self, limit: Option<usize>) -> Self {
+        self.inner = self.inner.with_biggest_coalesce_batch_size(limit);
+        self
+    }
+
     /// Return the schema of the output batches
     pub fn schema(&self) -> SchemaRef {
         self.inner.schema()
