@@ -18,6 +18,8 @@
 //! Shared state for query planning and execution.
 
 pub mod context;
+#[cfg(feature = "sql")]
+mod lateral_table_function;
 pub mod session_state;
 pub use session_state::{SessionState, SessionStateBuilder};
 

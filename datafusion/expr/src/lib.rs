@@ -63,6 +63,7 @@ pub mod groups_accumulator {
 pub mod interval_arithmetic {
     pub use datafusion_expr_common::interval_arithmetic::*;
 }
+pub mod lateral_table_function;
 pub mod logical_plan;
 pub mod dml {
     //! DML (Data Manipulation Language) types for DELETE, UPDATE operations.
