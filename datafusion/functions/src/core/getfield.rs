@@ -17,13 +17,15 @@
 
 use std::sync::{Arc, OnceLock};
 
+use arrow::array::types::{Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow::array::{
-    Array, BooleanArray, Capacities, MutableArrayData, Scalar, cast::AsArray, make_array,
-    make_comparator,
+    Array, ArrayDataBuilder, ArrayRef, BooleanArray, Capacities, MutableArrayData,
+    PrimitiveArray, RunArray, Scalar, StructArray, UInt32Array, UnionArray, cast::AsArray,
+    make_array, make_comparator,
 };
-use arrow::compute::SortOptions;
-use arrow::datatypes::{DataType, Field, FieldRef};
-use arrow_buffer::NullBuffer;
+use arrow::compute::{SortOptions, take};
+use arrow::datatypes::{DataType, Field, FieldRef, UnionMode};
+use arrow_buffer::{ArrowNativeType, NullBuffer, ScalarBuffer};
 
 use datafusion_common::cast::{as_map_array, as_struct_array};
 use datafusion_common::{
@@ -136,6 +138,12 @@ fn process_map_array(
     let matches = keys.values();
 
     for entry in 0..map_array.len() {
+        // A null map slot hides its entries even when the offsets still point
+        // at populated key/value rows.
+        if map_array.is_null(entry) {
+            mutable.try_extend_nulls(1)?;
+            continue;
+        }
         let start = offsets[entry] as usize;
         let end = offsets[entry + 1] as usize;
 
@@ -171,6 +179,10 @@ fn process_map_with_nested_key(
         MutableArrayData::with_capacities(vec![&original_data], true, capacity);
 
     for entry in 0..map_array.len() {
+        if map_array.is_null(entry) {
+            mutable.try_extend_nulls(1)?;
+            continue;
+        }
         let start = map_array.value_offsets()[entry] as usize;
         let end = map_array.value_offsets()[entry + 1] as usize;
 
@@ -238,7 +250,10 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
             let as_struct_array = as_struct_array(&array)?;
             match as_struct_array.column_by_name(&k) {
                 None => exec_err!("Field {k} not found in struct"),
-                Some(col) => Ok(ColumnarValue::Array(Arc::clone(col))),
+                Some(col) => Ok(ColumnarValue::Array(apply_parent_struct_nulls(
+                    as_struct_array,
+                    col,
+                )?)),
             }
         }
         (DataType::Struct(_), name, _) => exec_err!(
@@ -250,6 +265,222 @@ fn extract_single_field(base: ColumnarValue, name: ScalarValue) -> Result<Column
             "get_field is only possible on maps or structs. Received {dt} with {name:?} index"
         ),
     }
+}
+
+/// Apply a parent struct's null bitmap onto an extracted child field.
+///
+/// Arrow allows null struct slots whose children still hold values; field
+/// access must return null for those slots. Not every child type can carry a
+/// top-level validity bitmap (`Null`, `Union`, `RunEndEncoded`), so those use
+/// layout-aware paths instead of attaching the parent bitmap.
+fn apply_parent_struct_nulls(parent: &StructArray, child: &ArrayRef) -> Result<ArrayRef> {
+    // Fast path: parent has no null rows — return the child unchanged.
+    if parent.null_count() == 0 {
+        return Ok(Arc::clone(child));
+    }
+
+    let parent_nulls = parent
+        .nulls()
+        .expect("parent with null_count > 0 must have a null buffer");
+    mask_array_with_nulls(child, parent_nulls)
+}
+
+/// Apply `nulls` onto `array` using a layout-aware strategy.
+///
+/// Types that cannot carry a top-level validity bitmap (`Null`, `Union`,
+/// `RunEndEncoded`) are handled recursively / by rebuilding rather than by
+/// attaching a bitmap. Nested `Union` / `RunEndEncoded` variants inside a
+/// sparse union are therefore safe: each variant is dispatched on its own
+/// layout instead of assuming bitmap support.
+fn mask_array_with_nulls(array: &ArrayRef, nulls: &NullBuffer) -> Result<ArrayRef> {
+    debug_assert_eq!(
+        array.len(),
+        nulls.len(),
+        "mask length must match array length"
+    );
+    if nulls.null_count() == 0 {
+        return Ok(Arc::clone(array));
+    }
+    match array.data_type() {
+        // Null arrays are already all-null and reject a validity bitmap in
+        // `ArrayData::build()`.
+        DataType::Null => Ok(Arc::clone(array)),
+        DataType::Union(_, mode) => mask_union_with_nulls(array, nulls, *mode),
+        DataType::RunEndEncoded(_, _) => mask_run_end_encoded_with_nulls(array, nulls),
+        _ => {
+            let combined = NullBuffer::union(array.nulls(), Some(nulls));
+            Ok(make_array(
+                array.to_data().into_builder().nulls(combined).build()?,
+            ))
+        }
+    }
+}
+
+fn mask_union_with_nulls(
+    child: &ArrayRef,
+    parent_nulls: &NullBuffer,
+    mode: UnionMode,
+) -> Result<ArrayRef> {
+    let union = child
+        .as_any()
+        .downcast_ref::<UnionArray>()
+        .expect("UnionArray downcast");
+    let fields = union.fields().clone();
+
+    match mode {
+        UnionMode::Sparse => {
+            // Sparse children have the same length as the union / parent.
+            // Recurse so nested Union / REE variants are handled correctly
+            // instead of attaching a physical validity bitmap.
+            let children = fields
+                .iter()
+                .map(|(type_id, _)| {
+                    mask_array_with_nulls(union.child(type_id), parent_nulls)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(UnionArray::try_new(
+                fields,
+                union.type_ids().clone(),
+                None,
+                children,
+            )?))
+        }
+        UnionMode::Dense => {
+            // Dense rows can share a child offset. Nulling a shared slot would
+            // also null valid rows that point at it, so rebuild children and
+            // offsets together: each distinct original offset maps to one
+            // remapped slot (shared across rows), and parent-null rows share a
+            // single null slot per child. `take` is layout-aware for nested
+            // Union / RunEndEncoded children.
+            let tid_to_idx: std::collections::HashMap<i8, usize> = fields
+                .iter()
+                .enumerate()
+                .map(|(idx, (type_id, _))| (type_id, idx))
+                .collect();
+            let mut per_child_indices: Vec<Vec<Option<u32>>> =
+                fields.iter().map(|_| Vec::new()).collect();
+            // old_offset -> new offset within that child's rebuilt buffer
+            let mut per_child_remap: Vec<std::collections::HashMap<u32, i32>> =
+                fields.iter().map(|_| std::collections::HashMap::new()).collect();
+            // shared null slot per child (created lazily)
+            let mut per_child_null_slot: Vec<Option<i32>> =
+                fields.iter().map(|_| None).collect();
+            let mut new_offsets = Vec::with_capacity(parent_nulls.len());
+
+            for i in 0..parent_nulls.len() {
+                let type_id = union.type_id(i);
+                let child_idx = tid_to_idx[&type_id];
+                let old_offset = union.value_offset(i) as u32;
+                if parent_nulls.is_null(i) {
+                    let slot = *per_child_null_slot[child_idx].get_or_insert_with(|| {
+                        let slot = per_child_indices[child_idx].len() as i32;
+                        per_child_indices[child_idx].push(None);
+                        slot
+                    });
+                    new_offsets.push(slot);
+                } else if let Some(&slot) = per_child_remap[child_idx].get(&old_offset) {
+                    new_offsets.push(slot);
+                } else {
+                    let slot = per_child_indices[child_idx].len() as i32;
+                    per_child_indices[child_idx].push(Some(old_offset));
+                    per_child_remap[child_idx].insert(old_offset, slot);
+                    new_offsets.push(slot);
+                }
+            }
+
+            let mut children = Vec::with_capacity(fields.len());
+            for ((type_id, _), indices) in fields.iter().zip(per_child_indices) {
+                let index_array = UInt32Array::from(indices);
+                children.push(take(union.child(type_id).as_ref(), &index_array, None)?);
+            }
+
+            Ok(Arc::new(UnionArray::try_new(
+                fields,
+                union.type_ids().clone(),
+                Some(ScalarBuffer::from(new_offsets)),
+                children,
+            )?))
+        }
+    }
+}
+
+fn mask_run_end_encoded_with_nulls(
+    child: &ArrayRef,
+    nulls: &NullBuffer,
+) -> Result<ArrayRef> {
+    match child.data_type() {
+        DataType::RunEndEncoded(run_ends_field, _) => match run_ends_field.data_type() {
+            DataType::Int16 => mask_ree_impl::<Int16Type>(child, nulls),
+            DataType::Int32 => mask_ree_impl::<Int32Type>(child, nulls),
+            DataType::Int64 => mask_ree_impl::<Int64Type>(child, nulls),
+            other => {
+                internal_err!("unsupported run-end index type for get_field: {other}")
+            }
+        },
+        other => internal_err!("expected RunEndEncoded child, got {other}"),
+    }
+}
+
+/// Rebuild a `RunEndEncoded` child so masked logical slots become null
+/// values without attaching a top-level bitmap.
+///
+/// Splits runs only where parent validity or the underlying physical value
+/// changes, so a long run interrupted by an interior parent-null becomes a
+/// handful of runs (value / null / value) instead of one physical value per
+/// logical row. Preserves the original REE `Field`s (name / metadata /
+/// nullability) via `ArrayDataBuilder` — `RunArray::try_new` would replace
+/// them with defaults.
+fn mask_ree_impl<R: RunEndIndexType>(
+    child: &ArrayRef,
+    nulls: &NullBuffer,
+) -> Result<ArrayRef> {
+    let run = child
+        .as_any()
+        .downcast_ref::<RunArray<R>>()
+        .expect("RunArray downcast");
+    let len = nulls.len();
+    debug_assert_eq!(run.len(), len);
+
+    let re = run.run_ends();
+    let start_phys = re.get_start_physical_index();
+    let mut new_run_end_values: Vec<R::Native> = Vec::new();
+    let mut value_indices: Vec<Option<u32>> = Vec::new();
+
+    let mut logical_start = 0usize;
+    for (i, end_native) in re.sliced_values().enumerate() {
+        let physical_idx = start_phys + i;
+        let logical_end = end_native.as_usize();
+        let mut cursor = logical_start;
+        while cursor < logical_end {
+            let is_null = nulls.is_null(cursor);
+            let mut end = cursor + 1;
+            while end < logical_end && nulls.is_null(end) == is_null {
+                end += 1;
+            }
+            value_indices.push(if is_null {
+                None
+            } else {
+                Some(physical_idx as u32)
+            });
+            new_run_end_values.push(
+                R::Native::from_usize(end).expect("run end fits in index type"),
+            );
+            cursor = end;
+        }
+        logical_start = logical_end;
+    }
+
+    let index_array = UInt32Array::from(value_indices);
+    let new_values = take(run.values().as_ref(), &index_array, None)?;
+    let run_ends = PrimitiveArray::<R>::from_iter_values(new_run_end_values);
+
+    // Preserve original Field name/metadata/nullability (see scalar/mod.rs).
+    let dt = child.data_type().clone();
+    let builder = ArrayDataBuilder::new(dt)
+        .len(len)
+        .add_child_data(run_ends.to_data())
+        .add_child_data(new_values.to_data());
+    Ok(Arc::new(RunArray::<R>::from(builder.build()?)))
 }
 
 /// The shared `get_field` UDF, reused whenever simplification needs to build a
@@ -692,8 +923,460 @@ impl ScalarUDFImpl for GetFieldFunc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int32Array, StructArray};
-    use arrow::datatypes::Fields;
+    use arrow::array::types::Int32Type;
+    use arrow::array::{
+        ArrayDataBuilder, ArrayRef, Int32Array, NullArray, RunArray, StringArray,
+        StructArray, UnionArray,
+    };
+    use arrow::buffer::ScalarBuffer;
+    use arrow::datatypes::{Fields, UnionFields};
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_get_field_applies_parent_struct_nulls() -> Result<()> {
+        // Arrow allows a null struct slot whose children still hold values.
+        // Field access must return null for that slot, not the hidden child.
+        let a_values = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+        let fields: Fields = vec![Field::new("a", DataType::Int32, true)].into();
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::new(a_values) as ArrayRef], Some(nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("a".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        let expected = Int32Array::from(vec![Some(1), None, Some(3)]);
+        assert_eq!(result_array.as_ref(), &expected as &dyn Array);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_parent_nulls_fast_path_no_rebuild() -> Result<()> {
+        // When the parent has no null rows, the child Arc must be returned
+        // unchanged (no ArrayData rebuild).
+        let a_values = Int32Array::from(vec![Some(1), Some(2), Some(3)]);
+        let child: ArrayRef = Arc::new(a_values);
+        let child_ptr = Arc::as_ptr(&child);
+        let fields: Fields = vec![Field::new("a", DataType::Int32, true)].into();
+        let struct_array = StructArray::new(fields, vec![Arc::clone(&child)], None);
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("a".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert!(
+            Arc::ptr_eq(&result_array, &child),
+            "child ArrayRef must be Arc-cloned when parent has no nulls"
+        );
+        let _ = child_ptr;
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_null_child_with_nullable_parent() -> Result<()> {
+        // Null-typed children cannot carry a validity bitmap; Arrow rejects
+        // Null+bitmap in build(). Return the Null child unchanged.
+        let null_child: ArrayRef = Arc::new(NullArray::new(3));
+        let fields: Fields = vec![Field::new("n", DataType::Null, true)].into();
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&null_child)], Some(nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("n".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert_eq!(result_array.data_type(), &DataType::Null);
+        assert_eq!(result_array.len(), 3);
+        // NullArray has no physical null buffer; logical nulls cover every slot.
+        assert_eq!(result_array.logical_null_count(), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_sparse_union_child_with_nullable_parent() -> Result<()> {
+        // Sparse unions cannot carry a top-level validity bitmap. Parent nulls
+        // are applied by nulling every child at those slots so logical nulls
+        // follow the parent.
+        let union_fields = UnionFields::try_new(
+            vec![1, 3],
+            vec![
+                Field::new("str", DataType::Utf8, true),
+                Field::new("int", DataType::Int32, true),
+            ],
+        )?;
+        let type_ids = ScalarBuffer::from(vec![3_i8, 1, 3]);
+        let children: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])),
+            Arc::new(Int32Array::from(vec![Some(10), Some(20), Some(30)])),
+        ];
+        let union = UnionArray::try_new(union_fields.clone(), type_ids, None, children)?;
+        let union: ArrayRef = Arc::new(union);
+
+        let fields: Fields =
+            vec![Field::new("u", union.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&union)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert!(matches!(result_array.data_type(), DataType::Union(_, _)));
+        // Union has no top-level bitmap; parent nulls show up as logical nulls.
+        let logical = result_array
+            .logical_nulls()
+            .expect("union with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+        assert!(logical.is_valid(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_ree_child_with_nullable_parent() -> Result<()> {
+        // RunEndEncoded cannot carry a top-level validity bitmap. Parent nulls
+        // are encoded as null values in a rebuilt REE.
+        let run_ends = Int32Array::from(vec![2, 3]);
+        let values = Int32Array::from(vec![Some(7), Some(8)]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values)?;
+        let ree: ArrayRef = Arc::new(ree);
+
+        let fields: Fields = vec![Field::new("r", ree.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&ree)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("r".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert!(matches!(
+            result_array.data_type(),
+            DataType::RunEndEncoded(_, _)
+        ));
+        let logical = result_array
+            .logical_nulls()
+            .expect("REE with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+        assert!(logical.is_valid(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_nested_union_child_with_nullable_parent() -> Result<()> {
+        // Sparse-union variants can themselves be Union. Masking must recurse
+        // on the nested layout instead of attaching a parent validity bitmap
+        // (which Arrow rejects on Union during build()).
+        let inner_fields =
+            UnionFields::try_new(vec![0], vec![Field::new("i", DataType::Int32, true)])?;
+        let inner = UnionArray::try_new(
+            inner_fields,
+            ScalarBuffer::from(vec![0_i8, 0, 0]),
+            None,
+            vec![Arc::new(Int32Array::from(vec![Some(1), Some(2), Some(3)])) as ArrayRef],
+        )?;
+        let outer_fields = UnionFields::try_new(
+            vec![7],
+            vec![Field::new("nested", inner.data_type().clone(), true)],
+        )?;
+        let outer = UnionArray::try_new(
+            outer_fields,
+            ScalarBuffer::from(vec![7_i8, 7, 7]),
+            None,
+            vec![Arc::new(inner) as ArrayRef],
+        )?;
+        let outer: ArrayRef = Arc::new(outer);
+
+        let fields: Fields =
+            vec![Field::new("u", outer.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&outer)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert!(matches!(result_array.data_type(), DataType::Union(_, _)));
+        let logical = result_array
+            .logical_nulls()
+            .expect("nested union with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+        assert!(logical.is_valid(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_union_of_ree_child_with_nullable_parent() -> Result<()> {
+        // Sparse-union variants can be RunEndEncoded. Masking must use the REE
+        // path rather than attaching a parent validity bitmap.
+        let run_ends = Int32Array::from(vec![2, 3]);
+        let values = Int32Array::from(vec![Some(7), Some(8)]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values)?;
+        let union_fields = UnionFields::try_new(
+            vec![1],
+            vec![Field::new("r", ree.data_type().clone(), true)],
+        )?;
+        let union = UnionArray::try_new(
+            union_fields,
+            ScalarBuffer::from(vec![1_i8, 1, 1]),
+            None,
+            vec![Arc::new(ree) as ArrayRef],
+        )?;
+        let union: ArrayRef = Arc::new(union);
+
+        let fields: Fields =
+            vec![Field::new("u", union.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&union)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert!(matches!(result_array.data_type(), DataType::Union(_, _)));
+        let logical = result_array
+            .logical_nulls()
+            .expect("union-of-REE with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+        assert!(logical.is_valid(2));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_dense_union_shared_offset_with_nullable_parent() -> Result<()> {
+        // Dense-union rows can share a child offset. Parent-null masking must
+        // not null a slot still referenced by a valid row.
+        // type_ids=[0,0], offsets=[0,0], child=[10], parent validity=[true,false]
+        // must yield [10, NULL], not [NULL, NULL].
+        let union_fields = UnionFields::try_new(
+            vec![0],
+            vec![Field::new("int", DataType::Int32, true)],
+        )?;
+        let type_ids = ScalarBuffer::from(vec![0_i8, 0]);
+        let offsets = ScalarBuffer::from(vec![0_i32, 0]);
+        let children: Vec<ArrayRef> = vec![Arc::new(Int32Array::from(vec![Some(10)]))];
+        let union = UnionArray::try_new(union_fields, type_ids, Some(offsets), children)?;
+        let union: ArrayRef = Arc::new(union);
+
+        let fields: Fields =
+            vec![Field::new("u", union.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&union)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(2)?;
+        assert!(matches!(result_array.data_type(), DataType::Union(_, _)));
+        let logical = result_array
+            .logical_nulls()
+            .expect("dense union with parent nulls must expose logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(1));
+
+        let result_union = result_array
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("UnionArray");
+        let slot = result_union.value(0);
+        let child = slot
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("Int32 slot");
+        assert_eq!(child.value(0), 10);
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_dense_union_shared_offset_no_value_duplication() -> Result<()> {
+        // Many dense-union rows can share one child offset. Masking must remap
+        // distinct offsets (plus one null slot) instead of allocating a child
+        // slot per row — otherwise a later take of a large Utf8 value overflows
+        // 32-bit offsets (e.g. 8,192 rows × 1 MiB).
+        const N: usize = 8192;
+        let big = "x".repeat(1024); // large enough that N copies would be multi-MiB
+        let union_fields = UnionFields::try_new(
+            vec![0],
+            vec![Field::new("s", DataType::Utf8, true)],
+        )?;
+        let type_ids = ScalarBuffer::from(vec![0_i8; N]);
+        let offsets = ScalarBuffer::from(vec![0_i32; N]);
+        let children: Vec<ArrayRef> =
+            vec![Arc::new(StringArray::from(vec![Some(big.as_str())]))];
+        let union = UnionArray::try_new(union_fields, type_ids, Some(offsets), children)?;
+        let union: ArrayRef = Arc::new(union);
+
+        let mut validity = vec![true; N];
+        validity[N / 2] = false; // one interior parent null
+        let fields: Fields =
+            vec![Field::new("u", union.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(validity);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&union)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(N)?;
+        let result_union = result_array
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("UnionArray");
+        // One remapped shared value slot + one shared null slot.
+        assert_eq!(
+            result_union.child(0).len(),
+            2,
+            "dense shared-offset rebuild must not duplicate per row"
+        );
+        let logical = result_array
+            .logical_nulls()
+            .expect("logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(N / 2));
+        assert!(logical.is_valid(N - 1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_ree_preserves_runs_with_interior_parent_null() -> Result<()> {
+        // An 8,192-row run of one large Utf8 value with a single interior
+        // parent null must become three runs (value / null / value), not
+        // 8,191 physical copies that overflow Utf8 offsets.
+        const N: usize = 8192;
+        let big = "y".repeat(1024);
+        let run_ends = Int32Array::from(vec![N as i32]);
+        let values = StringArray::from(vec![Some(big.as_str())]);
+        let ree = RunArray::<Int32Type>::try_new(&run_ends, &values)?;
+        let ree: ArrayRef = Arc::new(ree);
+
+        let mut validity = vec![true; N];
+        validity[N / 2] = false;
+        let fields: Fields = vec![Field::new("r", ree.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(validity);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&ree)], Some(parent_nulls));
+
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("r".to_string())),
+        )?;
+        let result_array = result.into_array(N)?;
+        let result_ree = result_array
+            .as_any()
+            .downcast_ref::<RunArray<Int32Type>>()
+            .expect("RunArray");
+        assert_eq!(
+            result_ree.values().len(),
+            3,
+            "interior parent null must split into three runs, not expand per row"
+        );
+        assert_eq!(
+            result_ree.run_ends().values(),
+            &[(N / 2) as i32, (N / 2 + 1) as i32, N as i32]
+        );
+        let logical = result_array
+            .logical_nulls()
+            .expect("logical nulls");
+        assert!(logical.is_valid(0));
+        assert!(logical.is_null(N / 2));
+        assert!(logical.is_valid(N - 1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_get_field_ree_preserves_custom_field_metadata() -> Result<()> {
+        // RunArray::try_new replaces REE fields with defaults. Masking must
+        // rebuild via ArrayDataBuilder so custom names/metadata survive, both
+        // for a bare REE child and one nested in a sparse union.
+        let mut meta = HashMap::new();
+        meta.insert("k".to_string(), "v".to_string());
+        let run_ends_field = Arc::new(
+            Field::new("custom_run_ends", DataType::Int32, false).with_metadata(meta.clone()),
+        );
+        let values_field = Arc::new(
+            Field::new("custom_values", DataType::Int32, true).with_metadata(meta),
+        );
+        let run_ends = Int32Array::from(vec![2, 3]);
+        let values = Int32Array::from(vec![Some(7), Some(8)]);
+        let ree_dt = DataType::RunEndEncoded(
+            Arc::clone(&run_ends_field),
+            Arc::clone(&values_field),
+        );
+        let ree_data = ArrayDataBuilder::new(ree_dt.clone())
+            .len(3)
+            .add_child_data(run_ends.to_data())
+            .add_child_data(values.to_data())
+            .build()?;
+        let ree: ArrayRef = Arc::new(RunArray::<Int32Type>::from(ree_data));
+        assert_eq!(ree.data_type(), &ree_dt);
+
+        // Bare REE child with parent nulls.
+        let fields: Fields = vec![Field::new("r", ree_dt.clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&ree)], Some(parent_nulls));
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("r".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        assert_eq!(
+            result_array.data_type(),
+            &ree_dt,
+            "REE field names/metadata must be preserved after parent-null mask"
+        );
+
+        // Same REE nested as a sparse-union variant.
+        let union_fields = UnionFields::try_new(
+            vec![1],
+            vec![Field::new("r", ree_dt.clone(), true)],
+        )?;
+        let union = UnionArray::try_new(
+            union_fields,
+            ScalarBuffer::from(vec![1_i8, 1, 1]),
+            None,
+            vec![Arc::clone(&ree)],
+        )?;
+        let union: ArrayRef = Arc::new(union);
+        let fields: Fields =
+            vec![Field::new("u", union.data_type().clone(), true)].into();
+        let parent_nulls = NullBuffer::from(vec![true, false, true]);
+        let struct_array =
+            StructArray::new(fields, vec![Arc::clone(&union)], Some(parent_nulls));
+        let result = extract_single_field(
+            ColumnarValue::Array(Arc::new(struct_array)),
+            ScalarValue::Utf8(Some("u".to_string())),
+        )?;
+        let result_array = result.into_array(3)?;
+        let result_union = result_array
+            .as_any()
+            .downcast_ref::<UnionArray>()
+            .expect("UnionArray");
+        assert_eq!(
+            result_union.child(1).data_type(),
+            &ree_dt,
+            "REE field names/metadata must survive sparse-union parent-null mask"
+        );
+        Ok(())
+    }
 
     #[test]
     fn test_get_field_utf8view_key() -> Result<()> {
