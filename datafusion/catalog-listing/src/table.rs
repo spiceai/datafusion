@@ -232,10 +232,11 @@ impl ListingTable {
         // file schema before they are folded into the table schema.
         options.validate_metadata_cols(&file_schema)?;
 
-        // Add the partition columns to the file schema
+        // Add the partition columns to the file schema. They are nullable because a Hive
+        // compliant writer uses `__HIVE_DEFAULT_PARTITION__` for a null partition value.
         let mut builder = SchemaBuilder::from(file_schema.as_ref().to_owned());
         for (part_col_name, part_col_type) in &options.table_partition_cols {
-            builder.push(Field::new(part_col_name, part_col_type.clone(), false));
+            builder.push(Field::new(part_col_name, part_col_type.clone(), true));
         }
 
         // Append metadata columns (Spice extension) after the partition columns
@@ -359,7 +360,8 @@ impl ListingTable {
                 self.options
                     .table_partition_cols
                     .iter()
-                    .map(|(col, field)| Arc::new(Field::new(col, field.clone(), false)))
+                    // Nullable to match the table schema built in `try_new`.
+                    .map(|(col, field)| Arc::new(Field::new(col, field.clone(), true)))
                     .collect::<Vec<_>>(),
             )
             // Append metadata columns (Spice extension) after the partition columns.
@@ -1116,7 +1118,7 @@ impl ListingTable {
 
         // Note: Statistics already include both file columns and partition columns.
         // PartitionedFile::with_statistics automatically appends exact partition column
-        // statistics (min=max=partition_value, null_count=0, distinct_count=1) computed
+        // statistics (e.g. min=max=partition_value, null_count=0, distinct_count=1) computed
         // from partition_values.
         Ok(ListFilesResult {
             file_groups,
