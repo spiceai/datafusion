@@ -121,27 +121,48 @@ impl ScalarUDFImpl for LevenshteinFunc {
     }
 }
 
-/// The most character pairs, `chars(str1) * chars(str2)`, one row may compare.
-/// The distance takes that many steps with no cancellation point, so a larger
-/// row would hold its thread far past any query timeout.
-const MAX_LEVENSHTEIN_CHAR_PAIRS: u64 = 100_000_000;
+/// The most character pairs, `chars(str1) * chars(str2)` summed over its rows,
+/// one call may compare. The distances take that many steps with no
+/// cancellation point, so a larger call would hold its thread far past any
+/// query timeout.
+const MAX_LEVENSHTEIN_CHAR_PAIRS: u64 = 1_000_000_000;
 
-/// Refuses a row whose distance would take more than
-/// [`MAX_LEVENSHTEIN_CHAR_PAIRS`] steps.
-fn check_levenshtein_size(str1: &str, str2: &str) -> Result<()> {
-    // A character is at least one byte, so the byte lengths bound the pairs.
-    if (str1.len() as u64).saturating_mul(str2.len() as u64) <= MAX_LEVENSHTEIN_CHAR_PAIRS
-    {
+/// Refuses a call whose distances would take more than
+/// [`MAX_LEVENSHTEIN_CHAR_PAIRS`] steps in total. A row with a null string is
+/// not compared, so it does not count.
+fn check_levenshtein_size<'a, I>(rows: impl Fn() -> I) -> Result<()>
+where
+    I: Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
+{
+    // A character is at least one byte, so byte lengths bound the pairs.
+    if total_pairs(rows(), str::len) <= MAX_LEVENSHTEIN_CHAR_PAIRS {
         return Ok(());
     }
-    let chars1 = str1.chars().count() as u64;
-    let chars2 = str2.chars().count() as u64;
-    if chars1.saturating_mul(chars2) > MAX_LEVENSHTEIN_CHAR_PAIRS {
+    if total_pairs(rows(), |s| s.chars().count()) > MAX_LEVENSHTEIN_CHAR_PAIRS {
         return exec_err!(
-            "levenshtein input is too long: {chars1} x {chars2} characters is more than the limit of {MAX_LEVENSHTEIN_CHAR_PAIRS} character pairs per row"
+            "levenshtein input is too long: the strings in one batch have more than {MAX_LEVENSHTEIN_CHAR_PAIRS} character pairs (chars(str1) * chars(str2) summed over the batch's rows)"
         );
     }
     Ok(())
+}
+
+/// `len(str1) * len(str2)` summed over `rows`, stopping once the sum passes
+/// [`MAX_LEVENSHTEIN_CHAR_PAIRS`].
+fn total_pairs<'a>(
+    rows: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
+    len: impl Fn(&str) -> usize,
+) -> u64 {
+    let mut total = 0u64;
+    for (str1, str2) in rows {
+        if let (Some(str1), Some(str2)) = (str1, str2) {
+            let pairs = (len(str1) as u64).saturating_mul(len(str2) as u64);
+            total = total.saturating_add(pairs);
+            if total > MAX_LEVENSHTEIN_CHAR_PAIRS {
+                break;
+            }
+        }
+    }
+    total
 }
 
 ///Returns the Levenshtein distance between the two given strings.
@@ -169,6 +190,7 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
             DataType::Utf8View => {
                 let str1_array = as_string_view_array(&str1)?;
                 let str2_array = as_string_view_array(&str2)?;
+                check_levenshtein_size(|| str1_array.iter().zip(str2_array.iter()))?;
 
                 // Reusable buffer to avoid allocating for each row
                 let mut cache = Vec::new();
@@ -178,19 +200,19 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     .zip(str2_array.iter())
                     .map(|(string1, string2)| match (string1, string2) {
                         (Some(string1), Some(string2)) => {
-                            check_levenshtein_size(string1, string2)?;
-                            Ok(Some(datafusion_strsim::levenshtein_with_buffer(
+                            Some(datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
-                            ) as i32))
+                            ) as i32)
                         }
-                        _ => Ok(None),
+                        _ => None,
                     })
-                    .collect::<Result<Int32Array>>()?;
+                    .collect::<Int32Array>();
                 Ok(Arc::new(result) as ArrayRef)
             }
             DataType::Utf8 => {
                 let str1_array = as_generic_string_array::<T>(&str1)?;
                 let str2_array = as_generic_string_array::<T>(&str2)?;
+                check_levenshtein_size(|| str1_array.iter().zip(str2_array.iter()))?;
 
                 // Reusable buffer to avoid allocating for each row
                 let mut cache = Vec::new();
@@ -200,19 +222,19 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     .zip(str2_array.iter())
                     .map(|(string1, string2)| match (string1, string2) {
                         (Some(string1), Some(string2)) => {
-                            check_levenshtein_size(string1, string2)?;
-                            Ok(Some(datafusion_strsim::levenshtein_with_buffer(
+                            Some(datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
-                            ) as i32))
+                            ) as i32)
                         }
-                        _ => Ok(None),
+                        _ => None,
                     })
-                    .collect::<Result<Int32Array>>()?;
+                    .collect::<Int32Array>();
                 Ok(Arc::new(result) as ArrayRef)
             }
             DataType::LargeUtf8 => {
                 let str1_array = as_generic_string_array::<T>(&str1)?;
                 let str2_array = as_generic_string_array::<T>(&str2)?;
+                check_levenshtein_size(|| str1_array.iter().zip(str2_array.iter()))?;
 
                 // Reusable buffer to avoid allocating for each row
                 let mut cache = Vec::new();
@@ -222,14 +244,13 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     .zip(str2_array.iter())
                     .map(|(string1, string2)| match (string1, string2) {
                         (Some(string1), Some(string2)) => {
-                            check_levenshtein_size(string1, string2)?;
-                            Ok(Some(datafusion_strsim::levenshtein_with_buffer(
+                            Some(datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
-                            ) as i64))
+                            ) as i64)
                         }
-                        _ => Ok(None),
+                        _ => None,
                     })
-                    .collect::<Result<Int64Array>>()?;
+                    .collect::<Int64Array>();
                 Ok(Arc::new(result) as ArrayRef)
             }
             other => {
@@ -259,7 +280,12 @@ mod tests {
     const STRING_TYPES: [DataType; 3] =
         [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View];
 
-    const TOO_LONG: &str = "Execution error: levenshtein input is too long: 10001 x 10000 characters is more than the limit of 100000000 character pairs per row";
+    const TOO_LONG: &str = "Execution error: levenshtein input is too long: the strings in one batch have more than 1000000000 character pairs (chars(str1) * chars(str2) summed over the batch's rows)";
+
+    /// The size check over `rows` copies of one row.
+    fn check_rows(str1: &str, str2: &str, rows: usize) -> Result<()> {
+        check_levenshtein_size(|| std::iter::repeat_n((Some(str1), Some(str2)), rows))
+    }
 
     fn strings(data_type: &DataType, rows: Vec<Option<&str>>) -> ArrayRef {
         arrow::compute::cast(&StringArray::from(rows), data_type).unwrap()
@@ -306,31 +332,53 @@ mod tests {
 
     #[test]
     fn size_check_accepts_the_limit_and_refuses_past_it() {
-        let at_limit = "a".repeat(10_000);
-        check_levenshtein_size(&at_limit, &at_limit).unwrap();
-        // Two bytes per character: past the limit in bytes, at it in characters.
-        let two_byte = "\u{e9}".repeat(10_000);
-        check_levenshtein_size(&two_byte, &two_byte).unwrap();
-        check_levenshtein_size("", &"a".repeat(1_000_000)).unwrap();
-
-        let error = check_levenshtein_size(&"a".repeat(10_001), &at_limit).unwrap_err();
+        // One long row: 40,000 x 25,000 is the limit.
+        let (long1, long2) = ("a".repeat(40_000), "b".repeat(25_000));
+        check_rows(&long1, &long2, 1).unwrap();
+        let error = check_rows(&"a".repeat(40_001), &long2, 1).unwrap_err();
         assert_eq!(error.strip_backtrace(), TOO_LONG);
+
+        // Many shorter rows: 1,000 rows of 1,000 x 1,000 is the limit.
+        let short = "a".repeat(1_000);
+        check_rows(&short, &short, 1_000).unwrap();
+        let error = check_rows(&short, &short, 1_001).unwrap_err();
+        assert_eq!(error.strip_backtrace(), TOO_LONG);
+
+        // Two bytes per character: past the limit in bytes, at it in characters.
+        check_rows(&"\u{e9}".repeat(40_000), &"\u{e9}".repeat(25_000), 1).unwrap();
+
+        // A row with a null or an empty string compares nothing.
+        let huge = "a".repeat(1_000_000);
+        check_levenshtein_size(|| {
+            [
+                (None, Some(huge.as_str())),
+                (Some(""), Some(huge.as_str())),
+                (Some(long1.as_str()), Some(long2.as_str())),
+            ]
+            .into_iter()
+        })
+        .unwrap();
     }
 
     #[test]
-    fn every_string_type_refuses_a_row_past_the_size_limit() {
-        let (long1, long2) = ("a".repeat(10_001), "b".repeat(10_000));
+    fn every_string_type_refuses_a_call_past_the_size_limit() {
+        let (long1, long2) = ("a".repeat(40_001), "b".repeat(25_000));
+        let short = "a".repeat(1_000);
+        let shorts = vec![Some(short.as_str()); 1_001];
         for data_type in &STRING_TYPES {
             for args in [
+                // One long row.
                 vec![scalar(data_type, &long1), scalar(data_type, &long2)],
                 vec![
                     array(data_type, vec![Some("kitten"), Some(&long1)]),
                     array(data_type, vec![Some("sitting"), Some(&long2)]),
                 ],
+                // Many shorter rows; a scalar counts once for each row.
                 vec![
-                    array(data_type, vec![Some("kitten"), Some(&long1)]),
-                    scalar(data_type, &long2),
+                    array(data_type, shorts.clone()),
+                    array(data_type, shorts.clone()),
                 ],
+                vec![array(data_type, shorts.clone()), scalar(data_type, &short)],
             ] {
                 let error = invoke(args).unwrap_err();
                 assert_eq!(error.strip_backtrace(), TOO_LONG, "{data_type}");
