@@ -121,6 +121,29 @@ impl ScalarUDFImpl for LevenshteinFunc {
     }
 }
 
+/// The most character pairs, `chars(str1) * chars(str2)`, one row may compare.
+/// The distance takes that many steps with no cancellation point, so a larger
+/// row would hold its thread far past any query timeout.
+const MAX_LEVENSHTEIN_CHAR_PAIRS: u64 = 100_000_000;
+
+/// Refuses a row whose distance would take more than
+/// [`MAX_LEVENSHTEIN_CHAR_PAIRS`] steps.
+fn check_levenshtein_size(str1: &str, str2: &str) -> Result<()> {
+    // A character is at least one byte, so the byte lengths bound the pairs.
+    if (str1.len() as u64).saturating_mul(str2.len() as u64) <= MAX_LEVENSHTEIN_CHAR_PAIRS
+    {
+        return Ok(());
+    }
+    let chars1 = str1.chars().count() as u64;
+    let chars2 = str2.chars().count() as u64;
+    if chars1.saturating_mul(chars2) > MAX_LEVENSHTEIN_CHAR_PAIRS {
+        return exec_err!(
+            "levenshtein input is too long: {chars1} x {chars2} characters is more than the limit of {MAX_LEVENSHTEIN_CHAR_PAIRS} character pairs per row"
+        );
+    }
+    Ok(())
+}
+
 ///Returns the Levenshtein distance between the two given strings.
 /// LEVENSHTEIN('kitten', 'sitting') = 3
 fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
@@ -155,13 +178,14 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     .zip(str2_array.iter())
                     .map(|(string1, string2)| match (string1, string2) {
                         (Some(string1), Some(string2)) => {
-                            Some(datafusion_strsim::levenshtein_with_buffer(
+                            check_levenshtein_size(string1, string2)?;
+                            Ok(Some(datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
-                            ) as i32)
+                            ) as i32))
                         }
-                        _ => None,
+                        _ => Ok(None),
                     })
-                    .collect::<Int32Array>();
+                    .collect::<Result<Int32Array>>()?;
                 Ok(Arc::new(result) as ArrayRef)
             }
             DataType::Utf8 => {
@@ -176,13 +200,14 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     .zip(str2_array.iter())
                     .map(|(string1, string2)| match (string1, string2) {
                         (Some(string1), Some(string2)) => {
-                            Some(datafusion_strsim::levenshtein_with_buffer(
+                            check_levenshtein_size(string1, string2)?;
+                            Ok(Some(datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
-                            ) as i32)
+                            ) as i32))
                         }
-                        _ => None,
+                        _ => Ok(None),
                     })
-                    .collect::<Int32Array>();
+                    .collect::<Result<Int32Array>>()?;
                 Ok(Arc::new(result) as ArrayRef)
             }
             DataType::LargeUtf8 => {
@@ -197,13 +222,14 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
                     .zip(str2_array.iter())
                     .map(|(string1, string2)| match (string1, string2) {
                         (Some(string1), Some(string2)) => {
-                            Some(datafusion_strsim::levenshtein_with_buffer(
+                            check_levenshtein_size(string1, string2)?;
+                            Ok(Some(datafusion_strsim::levenshtein_with_buffer(
                                 string1, string2, &mut cache,
-                            ) as i64)
+                            ) as i64))
                         }
-                        _ => None,
+                        _ => Ok(None),
                     })
-                    .collect::<Int64Array>();
+                    .collect::<Result<Int64Array>>()?;
                 Ok(Arc::new(result) as ArrayRef)
             }
             other => {
@@ -222,10 +248,125 @@ fn levenshtein<T: OffsetSizeTrait>(args: &[ArrayRef]) -> Result<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use arrow::array::StringArray;
+    use arrow::datatypes::Field;
 
-    use datafusion_common::cast::as_int32_array;
+    use datafusion_common::ScalarValue;
+    use datafusion_common::cast::{as_int32_array, as_int64_array};
+    use datafusion_common::config::ConfigOptions;
 
     use super::*;
+
+    const STRING_TYPES: [DataType; 3] =
+        [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View];
+
+    const TOO_LONG: &str = "Execution error: levenshtein input is too long: 10001 x 10000 characters is more than the limit of 100000000 character pairs per row";
+
+    fn strings(data_type: &DataType, rows: Vec<Option<&str>>) -> ArrayRef {
+        arrow::compute::cast(&StringArray::from(rows), data_type).unwrap()
+    }
+
+    fn scalar(data_type: &DataType, value: &str) -> ColumnarValue {
+        let array = strings(data_type, vec![Some(value)]);
+        ColumnarValue::Scalar(ScalarValue::try_from_array(&array, 0).unwrap())
+    }
+
+    fn array(data_type: &DataType, rows: Vec<Option<&str>>) -> ColumnarValue {
+        ColumnarValue::Array(strings(data_type, rows))
+    }
+
+    /// Calls the function the way a physical plan does.
+    fn invoke(args: Vec<ColumnarValue>) -> Result<ColumnarValue> {
+        let func = LevenshteinFunc::new();
+        let arg_types: Vec<_> = args.iter().map(ColumnarValue::data_type).collect();
+        let return_type = func.return_type(&arg_types)?;
+        let number_rows = args
+            .iter()
+            .find_map(|arg| match arg {
+                ColumnarValue::Array(array) => Some(array.len()),
+                ColumnarValue::Scalar(_) => None,
+            })
+            .unwrap_or(1);
+        func.invoke_with_args(ScalarFunctionArgs {
+            arg_fields: arg_types
+                .into_iter()
+                .map(|data_type| Arc::new(Field::new("s", data_type, true)))
+                .collect(),
+            args,
+            number_rows,
+            return_field: Arc::new(Field::new("d", return_type, true)),
+            config_options: Arc::new(ConfigOptions::default()),
+        })
+    }
+
+    fn distances(result: ColumnarValue) -> Vec<Option<i64>> {
+        let result =
+            arrow::compute::cast(&result.to_array(1).unwrap(), &DataType::Int64).unwrap();
+        as_int64_array(&result).unwrap().iter().collect()
+    }
+
+    #[test]
+    fn size_check_accepts_the_limit_and_refuses_past_it() {
+        let at_limit = "a".repeat(10_000);
+        check_levenshtein_size(&at_limit, &at_limit).unwrap();
+        // Two bytes per character: past the limit in bytes, at it in characters.
+        let two_byte = "\u{e9}".repeat(10_000);
+        check_levenshtein_size(&two_byte, &two_byte).unwrap();
+        check_levenshtein_size("", &"a".repeat(1_000_000)).unwrap();
+
+        let error = check_levenshtein_size(&"a".repeat(10_001), &at_limit).unwrap_err();
+        assert_eq!(error.strip_backtrace(), TOO_LONG);
+    }
+
+    #[test]
+    fn every_string_type_refuses_a_row_past_the_size_limit() {
+        let (long1, long2) = ("a".repeat(10_001), "b".repeat(10_000));
+        for data_type in &STRING_TYPES {
+            for args in [
+                vec![scalar(data_type, &long1), scalar(data_type, &long2)],
+                vec![
+                    array(data_type, vec![Some("kitten"), Some(&long1)]),
+                    array(data_type, vec![Some("sitting"), Some(&long2)]),
+                ],
+                vec![
+                    array(data_type, vec![Some("kitten"), Some(&long1)]),
+                    scalar(data_type, &long2),
+                ],
+            ] {
+                let error = invoke(args).unwrap_err();
+                assert_eq!(error.strip_backtrace(), TOO_LONG, "{data_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_string_type_keeps_its_distances() {
+        for data_type in &STRING_TYPES {
+            let result = invoke(vec![
+                scalar(data_type, "kitten"),
+                scalar(data_type, "sitting"),
+            ])
+            .unwrap();
+            assert!(matches!(result, ColumnarValue::Scalar(_)), "{data_type}");
+            assert_eq!(distances(result), vec![Some(3)], "{data_type}");
+
+            let result = invoke(vec![
+                array(
+                    data_type,
+                    vec![Some("123"), Some("na\u{ef}ve"), None, Some("")],
+                ),
+                array(
+                    data_type,
+                    vec![Some("321"), Some("naive"), Some("x"), Some("abc")],
+                ),
+            ])
+            .unwrap();
+            assert_eq!(
+                distances(result),
+                vec![Some(2), Some(1), None, Some(3)],
+                "{data_type}"
+            );
+        }
+    }
 
     #[test]
     fn to_levenshtein() -> Result<()> {
