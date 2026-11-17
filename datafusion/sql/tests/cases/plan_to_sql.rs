@@ -17,6 +17,7 @@
 
 use arrow::datatypes::{DataType, Field, Schema};
 
+use datafusion_common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
 use datafusion_common::{
     Column, DFSchema, DFSchemaRef, DataFusionError, NullEquality, Result, TableReference,
     assert_contains, internal_err,
@@ -1834,6 +1835,13 @@ fn generate_round_trip_statement<D>(dialect: D, sql: &str) -> Statement
 where
     D: Dialect,
 {
+    plan_to_sql(&round_trip_plan(dialect, sql)).unwrap()
+}
+
+fn round_trip_plan<D>(dialect: D, sql: &str) -> LogicalPlan
+where
+    D: Dialect,
+{
     let statement = Parser::new(&dialect)
         .try_with_sql(sql)
         .unwrap()
@@ -1854,9 +1862,7 @@ where
             .with_expr_planner(Arc::new(FieldAccessPlanner)),
     };
     let sql_to_rel = SqlToRel::new(&context);
-    let plan = sql_to_rel.sql_statement_to_plan(statement).unwrap();
-
-    plan_to_sql(&plan).unwrap()
+    sql_to_rel.sql_statement_to_plan(statement).unwrap()
 }
 
 #[test]
@@ -3011,6 +3017,82 @@ fn test_unnest_to_sql_2() {
         statement,
         @"SELECT UNNEST([1, 2, 2, 5, NULL]) AS u1"
     );
+}
+
+/// Once nothing reads a derived table's columns, projection pushdown leaves an
+/// empty `Projection` over its `Unnest`. The derived table still has one row per
+/// element, so a join with it multiplies the other side; unparsing it as
+/// `(SELECT 1)` silently returns one row per row of the other side instead.
+#[test]
+fn test_unnest_under_an_empty_projection_keeps_its_rows() -> Result<()> {
+    let plan = round_trip_plan(
+        GenericDialect {},
+        "SELECT j1.j1_id FROM j1 CROSS JOIN (SELECT unnest(make_array(1, 2, 3)) AS x) AS b",
+    );
+    let plan = plan
+        .transform_up(|plan| match plan {
+            LogicalPlan::Projection(projection)
+                if matches!(projection.input.as_ref(), LogicalPlan::Unnest(_)) =>
+            {
+                Ok(Transformed::yes(LogicalPlan::Projection(
+                    Projection::try_new(vec![], projection.input)?,
+                )))
+            }
+            plan => Ok(Transformed::yes(plan.recompute_schema()?)),
+        })?
+        .data;
+    assert_snapshot!(
+        plan,
+        @r"
+    Projection: j1.j1_id
+      Cross Join:
+        TableScan: j1
+        SubqueryAlias: b
+          Projection:
+            Unnest: lists[__unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3)))|depth=1] structs[]
+              Projection: make_array(Int64(1), Int64(2), Int64(3)) AS __unnest_placeholder(make_array(Int64(1),Int64(2),Int64(3)))
+                EmptyRelation: rows=1
+    "
+    );
+
+    assert_snapshot!(
+        plan_to_sql(&plan)?,
+        @"SELECT j1.j1_id FROM j1 CROSS JOIN (SELECT 1 FROM (SELECT UNNEST([1, 2, 3])) AS __unnest_rows) AS b"
+    );
+    Ok(())
+}
+
+/// An emptied Unnest keeps the shape every other empty projection has, so a
+/// UNION of it with one still has operands of one width.
+#[test]
+fn test_unnest_under_an_empty_projection_unions_with_another_empty_projection()
+-> Result<()> {
+    let unnest = round_trip_plan(
+        GenericDialect {},
+        "SELECT unnest(make_array(1, 2)) AS x, unnest(make_array(3, 4)) AS y",
+    );
+    let mut found = None;
+    unnest.apply(|plan| {
+        if let LogicalPlan::Unnest(_) = plan {
+            found = Some(plan.clone());
+            return Ok(TreeNodeRecursion::Stop);
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let unnest = found.expect("the plan has an Unnest");
+    let emptied = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    let table = LogicalPlanBuilder::from(round_trip_plan(
+        GenericDialect {},
+        "SELECT j1_id FROM j1",
+    ))
+    .project(Vec::<Expr>::new())?
+    .build()?;
+    let union = LogicalPlanBuilder::from(emptied).union(table)?.build()?;
+    assert_snapshot!(
+        plan_to_sql(&union)?,
+        @"SELECT 1 FROM (SELECT UNNEST([1, 2]), UNNEST([3, 4])) AS __unnest_rows UNION ALL SELECT 1 FROM (SELECT j1.j1_id FROM j1)"
+    );
+    Ok(())
 }
 
 #[test]
@@ -10964,6 +11046,180 @@ fn test_unparse_left_semi_join_refuses_probe_only_reserved_name_in_a_filter() ->
     assert_captured_correlation_refused(
         &plan,
         "a probe-side reference an invented alias could shadow must be refused",
+    );
+    Ok(())
+}
+
+/// The derived table an empty projection over an `Unnest` is emitted as is named
+/// by the unparser, like the `derived_*` aliases, so a probe-side reference that
+/// spells that name must be refused: inside the `EXISTS` body the reference
+/// would bind to the derived table's passthrough column instead of the probe.
+#[test]
+fn test_unparse_left_semi_join_refuses_probe_reference_an_unnest_rows_table_captures()
+-> Result<()> {
+    let probe =
+        table_scan(Some("__unnest_rows"), &exists_fetch_schema(), None)?.build()?;
+    let source = Schema::new(vec![
+        Field::new("c", DataType::Int32, false),
+        Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            true,
+        ),
+    ]);
+    let unnest = table_scan(Some("source"), &source, None)?
+        .project(vec![
+            col("source.c"),
+            col("source.items").alias("__unnest_placeholder(items)"),
+        ])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .build()?;
+    let build = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    let plan = LogicalPlanBuilder::from(probe)
+        .join_on(
+            build,
+            datafusion_expr::JoinType::LeftSemi,
+            vec![col("__unnest_rows.c").gt(lit(0))],
+        )?
+        .build()?;
+
+    assert_captured_correlation_refused(
+        &plan,
+        "a probe-side reference the __unnest_rows derived table could shadow must be refused",
+    );
+    Ok(())
+}
+
+/// The plan an explicit `EXISTS` test reads: `__unnest_rows` (columns `c`, `d`)
+/// filtered by `EXISTS (body)`, where `body` is `wrap` applied to an empty
+/// projection over an `Unnest` of `source.items` that keeps `source.c`.
+fn exists_over_empty_unnest(
+    wrap: impl FnOnce(LogicalPlan) -> Result<LogicalPlan>,
+) -> Result<LogicalPlan> {
+    let source = Schema::new(vec![
+        Field::new("c", DataType::Int32, false),
+        Field::new(
+            "items",
+            DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            true,
+        ),
+    ]);
+    let unnest = table_scan(Some("source"), &source, None)?
+        .project(vec![
+            col("source.c"),
+            col("source.items").alias("__unnest_placeholder(items)"),
+        ])?
+        .unnest_column("__unnest_placeholder(items)")?
+        .build()?;
+    let empty = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    table_scan(Some("__unnest_rows"), &exists_fetch_schema(), None)?
+        .filter(exists(Arc::new(wrap(empty)?)))?
+        .build()
+}
+
+/// Asserts `plan` is refused for `reference` on a dialect that names every
+/// derived table, one that does not, and Snowflake, whose `FLATTEN` exposes a
+/// column, `VALUE`, the plan has no field for.
+#[track_caller]
+fn assert_exists_over_empty_unnest_refused(
+    plan: &LogicalPlan,
+    reference: &str,
+    carries: &str,
+) {
+    let snowflake = SnowflakeDialect::new();
+    for unparser in [
+        Unparser::new(&UnparserPostgreSqlDialect {}),
+        Unparser::new(&UnparserDefaultDialect {}),
+        Unparser::new(&snowflake),
+    ] {
+        let err = unparser
+            .plan_to_sql(plan)
+            .map(|sql| sql.to_string())
+            .expect_err(reference);
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "This feature is not implemented: Unparsing an empty projection over an UNNEST is not supported when the outer reference {reference} carries {carries}"
+            )
+        );
+    }
+}
+
+/// An explicit `EXISTS` reaches the derived table an empty projection over an
+/// `Unnest` is emitted as through a `Filter`, not a semi join, so its outer
+/// reference must meet a guard of its own. Before the guard, the PostgreSQL
+/// unparse of the qualified case was
+/// `SELECT * FROM "__unnest_rows" WHERE EXISTS (SELECT FROM (SELECT "source"."c", UNNEST("source"."items") FROM "source") AS "__unnest_rows" WHERE ("__unnest_rows"."c" > 0))`,
+/// whose `"__unnest_rows"."c"` binds to the derived table's passthrough column
+/// instead of the enclosing query's. The derived table is named on every
+/// dialect, so the qualified reference is refused on one that does not name
+/// every derived table as well. An unqualified reference is refused whatever its
+/// name: `c` is a column the derived table exposes, and on Snowflake so is
+/// `VALUE`, which the plan never names.
+#[test]
+fn test_unparse_exists_refuses_outer_reference_an_unnest_rows_table_captures()
+-> Result<()> {
+    for reference in ["__unnest_rows.c", "c", "VALUE"] {
+        // Built unnormalized, so `VALUE` keeps the spelling Snowflake gives it.
+        let column = if reference.contains('.') {
+            Column::from(reference)
+        } else {
+            Column::new_unqualified(reference)
+        };
+        let plan = exists_over_empty_unnest(|empty| {
+            LogicalPlanBuilder::from(empty)
+                .filter(out_ref_col(DataType::Int32, column).gt(lit(0)))?
+                .build()
+        })?;
+        let carries = if reference.contains('.') {
+            "the name the unparser gives the derived table"
+        } else {
+            "no qualifier, so a column the derived table exposes can take it"
+        };
+        assert_exists_over_empty_unnest_refused(&plan, reference, carries);
+    }
+    Ok(())
+}
+
+/// The same capture one subquery further down. SQL resolves the inner body's
+/// outer reference from the inside out, so it reaches the `__unnest_rows`
+/// derived table before the enclosing query. Before the guard followed the
+/// subqueries a clause holds, the PostgreSQL unparse was
+/// `SELECT * FROM "__unnest_rows" WHERE EXISTS (SELECT FROM (SELECT "source"."c", UNNEST("source"."items") FROM "source") AS "__unnest_rows" WHERE EXISTS (SELECT * FROM "z" WHERE ("z"."k" = "__unnest_rows"."c")))`.
+#[test]
+fn test_unparse_exists_refuses_nested_outer_reference_an_unnest_rows_table_captures()
+-> Result<()> {
+    let plan = exists_over_empty_unnest(|empty| {
+        let inner = table_scan(Some("z"), &int32_schema(&["k"]), None)?
+            .filter(col("z.k").eq(out_ref_col(DataType::Int32, "__unnest_rows.c")))?
+            .build()?;
+        LogicalPlanBuilder::from(empty)
+            .filter(exists(Arc::new(inner)))?
+            .build()
+    })?;
+    assert_exists_over_empty_unnest_refused(
+        &plan,
+        "__unnest_rows.c",
+        "the name the unparser gives the derived table",
+    );
+    Ok(())
+}
+
+/// The guard refuses only a reference the derived table can take: one qualified
+/// with a relation this `FROM` does not have reaches the enclosing query, so the
+/// body keeps its rows in the derived table and the plan unparses.
+#[test]
+fn test_unparse_exists_keeps_outer_reference_to_another_relation_over_unnest_rows()
+-> Result<()> {
+    let plan = exists_over_empty_unnest(|empty| {
+        LogicalPlanBuilder::from(empty)
+            .filter(out_ref_col(DataType::Int32, "outer_t.c").gt(lit(0)))?
+            .build()
+    })?;
+    let sql = Unparser::new(&UnparserPostgreSqlDialect {}).plan_to_sql(&plan)?;
+    assert_eq!(
+        sql.to_string(),
+        r#"SELECT * FROM "__unnest_rows" WHERE EXISTS (SELECT FROM (SELECT "source"."c", UNNEST("source"."items") FROM "source") AS "__unnest_rows" WHERE ("outer_t"."c" > 0))"#
     );
     Ok(())
 }
@@ -20223,6 +20479,82 @@ fn test_field_path_over_a_limit_input_is_judged_by_its_column() -> Result<()> {
     assert_snapshot!(
         statement,
         @"SELECT u.struct_col.field1 FROM (SELECT unnest_table.array_col, unnest_table.struct_col FROM unnest_table LIMIT 1) AS u"
+    );
+    Ok(())
+}
+
+/// The items column of a `source` table, unnested.
+fn unnest_source_items() -> Result<LogicalPlanBuilder> {
+    let schema = Schema::new(vec![Field::new(
+        "items",
+        DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true))),
+        true,
+    )]);
+    table_scan(Some("source"), &schema, None)?
+        .project(vec![col("items").alias("__unnest_placeholder(items)")])?
+        .unnest_column("__unnest_placeholder(items)")
+}
+
+/// Snowflake joins an unnest in as `LATERAL FLATTEN`. Under an empty projection
+/// the FLATTEN stays inside the derived table, next to the table it reads,
+/// instead of joining into the outer SELECT where the table is out of scope.
+#[test]
+fn test_snowflake_unnest_under_an_empty_projection_keeps_its_scope() -> Result<()> {
+    let plan = LogicalPlan::Projection(Projection::try_new(
+        vec![],
+        Arc::new(unnest_source_items()?.build()?),
+    )?);
+    let snowflake = SnowflakeDialect::new();
+    assert_snapshot!(
+        Unparser::new(&snowflake).plan_to_sql(&plan)?,
+        @r#"SELECT 1 FROM (SELECT "_unnest_1"."VALUE" FROM "source" CROSS JOIN LATERAL FLATTEN(INPUT => "source"."items", OUTER => true) AS "_unnest_1") AS "__unnest_rows""#
+    );
+    Ok(())
+}
+
+/// A Limit between the empty projection and the Unnest does not hide the
+/// Unnest: the derived table still unnests, and still applies the LIMIT to the
+/// unnested rows. (The generic dialect places that LIMIT the way it does for a
+/// non-empty projection over Limit and Unnest, so only Snowflake is snapshotted.)
+#[test]
+fn test_unnest_under_a_limit_under_an_empty_projection_keeps_its_rows() -> Result<()> {
+    let plan = LogicalPlan::Projection(Projection::try_new(
+        vec![],
+        Arc::new(unnest_source_items()?.limit(0, Some(5))?.build()?),
+    )?);
+    let generic = plan_to_sql(&plan)?.to_string();
+    assert!(
+        generic.contains("UNNEST(\"source\".\"items\")"),
+        "{generic}"
+    );
+    let snowflake = SnowflakeDialect::new();
+    assert_snapshot!(
+        Unparser::new(&snowflake).plan_to_sql(&plan)?,
+        @r#"SELECT 1 FROM (SELECT "_unnest_1"."VALUE" FROM "source" CROSS JOIN LATERAL FLATTEN(INPUT => "source"."items", OUTER => true) AS "_unnest_1" LIMIT 5) AS "__unnest_rows""#
+    );
+    Ok(())
+}
+
+/// Unnesting a zero-field struct leaves no columns for the derived table to
+/// project. Unparsing an empty projection over it must terminate, with the
+/// unparser's existing error for struct columns in UNNEST.
+#[test]
+fn test_empty_projection_over_unnest_with_no_columns_terminates() -> Result<()> {
+    let schema = Schema::new(vec![Field::new(
+        "s",
+        DataType::Struct(arrow::datatypes::Fields::empty()),
+        true,
+    )]);
+    let unnest = table_scan(Some("source"), &schema, None)?
+        .project(vec![col("s").alias("__unnest_placeholder(s)")])?
+        .unnest_column("__unnest_placeholder(s)")?
+        .build()?;
+    assert!(unnest.schema().fields().is_empty());
+    let plan = LogicalPlan::Projection(Projection::try_new(vec![], Arc::new(unnest))?);
+    let err = plan_to_sql(&plan).unwrap_err().to_string();
+    assert!(
+        err.contains("Struct type columns are not currently supported in UNNEST"),
+        "{err}"
     );
     Ok(())
 }

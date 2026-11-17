@@ -306,17 +306,13 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
 
     /// Returns the [`EmitTo`], with an early `EmitTo::First` clamped to the
     /// batch size. `EmitTo::All` is emitted whole and sliced from `drained`.
-    ///
-    /// Returns `(emit_to, should_remove_groups)`, where `emit_to` is the number
-    /// of groups to emit from `GroupValues` / accumulators, and
-    /// `should_remove_groups` indicates whether `GroupOrdering` must also shift
-    /// its tracked indexes.
-    pub(super) fn clamp_emit_to(&self, emit_to: EmitTo) -> (EmitTo, bool) {
+    pub(super) fn clamp_emit_to(&self, emit_to: EmitTo) -> EmitTo {
         match emit_to {
-            EmitTo::First(n) => (EmitTo::First(n.min(self.batch_size)), true),
-            EmitTo::All => (EmitTo::All, false),
+            EmitTo::First(n) => EmitTo::First(n.min(self.batch_size)),
+            EmitTo::All => EmitTo::All,
         }
     }
+
     /// Aggregates one evaluated input batch.
     ///
     /// This common utility is used by ordered partial and ordered final aggregation.
@@ -401,31 +397,8 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         let Some(emit_to) = self.buffer.group_ordering.emit_to() else {
             return Ok(None);
         };
-        let (emit_to, should_remove_groups) = self.clamp_emit_to(emit_to);
-
-        let timer = self.group_by_metrics.emitting_time.timer();
-        let mut output = self.buffer.group_values.emit(emit_to)?;
-        if should_remove_groups {
-            match emit_to {
-                EmitTo::First(n) => self.buffer.group_ordering.remove_groups(n),
-                // `EmitTo::All` is only used after `input_done`, when all
-                // buffered groups are known complete and the ordering state is
-                // no longer needed.
-                EmitTo::All => {}
-            }
-        }
-
-        for acc in &mut self.buffer.accumulators {
-            if is_final {
-                output.push(acc.evaluate(emit_to)?);
-            } else {
-                output.extend(acc.state(emit_to)?);
-            }
-        }
-        drop(timer);
-
-        let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), output)?;
-        debug_assert!(batch.num_rows() > 0);
+        let emit_to = self.clamp_emit_to(emit_to);
+        let batch = self.materialize_groups(emit_to, is_final)?;
 
         if emit_to == EmitTo::All {
             // Every group is now in `batch`; release the emptied key and index
@@ -440,6 +413,43 @@ impl<AggrMode> OrderedAggregateTable<AggrMode> {
         let mut drained = MaterializedAggregateOutput::new(batch);
         let batch = drained.next_batch(self.batch_size);
         self.drained = Some(drained);
+        Ok(batch)
+    }
+
+    /// Removes the selected groups once and materializes their output columns.
+    /// The caller chooses the completed prefix and any output-size limit.
+    ///
+    /// # Argument: `is_final`
+    ///
+    /// - `true`: output final aggregate values.
+    /// - `false`: output partial accumulator states.
+    pub(super) fn materialize_groups(
+        &mut self,
+        emit_to: EmitTo,
+        is_final: bool,
+    ) -> Result<RecordBatch> {
+        let timer = self.group_by_metrics.emitting_time.timer();
+        let mut output = self.buffer.group_values.emit(emit_to)?;
+        // EOF can also emit a prefix when a caller limits its batch size,
+        // but the completed ordering state no longer tracks group indexes.
+        if let EmitTo::First(n) = emit_to
+            && matches!(self.buffer.group_ordering.emit_to(), Some(EmitTo::First(_)))
+        {
+            self.buffer.group_ordering.remove_groups(n);
+        }
+
+        for acc in &mut self.buffer.accumulators {
+            if is_final {
+                output.push(acc.evaluate(emit_to)?);
+            } else {
+                output.extend(acc.state(emit_to)?);
+            }
+        }
+        drop(timer);
+
+        let batch = RecordBatch::try_new(Arc::clone(&self.output_schema), output)?;
+        debug_assert!(batch.num_rows() > 0);
+
         Ok(batch)
     }
 }
