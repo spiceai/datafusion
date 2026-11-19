@@ -1410,6 +1410,197 @@ mod test {
         assert_eq!(file_metrics.pushdown_rows_matched.value(), 2);
     }
 
+    /// A filter on `som['mm']['k']` (simplified to `get_field(som, 'mm', 'k')`)
+    /// where `mm` is a Map inside a struct: `k` is a key lookup, not a struct
+    /// field, so the row filter must decode the whole map rather than no
+    /// leaves at all (which failed with "PhysicalExpr Column references column
+    /// 'som' at index 0 (zero-based) but input schema only has 0 columns").
+    #[test]
+    fn get_field_map_key_under_struct_filters_rows() {
+        use arrow::array::{Array, Int64Array, Int64Builder, MapBuilder, StringBuilder};
+
+        let mut map_builder =
+            MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        map_builder.keys().append_value("k");
+        map_builder.values().append_value(1);
+        map_builder.append(true).unwrap();
+        map_builder.append(false).unwrap();
+        map_builder.keys().append_value("k");
+        map_builder.values().append_value(2);
+        map_builder.append(true).unwrap();
+        let map = map_builder.finish();
+
+        let struct_fields: Fields =
+            vec![Arc::new(Field::new("mm", map.data_type().clone(), true))].into();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("som", DataType::Struct(struct_fields.clone()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![0, 1, 2])),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(map) as _],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+            .expect("reader builder");
+        let metadata = builder.metadata().clone();
+        let file_schema = builder.schema().clone();
+
+        let predicate = get_field()
+            .call(vec![
+                col("som"),
+                Expr::Literal(ScalarValue::Utf8(Some("mm".to_string())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("k".to_string())), None),
+            ])
+            .eq(Expr::Literal(ScalarValue::Int64(Some(1)), None));
+        let expr = logical2physical(&predicate, &file_schema);
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics = ParquetFileMetrics::new(0, "struct_map_key.parquet", &metrics);
+        let row_filter =
+            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
+                .expect("building row filter")
+                .expect("row filter should exist");
+
+        let ids: Vec<i64> = builder
+            .with_row_filter(row_filter)
+            .build()
+            .expect("build reader")
+            .flat_map(|batch| {
+                let batch = batch.expect("record batch");
+                let ids = batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .clone();
+                ids.values().to_vec()
+            })
+            .collect();
+
+        assert_eq!(ids, vec![0]);
+        assert_eq!(file_metrics.pushdown_rows_matched.value(), 1);
+        assert_eq!(file_metrics.pushdown_rows_pruned.value(), 2);
+    }
+
+    /// The table's struct has a field the file lacks, so the adapter casts
+    /// the file's struct to the table's. The scan accepts
+    /// `som['mm']['k'] = 1` as a row filter at planning time, against the
+    /// table schema. Per file, the predicate must still be evaluable after
+    /// that cast: if it is not, the scan drops it and returns rows it rejects.
+    #[test]
+    fn get_field_map_key_under_evolved_struct_filters_rows() {
+        use arrow::array::{Array, Int64Array, Int64Builder, MapBuilder, StringBuilder};
+
+        let mut map_builder =
+            MapBuilder::new(None, StringBuilder::new(), Int64Builder::new());
+        for value in [1, 3] {
+            map_builder.keys().append_value("k");
+            map_builder.values().append_value(value);
+            map_builder.append(true).unwrap();
+        }
+        let map = map_builder.finish();
+        let map_type = map.data_type().clone();
+
+        let file_struct: Fields =
+            vec![Arc::new(Field::new("mm", map_type.clone(), true))].into();
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("som", DataType::Struct(file_struct.clone()), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![2, 3])),
+                Arc::new(StructArray::new(
+                    file_struct,
+                    vec![Arc::new(map) as _],
+                    None,
+                )),
+            ],
+        )
+        .unwrap();
+        let file = NamedTempFile::new().expect("temp file");
+        let mut writer =
+            ArrowWriter::try_new(file.reopen().unwrap(), Arc::clone(&file_schema), None)
+                .expect("writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+
+        let table_struct: Fields = vec![
+            Arc::new(Field::new("mm", map_type, true)),
+            Arc::new(Field::new("n", DataType::Int64, true)),
+        ]
+        .into();
+        let table_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("som", DataType::Struct(table_struct), true),
+        ]));
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file.reopen().unwrap())
+            .expect("reader builder");
+        let metadata = builder.metadata().clone();
+        let file_schema = builder.schema().clone();
+
+        let predicate = get_field()
+            .call(vec![
+                col("som"),
+                Expr::Literal(ScalarValue::Utf8(Some("mm".to_string())), None),
+                Expr::Literal(ScalarValue::Utf8(Some("k".to_string())), None),
+            ])
+            .eq(Expr::Literal(ScalarValue::Int64(Some(1)), None));
+        let expr = logical2physical(&predicate, &table_schema);
+        assert!(can_expr_be_pushed_down_with_schemas(&expr, &table_schema));
+        let expr = DefaultPhysicalExprAdapterFactory {}
+            .create(Arc::clone(&table_schema), Arc::clone(&file_schema))
+            .expect("creating expr adapter")
+            .rewrite(expr)
+            .expect("rewriting expression");
+
+        let metrics = ExecutionPlanMetricsSet::new();
+        let file_metrics =
+            ParquetFileMetrics::new(0, "evolved_struct_map_key.parquet", &metrics);
+        let row_filter =
+            build_row_filter(&expr, &file_schema, &metadata, false, &file_metrics)
+                .expect("building row filter")
+                .expect("the predicate accepted at planning time must filter this file");
+
+        let ids: Vec<i64> = builder
+            .with_row_filter(row_filter)
+            .build()
+            .expect("build reader")
+            .flat_map(|batch| {
+                let batch = batch.expect("record batch");
+                batch
+                    .column_by_name("id")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        assert_eq!(ids, vec![2]);
+    }
+
     /// Sanity check that the given expression could be evaluated against the given schema without any errors.
     /// This will fail if the expression references columns that are not in the schema or if the types of the columns are incompatible, etc.
     fn check_expression_can_evaluate_against_schema(

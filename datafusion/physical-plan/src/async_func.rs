@@ -234,13 +234,32 @@ impl ExecutionPlan for AsyncFuncExec {
         let schema_captured = self.schema();
         let config_options_ref = Arc::clone(context.session_config().options());
 
+        // Do not give an async UDF more rows than its ideal batch size in one
+        // step. Each step then emits its own output batch, so an operator
+        // above (for example a LIMIT) can stop before all input is evaluated.
+        let mut ideal_batch_size: Option<usize> = None;
+        for async_expr in self.async_exprs.iter() {
+            if let Some(size) = async_expr.ideal_batch_size()?
+                && size > 0
+            {
+                ideal_batch_size = Some(ideal_batch_size.map_or(size, |s| s.min(size)));
+            }
+        }
+
+        let batch_size = config_options_ref.execution.batch_size.get();
+        let mut batch_coalescer = LimitedBatchCoalescer::new(
+            Arc::clone(&self.input.schema()),
+            ideal_batch_size.map_or(batch_size, |s| s.min(batch_size)),
+            None,
+        );
+        if ideal_batch_size.is_some() {
+            // Split large input batches too, so no batch exceeds the ideal size
+            batch_coalescer = batch_coalescer.with_biggest_coalesce_batch_size(None);
+        }
+
         let coalesced_input_stream = CoalesceInputStream {
             input_stream,
-            batch_coalescer: LimitedBatchCoalescer::new(
-                Arc::clone(&self.input.schema()),
-                config_options_ref.execution.batch_size.get(),
-                None,
-            ),
+            batch_coalescer,
         };
 
         let stream_with_async_functions = coalesced_input_stream.then(move |batch| {

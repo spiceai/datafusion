@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use super::{
     Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
@@ -39,6 +42,13 @@ use sqlparser::{
     },
     keywords::ALL_KEYWORDS,
 };
+
+/// An identifier [`DefaultDialect`] can write unquoted. Compiled once:
+/// `identifier_quote_style` runs for every identifier the unparser writes, and
+/// compiling the pattern on each call was most of the time it took to unparse
+/// a short query.
+static UNQUOTED_IDENTIFIER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").unwrap());
 
 pub type ScalarFnToSqlHandler =
     Box<dyn Fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>> + Send + Sync>;
@@ -80,6 +90,11 @@ pub trait Dialect: Send + Sync {
     /// E.g. Postgres uses DOUBLE PRECISION instead of DOUBLE
     fn float64_ast_dtype(&self) -> ast::DataType {
         ast::DataType::Double(ast::ExactNumberInfo::None)
+    }
+
+    /// How a floating-point literal is written: `FloatLiteralStyle`
+    fn float_literal_style(&self) -> FloatLiteralStyle {
+        FloatLiteralStyle::Decimal
     }
 
     /// The SQL type to use for Arrow Utf8 unparsing
@@ -381,6 +396,19 @@ pub trait Dialect: Send + Sync {
         None
     }
 
+    /// How the dialect spells `lhs || rhs`, DataFusion's string and binary
+    /// concatenation, which is `NULL` when either operand is `NULL`.
+    ///
+    /// `lhs` and `rhs` are the already-unparsed operands. Returning `None` (the
+    /// default) keeps the `||` operator, for a dialect where it concatenates.
+    fn string_concat_to_sql(
+        &self,
+        _lhs: ast::Expr,
+        _rhs: ast::Expr,
+    ) -> Option<ast::Expr> {
+        None
+    }
+
     /// Allows the dialect to override scalar function unparsing if the dialect has specific rules.
     /// Returns None if the default unparsing should be used, or Some(ast::Expr) if there is
     /// a custom implementation for the function.
@@ -636,6 +664,17 @@ pub enum CharacterLengthStyle {
     CharacterLength,
 }
 
+/// How a [`Dialect`] writes a floating-point literal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FloatLiteralStyle {
+    /// Decimal notation: `3.0`, `0.25`.
+    Decimal,
+    /// Scientific notation: `3E0`, `2.5E-1`. For a dialect that reads decimal
+    /// notation as an exact `DECIMAL` and only a number with an exponent as a
+    /// double.
+    Scientific,
+}
+
 /// How a [`Dialect`] renders a cast that attaches a specific timezone to a
 /// timestamp. DataFusion lowers `expr AT TIME ZONE 'tz'` to
 /// `CAST(expr AS Timestamp(_, Some(tz)))`; this selects how that cast is
@@ -745,14 +784,13 @@ pub struct DefaultDialect {}
 
 impl Dialect for DefaultDialect {
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
-        let identifier_regex = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").unwrap();
         let id_upper = identifier.to_uppercase();
         // Special case ignore "ID", see https://github.com/sqlparser-rs/sqlparser-rs/issues/1382
         // ID is a keyword in ClickHouse, but we don't want to quote it when unparsing SQL here
         // Also quote identifiers with uppercase letters since unquoted identifiers are
         // normalized to lowercase by the SQL parser, which would break case-sensitive schemas
         let needs_quote = (id_upper != "ID" && ALL_KEYWORDS.contains(&id_upper.as_str()))
-            || !identifier_regex.is_match(identifier)
+            || !UNQUOTED_IDENTIFIER.is_match(identifier)
             || identifier.chars().any(|c| c.is_ascii_uppercase());
         if needs_quote { Some('"') } else { None }
     }
@@ -1080,6 +1118,56 @@ impl Dialect for MySqlDialect {
 
     fn requires_derived_table_alias(&self) -> bool {
         true
+    }
+
+    /// MySQL reads a number in decimal notation as an exact `DECIMAL`, and a
+    /// division keeps only `div_precision_increment` (4 by default) more digits
+    /// than its dividend: `1 / 30000.0` is `0.0000`. A number with an exponent
+    /// is a `DOUBLE`, the type of the plan's float literal.
+    fn float_literal_style(&self) -> FloatLiteralStyle {
+        FloatLiteralStyle::Scientific
+    }
+
+    /// MySQL's `/` divides integers exactly, `7 / 2` is `3.5000`, where the
+    /// plan's integer division truncates toward zero. `DIV` truncates toward
+    /// zero as well. Like `/`, it answers `NULL` for a zero divisor where the
+    /// plan raises an error, so a caller that must preserve that error keeps a
+    /// division by a possible zero out of the SQL it sends.
+    fn integer_division_to_sql(
+        &self,
+        lhs: ast::Expr,
+        rhs: ast::Expr,
+    ) -> Option<ast::Expr> {
+        Some(ast::Expr::Nested(Box::new(ast::Expr::BinaryOp {
+            left: Box::new(lhs),
+            op: BinaryOperator::MyIntegerDivide,
+            right: Box::new(rhs),
+        })))
+    }
+
+    /// MySQL and MariaDB read `||` as logical `OR` unless the session's
+    /// `sql_mode` includes `PIPES_AS_CONCAT`, which neither enables by default:
+    /// `SELECT 'a' || 'b'` answers `0`, and a filter over it selects other rows.
+    /// `CONCAT` concatenates under every `sql_mode`, and like `||` it is `NULL`
+    /// when any argument is `NULL`.
+    fn string_concat_to_sql(&self, lhs: ast::Expr, rhs: ast::Expr) -> Option<ast::Expr> {
+        Some(ast::Expr::Function(Function {
+            name: ObjectName::from(vec![Ident::new("CONCAT")]),
+            args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+                duplicate_treatment: None,
+                args: vec![
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(lhs)),
+                    ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(rhs)),
+                ],
+                clauses: vec![],
+            }),
+            filter: None,
+            null_treatment: None,
+            over: None,
+            within_group: vec![],
+            parameters: ast::FunctionArguments::None,
+            uses_odbc_syntax: false,
+        }))
     }
 
     fn scalar_function_to_sql_overrides(
@@ -1772,6 +1860,7 @@ pub struct CustomDialect {
     use_timestamp_for_date64: bool,
     interval_style: IntervalStyle,
     float64_ast_dtype: ast::DataType,
+    float_literal_style: FloatLiteralStyle,
     utf8_cast_dtype: ast::DataType,
     large_utf8_cast_dtype: ast::DataType,
     date_field_extract_style: DateFieldExtractStyle,
@@ -1802,6 +1891,7 @@ impl Default for CustomDialect {
             use_timestamp_for_date64: false,
             interval_style: IntervalStyle::SQLStandard,
             float64_ast_dtype: ast::DataType::Double(ast::ExactNumberInfo::None),
+            float_literal_style: FloatLiteralStyle::Decimal,
             utf8_cast_dtype: ast::DataType::Varchar(None),
             large_utf8_cast_dtype: ast::DataType::Text,
             date_field_extract_style: DateFieldExtractStyle::DatePart,
@@ -1848,6 +1938,10 @@ impl Dialect for CustomDialect {
 
     fn float64_ast_dtype(&self) -> ast::DataType {
         self.float64_ast_dtype.clone()
+    }
+
+    fn float_literal_style(&self) -> FloatLiteralStyle {
+        self.float_literal_style
     }
 
     fn utf8_cast_dtype(&self) -> ast::DataType {
@@ -1987,6 +2081,7 @@ pub struct CustomDialectBuilder {
     use_timestamp_for_date64: bool,
     interval_style: IntervalStyle,
     float64_ast_dtype: ast::DataType,
+    float_literal_style: FloatLiteralStyle,
     utf8_cast_dtype: ast::DataType,
     large_utf8_cast_dtype: ast::DataType,
     date_field_extract_style: DateFieldExtractStyle,
@@ -2023,6 +2118,7 @@ impl CustomDialectBuilder {
             use_timestamp_for_date64: false,
             interval_style: IntervalStyle::PostgresVerbose,
             float64_ast_dtype: ast::DataType::Double(ast::ExactNumberInfo::None),
+            float_literal_style: FloatLiteralStyle::Decimal,
             utf8_cast_dtype: ast::DataType::Varchar(None),
             large_utf8_cast_dtype: ast::DataType::Text,
             date_field_extract_style: DateFieldExtractStyle::DatePart,
@@ -2056,6 +2152,7 @@ impl CustomDialectBuilder {
             use_timestamp_for_date64: self.use_timestamp_for_date64,
             interval_style: self.interval_style,
             float64_ast_dtype: self.float64_ast_dtype,
+            float_literal_style: self.float_literal_style,
             utf8_cast_dtype: self.utf8_cast_dtype,
             large_utf8_cast_dtype: self.large_utf8_cast_dtype,
             date_field_extract_style: self.date_field_extract_style,
@@ -2129,6 +2226,12 @@ impl CustomDialectBuilder {
     /// Customize the dialect with a specific SQL type for Float64 casting: DOUBLE, DOUBLE PRECISION, etc.
     pub fn with_float64_ast_dtype(mut self, float64_ast_dtype: ast::DataType) -> Self {
         self.float64_ast_dtype = float64_ast_dtype;
+        self
+    }
+
+    /// Customize the dialect with how it writes a floating-point literal
+    pub fn with_float_literal_style(mut self, style: FloatLiteralStyle) -> Self {
+        self.float_literal_style = style;
         self
     }
 
