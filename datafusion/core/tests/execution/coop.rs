@@ -43,7 +43,9 @@ use datafusion_physical_optimizer::PhysicalOptimizerRule;
 use datafusion_physical_optimizer::ensure_coop::EnsureCooperative;
 use datafusion_physical_plan::coop::make_cooperative;
 use datafusion_physical_plan::filter::FilterExec;
-use datafusion_physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use datafusion_physical_plan::joins::{
+    CrossJoinExec, HashJoinExec, NestedLoopJoinExec, PartitionMode, SortMergeJoinExec,
+};
 use datafusion_physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec};
 use datafusion_physical_plan::projection::{ProjectionExec, ProjectionExpr};
 use datafusion_physical_plan::repartition::RepartitionExec;
@@ -762,6 +764,63 @@ async fn hash_join_without_repartition_and_no_agg(
     )?);
 
     query_yields(join, session_ctx.task_ctx()).await
+}
+
+/// An aggregate over a join whose every probe batch is joined with a large build
+/// side: each probe batch produces thousands of output batches, so the join's
+/// output has to spend the cooperative budget for the aggregate to yield.
+fn max_over_amplifying_join(
+    join: impl FnOnce(
+        Arc<dyn ExecutionPlan>,
+        Arc<dyn ExecutionPlan>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>>,
+) -> Result<Arc<dyn ExecutionPlan>, Box<dyn Error>> {
+    let build = Arc::new(make_lazy_exec_with_range("build", 0..100_000, false));
+    let probe = Arc::new(make_lazy_exec_with_range("probe", 0..i64::MAX, false));
+    let join = join(build, probe)?;
+    let schema = join.schema();
+    Ok(Arc::new(AggregateExec::try_new(
+        AggregateMode::Single,
+        PhysicalGroupBy::new(vec![], vec![], vec![], false),
+        vec![Arc::new(
+            AggregateExprBuilder::new(
+                min_max::max_udaf(),
+                vec![col("probe", &schema)?],
+            )
+            .schema(Arc::clone(&schema))
+            .alias("max")
+            .build()?,
+        )],
+        vec![None],
+        join,
+        schema,
+    )?))
+}
+
+#[tokio::test]
+async fn nested_loop_join_agg_yields() -> Result<(), Box<dyn Error>> {
+    let session_ctx = SessionContext::new();
+    let aggr = max_over_amplifying_join(|build, probe| {
+        Ok(Arc::new(NestedLoopJoinExec::try_new(
+            build,
+            probe,
+            None,
+            &JoinType::Inner,
+            None,
+        )?))
+    })?;
+
+    query_yields(aggr, session_ctx.task_ctx()).await
+}
+
+#[tokio::test]
+async fn cross_join_agg_yields() -> Result<(), Box<dyn Error>> {
+    let session_ctx = SessionContext::new();
+    let aggr = max_over_amplifying_join(|build, probe| {
+        Ok(Arc::new(CrossJoinExec::new(build, probe)))
+    })?;
+
+    query_yields(aggr, session_ctx.task_ctx()).await
 }
 
 #[derive(Debug)]
