@@ -21,6 +21,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use crate::expr::NullTreatment;
+use crate::lateral_table_function::LateralTableFunctionCall;
 #[cfg(feature = "sql")]
 use crate::logical_plan::LogicalPlan;
 use crate::{
@@ -59,6 +60,24 @@ pub trait ContextProvider {
         _args: Vec<Expr>,
     ) -> Result<Arc<dyn TableSource>> {
         not_impl_err!("Table Functions are not supported")
+    }
+
+    /// Creates the scalar UDF that evaluates a LATERAL table-function call
+    /// whose arguments reference columns of an earlier FROM item.
+    ///
+    /// The UDF takes one argument per [`LateralTableFunctionCall::outer_columns`]
+    /// entry and returns [`LateralTableFunctionCall::return_type`]: for each
+    /// input row, all rows the table function returns for that row's values.
+    /// An empty list means the call returned no rows. The SQL planner unnests
+    /// the result.
+    fn create_lateral_table_function_udf(
+        &self,
+        call: LateralTableFunctionCall,
+    ) -> Result<Arc<ScalarUDF>> {
+        not_impl_err!(
+            "LATERAL table function '{}' with column arguments is not supported",
+            call.name
+        )
     }
 
     /// Provides an intermediate table that is used to expose a recursive CTE

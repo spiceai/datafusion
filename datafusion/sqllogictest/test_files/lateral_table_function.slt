@@ -1,0 +1,204 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+# LATERAL table-function calls whose arguments reference columns of an
+# earlier FROM item. The SQL planner lowers them to a projection that calls
+# the table function once per distinct argument tuple, then UNNEST.
+
+# n = 0 gives an empty series, and a NULL argument gives an empty series.
+# Rows 1 and 4 have the same argument value.
+statement ok
+CREATE TABLE t(id BIGINT, n BIGINT) AS VALUES (1, 2), (2, 0), (3, NULL), (4, 2), (5, 1);
+
+# CROSS JOIN LATERAL
+query II rowsort
+SELECT t.id, s.value FROM t CROSS JOIN LATERAL generate_series(1, t.n) AS s;
+----
+1 1
+1 2
+4 1
+4 2
+5 1
+
+# Without an alias, the output is qualified by the function name
+query II rowsort
+SELECT t.id, generate_series.value FROM t CROSS JOIN LATERAL generate_series(1, t.n);
+----
+1 1
+1 2
+4 1
+4 2
+5 1
+
+# Comma join
+query II rowsort
+SELECT t.id, s.value FROM t, LATERAL generate_series(1, t.n) AS s;
+----
+1 1
+1 2
+4 1
+4 2
+5 1
+
+# CROSS APPLY
+query II rowsort
+SELECT t.id, s.value FROM t CROSS APPLY generate_series(1, t.n) AS s;
+----
+1 1
+1 2
+4 1
+4 2
+5 1
+
+# INNER JOIN with an ON condition on the function output
+query II rowsort
+SELECT t.id, s.value FROM t JOIN LATERAL generate_series(1, t.n) AS s ON s.value > 1;
+----
+1 2
+4 2
+
+# INNER JOIN with an ON condition on both sides
+query II rowsort
+SELECT t.id, s.value FROM t INNER JOIN LATERAL generate_series(1, t.n) AS s ON s.value < t.id;
+----
+4 1
+4 2
+5 1
+
+# LEFT JOIN ON true keeps rows whose call returned no rows (n = 0 and n = NULL)
+query II rowsort
+SELECT t.id, s.value FROM t LEFT JOIN LATERAL generate_series(1, t.n) AS s ON true;
+----
+1 1
+1 2
+2 NULL
+3 NULL
+4 1
+4 2
+5 1
+
+# OUTER APPLY is the same as LEFT JOIN LATERAL ... ON true
+query II rowsort
+SELECT t.id, s.value FROM t OUTER APPLY generate_series(1, t.n) AS s;
+----
+1 1
+1 2
+2 NULL
+3 NULL
+4 1
+4 2
+5 1
+
+# r.* and SELECT *
+query II rowsort
+SELECT t.id, s.* FROM t CROSS JOIN LATERAL generate_series(1, t.n) AS s WHERE t.id = 1;
+----
+1 1
+1 2
+
+query III rowsort
+SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.n) AS s WHERE t.id = 5;
+----
+5 1 1
+
+# Column alias
+query II rowsort
+SELECT t.id, s.v FROM t CROSS JOIN LATERAL generate_series(1, t.n) AS s(v) WHERE t.id = 5;
+----
+5 1
+
+query error DataFusion error: Error during planning: Source table contains 1 columns but only 2 names given as column alias
+SELECT * FROM t CROSS JOIN LATERAL generate_series(1, t.n) AS s(a, b);
+
+# Several outer columns, inside an expression argument
+query II rowsort
+SELECT u.id, s.value
+FROM (SELECT * FROM t WHERE id IN (1, 5)) AS u
+CROSS JOIN LATERAL generate_series(u.id, u.id + u.n) AS s;
+----
+1 1
+1 2
+1 3
+5 5
+5 6
+
+# Named arguments with a column value
+query II rowsort
+SELECT t.id, s.value FROM t CROSS JOIN LATERAL generate_series(start => 1, stop => t.n) AS s;
+----
+1 1
+1 2
+4 1
+4 2
+5 1
+
+# A LATERAL call can reference the output of an earlier LATERAL call
+query III rowsort
+SELECT t.id, a.value, b.value
+FROM t
+CROSS JOIN LATERAL generate_series(1, t.n) AS a
+CROSS JOIN LATERAL generate_series(1, a.value) AS b;
+----
+1 1 1
+1 2 1
+1 2 2
+4 1 1
+4 2 1
+4 2 2
+5 1 1
+
+# A later join after a comma-separated LATERAL call
+query III rowsort
+SELECT t.id, s.value, x.id
+FROM t, LATERAL generate_series(1, t.n) AS s JOIN t AS x ON x.id = s.value + 3;
+----
+1 1 4
+1 2 5
+4 1 4
+4 2 5
+5 1 4
+
+# An uncorrelated LATERAL call is planned as before, as a cross join
+query II rowsort
+SELECT t.id, s.value FROM t CROSS JOIN LATERAL generate_series(1, 2) AS s WHERE t.id = 1;
+----
+1 1
+1 2
+
+# LEFT JOIN LATERAL with a condition other than ON true is not supported
+query error DataFusion error: This feature is not implemented: LEFT JOIN LATERAL table function with column arguments supports only ON true
+SELECT t.id, s.value FROM t LEFT JOIN LATERAL generate_series(1, t.n) AS s ON s.value > 1;
+
+# Plan shape
+statement ok
+set datafusion.explain.logical_plan_only = true;
+
+query TT
+EXPLAIN SELECT t.id, s.value FROM t CROSS JOIN LATERAL generate_series(1, t.n) AS s;
+----
+logical_plan
+01)Projection: t.id, __lateral_rows.value AS s.value
+02)--Unnest: lists[] structs[__lateral_rows]
+03)----Unnest: lists[__lateral_rows|depth=1] structs[]
+04)------Projection: t.id, lateral_generate_series(t.n) AS __lateral_rows
+05)--------TableScan: t projection=[id, n]
+
+statement ok
+set datafusion.explain.logical_plan_only = false;
+
+statement ok
+DROP TABLE t;

@@ -1952,6 +1952,45 @@ impl From<SessionState> for SessionStateBuilder {
     }
 }
 
+/// Creates the provider for a call of `tbl_func` with `args`.
+///
+/// Arguments are type-coerced and simplified first, so a call planned from
+/// SQL (`FROM f(...)`) and a call made once per row for a LATERAL join see the
+/// same arguments.
+#[cfg(feature = "sql")]
+pub(crate) fn table_function_provider(
+    state: &SessionState,
+    tbl_func: &TableFunction,
+    args: Vec<Expr>,
+) -> datafusion_common::Result<Arc<dyn crate::catalog::TableProvider>> {
+    use datafusion_catalog::TableFunctionArgs;
+
+    let simplify_context = SimplifyContext::builder()
+        .with_config_options(Arc::clone(state.config_options()))
+        .with_query_execution_start_time(
+            state.execution_props().query_execution_start_time,
+        )
+        .build();
+    let simplifier = ExprSimplifier::new(simplify_context);
+    let schema = DFSchema::empty();
+    let args = args
+        .into_iter()
+        .map(|arg| {
+            // Type-coerce arguments where possible. Spice table functions
+            // (`vector_search`/`rrf`) take a table name as a bare-identifier
+            // argument, which resolves to an unqualified `Column` whose type
+            // cannot be looked up against the empty schema — DF53 errors here
+            // (DF52 did not). Fall back to simplify-only on coercion failure
+            // so the table function can interpret the column-as-table-name.
+            match simplifier.coerce(arg.clone(), &schema) {
+                Ok(coerced) => simplifier.simplify(coerced),
+                Err(_) => simplifier.simplify(arg),
+            }
+        })
+        .collect::<datafusion_common::Result<Vec<_>>>()?;
+    tbl_func.create_table_provider_with_args(TableFunctionArgs::new(&args, state))
+}
+
 /// Adapter that implements the [`ContextProvider`] trait for a [`SessionState`]
 ///
 /// This is used so the SQL planner can access the state of the session without
@@ -1996,41 +2035,38 @@ impl ContextProvider for SessionContextProvider<'_> {
         name: &str,
         args: Vec<Expr>,
     ) -> datafusion_common::Result<Arc<dyn TableSource>> {
-        use datafusion_catalog::TableFunctionArgs;
-
         let tbl_func = self
             .state
             .table_functions
             .get(name)
             .cloned()
             .ok_or_else(|| plan_datafusion_err!("table function '{name}' not found"))?;
-        let simplify_context = SimplifyContext::builder()
-            .with_config_options(Arc::clone(self.state.config_options()))
-            .with_query_execution_start_time(
-                self.state.execution_props().query_execution_start_time,
-            )
-            .build();
-        let simplifier = ExprSimplifier::new(simplify_context);
-        let schema = DFSchema::empty();
-        let args = args
-            .into_iter()
-            .map(|arg| {
-                // Type-coerce arguments where possible. Spice table functions
-                // (`vector_search`/`rrf`) take a table name as a bare-identifier
-                // argument, which resolves to an unqualified `Column` whose type
-                // cannot be looked up against the empty schema — DF53 errors here
-                // (DF52 did not). Fall back to simplify-only on coercion failure
-                // so the table function can interpret the column-as-table-name.
-                match simplifier.coerce(arg.clone(), &schema) {
-                    Ok(coerced) => simplifier.simplify(coerced),
-                    Err(_) => simplifier.simplify(arg),
-                }
-            })
-            .collect::<datafusion_common::Result<Vec<_>>>()?;
-        let provider = tbl_func
-            .create_table_provider_with_args(TableFunctionArgs::new(&args, self.state))?;
+        let provider = table_function_provider(self.state, &tbl_func, args)?;
 
         Ok(provider_as_source(provider))
+    }
+
+    fn create_lateral_table_function_udf(
+        &self,
+        call: datafusion_expr::lateral_table_function::LateralTableFunctionCall,
+    ) -> datafusion_common::Result<Arc<ScalarUDF>> {
+        use crate::execution::lateral_table_function::LateralTableFunctionUdf;
+
+        let tbl_func = self
+            .state
+            .table_functions
+            .get(&call.name)
+            .cloned()
+            .ok_or_else(|| {
+                plan_datafusion_err!("table function '{}' not found", call.name)
+            })?;
+        // The UDF plans and runs one call per row at execution time, so it
+        // keeps the session that planned the query.
+        Ok(LateralTableFunctionUdf::new_udf(
+            tbl_func,
+            call,
+            Arc::new(self.state.clone()),
+        ))
     }
 
     /// Create a new CTE work table for a recursive CTE logical plan
