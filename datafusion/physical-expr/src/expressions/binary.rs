@@ -19,7 +19,7 @@ mod kernels;
 
 use crate::PhysicalExpr;
 use crate::expressions::SqlSimilarToPattern;
-use crate::expressions::translate_scalar;
+use crate::expressions::translate_literal;
 use crate::intervals::cp_solver::{propagate_arithmetic, propagate_comparison};
 use std::cmp::Ordering;
 use std::hash::Hash;
@@ -629,7 +629,16 @@ impl PhysicalExpr for BinaryExpr {
             }
         }
 
-        let rhs = self.right.evaluate(batch)?;
+        let rhs = match self.right.downcast_ref::<SqlSimilarToPattern>() {
+            // Translate only the `SIMILAR TO` patterns that are matched against
+            // a value that is not NULL.
+            Some(pattern) => match pattern.evaluate_for_values(batch, &lhs)? {
+                Some(rhs) => rhs,
+                // Every value is NULL, so the predicate is NULL in every row.
+                None => return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None))),
+            },
+            None => self.right.evaluate(batch)?,
+        };
         let left_data_type = lhs.data_type();
         let right_data_type = rhs.data_type();
 
@@ -1565,10 +1574,16 @@ pub fn similar_to(
         (true, true) => Operator::RegexNotIMatch,
     };
 
-    let translated_pattern = match pattern.downcast_ref::<crate::expressions::Literal>() {
-        Some(literal) => Arc::new(crate::expressions::Literal::new(translate_scalar(
-            literal.value(),
-        )?)) as Arc<dyn PhysicalExpr>,
+    // A literal pattern is translated once, here. A pattern that is not valid
+    // is translated, and rejected, only where it is matched against a value.
+    let translated_pattern = match pattern
+        .downcast_ref::<crate::expressions::Literal>()
+        .map(|literal| translate_literal(literal.value()))
+        .transpose()?
+        .flatten()
+    {
+        Some(translated) => Arc::new(crate::expressions::Literal::new(translated))
+            as Arc<dyn PhysicalExpr>,
         None => Arc::new(SqlSimilarToPattern::new(pattern)) as Arc<dyn PhysicalExpr>,
     };
 
@@ -5845,30 +5860,117 @@ mod tests {
         }
     }
 
-    /// Asserts that `pattern` is rejected with exactly `expected`: a literal
-    /// pattern when the expression is built, a column pattern when evaluated.
+    /// Asserts that `pattern`, as a literal and as a column, is rejected with
+    /// exactly `expected` when it is matched against a value. Building the
+    /// expression succeeds, so a predicate that is never evaluated cannot fail.
     fn assert_similar_to_error(pattern: &str, expected: &str) {
         let batch = similar_to_batch(vec!["a"], pattern);
         let schema = batch.schema();
         let a = col("a", &schema).expect("column a");
+        for (kind, pattern_expr) in [
+            ("literal", lit(pattern)),
+            ("column", col("p", &schema).expect("column p")),
+        ] {
+            let op = similar_to(false, false, Arc::clone(&a), pattern_expr)
+                .unwrap_or_else(|e| {
+                    panic!("{kind} pattern {pattern:?} failed before evaluation: {e}")
+                });
+            let err = op
+                .evaluate(&batch)
+                .expect_err(&format!("{kind} pattern {pattern:?} should be rejected"));
+            assert_eq!(
+                err.strip_backtrace(),
+                expected,
+                "{kind} pattern {pattern:?}"
+            );
+        }
+    }
 
-        let err = similar_to(false, false, Arc::clone(&a), lit(pattern))
-            .expect_err(&format!("literal pattern {pattern:?} should be rejected"));
-        assert_eq!(
-            err.strip_backtrace(),
-            expected,
-            "literal pattern {pattern:?}"
-        );
+    // Regression: a pattern that is not valid fails only where it is matched.
+    // In a row whose value is NULL the predicate is NULL, as in PostgreSQL:
+    // `SELECT v SIMILAR TO p FROM (VALUES (NULL, '['), ('a', 'a')) t(v, p)`
+    // returns NULL and true.
+    #[test]
+    fn test_similar_to_invalid_pattern_with_null_value() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, true),
+            Field::new("p", DataType::Utf8, true),
+        ]));
+        let batch = |values: Vec<Option<&str>>, patterns: Vec<Option<&str>>| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(StringArray::from(values)),
+                    Arc::new(StringArray::from(patterns)),
+                ],
+            )
+            .expect("batch")
+        };
+        let evaluate = |pattern: Arc<dyn PhysicalExpr>, batch: &RecordBatch| {
+            similar_to(false, false, col("a", &schema).expect("column a"), pattern)
+                .and_then(|op| op.evaluate(batch))
+                .and_then(|value| value.into_array(batch.num_rows()))
+        };
+        let column = || col("p", &schema).expect("column p");
 
-        let op = similar_to(false, false, a, col("p", &schema).expect("column p"))
-            .expect("a column pattern is translated when evaluated");
-        let err = op
+        let result = evaluate(
+            column(),
+            &batch(vec![None, Some("a")], vec![Some("["), Some("a")]),
+        )
+        .expect("the invalid pattern is only in a row whose value is NULL");
+        let expected: BooleanArray = [None, Some(true)].iter().collect();
+        assert_eq!(as_boolean_array(&result).expect("boolean"), &expected);
+
+        let result = evaluate(lit("["), &batch(vec![None, None], vec![None, None]))
+            .expect("every value is NULL");
+        let expected: BooleanArray = [None, None].iter().collect();
+        assert_eq!(as_boolean_array(&result).expect("boolean"), &expected);
+
+        for (pattern, patterns) in [
+            (lit("["), vec![None, None]),
+            (column(), vec![Some("["), Some("[")]),
+        ] {
+            let err = evaluate(pattern, &batch(vec![None, Some("a")], patterns))
+                .expect_err("the pattern is matched against 'a'");
+            assert_eq!(
+                err.strip_backtrace(),
+                "Execution error: Invalid SIMILAR TO pattern '[': brackets [] not balanced"
+            );
+        }
+    }
+
+    // Regression: a pattern that is not valid fails when it is evaluated, not
+    // when the plan is built, so it does not fail a query that never matches
+    // it, such as a CASE branch no row takes (PostgreSQL returns NULL for
+    // `CASE WHEN v = 'zzz' THEN v SIMILAR TO '[' END`).
+    #[test]
+    fn test_similar_to_invalid_pattern_in_unselected_case_branch() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(StringArray::from(vec!["a", "b"]))],
+        )
+        .expect("batch");
+        let a = || col("a", &schema).expect("column a");
+        let case_when = |value: &str| {
+            let when = binary(a(), Operator::Eq, lit(value), &schema).expect("when");
+            let then = similar_to(false, false, a(), lit("[")).expect("then");
+            crate::expressions::case(None, vec![(when, then)], None).expect("case")
+        };
+
+        let result = case_when("zzz")
             .evaluate(&batch)
-            .expect_err(&format!("column pattern {pattern:?} should be rejected"));
+            .and_then(|value| value.into_array(batch.num_rows()))
+            .expect("no row takes the branch");
+        let expected: BooleanArray = [None, None].iter().collect();
+        assert_eq!(as_boolean_array(&result).expect("boolean"), &expected);
+
+        let err = case_when("a")
+            .evaluate(&batch)
+            .expect_err("the row 'a' takes the branch");
         assert_eq!(
             err.strip_backtrace(),
-            expected,
-            "column pattern {pattern:?}"
+            "Execution error: Invalid SIMILAR TO pattern '[': brackets [] not balanced"
         );
     }
 

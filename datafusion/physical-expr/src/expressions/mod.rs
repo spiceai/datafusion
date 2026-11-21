@@ -59,7 +59,7 @@ pub use literal::{Literal, lit};
 pub use negative::{NegativeExpr, negative};
 pub use no_op::NoOp;
 pub use not::{NotExpr, not};
-pub(crate) use similar_to_pattern::translate_scalar;
+pub(crate) use similar_to_pattern::translate_literal;
 pub use similar_to_pattern::{SqlSimilarToPattern, sql_similar_to_regex};
 pub use try_cast::{TryCastExpr, try_cast, try_cast_with_target_field};
 pub use unknown_column::UnKnownColumn;
