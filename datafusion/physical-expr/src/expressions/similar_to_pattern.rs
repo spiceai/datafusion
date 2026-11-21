@@ -21,7 +21,8 @@ use std::sync::Arc;
 
 use crate::PhysicalExpr;
 
-use arrow::array::{ArrayRef, LargeStringArray, StringArray, StringViewArray};
+use arrow::array::{Array, ArrayRef, LargeStringArray, StringArray, StringViewArray};
+use arrow::buffer::NullBuffer;
 use arrow::datatypes::{DataType, FieldRef};
 use arrow::record_batch::RecordBatch;
 use datafusion_common::{Result, ScalarValue, exec_err};
@@ -355,6 +356,39 @@ impl SqlSimilarToPattern {
     pub fn expr(&self) -> &Arc<dyn PhysicalExpr> {
         &self.expr
     }
+
+    /// Evaluates the pattern to match against `values`, translating only the
+    /// patterns that are matched: those in rows whose value is not NULL.
+    ///
+    /// In a row whose value is NULL the predicate is NULL whatever the pattern,
+    /// so, as in PostgreSQL, a pattern that is not valid fails the query only
+    /// where it is matched. Returns `None` when every value is NULL (or there
+    /// are no rows), so no pattern is matched at all.
+    pub(crate) fn evaluate_for_values(
+        &self,
+        batch: &RecordBatch,
+        values: &ColumnarValue,
+    ) -> Result<Option<ColumnarValue>> {
+        let matched_rows = match values {
+            ColumnarValue::Scalar(value) if value.is_null() => return Ok(None),
+            ColumnarValue::Scalar(_) => None,
+            ColumnarValue::Array(values) => {
+                if values.logical_null_count() == values.len() {
+                    return Ok(None);
+                }
+                values.logical_nulls()
+            }
+        };
+        let translated = match self.expr.evaluate(batch)? {
+            ColumnarValue::Array(patterns) => {
+                translate_array(&patterns, matched_rows.as_ref())?
+            }
+            ColumnarValue::Scalar(pattern) => {
+                ColumnarValue::Scalar(translate_scalar(&pattern)?)
+            }
+        };
+        Ok(Some(translated))
+    }
 }
 
 impl fmt::Display for SqlSimilarToPattern {
@@ -374,7 +408,7 @@ impl PhysicalExpr for SqlSimilarToPattern {
 
     fn evaluate(&self, batch: &RecordBatch) -> Result<ColumnarValue> {
         match self.expr.evaluate(batch)? {
-            ColumnarValue::Array(array) => translate_array(&array),
+            ColumnarValue::Array(array) => translate_array(&array, None),
             ColumnarValue::Scalar(scalar) => {
                 Ok(ColumnarValue::Scalar(translate_scalar(&scalar)?))
             }
@@ -485,34 +519,78 @@ pub(crate) fn translate_scalar(scalar: &ScalarValue) -> Result<ScalarValue> {
     }
 }
 
-fn translate_array(array: &ArrayRef) -> Result<ColumnarValue> {
-    match array.data_type() {
+/// Translates a literal pattern when the plan is built.
+///
+/// Returns `None` for a string pattern that is not valid: it is translated,
+/// and rejected, only when it is matched against a value, so it cannot fail
+/// a query that never evaluates it. A pattern that is not a string is
+/// rejected here.
+pub(crate) fn translate_literal(scalar: &ScalarValue) -> Result<Option<ScalarValue>> {
+    match translate_scalar(scalar) {
+        Ok(translated) => Ok(Some(translated)),
+        Err(_) if is_string_scalar(scalar) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn is_string_scalar(scalar: &ScalarValue) -> bool {
+    match scalar {
+        ScalarValue::Utf8(_) | ScalarValue::LargeUtf8(_) | ScalarValue::Utf8View(_) => {
+            true
+        }
+        ScalarValue::Dictionary(_, value) | ScalarValue::RunEndEncoded(_, _, value) => {
+            is_string_scalar(value)
+        }
+        _ => false,
+    }
+}
+
+/// Translates the patterns in `array` in the rows `matched_rows` marks valid,
+/// or in every row when it is `None`. The other rows become NULL without
+/// being translated.
+fn translate_array(
+    array: &ArrayRef,
+    matched_rows: Option<&NullBuffer>,
+) -> Result<ColumnarValue> {
+    let translated: ArrayRef = match array.data_type() {
         DataType::Utf8 => {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-            let translated: StringArray = arr
-                .iter()
-                .map(|opt| opt.map(sql_similar_to_regex).transpose())
-                .collect::<Result<_>>()?;
-            Ok(ColumnarValue::Array(Arc::new(translated)))
+            Arc::new(translate_strings::<StringArray>(arr.iter(), matched_rows)?)
         }
         DataType::LargeUtf8 => {
             let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
-            let translated: LargeStringArray = arr
-                .iter()
-                .map(|opt| opt.map(sql_similar_to_regex).transpose())
-                .collect::<Result<_>>()?;
-            Ok(ColumnarValue::Array(Arc::new(translated)))
+            Arc::new(translate_strings::<LargeStringArray>(
+                arr.iter(),
+                matched_rows,
+            )?)
         }
         DataType::Utf8View => {
             let arr = array.as_any().downcast_ref::<StringViewArray>().unwrap();
-            let translated: StringViewArray = arr
-                .iter()
-                .map(|opt| opt.map(sql_similar_to_regex).transpose())
-                .collect::<Result<_>>()?;
-            Ok(ColumnarValue::Array(Arc::new(translated)))
+            Arc::new(translate_strings::<StringViewArray>(
+                arr.iter(),
+                matched_rows,
+            )?)
         }
-        other => exec_err!("SIMILAR TO pattern must be a string type, got {other:?}"),
-    }
+        other => {
+            return exec_err!("SIMILAR TO pattern must be a string type, got {other:?}");
+        }
+    };
+    Ok(ColumnarValue::Array(translated))
+}
+
+fn translate_strings<'a, T: FromIterator<Option<String>>>(
+    patterns: impl Iterator<Item = Option<&'a str>>,
+    matched_rows: Option<&NullBuffer>,
+) -> Result<T> {
+    patterns
+        .enumerate()
+        .map(|(row, pattern)| match pattern {
+            Some(pattern) if matched_rows.is_none_or(|rows| rows.is_valid(row)) => {
+                sql_similar_to_regex(pattern).map(Some)
+            }
+            _ => Ok(None),
+        })
+        .collect()
 }
 
 #[cfg(test)]

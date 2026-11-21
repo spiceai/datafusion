@@ -394,6 +394,24 @@ SELECT value SIMILAR TO pattern FROM similar_to_invalid;
 statement ok
 DROP TABLE similar_to_invalid;
 
+# A pattern that is not valid fails only where it is matched against a value,
+# as in PostgreSQL: not in a CASE branch no row takes, and not in a row whose
+# value is NULL.
+query B
+SELECT CASE WHEN v = 'zzz' THEN v SIMILAR TO '[' END FROM (VALUES ('a'), ('b')) t(v);
+----
+NULL
+NULL
+
+query error Invalid SIMILAR TO pattern '\[': brackets \[\] not balanced
+SELECT CASE WHEN v = 'a' THEN v SIMILAR TO '[' END FROM (VALUES ('a'), ('b')) t(v);
+
+query B rowsort
+SELECT v SIMILAR TO p FROM (VALUES (CAST(NULL AS VARCHAR), '['), ('a', 'a')) t(v, p);
+----
+NULL
+true
+
 # NOT LIKE
 query T rowsort
 SELECT s FROM test WHERE s NOT LIKE 'p1%';
