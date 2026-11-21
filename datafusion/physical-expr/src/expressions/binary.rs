@@ -5640,10 +5640,31 @@ mod tests {
         apply_similar_to(&schema, vec!["^x$", "x"], r"^x$", false, false, &expected)
             .unwrap();
 
-        // `\` is a literal backslash (we don't support the ESCAPE clause).
+        // `\` is the default escape character: an escaped wildcard or
+        // backslash is a literal character.
+        let expected = [Some(true), Some(false), Some(false)].iter().collect();
+        apply_similar_to(
+            &schema,
+            vec!["a%", "ab", r"a\xyz"],
+            r"a\%",
+            false,
+            false,
+            &expected,
+        )
+        .unwrap();
         let expected = [Some(true), Some(false)].iter().collect();
-        apply_similar_to(&schema, vec![r"a\b", "ab"], r"a\b", false, false, &expected)
+        apply_similar_to(&schema, vec!["a_", "ab"], r"a\_", false, false, &expected)
             .unwrap();
+        let expected = [Some(true), Some(false)].iter().collect();
+        apply_similar_to(
+            &schema,
+            vec![r"a\b", "ab"],
+            r"a\\b",
+            false,
+            false,
+            &expected,
+        )
+        .unwrap();
     }
 
     // SIMILAR TO borrows POSIX metacharacters from regular expressions:
@@ -5785,6 +5806,335 @@ mod tests {
             .unwrap();
         let expected: BooleanArray = [None].iter().collect();
         assert_eq!(result.as_ref(), &expected);
+    }
+
+    /// A batch with the values `a` and, in every row, `pattern` as column `p`.
+    fn similar_to_batch(values: Vec<&str>, pattern: &str) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Utf8, false),
+            Field::new("p", DataType::Utf8, false),
+        ]));
+        let patterns = StringArray::from(vec![pattern; values.len()]);
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(StringArray::from(values)), Arc::new(patterns)],
+        )
+        .expect("similar_to_batch")
+    }
+
+    /// Asserts `value SIMILAR TO pattern` for each `(value, expected)` case,
+    /// with the pattern both as a literal and as a column (`p`).
+    fn assert_similar_to(pattern: &str, cases: &[(&str, bool)]) {
+        let batch = similar_to_batch(cases.iter().map(|(v, _)| *v).collect(), pattern);
+        let schema = batch.schema();
+        let expected: BooleanArray = cases.iter().map(|(_, e)| Some(*e)).collect();
+        let a = col("a", &schema).expect("column a");
+        for (kind, pattern_expr) in [
+            ("literal", lit(pattern)),
+            ("column", col("p", &schema).expect("column p")),
+        ] {
+            let result = similar_to(false, false, Arc::clone(&a), pattern_expr)
+                .and_then(|op| op.evaluate(&batch))
+                .and_then(|value| value.into_array(batch.num_rows()))
+                .unwrap_or_else(|e| panic!("{kind} pattern {pattern:?} failed: {e}"));
+            assert_eq!(
+                as_boolean_array(&result).expect("boolean result"),
+                &expected,
+                "{kind} pattern {pattern:?}"
+            );
+        }
+    }
+
+    /// Asserts that `pattern` is rejected with exactly `expected`: a literal
+    /// pattern when the expression is built, a column pattern when evaluated.
+    fn assert_similar_to_error(pattern: &str, expected: &str) {
+        let batch = similar_to_batch(vec!["a"], pattern);
+        let schema = batch.schema();
+        let a = col("a", &schema).expect("column a");
+
+        let err = similar_to(false, false, Arc::clone(&a), lit(pattern))
+            .expect_err(&format!("literal pattern {pattern:?} should be rejected"));
+        assert_eq!(
+            err.strip_backtrace(),
+            expected,
+            "literal pattern {pattern:?}"
+        );
+
+        let op = similar_to(false, false, a, col("p", &schema).expect("column p"))
+            .expect("a column pattern is translated when evaluated");
+        let err = op
+            .evaluate(&batch)
+            .expect_err(&format!("column pattern {pattern:?} should be rejected"));
+        assert_eq!(
+            err.strip_backtrace(),
+            expected,
+            "column pattern {pattern:?}"
+        );
+    }
+
+    // Regression: a pattern with unbalanced parentheses is rejected instead of
+    // wrapped, because wrapping `a)|b(` gives `^(?:a)|b()$`, whose first
+    // alternative is no longer anchored at the end and matches a prefix.
+    #[test]
+    fn test_similar_to_unbalanced_parentheses() {
+        assert_similar_to_error(
+            "a)|b(",
+            "Execution error: Invalid SIMILAR TO pattern 'a)|b(': parentheses () not balanced",
+        );
+        assert_similar_to_error(
+            "a)",
+            "Execution error: Invalid SIMILAR TO pattern 'a)': parentheses () not balanced",
+        );
+        assert_similar_to_error(
+            "(a",
+            "Execution error: Invalid SIMILAR TO pattern '(a': parentheses () not balanced",
+        );
+        assert_similar_to_error(
+            "((a)",
+            "Execution error: Invalid SIMILAR TO pattern '((a)': parentheses () not balanced",
+        );
+        // Balanced groups, including nested and empty ones, still match.
+        assert_similar_to("(a)(b)", &[("ab", true), ("a", false)]);
+        assert_similar_to("((a)b)", &[("ab", true), ("b", false)]);
+        assert_similar_to("()", &[("", true), ("a", false)]);
+        assert_similar_to("(a|b)c", &[("ac", true), ("bc", true), ("abc", false)]);
+    }
+
+    // Regression: `(` opens a plain group, so `(?` cannot reach the regex
+    // engine as an inline flag group that changes how the rest matches.
+    #[test]
+    fn test_similar_to_group_is_not_a_flag_group() {
+        assert_similar_to_error(
+            "(?i)A",
+            "Execution error: Invalid SIMILAR TO pattern '(?i)A': quantifier operand invalid",
+        );
+    }
+
+    // A quantifier needs something to repeat, and only a `?` (non-greedy) may
+    // follow another quantifier or `%`. A `{` starts a bound only when a digit
+    // follows it; otherwise it is a literal.
+    #[test]
+    fn test_similar_to_quantifiers() {
+        for pattern in ["*a", "(*a)", "b|*a", "a**", "a*?*", "a*??", "%*", "a{1}{2}"] {
+            assert_similar_to_error(
+                pattern,
+                &format!(
+                    "Execution error: Invalid SIMILAR TO pattern '{pattern}': quantifier operand invalid"
+                ),
+            );
+        }
+        for pattern in ["a{2", "a{2,1}", "a{256}", "a{2x}"] {
+            assert_similar_to_error(
+                pattern,
+                &format!(
+                    "Execution error: Invalid SIMILAR TO pattern '{pattern}': invalid repetition count(s)"
+                ),
+            );
+        }
+        assert_similar_to("a*?", &[("a", true), ("", true), ("b", false)]);
+        assert_similar_to("%?", &[("a", true), ("", true)]);
+        assert_similar_to("a{2}?", &[("aa", true), ("a", false)]);
+        assert_similar_to("a{1,2}?", &[("aa", true), ("aaa", false)]);
+        assert_similar_to("a{1,}", &[("aa", true), ("", false)]);
+        assert_similar_to("a{255}", &[("a", false)]);
+        assert_similar_to("a{0}", &[("", true), ("a", false)]);
+        assert_similar_to("a{01,03}", &[("aaa", true), ("aaaa", false)]);
+        assert_similar_to("_*", &[("ab", true), ("", true)]);
+        assert_similar_to("()*", &[("", true), ("a", false)]);
+        assert_similar_to(r"\%*", &[("%%", true), ("a", false)]);
+        assert_similar_to(r"a\++", &[("a+", true), ("a++", true), ("a", false)]);
+        assert_similar_to("{", &[("{", true)]);
+        assert_similar_to("a{,3}", &[("a{,3}", true), ("aaa", false)]);
+        assert_similar_to("a{ 1}", &[("a{ 1}", true), ("a", false)]);
+        assert_similar_to("a{}", &[("a{}", true)]);
+        assert_similar_to("a}", &[("a}", true)]);
+    }
+
+    // Regression: the `]` that closes a named class such as `[:digit:]` does
+    // not close the bracket expression around it, so a following `_` or `%`
+    // is still a literal character of that bracket expression.
+    #[test]
+    fn test_similar_to_bracket_named_classes() {
+        assert_similar_to(
+            "[[:digit:]_]",
+            &[("_", true), ("5", true), ("s", false), ("x", false)],
+        );
+        assert_similar_to("[[:alpha:]_]", &[("_", true), ("a", true), ("5", false)]);
+        assert_similar_to("[[:alpha:]%]", &[("%", true), ("a", true), ("ab", false)]);
+        assert_similar_to("[[:alpha:]]%", &[("a%", true), ("ab", true), ("5", false)]);
+        assert_similar_to("[[:word:]]", &[("a", true), ("_", true), ("-", false)]);
+        assert_similar_to_error(
+            "[[:foo:]]",
+            "Execution error: Invalid SIMILAR TO pattern '[[:foo:]]': invalid character class '[:foo:]'",
+        );
+        assert_similar_to_error(
+            "[[:ALPHA:]]",
+            "Execution error: Invalid SIMILAR TO pattern '[[:ALPHA:]]': invalid character class '[:ALPHA:]'",
+        );
+        assert_similar_to_error(
+            "[[:alpha:]",
+            "Execution error: Invalid SIMILAR TO pattern '[[:alpha:]': brackets [] not balanced",
+        );
+        assert_similar_to_error(
+            "[[=a=]]",
+            "Execution error: Invalid SIMILAR TO pattern '[[=a=]]': equivalence classes ('[=') and collating elements ('[.') are not supported",
+        );
+        assert_similar_to_error(
+            "[[.a.]]",
+            "Execution error: Invalid SIMILAR TO pattern '[[.a.]]': equivalence classes ('[=') and collating elements ('[.') are not supported",
+        );
+    }
+
+    // Every character of a bracket expression other than a leading `^`, a
+    // range `-` and a named class is literal, including the characters that
+    // are set operators (`&&`, `~~`, `--`) or nested classes (`[`) in the
+    // regex engine.
+    #[test]
+    fn test_similar_to_bracket_literals() {
+        assert_similar_to("[]a]", &[("]", true), ("a", true), ("b", false)]);
+        assert_similar_to("[^]a]", &[("]", false), ("a", false), ("b", true)]);
+        assert_similar_to("[-a]", &[("-", true), ("a", true), ("b", false)]);
+        assert_similar_to("[a-]", &[("-", true), ("a", true), ("b", false)]);
+        assert_similar_to("[a-c-]", &[("-", true), ("b", true), ("d", false)]);
+        assert_similar_to("[^-a]", &[("-", false), ("a", false), ("b", true)]);
+        assert_similar_to("[%-_]", &[("_", true), ("A", true), ("a", false)]);
+        assert_similar_to("[a^]", &[("^", true), ("a", true), ("b", false)]);
+        assert_similar_to("[a&&b]", &[("&", true), ("a", true), ("c", false)]);
+        assert_similar_to("[a~~b]", &[("~", true), ("b", true), ("c", false)]);
+        assert_similar_to(
+            "[(|)]",
+            &[("(", true), ("|", true), (")", true), ("a", false)],
+        );
+        assert_similar_to("[é-ü]", &[("ö", true), ("e", false)]);
+        assert_similar_to_error(
+            "[abc",
+            "Execution error: Invalid SIMILAR TO pattern '[abc': brackets [] not balanced",
+        );
+        assert_similar_to_error(
+            "[]",
+            "Execution error: Invalid SIMILAR TO pattern '[]': brackets [] not balanced",
+        );
+        for pattern in [
+            "[c-a]",
+            "[a-c-e]",
+            "[[:digit:]-z]",
+            "[a-[:digit:]]",
+            "[a--]",
+        ] {
+            assert_similar_to_error(
+                pattern,
+                &format!(
+                    "Execution error: Invalid SIMILAR TO pattern '{pattern}': invalid character range"
+                ),
+            );
+        }
+        for pattern in ["[[]", "[a[b]%"] {
+            assert_similar_to_error(
+                pattern,
+                &format!(
+                    r"Execution error: Invalid SIMILAR TO pattern '{pattern}': '[' inside a bracket expression must be escaped as '\['"
+                ),
+            );
+        }
+    }
+
+    // Regression: `\` is the default escape character. An escaped wildcard,
+    // metacharacter or backslash matches only itself, in and out of a bracket
+    // expression.
+    #[test]
+    fn test_similar_to_default_escape() {
+        assert_similar_to(r"a\%", &[("a%", true), ("ab", false), (r"a\xyz", false)]);
+        assert_similar_to(r"a\_", &[("a_", true), ("ab", false)]);
+        assert_similar_to(r"a\\b", &[(r"a\b", true), ("ab", false)]);
+        assert_similar_to(r"\%", &[("%", true), ("", false), ("a", false)]);
+        assert_similar_to(r"a\|b", &[("a|b", true), ("a", false), ("b", false)]);
+        assert_similar_to(r"a\*", &[("a*", true), ("aa", false)]);
+        assert_similar_to(r"a\+", &[("a+", true), ("aa", false)]);
+        assert_similar_to(r"a\?", &[("a?", true), ("a", false)]);
+        assert_similar_to(r"\(a\)", &[("(a)", true), ("a", false)]);
+        assert_similar_to(r"\[a\]", &[("[a]", true), ("a", false)]);
+        assert_similar_to(r"a\{2\}", &[("a{2}", true), ("aa", false)]);
+        assert_similar_to(r"a\.b", &[("a.b", true), ("axb", false)]);
+        assert_similar_to(r"\:", &[(":", true)]);
+        assert_similar_to(r"[\]]", &[("]", true), (r"\", false)]);
+        assert_similar_to(r"[\\]", &[(r"\", true), ("a", false)]);
+        assert_similar_to(r"[\%]", &[("%", true), ("a", false)]);
+        assert_similar_to(r#"[\"]"#, &[("\"", true), ("a", false)]);
+        assert_similar_to(r"[[:digit:]\_]", &[("_", true), ("5", true), ("a", false)]);
+        assert_similar_to(r"[\--z]", &[("b", true), ("-", true), ("+", false)]);
+        assert_similar_to_error(
+            r"a\",
+            r"Execution error: Invalid SIMILAR TO pattern 'a\': the pattern ends with the escape character '\'",
+        );
+        assert_similar_to_error(
+            r"[a\]",
+            r"Execution error: Invalid SIMILAR TO pattern '[a\]': brackets [] not balanced",
+        );
+        // An escaped letter or digit is a regex escape sequence in PostgreSQL
+        // (`\d` is a digit, `\b` a backspace), so it is rejected rather than
+        // matched as the letter.
+        for (pattern, sequence) in [(r"\d", r"\d"), (r"a\b", r"\b"), (r"[\x]", r"\x")] {
+            assert_similar_to_error(
+                pattern,
+                &format!(
+                    "Execution error: Invalid SIMILAR TO pattern '{pattern}': unsupported escape sequence '{sequence}'; only a character that is not a letter or digit can be escaped"
+                ),
+            );
+        }
+        // `\"` separates the parts of a `SUBSTRING ... SIMILAR` pattern.
+        assert_similar_to_error(
+            r#"a\"b"#,
+            r#"Execution error: Invalid SIMILAR TO pattern 'a\"b': unsupported escape sequence '\"'; only a character that is not a letter or digit can be escaped"#,
+        );
+    }
+
+    // Characters that are regex syntax but not `SIMILAR TO` syntax match
+    // themselves outside a bracket expression, and multi-byte characters are
+    // single characters for `_`.
+    #[test]
+    fn test_similar_to_regex_only_syntax_is_literal() {
+        assert_similar_to("#&-~ ]", &[("#&-~ ]", true), ("#&-~ ", false)]);
+        assert_similar_to("é_", &[("éa", true), ("éü", true), ("é", false)]);
+    }
+
+    // Regression: a dictionary- or run-end-encoded string literal pattern is
+    // translated like the string it wraps, because the regex kernel accepts
+    // either encoding.
+    #[test]
+    fn test_similar_to_encoded_literal_pattern() {
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["abc", "xab", "a"]))],
+        )
+        .expect("batch");
+        let dictionary = ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::from("a%")),
+        );
+        let run_end_encoded = ScalarValue::RunEndEncoded(
+            Arc::new(Field::new("run_ends", DataType::Int32, false)),
+            Arc::new(Field::new("values", DataType::Utf8, true)),
+            Box::new(ScalarValue::from("a%")),
+        );
+        let expected: BooleanArray =
+            [Some(true), Some(false), Some(true)].iter().collect();
+        for pattern in [dictionary, run_end_encoded] {
+            let result = similar_to(
+                false,
+                false,
+                col("a", &schema).expect("column a"),
+                lit(pattern.clone()),
+            )
+            .and_then(|op| op.evaluate(&batch))
+            .and_then(|value| value.into_array(batch.num_rows()))
+            .unwrap_or_else(|e| panic!("pattern {pattern:?} failed: {e}"));
+            assert_eq!(
+                as_boolean_array(&result).expect("boolean result"),
+                &expected,
+                "pattern {pattern:?}"
+            );
+        }
     }
 
     pub fn binary_expr(
