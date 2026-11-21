@@ -335,6 +335,65 @@ true
 statement ok
 DROP TABLE mixed_patterns;
 
+# SIMILAR TO: `\` is the default escape character, so an escaped wildcard,
+# metacharacter or backslash matches only itself.
+query BBBBBB
+SELECT 'a%' SIMILAR TO 'a\%', 'ab' SIMILAR TO 'a\%', 'a_' SIMILAR TO 'a\_',
+  'ab' SIMILAR TO 'a\_', 'a\b' SIMILAR TO 'a\\b', 'a|b' SIMILAR TO 'a\|b';
+----
+true false true false true true
+
+# SIMILAR TO: the `]` that closes a named class such as `[:digit:]` does not
+# close the bracket expression around it, and characters that are set
+# operators in the regex engine (`&&`, `~~`) are literal.
+query BBBBBB
+SELECT '_' SIMILAR TO '[[:digit:]_]', '5' SIMILAR TO '[[:digit:]_]',
+  's' SIMILAR TO '[[:digit:]_]', '&' SIMILAR TO '[a&&b]',
+  '~' SIMILAR TO '[a~~b]', 'c' SIMILAR TO '[a&&b]';
+----
+true true false true true false
+
+# The same patterns from a column.
+statement ok
+CREATE TABLE similar_to_cases(value TEXT, pattern TEXT) AS VALUES
+  ('a%', 'a\%'),
+  ('ab', 'a\%'),
+  ('a_', 'a\_'),
+  ('a\b', 'a\\b'),
+  ('_', '[[:digit:]_]'),
+  ('s', '[[:digit:]_]'),
+  ('&', '[a&&b]'),
+  ('c', '[a&&b]');
+
+query TTB rowsort
+SELECT value, pattern, value SIMILAR TO pattern FROM similar_to_cases;
+----
+& [a&&b] true
+_ [[:digit:]_] true
+a% a\% true
+a\b a\\b true
+a_ a\_ true
+ab a\% false
+c [a&&b] false
+s [[:digit:]_] false
+
+statement ok
+DROP TABLE similar_to_cases;
+
+# SIMILAR TO rejects a pattern with unbalanced parentheses, which would
+# otherwise let `|` take apart the anchors around the pattern.
+statement ok
+CREATE TABLE similar_to_invalid(value TEXT, pattern TEXT) AS VALUES ('ax', 'a)|b(');
+
+query error Invalid SIMILAR TO pattern 'a\)\|b\(': parentheses \(\) not balanced
+SELECT value SIMILAR TO 'a)|b(' FROM similar_to_invalid;
+
+query error Invalid SIMILAR TO pattern 'a\)\|b\(': parentheses \(\) not balanced
+SELECT value SIMILAR TO pattern FROM similar_to_invalid;
+
+statement ok
+DROP TABLE similar_to_invalid;
+
 # NOT LIKE
 query T rowsort
 SELECT s FROM test WHERE s NOT LIKE 'p1%';

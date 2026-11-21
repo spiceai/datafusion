@@ -28,34 +28,299 @@ use datafusion_common::{Result, ScalarValue, exec_err};
 use datafusion_expr::ColumnarValue;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 
-pub fn sql_similar_to_regex(pattern: &str) -> String {
-    let mut result = String::with_capacity(pattern.len() + 10);
-    result.push_str("^(?:");
-    let mut in_bracket = false;
-    for ch in pattern.chars() {
-        match (ch, in_bracket) {
-            ('%', false) => result.push_str("(?s:.*)"),
-            ('_', false) => result.push_str("(?s:.)"),
-            ('[', false) => {
-                result.push('[');
-                in_bracket = true;
+/// The escape character of a `SIMILAR TO` pattern, as in PostgreSQL.
+const ESCAPE: char = '\\';
+
+/// The named classes a bracket expression may contain (`[[:digit:]]`): the
+/// POSIX classes PostgreSQL accepts, which the regex engine also supports.
+const NAMED_CLASSES: [&str; 13] = [
+    "alnum", "alpha", "blank", "cntrl", "digit", "graph", "lower", "print", "punct",
+    "space", "upper", "word", "xdigit",
+];
+
+/// The characters the regex engine gives a meaning anywhere in a regex,
+/// including inside a class.
+const REGEX_META_CHARS: &str = r"\.+*?()|[]{}^$#&-~";
+
+/// The largest count a bound such as `{m,n}` may use, as in PostgreSQL.
+const MAX_REPETITIONS: u32 = 255;
+
+/// What a quantifier (`*`, `+`, `?` or a bound) that comes next applies to.
+#[derive(Clone, Copy)]
+enum Operand {
+    /// Nothing: the start of the pattern, of a group or of an alternative.
+    None,
+    /// A character, `_`, a bracket expression or a group.
+    Atom,
+    /// A quantified atom, or `%`, which only a `?` (non-greedy) may follow.
+    Quantified,
+    /// A quantified atom already followed by a non-greedy `?`.
+    NonGreedy,
+}
+
+/// Translates a SQL `SIMILAR TO` pattern into a regular expression that
+/// matches the same strings.
+///
+/// `%` matches any string and `_` any single character; `|`, `*`, `+`, `?`,
+/// `{m,n}`, `(...)` and `[...]` keep their regular-expression meaning; `\`
+/// escapes the next character; every other character matches itself. The
+/// result is anchored as `^(?:...)$` so it must match the whole string.
+///
+/// Returns an error for a pattern that is not valid, such as one with
+/// unbalanced parentheses or brackets or a quantifier with nothing to repeat.
+/// The pattern is checked before it is wrapped, so its syntax can never take
+/// apart the anchors around it.
+pub fn sql_similar_to_regex(pattern: &str) -> Result<String> {
+    let mut regex = String::with_capacity(pattern.len() + 10);
+    regex.push_str("^(?:");
+    let mut chars = pattern.chars();
+    let mut open_groups = 0usize;
+    let mut operand = Operand::None;
+    while let Some(ch) = chars.next() {
+        operand = match ch {
+            '%' => {
+                regex.push_str("(?s:.*)");
+                Operand::Quantified
             }
-            (']', true) => {
-                result.push(']');
-                in_bracket = false;
+            '_' => {
+                regex.push_str("(?s:.)");
+                Operand::Atom
             }
-            // `. ^ $` are SQL literals but regex metachars when not inside a
-            // bracket expression; `\` is a regex escape character in all
-            // positions, so it always needs escaping.
-            ('.' | '^' | '$', false) | ('\\', _) => {
-                result.push('\\');
-                result.push(ch);
+            // A non-capturing group, so `(?` cannot start an inline flag group.
+            '(' => {
+                open_groups += 1;
+                regex.push_str("(?:");
+                Operand::None
             }
-            (c, _) => result.push(c),
+            ')' => {
+                if open_groups == 0 {
+                    return invalid_pattern(pattern, "parentheses () not balanced");
+                }
+                open_groups -= 1;
+                regex.push(')');
+                Operand::Atom
+            }
+            '|' => {
+                regex.push('|');
+                Operand::None
+            }
+            '*' | '+' | '?' => {
+                regex.push(ch);
+                quantify(pattern, operand, ch == '?')?
+            }
+            // A `{` that is not followed by a digit is a literal.
+            '{' if chars.as_str().starts_with(|c: char| c.is_ascii_digit()) => {
+                push_bound(pattern, &mut chars, &mut regex)?;
+                quantify(pattern, operand, false)?
+            }
+            '[' => {
+                translate_bracket_expression(pattern, &mut chars, &mut regex)?;
+                Operand::Atom
+            }
+            ESCAPE => {
+                match chars.next() {
+                    // `\"` separates the parts of a `SUBSTRING ... SIMILAR` pattern.
+                    Some('"') => return unsupported_escape(pattern, '"'),
+                    next => push_literal(&mut regex, escaped_char(pattern, next)?),
+                }
+                Operand::Atom
+            }
+            _ => {
+                push_literal(&mut regex, ch);
+                Operand::Atom
+            }
+        };
+    }
+    if open_groups != 0 {
+        return invalid_pattern(pattern, "parentheses () not balanced");
+    }
+    regex.push_str(")$");
+    Ok(regex)
+}
+
+/// The operand that follows a quantifier applied to `operand`. A `?` right
+/// after a quantifier makes it non-greedy, which does not change what matches;
+/// any other quantifier needs an unquantified operand.
+fn quantify(pattern: &str, operand: Operand, is_question_mark: bool) -> Result<Operand> {
+    match (operand, is_question_mark) {
+        (Operand::Atom, _) => Ok(Operand::Quantified),
+        (Operand::Quantified, true) => Ok(Operand::NonGreedy),
+        _ => invalid_pattern(pattern, "quantifier operand invalid"),
+    }
+}
+
+/// Translates the bound (`{m}`, `{m,}` or `{m,n}`) whose `{` was just read
+/// from `chars`, which continues with a digit.
+fn push_bound(
+    pattern: &str,
+    chars: &mut std::str::Chars<'_>,
+    regex: &mut String,
+) -> Result<()> {
+    let min = read_count(chars);
+    let max = if chars.as_str().starts_with(',') {
+        chars.next();
+        chars
+            .as_str()
+            .starts_with(|c: char| c.is_ascii_digit())
+            .then(|| read_count(chars))
+    } else {
+        Some(min)
+    };
+    let in_range = match max {
+        Some(max) => min <= max && max <= MAX_REPETITIONS,
+        None => min <= MAX_REPETITIONS,
+    };
+    if chars.next() != Some('}') || !in_range {
+        return invalid_pattern(pattern, "invalid repetition count(s)");
+    }
+    regex.push('{');
+    regex.push_str(&min.to_string());
+    if max != Some(min) {
+        regex.push(',');
+        if let Some(max) = max {
+            regex.push_str(&max.to_string());
         }
     }
-    result.push_str(")$");
-    result
+    regex.push('}');
+    Ok(())
+}
+
+/// Reads the decimal number at the start of `chars`, saturating on overflow.
+fn read_count(chars: &mut std::str::Chars<'_>) -> u32 {
+    let mut count = 0u32;
+    while let Some(digit) = chars.as_str().chars().next().and_then(|c| c.to_digit(10)) {
+        chars.next();
+        count = count.saturating_mul(10).saturating_add(digit);
+    }
+    count
+}
+
+/// Translates the bracket expression whose `[` was just read from `chars`,
+/// consuming it through its closing `]`.
+///
+/// Every character in it matches itself except a leading `^` (negation), a
+/// `-` between two characters (a range) and a named class such as
+/// `[:digit:]`. A `]` right after the opening `[` or `[^` is a literal. Each
+/// literal is escaped, so none can act as regex syntax: a nested class, a set
+/// operation such as `&&`, or the end of the class.
+fn translate_bracket_expression(
+    pattern: &str,
+    chars: &mut std::str::Chars<'_>,
+    regex: &mut String,
+) -> Result<()> {
+    regex.push('[');
+    if chars.as_str().starts_with('^') {
+        chars.next();
+        regex.push('^');
+    }
+    let mut is_first = true;
+    // The previous item, when it is a single character that can start a range.
+    let mut range_start = None;
+    loop {
+        let Some(ch) = chars.next() else {
+            return invalid_pattern(pattern, "brackets [] not balanced");
+        };
+        match ch {
+            ']' if !is_first => break,
+            // A `-` that is neither the first nor the last item makes a range.
+            '-' if !is_first && !chars.as_str().starts_with(']') => {
+                let end = match chars.next() {
+                    None => return invalid_pattern(pattern, "brackets [] not balanced"),
+                    Some('[') => None,
+                    Some(ESCAPE) => Some(escaped_char(pattern, chars.next())?),
+                    Some(end) => Some(end),
+                };
+                match (range_start.take(), end) {
+                    (Some(start), Some(end)) if start <= end => {
+                        regex.push('-');
+                        push_literal(regex, end);
+                    }
+                    _ => return invalid_pattern(pattern, "invalid character range"),
+                }
+            }
+            '[' => {
+                let rest = chars.as_str();
+                if rest.starts_with('=') || rest.starts_with('.') {
+                    return invalid_pattern(
+                        pattern,
+                        "equivalence classes ('[=') and collating elements ('[.') are not supported",
+                    );
+                }
+                if !rest.starts_with(':') {
+                    return invalid_pattern(
+                        pattern,
+                        r"'[' inside a bracket expression must be escaped as '\['",
+                    );
+                }
+                let Some(name_len) = rest[1..].find(":]") else {
+                    return invalid_pattern(pattern, "brackets [] not balanced");
+                };
+                let name = &rest[1..=name_len];
+                if !NAMED_CLASSES.contains(&name) {
+                    return invalid_pattern(
+                        pattern,
+                        format!("invalid character class '[:{name}:]'"),
+                    );
+                }
+                regex.push_str("[:");
+                regex.push_str(name);
+                regex.push_str(":]");
+                // Continue after the `:]` that closes the named class.
+                *chars = rest[name_len + 3..].chars();
+                range_start = None;
+            }
+            ESCAPE => {
+                let escaped = escaped_char(pattern, chars.next())?;
+                push_literal(regex, escaped);
+                range_start = Some(escaped);
+            }
+            _ => {
+                push_literal(regex, ch);
+                range_start = Some(ch);
+            }
+        }
+        is_first = false;
+    }
+    regex.push(']');
+    Ok(())
+}
+
+/// The character after an escape character: any character that is not a
+/// letter or digit, which then matches itself.
+///
+/// PostgreSQL hands an escaped letter or digit to its regex engine as an
+/// escape sequence (`\d` matches a digit, `\b` a backspace) that this regex
+/// engine does not share, so it is rejected rather than matched as the letter.
+fn escaped_char(pattern: &str, next: Option<char>) -> Result<char> {
+    match next {
+        None => invalid_pattern(
+            pattern,
+            format!("the pattern ends with the escape character '{ESCAPE}'"),
+        ),
+        Some(ch) if ch.is_alphanumeric() => unsupported_escape(pattern, ch),
+        Some(ch) => Ok(ch),
+    }
+}
+
+/// Appends `ch` so that it matches exactly itself, in or out of a class.
+fn push_literal(regex: &mut String, ch: char) {
+    if REGEX_META_CHARS.contains(ch) {
+        regex.push('\\');
+    }
+    regex.push(ch);
+}
+
+fn unsupported_escape<T>(pattern: &str, ch: char) -> Result<T> {
+    invalid_pattern(
+        pattern,
+        format!(
+            "unsupported escape sequence '{ESCAPE}{ch}'; only a character that is not a letter or digit can be escaped"
+        ),
+    )
+}
+
+fn invalid_pattern<T>(pattern: &str, reason: impl fmt::Display) -> Result<T> {
+    exec_err!("Invalid SIMILAR TO pattern '{pattern}': {reason}")
 }
 
 #[derive(Debug, Eq)]
@@ -182,13 +447,26 @@ impl SqlSimilarToPattern {
 pub(crate) fn translate_scalar(scalar: &ScalarValue) -> Result<ScalarValue> {
     match scalar {
         ScalarValue::Utf8(Some(s)) => {
-            Ok(ScalarValue::Utf8(Some(sql_similar_to_regex(s))))
+            Ok(ScalarValue::Utf8(Some(sql_similar_to_regex(s)?)))
         }
         ScalarValue::LargeUtf8(Some(s)) => {
-            Ok(ScalarValue::LargeUtf8(Some(sql_similar_to_regex(s))))
+            Ok(ScalarValue::LargeUtf8(Some(sql_similar_to_regex(s)?)))
         }
         ScalarValue::Utf8View(Some(s)) => {
-            Ok(ScalarValue::Utf8View(Some(sql_similar_to_regex(s))))
+            Ok(ScalarValue::Utf8View(Some(sql_similar_to_regex(s)?)))
+        }
+        // The regex kernel reads the string inside either encoding, so the
+        // pattern is translated in place and keeps its encoding.
+        ScalarValue::Dictionary(key_type, value) => Ok(ScalarValue::Dictionary(
+            key_type.clone(),
+            Box::new(translate_scalar(value)?),
+        )),
+        ScalarValue::RunEndEncoded(run_ends, values, value) => {
+            Ok(ScalarValue::RunEndEncoded(
+                Arc::clone(run_ends),
+                Arc::clone(values),
+                Box::new(translate_scalar(value)?),
+            ))
         }
         // A NULL pattern makes the whole predicate NULL, but the string variant
         // still has to survive the translation: the regex kernel dispatches on
@@ -207,24 +485,24 @@ fn translate_array(array: &ArrayRef) -> Result<ColumnarValue> {
             let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
             let translated: StringArray = arr
                 .iter()
-                .map(|opt| opt.map(sql_similar_to_regex))
-                .collect();
+                .map(|opt| opt.map(sql_similar_to_regex).transpose())
+                .collect::<Result<_>>()?;
             Ok(ColumnarValue::Array(Arc::new(translated)))
         }
         DataType::LargeUtf8 => {
             let arr = array.as_any().downcast_ref::<LargeStringArray>().unwrap();
             let translated: LargeStringArray = arr
                 .iter()
-                .map(|opt| opt.map(sql_similar_to_regex))
-                .collect();
+                .map(|opt| opt.map(sql_similar_to_regex).transpose())
+                .collect::<Result<_>>()?;
             Ok(ColumnarValue::Array(Arc::new(translated)))
         }
         DataType::Utf8View => {
             let arr = array.as_any().downcast_ref::<StringViewArray>().unwrap();
             let translated: StringViewArray = arr
                 .iter()
-                .map(|opt| opt.map(sql_similar_to_regex))
-                .collect();
+                .map(|opt| opt.map(sql_similar_to_regex).transpose())
+                .collect::<Result<_>>()?;
             Ok(ColumnarValue::Array(Arc::new(translated)))
         }
         other => exec_err!("SIMILAR TO pattern must be a string type, got {other:?}"),
@@ -276,7 +554,62 @@ mod tests {
             translate_scalar(&ScalarValue::Utf8View(Some("a%".to_string())))?,
             ScalarValue::Utf8View(Some(r"^(?:a(?s:.*))$".to_string()))
         );
-        assert!(translate_scalar(&ScalarValue::Int32(Some(1))).is_err());
+        // A dictionary- or run-end-encoded pattern keeps its encoding.
+        assert_eq!(
+            translate_scalar(&ScalarValue::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(ScalarValue::from("a%")),
+            ))?,
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int8),
+                Box::new(ScalarValue::from(r"^(?:a(?s:.*))$")),
+            )
+        );
+        let run_ends = Arc::new(Field::new("run_ends", DataType::Int16, false));
+        let values = Arc::new(Field::new("values", DataType::LargeUtf8, true));
+        assert_eq!(
+            translate_scalar(&ScalarValue::RunEndEncoded(
+                Arc::clone(&run_ends),
+                Arc::clone(&values),
+                Box::new(ScalarValue::LargeUtf8(Some("a_".to_string()))),
+            ))?,
+            ScalarValue::RunEndEncoded(
+                run_ends,
+                values,
+                Box::new(ScalarValue::LargeUtf8(Some(r"^(?:a(?s:.))$".to_string()))),
+            )
+        );
+        assert_eq!(
+            translate_scalar(&ScalarValue::Int32(Some(1)))
+                .unwrap_err()
+                .strip_backtrace(),
+            "Execution error: SIMILAR TO pattern must be a string type, got Int32(1)"
+        );
+        Ok(())
+    }
+
+    /// The regex each pattern translates to: every SQL literal is escaped,
+    /// groups are non-capturing, and a bracket expression is rebuilt item by
+    /// item, so only the pattern's own operators reach the regex engine.
+    #[test]
+    fn test_sql_similar_to_regex() -> Result<()> {
+        for (pattern, expected) in [
+            ("a%b_", r"^(?:a(?s:.*)b(?s:.))$"),
+            ("(a|b)+", r"^(?:(?:a|b)+)$"),
+            ("a{2,3}", r"^(?:a{2,3})$"),
+            ("a{02,}?b{,3}{", r"^(?:a{2,}?b\{,3\}\{)$"),
+            (r"a\%\_\\\(", r"^(?:a%_\\\()$"),
+            (".^$#&-~ ]", r"^(?:\.\^\$\#\&\-\~ \])$"),
+            ("[[:digit:]_%]", r"^(?:[[:digit:]_%])$"),
+            ("[^]a-c&&~~-]", r"^(?:[^\]a-c\&\&\~\~\-])$"),
+            (r"[\]\--z]", r"^(?:[\]\--z])$"),
+        ] {
+            assert_eq!(
+                sql_similar_to_regex(pattern)?,
+                expected,
+                "pattern {pattern:?}"
+            );
+        }
         Ok(())
     }
 
