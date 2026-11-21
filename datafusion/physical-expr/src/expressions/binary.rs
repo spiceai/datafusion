@@ -6081,11 +6081,13 @@ mod tests {
                 ),
             );
         }
-        // `\"` separates the parts of a `SUBSTRING ... SIMILAR` pattern.
+        // `\"` separates the parts of a `SUBSTRING ... SIMILAR` pattern, so the
+        // error says so; an unescaped `"` is an ordinary character.
         assert_similar_to_error(
             r#"a\"b"#,
-            r#"Execution error: Invalid SIMILAR TO pattern 'a\"b': unsupported escape sequence '\"'; only a character that is not a letter or digit can be escaped"#,
+            r#"Execution error: Invalid SIMILAR TO pattern 'a\"b': '\"' separates the parts of a SUBSTRING ... SIMILAR pattern and is not supported in SIMILAR TO; write '"' without the escape character to match a double quote"#,
         );
+        assert_similar_to(r#"a"b"#, &[(r#"a"b"#, true), ("ab", false)]);
     }
 
     // Characters that are regex syntax but not `SIMILAR TO` syntax match
