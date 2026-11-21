@@ -412,6 +412,35 @@ SELECT v SIMILAR TO p FROM (VALUES (CAST(NULL AS VARCHAR), '['), ('a', 'a')) t(v
 NULL
 true
 
+# A SIMILAR TO with column patterns is not a constant inside an IN list, so
+# the plan has no constant `(SET)`. The list has four items so it stays an IN
+# list instead of becoming ORs.
+statement ok
+CREATE TABLE similar_to_in_list(x BOOLEAN, a TEXT, p TEXT, q TEXT) AS VALUES
+  (true, 'abc', 'a%', 'b%'),
+  (false, 'abc', 'b%', 'c%');
+
+query TT
+EXPLAIN SELECT x IN (a SIMILAR TO p, a SIMILAR TO q, a SIMILAR TO p || 'x',
+  a SIMILAR TO q || 'x') FROM similar_to_in_list;
+----
+logical_plan
+01)Projection: similar_to_in_list.x IN ([similar_to_in_list.a SIMILAR TO similar_to_in_list.p, similar_to_in_list.a SIMILAR TO similar_to_in_list.q, similar_to_in_list.a SIMILAR TO similar_to_in_list.p || Utf8View("x"), similar_to_in_list.a SIMILAR TO similar_to_in_list.q || Utf8View("x")]) AS similar_to_in_list.x IN similar_to_in_list.a SIMILAR TO similar_to_in_list.p, similar_to_in_list.a SIMILAR TO similar_to_in_list.q, similar_to_in_list.a SIMILAR TO similar_to_in_list.p || Utf8("x"), similar_to_in_list.a SIMILAR TO similar_to_in_list.q || Utf8("x")
+02)--TableScan: similar_to_in_list projection=[x, a, p, q]
+physical_plan
+01)ProjectionExec: expr=[x@0 IN ([a@1 ~ sql_similar_to_regex(p@2), a@1 ~ sql_similar_to_regex(q@3), a@1 ~ sql_similar_to_regex(p@2 || x), a@1 ~ sql_similar_to_regex(q@3 || x)]) as similar_to_in_list.x IN similar_to_in_list.a SIMILAR TO similar_to_in_list.p, similar_to_in_list.a SIMILAR TO similar_to_in_list.q, similar_to_in_list.a SIMILAR TO similar_to_in_list.p || Utf8("x"), similar_to_in_list.a SIMILAR TO similar_to_in_list.q || Utf8("x")]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+query B
+SELECT x IN (a SIMILAR TO p, a SIMILAR TO q, a SIMILAR TO p || 'x',
+  a SIMILAR TO q || 'x') FROM similar_to_in_list;
+----
+true
+true
+
+statement ok
+DROP TABLE similar_to_in_list;
+
 # NOT LIKE
 query T rowsort
 SELECT s FROM test WHERE s NOT LIKE 'p1%';

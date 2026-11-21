@@ -629,15 +629,40 @@ impl PhysicalExpr for BinaryExpr {
             }
         }
 
+        let is_regex_match = matches!(
+            self.op,
+            Operator::RegexMatch
+                | Operator::RegexIMatch
+                | Operator::RegexNotMatch
+                | Operator::RegexNotIMatch
+        );
         let rhs = match self.right.downcast_ref::<SqlSimilarToPattern>() {
             // Translate only the `SIMILAR TO` patterns that are matched against
             // a value that is not NULL.
-            Some(pattern) => match pattern.evaluate_for_values(batch, &lhs)? {
-                Some(rhs) => rhs,
-                // Every value is NULL, so the predicate is NULL in every row.
-                None => return Ok(ColumnarValue::Scalar(ScalarValue::Boolean(None))),
-            },
-            None => self.right.evaluate(batch)?,
+            Some(pattern) if is_regex_match => {
+                // A batch without rows matches no pattern. Its result is an
+                // empty array rather than a scalar, so the predicate is never
+                // taken for a constant: `InListExpr` evaluates its list on an
+                // empty batch to find constants.
+                if batch.num_rows() == 0 {
+                    return Ok(ColumnarValue::Array(new_empty_array(&DataType::Boolean)));
+                }
+                match pattern.evaluate_for_values(batch, &lhs)? {
+                    Some(rhs) => rhs,
+                    // Every value is NULL, so the predicate is NULL in every row.
+                    None => {
+                        return Ok(match lhs {
+                            ColumnarValue::Array(values) => ColumnarValue::Array(
+                                new_null_array(&DataType::Boolean, values.len()),
+                            ),
+                            ColumnarValue::Scalar(_) => {
+                                ColumnarValue::Scalar(ScalarValue::Boolean(None))
+                            }
+                        });
+                    }
+                }
+            }
+            _ => self.right.evaluate(batch)?,
         };
         let left_data_type = lhs.data_type();
         let right_data_type = rhs.data_type();
@@ -5971,6 +5996,91 @@ mod tests {
         assert_eq!(
             err.strip_backtrace(),
             "Execution error: Invalid SIMILAR TO pattern '[': brackets [] not balanced"
+        );
+    }
+
+    // Regression: on a batch with no rows a column `SIMILAR TO` must return an
+    // empty array, not a scalar, because `InListExpr` treats an expression
+    // that evaluates to a scalar on an empty batch as a constant. A scalar
+    // NULL there turned `x IN (a SIMILAR TO p)` into `x IN (NULL)`.
+    #[test]
+    fn test_similar_to_in_list_is_not_constant() {
+        let schema = Schema::new(vec![
+            Field::new("x", DataType::Boolean, false),
+            Field::new("a", DataType::Utf8, false),
+            Field::new("p", DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(BooleanArray::from(vec![true, false])),
+                Arc::new(StringArray::from(vec!["abc", "abc"])),
+                Arc::new(StringArray::from(vec!["a%", "b%"])),
+            ],
+        )
+        .expect("batch");
+        let column = |name: &str| col(name, &schema).expect("column");
+        let predicate =
+            similar_to(false, false, column("a"), column("p")).expect("similar_to");
+        let expr =
+            crate::expressions::in_list(column("x"), vec![predicate], &false, &schema)
+                .expect("in_list");
+        let result = expr
+            .evaluate(&batch)
+            .and_then(|value| value.into_array(batch.num_rows()))
+            .expect("evaluate");
+        // `true IN (true)` and `false IN (false)`.
+        let expected = BooleanArray::from(vec![Some(true), Some(true)]);
+        assert_eq!(as_boolean_array(&result).expect("boolean"), &expected);
+    }
+
+    // A batch with no rows never fails on a pattern that is not valid, even
+    // when the value is a non-NULL literal, because no row is matched.
+    #[test]
+    fn test_similar_to_invalid_pattern_on_empty_batch() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, false)]);
+        let batch = RecordBatch::new_empty(Arc::new(schema));
+        let result = similar_to(false, false, lit("a"), lit("["))
+            .and_then(|op| op.evaluate(&batch))
+            .expect("no row is matched");
+        match result {
+            ColumnarValue::Array(array) => {
+                assert_eq!(array.data_type(), &DataType::Boolean);
+                assert_eq!(array.len(), 0);
+            }
+            ColumnarValue::Scalar(scalar) => {
+                panic!("expected an empty array, got {scalar:?}")
+            }
+        }
+    }
+
+    // Regression: only the regex match operators skip the patterns of NULL
+    // values. Any other operator over a `SqlSimilarToPattern` evaluates it as
+    // an ordinary string operand.
+    #[test]
+    fn test_similar_to_pattern_under_other_operators() {
+        let schema = Schema::new(vec![Field::new("a", DataType::Utf8, true)]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![Arc::new(StringArray::from(vec![None::<&str>]))],
+        )
+        .expect("batch");
+        let evaluate = |op: Operator| {
+            let pattern = Arc::new(SqlSimilarToPattern::new(lit("a%")));
+            binary(col("a", &schema).expect("column a"), op, pattern, &schema)
+                .and_then(|expr| expr.evaluate(&batch))
+                .and_then(|value| value.into_array(batch.num_rows()))
+                .expect("evaluate")
+        };
+
+        let distinct = evaluate(Operator::IsDistinctFrom);
+        let expected = BooleanArray::from(vec![Some(true)]);
+        assert_eq!(as_boolean_array(&distinct).expect("boolean"), &expected);
+
+        let concat = evaluate(Operator::StringConcat);
+        assert_eq!(
+            concat.as_any().downcast_ref::<StringArray>(),
+            Some(&StringArray::from(vec![None::<&str>]))
         );
     }
 
