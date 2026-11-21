@@ -119,8 +119,14 @@ pub fn sql_similar_to_regex(pattern: &str) -> Result<String> {
             }
             ESCAPE => {
                 match chars.next() {
-                    // `\"` separates the parts of a `SUBSTRING ... SIMILAR` pattern.
-                    Some('"') => return unsupported_escape(pattern, '"'),
+                    Some('"') => {
+                        return invalid_pattern(
+                            pattern,
+                            format!(
+                                "'{ESCAPE}\"' separates the parts of a SUBSTRING ... SIMILAR pattern and is not supported in SIMILAR TO; write '\"' without the escape character to match a double quote"
+                            ),
+                        );
+                    }
                     next => push_literal(&mut regex, escaped_char(pattern, next)?),
                 }
                 Operand::Atom
