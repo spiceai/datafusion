@@ -180,7 +180,7 @@ fn collect_concat_to_like_string(parts: &[Hir]) -> Option<String> {
 }
 
 /// Returns a str represented by `Literal` if it contains a valid utf8
-/// sequence and is safe for like (has no '%' and '_')
+/// sequence and is safe for like (has no '%', '_' or '\')
 fn like_str_from_literal(l: &Literal) -> Option<&str> {
     // if not utf8, no good
     let s = std::str::from_utf8(&l.0).ok()?;
@@ -200,8 +200,10 @@ fn str_from_literal(l: &Literal) -> Option<&str> {
     Some(s)
 }
 
+/// `\` is excluded because it is `LIKE`'s default escape character: a regex that
+/// matches a backslash would otherwise become a pattern that matches something else.
 fn is_safe_for_like(c: char) -> bool {
-    (c != '%') && (c != '_')
+    (c != '%') && (c != '_') && (c != '\\')
 }
 
 /// Returns true if the elements in a `Concat` pattern are:
