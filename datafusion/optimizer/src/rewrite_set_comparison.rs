@@ -20,6 +20,7 @@
 //! that capture SQL three-valued logic.
 
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, plan_err};
 use datafusion_expr::expr::{self, Exists, SetComparison, SetQuantifier};
@@ -43,7 +44,11 @@ impl RewriteSetComparison {
         Self
     }
 
-    fn rewrite_plan(&self, plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    fn rewrite_plan(
+        &self,
+        plan: LogicalPlan,
+        alias_generator: &Arc<AliasGenerator>,
+    ) -> Result<Transformed<LogicalPlan>> {
         let mut schema = merge_schema(&plan.inputs());
         if let LogicalPlan::Dml(DmlStatement {
             op: WriteOp::MergeInto(_),
@@ -58,7 +63,9 @@ impl RewriteSetComparison {
             )?);
         }
         plan.map_expressions(|expr| {
-            expr.transform_up(|expr| rewrite_set_comparison(expr, &schema))
+            expr.transform_up(|expr| {
+                rewrite_set_comparison(expr, &schema, alias_generator)
+            })
         })
     }
 }
@@ -71,19 +78,25 @@ impl OptimizerRule for RewriteSetComparison {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up_with_subqueries(|plan| self.rewrite_plan(plan))
+        let alias_generator = config.alias_generator();
+        plan.transform_up_with_subqueries(|plan| self.rewrite_plan(plan, alias_generator))
     }
 }
 
 fn rewrite_set_comparison(
     expr: Expr,
     outer_schema: &DFSchema,
+    alias_generator: &Arc<AliasGenerator>,
 ) -> Result<Transformed<Expr>> {
     match expr {
         Expr::SetComparison(set_comparison) => {
-            let rewritten = build_set_comparison_subquery(set_comparison, outer_schema)?;
+            let rewritten = build_set_comparison_subquery(
+                set_comparison,
+                outer_schema,
+                alias_generator,
+            )?;
             Ok(Transformed::yes(rewritten))
         }
         _ => Ok(Transformed::no(expr)),
@@ -93,6 +106,7 @@ fn rewrite_set_comparison(
 fn build_set_comparison_subquery(
     set_comparison: SetComparison,
     outer_schema: &DFSchema,
+    alias_generator: &Arc<AliasGenerator>,
 ) -> Result<Expr> {
     let SetComparison {
         expr,
@@ -107,7 +121,21 @@ fn build_set_comparison_subquery(
         return plan_err!("single expression required.");
     }
     // avoid `head_output_expr` for aggr/window plan, it will gives group-by expr if exists
-    let right_expr = Expr::Column(Column::from(subquery_schema.qualified_field(0)));
+    let first_column = Column::from(subquery_schema.qualified_field(0));
+    // The subquery can read a relation with the outer query's name, as in
+    // `x = ANY (SELECT x FROM t)` over `t`. Decorrelation drops the outer
+    // reference from `outer.x = inner.x`, so the subquery column gets a name
+    // of its own.
+    let value_name = alias_generator.next("__set_comparison_value");
+    let subquery = Subquery {
+        subquery: Arc::new(
+            LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
+                .project(vec![Expr::Column(first_column).alias(&value_name)])?
+                .build()?,
+        ),
+        ..subquery
+    };
+    let right_expr = Expr::Column(Column::new_unqualified(value_name));
 
     let comparison = Expr::BinaryExpr(expr::BinaryExpr::new(
         Box::new(left_expr),

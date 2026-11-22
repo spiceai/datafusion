@@ -2072,27 +2072,30 @@ explain select v from (values (1), (6), (10)) set_cmp_t(v) where v > any(select 
 ----
 logical_plan
 01)Projection: set_cmp_t.v
-02)--Filter: __correlated_sq_1.mark OR __correlated_sq_2.mark AND NOT __correlated_sq_3.mark AND Boolean(NULL)
-03)----LeftMark Join:  Filter: set_cmp_t.v > __correlated_sq_3.v IS TRUE
-04)------Filter: __correlated_sq_1.mark OR __correlated_sq_2.mark AND Boolean(NULL)
-05)--------LeftMark Join:  Filter: set_cmp_t.v > __correlated_sq_2.v IS NULL
-06)----------Filter: __correlated_sq_1.mark OR Boolean(NULL)
-07)------------LeftMark Join:  Filter: set_cmp_t.v > __correlated_sq_1.v IS TRUE
+02)--Filter: __correlated_sq_2.mark OR __correlated_sq_3.mark AND NOT __correlated_sq_4.mark AND Boolean(NULL)
+03)----LeftMark Join:  Filter: set_cmp_t.v > __correlated_sq_4.__set_comparison_value_1 IS TRUE
+04)------Filter: __correlated_sq_2.mark OR __correlated_sq_3.mark AND Boolean(NULL)
+05)--------LeftMark Join:  Filter: set_cmp_t.v > __correlated_sq_3.__set_comparison_value_1 IS NULL
+06)----------Filter: __correlated_sq_2.mark OR Boolean(NULL)
+07)------------LeftMark Join:  Filter: set_cmp_t.v > __correlated_sq_2.__set_comparison_value_1 IS TRUE
 08)--------------SubqueryAlias: set_cmp_t
 09)----------------Projection: column1 AS v
 10)------------------Values: (Int64(1)), (Int64(6)), (Int64(10))
-11)--------------SubqueryAlias: __correlated_sq_1
-12)----------------SubqueryAlias: set_cmp_s
-13)------------------Projection: column1 AS v
-14)--------------------Values: (Int64(5)), (Int64(NULL))
-15)----------SubqueryAlias: __correlated_sq_2
-16)------------SubqueryAlias: set_cmp_s
-17)--------------Projection: column1 AS v
-18)----------------Values: (Int64(5)), (Int64(NULL))
-19)------SubqueryAlias: __correlated_sq_3
-20)--------SubqueryAlias: set_cmp_s
-21)----------Projection: column1 AS v
-22)------------Values: (Int64(5)), (Int64(NULL))
+11)--------------SubqueryAlias: __correlated_sq_2
+12)----------------Projection: set_cmp_s.v AS __set_comparison_value_1
+13)------------------SubqueryAlias: set_cmp_s
+14)--------------------Projection: column1 AS v
+15)----------------------Values: (Int64(5)), (Int64(NULL))
+16)----------SubqueryAlias: __correlated_sq_3
+17)------------Projection: set_cmp_s.v AS __set_comparison_value_1
+18)--------------SubqueryAlias: set_cmp_s
+19)----------------Projection: column1 AS v
+20)------------------Values: (Int64(5)), (Int64(NULL))
+21)------SubqueryAlias: __correlated_sq_4
+22)--------Projection: set_cmp_s.v AS __set_comparison_value_1
+23)----------SubqueryAlias: set_cmp_s
+24)------------Projection: column1 AS v
+25)--------------Values: (Int64(5)), (Int64(NULL))
 
 # same-table `= ANY` / `<> ALL` must plan without
 # "duplicate unqualified field name mark".
@@ -2109,6 +2112,48 @@ select id from set_cmp_self where age = any(select age from set_cmp_self);
 query I
 select id from set_cmp_self where age <> all(select age from set_cmp_self);
 ----
+
+# A subquery over the outer query's table, with a filter of its own.
+query I rowsort
+select id from set_cmp_self where age = any(select age from set_cmp_self where id < 3);
+----
+1
+2
+
+query I rowsort
+select id from set_cmp_self where age > any(select age from set_cmp_self where id < 3);
+----
+2
+3
+
+query I
+select id from set_cmp_self where age <> all(select age from set_cmp_self where id < 3);
+----
+3
+
+statement ok
+create table set_cmp_null(id int, age int) as values (1, 20), (2, NULL), (3, 40);
+
+query I rowsort
+select id from set_cmp_null where (age = any(select age from set_cmp_null where id < 3)) is null;
+----
+2
+3
+
+statement count 0
+drop table set_cmp_null;
+
+query I rowsort
+select column1 from (values (1), (2), (3)) where column1 = any(select column1 from (values (1), (2), (3)) where column1 < 3);
+----
+1
+2
+
+query I rowsort
+select id from set_cmp_self o where o.age > any(select i.age from set_cmp_self i where i.id < o.id);
+----
+2
+3
 
 statement count 0
 drop table set_cmp_self;
