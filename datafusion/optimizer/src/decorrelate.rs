@@ -451,6 +451,12 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 {
                     // Correlated exist subquery, remove the limit(so that correlated expressions can pull up)
                     (true, false) => Transformed::yes(match limit.get_fetch_type()? {
+                        // An OFFSET drops rows of each correlated group, which
+                        // the join cannot do, so the subquery stays correlated.
+                        _ if !matches!(limit.get_skip_type()?, SkipType::Literal(0)) => {
+                            self.can_pull_up = false;
+                            LogicalPlanBuilder::from((*limit.input).clone()).build()?
+                        }
                         FetchType::Literal(Some(0)) => {
                             LogicalPlan::EmptyRelation(EmptyRelation {
                                 produce_one_row: false,

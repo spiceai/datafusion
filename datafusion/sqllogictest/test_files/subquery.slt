@@ -3119,6 +3119,18 @@ select o.k from set_cmp_agg_outer o where not exists (select count(*) from set_c
 2
 3
 
+# OFFSET 1 drops the aggregate's only row (expected no rows for EXISTS, and every
+# row for NOT EXISTS), and it drops the first match of a plain EXISTS (expected
+# `1`). These stay correlated.
+query error Physical plan does not support logical expression Exists
+select o.k from set_cmp_agg_outer o where exists (select count(*) from set_cmp_agg_inner i where i.k = o.k offset 1) order by o.k;
+
+query error Physical plan does not support logical expression Exists
+select o.k from set_cmp_agg_outer o where not exists (select count(*) from set_cmp_agg_inner i where i.k = o.k offset 1) order by o.k;
+
+query error Physical plan does not support logical expression Exists
+select o.k from set_cmp_agg_outer o where exists (select 1 from set_cmp_agg_inner i where i.k = o.k offset 1) order by o.k;
+
 # IN over a groupless max inside OR. spiceai-55 builds a projection with a
 # duplicate name for this shape. Expected `1, 3`.
 query error Projections require unique expression names
