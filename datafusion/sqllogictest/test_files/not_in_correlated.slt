@@ -706,15 +706,15 @@ SELECT id FROM nisd_a WHERE x NOT IN (SELECT y FROM nisd_b WHERE y = nisd_a.x)
 
 # A scalar aggregate that the decorrelation groups by the correlation has no row
 # for an outer row without a group, where the subquery returns the aggregate
-# over no input. These keep the null-aware plan, which does not support them,
-# rather than answer from the missing rows.
+# over no input. These stay correlated, which the physical planner does not
+# support, rather than answer from the missing rows.
 statement ok
 CREATE TABLE nisd_c(y INT, g INT) AS VALUES (4, 1);
 
-query error null_aware anti join only supports single column join key
+query error Physical plan does not support logical expression InSubquery
 SELECT id FROM nisd_a WHERE x NOT IN (SELECT SUM(y) FROM nisd_c WHERE nisd_c.g = nisd_a.g)
 
-query error null_aware anti join only supports single column join key
+query error Physical plan does not support logical expression InSubquery
 SELECT id FROM nisd_a WHERE x NOT IN (SELECT COUNT(*) FROM nisd_c WHERE nisd_c.g = nisd_a.g)
 
 statement ok
