@@ -36,7 +36,7 @@ use datafusion_expr::utils::{
 };
 use datafusion_expr::{
     BinaryExpr, Cast, EmptyRelation, Expr, ExprSchemable, FetchType, LogicalPlan,
-    LogicalPlanBuilder, Operator, expr, lit,
+    LogicalPlanBuilder, Operator, SkipType, expr, lit,
 };
 
 /// This struct rewrite the sub query plan by pull up the correlated
@@ -429,6 +429,14 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     .collected_count_expr_map
                     .get(limit.input.deref())
                     .cloned();
+                // A LIMIT 0 or an OFFSET drops the aggregate's row, so the
+                // count bug does not apply above it.
+                let keeps_the_row =
+                    matches!(limit.get_skip_type()?, SkipType::Literal(0))
+                        && !matches!(
+                            limit.get_fetch_type()?,
+                            FetchType::Literal(Some(0))
+                        );
                 // handling the limit clause in the subquery
                 let new_plan = match (self.exists_sub_query, self.join_filters.is_empty())
                 {
@@ -444,7 +452,9 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     }),
                     _ => Transformed::no(plan),
                 };
-                if let Some(input_map) = input_expr_map {
+                if let Some(input_map) = input_expr_map
+                    && keeps_the_row
+                {
                     self.collected_count_expr_map
                         .insert(new_plan.data.clone(), input_map);
                 }

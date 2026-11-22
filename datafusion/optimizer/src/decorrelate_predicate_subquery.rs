@@ -27,9 +27,7 @@ use crate::utils::replace_qualified_name;
 use crate::{OptimizerConfig, OptimizerRule};
 
 use datafusion_common::alias::AliasGenerator;
-use datafusion_common::tree_node::{
-    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
-};
+use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion_common::{
     Column, DFSchemaRef, ExprSchema, NullEquality, Result, assert_or_internal_err,
     internal_err, plan_err,
@@ -357,27 +355,32 @@ fn join_keys_may_be_null(
     Ok(false)
 }
 
-fn subquery_operands_are_bare_columns(
+/// Whether every join filter is `<subquery column> = <outer expression>`. Only
+/// then does an outer row with no match mean that its group is absent. Any
+/// other filter, such as a HAVING that reads only outer columns, can reject a
+/// row of a group that exists, and compensation would read that miss as an
+/// absent group.
+fn join_filters_are_correlation_keys(
     join_filters: &[Expr],
     subquery_cols: &BTreeSet<Column>,
 ) -> bool {
-    join_filters.iter().all(|filter| {
-        let mut bare = true;
-        filter
-            .apply(|e| {
-                let refs = e.column_refs();
-                if !refs.is_empty() && refs.iter().all(|c| subquery_cols.contains(*c)) {
-                    bare = matches!(e, Expr::Column(_));
-                    return Ok(if bare {
-                        TreeNodeRecursion::Jump
-                    } else {
-                        TreeNodeRecursion::Stop
-                    });
-                }
-                Ok(TreeNodeRecursion::Continue)
-            })
-            .expect("infallible");
-        bare
+    let is_subquery_column =
+        |expr: &Expr| matches!(expr, Expr::Column(c) if subquery_cols.contains(c));
+    let reads_subquery = |expr: &Expr| {
+        expr.column_refs()
+            .iter()
+            .any(|column| subquery_cols.contains(*column))
+    };
+    join_filters.iter().all(|filter| match filter {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::Eq,
+            right,
+        }) => {
+            (is_subquery_column(left) && !reads_subquery(right))
+                || (is_subquery_column(right) && !reads_subquery(left))
+        }
+        _ => false,
     })
 }
 
@@ -420,7 +423,7 @@ fn build_join(
         .cloned()
         .collect();
     let keys_are_bare = count_bug_compensation.is_none()
-        || subquery_operands_are_bare_columns(&pull_up.join_filters, &subquery_cols);
+        || join_filters_are_correlation_keys(&pull_up.join_filters, &subquery_cols);
     // Fall back to the uncompensated rewrite whenever compensation can't safely apply, so a HAVING never gets silently dropped.
     let compensable = pull_up.can_pull_up
         && !reads_agg_output
@@ -437,9 +440,10 @@ fn build_join(
     // The subquery stays correlated unless an outer row with no match gets the
     // right answer anyway.
     if !exists_sub_query && pull_up.pulled_up_scalar_agg {
-        // This branch has no null-aware mark join, so only a semi join reads a
-        // NULL result as false.
-        let null_reads_as_false = join_type == JoinType::LeftSemi;
+        // This branch has no null-aware mark join: a mark join reads every NULL
+        // comparison as false, as a semi join does.
+        let null_reads_as_false =
+            matches!(join_type, JoinType::LeftSemi | JoinType::LeftMark);
         let count_bug_is_harmless = match rewrite(true) {
             Ok((plan, pull_up)) => pull_up
                 .collected_count_expr_map
