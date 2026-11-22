@@ -1718,7 +1718,7 @@ explain SELECT t1_id, t1_int FROM t1 WHERE EXISTS (SELECT count(*) FROM t2 WHERE
 ----
 logical_plan
 01)Projection: t1.t1_id, t1.t1_int
-02)--Filter: CASE WHEN __correlated_sq_1.__always_true IS NULL THEN Boolean(true) WHEN __correlated_sq_1.count(Int64(1)) = Int64(0) IS NOT TRUE THEN Boolean(false) ELSE Boolean(true) END
+02)--Filter: __correlated_sq_1.__always_true IS NULL OR __correlated_sq_1.__always_true IS NOT NULL AND NOT __correlated_sq_1.count(Int64(1)) = Int64(0) IS NOT TRUE
 03)----Projection: t1.t1_id, t1.t1_int, __correlated_sq_1.count(Int64(1)), __correlated_sq_1.__always_true
 04)------Left Join: t1.t1_id = __correlated_sq_1.t2_id
 05)--------TableScan: t1 projection=[t1_id, t1_int]
@@ -3075,3 +3075,46 @@ DROP TABLE nested_agg_outer;
 
 statement ok
 DROP TABLE nested_agg_inner;
+
+# A correlated ANY/ALL or IN over a groupless aggregate: an outer row with no
+# subquery row compares with the aggregate over no rows (count 0, max NULL).
+statement ok
+create table set_cmp_agg_outer(k int, v int) as values (1, 10), (2, 20), (3, 40);
+
+statement ok
+create table set_cmp_agg_inner(k int, v int) as values (1, 5), (1, 10), (2, 30);
+
+query I
+select o.k from set_cmp_agg_outer o where 0 = any (select count(*) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
+----
+3
+
+query I
+select o.k from set_cmp_agg_outer o where not (1 <> all (select count(*) from set_cmp_agg_inner i where i.k = o.k)) order by o.k;
+----
+2
+
+query I
+select o.k from set_cmp_agg_outer o where o.v < any (select max(i.v) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
+----
+2
+
+query error Physical plan does not support logical expression InSubquery
+select o.k from set_cmp_agg_outer o where 0 in (select count(*) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
+
+query I
+select o.k from set_cmp_agg_outer o where exists (select count(*) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
+----
+1
+2
+3
+
+query I
+select o.k from set_cmp_agg_outer o where not exists (select max(i.v) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
+----
+
+statement ok
+drop table set_cmp_agg_outer;
+
+statement ok
+drop table set_cmp_agg_inner;
