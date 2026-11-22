@@ -3429,6 +3429,11 @@ mod tests {
         assert_no_change(regex_match(col("c1"), lit("f%o")));
         assert_no_change(regex_match(col("c1"), lit("^f%o")));
         assert_no_change(regex_match(col("c1"), lit("f_o")));
+        // `\` is LIKE's escape character
+        assert_no_change(regex_match(col("c1"), lit(r"\\")));
+        assert_no_change(regex_match(col("c1"), lit(r"a\\b")));
+        assert_no_change(regex_match(col("c1"), lit(r"^a\\")));
+        assert_no_change(regex_imatch(col("c1"), lit(r"a\\b")));
 
         // empty cases
         assert_change(

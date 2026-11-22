@@ -366,5 +366,22 @@ select * from regexp_test where regexp_like('f', regexp_replace((('v\r') like ('
 ----
 
 
+# A regex that matches a backslash is not rewritten to LIKE, where `\` is the escape character
+statement ok
+create or replace table backslash_strings as values ('a\b'), ('a%'), ('plain');
+
+query T rowsort
+select column1 from backslash_strings where column1 ~ '\\';
+----
+a\b
+
+query T rowsort
+select column1 from backslash_strings where regexp_like(column1, '^a\\');
+----
+a\b
+
+statement ok
+drop table backslash_strings;
+
 statement ok
 drop table if exists dict_table;
