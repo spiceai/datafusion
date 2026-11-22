@@ -27,7 +27,9 @@ use crate::utils::replace_qualified_name;
 use crate::{OptimizerConfig, OptimizerRule};
 
 use datafusion_common::alias::AliasGenerator;
-use datafusion_common::tree_node::{Transformed, TransformedResult, TreeNode};
+use datafusion_common::tree_node::{
+    Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
+};
 use datafusion_common::{
     Column, DFSchemaRef, ExprSchema, NullEquality, Result, assert_or_internal_err,
     internal_err, plan_err,
@@ -136,6 +138,28 @@ impl OptimizerRule for DecorrelatePredicateSubquery {
     }
 }
 
+/// Collects the `IN` subqueries of `expr` for which a NULL result and a false
+/// result keep the same rows of a filter: reached through `AND`/`OR` only, not
+/// negated, and with a value that holds no subquery.
+fn positive_in_subqueries(expr: &Expr, found: &mut Vec<Expr>) {
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And | Operator::Or,
+            right,
+        }) => {
+            positive_in_subqueries(left, found);
+            positive_in_subqueries(right, found);
+        }
+        Expr::InSubquery(InSubquery {
+            expr: value,
+            negated: false,
+            ..
+        }) if !has_subquery(value) => found.push(expr.clone()),
+        _ => {}
+    }
+}
+
 fn rewrite_inner_subqueries(
     outer: LogicalPlan,
     expr: Expr,
@@ -143,11 +167,28 @@ fn rewrite_inner_subqueries(
 ) -> Result<(LogicalPlan, Expr)> {
     let mut cur_input = outer;
     let alias = config.alias_generator();
+    let mut positive = vec![];
+    positive_in_subqueries(&expr, &mut positive);
+    // An `IN` that also occurs in another position of the conjunct is not
+    // positive there, and the copies compare equal.
+    let mut occurrences = vec![];
+    expr.apply(|e| {
+        if matches!(e, Expr::InSubquery(_)) {
+            occurrences.push(e.clone());
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })?;
+    let count = |list: &[Expr], e: &Expr| list.iter().filter(|other| *other == e).count();
+    let positive: Vec<Expr> = positive
+        .iter()
+        .filter(|e| count(&positive, e) == count(&occurrences, e))
+        .cloned()
+        .collect();
     let expr_without_subqueries = expr.transform(|e| match e {
         Expr::Exists(Exists {
             subquery: Subquery { subquery, .. },
             negated,
-        }) => match mark_join(&cur_input, &subquery, None, negated, alias)? {
+        }) => match mark_join(&cur_input, &subquery, None, negated, true, alias)? {
             Some((plan, exists_expr)) => {
                 cur_input = plan;
                 Ok(Transformed::yes(exists_expr))
@@ -155,17 +196,27 @@ fn rewrite_inner_subqueries(
             None if negated => Ok(Transformed::no(not_exists(subquery))),
             None => Ok(Transformed::no(exists(subquery))),
         },
-        Expr::InSubquery(InSubquery {
-            expr,
-            subquery: Subquery { subquery, .. },
-            negated,
-        }) => {
+        Expr::InSubquery(in_sub) => {
+            let needs_null_aware_mark =
+                !positive.contains(&Expr::InSubquery(in_sub.clone()));
+            let InSubquery {
+                expr,
+                subquery: Subquery { subquery, .. },
+                negated,
+            } = in_sub;
             let in_predicate = subquery
                 .head_output_expr()?
                 .map_or(plan_err!("single expression required."), |output_expr| {
                     Ok(Expr::eq(*expr.clone(), output_expr))
                 })?;
-            match mark_join(&cur_input, &subquery, Some(&in_predicate), negated, alias)? {
+            match mark_join(
+                &cur_input,
+                &subquery,
+                Some(&in_predicate),
+                negated,
+                needs_null_aware_mark,
+                alias,
+            )? {
                 Some((plan, exists_expr)) => {
                     cur_input = plan;
                     Ok(Transformed::yes(exists_expr))
@@ -286,6 +337,7 @@ fn build_join_top(
         in_predicate_opt.as_ref(),
         join_type,
         subquery_alias,
+        false,
     )
 }
 
@@ -309,6 +361,7 @@ fn mark_join(
     subquery: &LogicalPlan,
     in_predicate_opt: Option<&Expr>,
     negated: bool,
+    needs_null_aware_mark: bool,
     alias_generator: &Arc<AliasGenerator>,
 ) -> Result<Option<(LogicalPlan, Expr)>> {
     let alias = alias_generator.next("__correlated_sq");
@@ -316,10 +369,15 @@ fn mark_join(
     let exists_col = Expr::Column(Column::new(Some(alias.clone()), "mark"));
     let exists_expr = if negated { !exists_col } else { exists_col };
 
-    Ok(
-        build_join(left, subquery, in_predicate_opt, JoinType::LeftMark, alias)?
-            .map(|plan| (plan, exists_expr)),
-    )
+    Ok(build_join(
+        left,
+        subquery,
+        in_predicate_opt,
+        JoinType::LeftMark,
+        alias,
+        needs_null_aware_mark,
+    )?
+    .map(|plan| (plan, exists_expr)))
 }
 
 /// Check if join keys in the join filter may contain NULL values
@@ -390,6 +448,7 @@ fn build_join(
     in_predicate_opt: Option<&Expr>,
     join_type: JoinType,
     alias: String,
+    needs_null_aware_mark: bool,
 ) -> Result<Option<LogicalPlan>> {
     let exists_sub_query = in_predicate_opt.is_none();
     let rewrite =
@@ -441,9 +500,13 @@ fn build_join(
     // right answer anyway.
     if !exists_sub_query && pull_up.pulled_up_scalar_agg {
         // This branch has no null-aware mark join: a mark join reads every NULL
-        // comparison as false, as a semi join does.
-        let null_reads_as_false =
-            matches!(join_type, JoinType::LeftSemi | JoinType::LeftMark);
+        // comparison as false, which is right only where NULL and false keep the
+        // same rows.
+        let null_reads_as_false = match join_type {
+            JoinType::LeftSemi => true,
+            JoinType::LeftMark => !needs_null_aware_mark,
+            _ => false,
+        };
         let count_bug_is_harmless = match rewrite(true) {
             Ok((plan, pull_up)) => pull_up
                 .collected_count_expr_map

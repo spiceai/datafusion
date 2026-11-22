@@ -74,10 +74,10 @@ pub struct PullUpCorrelatedExpr {
     pub pull_up_having_expr: Option<Expr>,
     /// whether we have converted a scalar aggregation into a group aggregation. When unnesting
     /// lateral joins, we need to produce a left outer join in such cases.
-    ///
-    /// An `Aggregate` above stops the pull up when this is set. `f_up` visits
-    /// the aggregate that sets it before any node above.
     pub pulled_up_scalar_agg: bool,
+    /// The scalar aggregates the pull up grouped by the correlation. An
+    /// `Aggregate` whose input holds one stops the pull up.
+    pub grouped_scalar_aggs: Vec<LogicalPlan>,
     /// whether a subquery filter equal to `in_predicate_opt` was dropped from the
     /// join filters as its duplicate. The subquery then kept only rows whose value
     /// equals the outer value, which a `NOT IN` decorrelation has to account for.
@@ -103,6 +103,7 @@ impl PullUpCorrelatedExpr {
             collected_count_expr_map: HashMap::new(),
             pull_up_having_expr: None,
             pulled_up_scalar_agg: false,
+            grouped_scalar_aggs: vec![],
             removed_duplicated_in_predicate: false,
         }
     }
@@ -349,7 +350,10 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 // outer rows, so this aggregate would see an empty input. Stop
                 // the rewrite here, since rebuilding the nodes above can fail
                 // with a schema error. See https://github.com/apache/datafusion/issues/26508
-                if self.pulled_up_scalar_agg {
+                if aggregate
+                    .input
+                    .exists(|node| Ok(self.grouped_scalar_aggs.contains(node)))?
+                {
                     self.can_pull_up = false;
                     return Ok(Transformed::new(plan, false, TreeNodeRecursion::Stop));
                 }
@@ -371,6 +375,8 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     &local_correlated_cols,
                     aggregate.input.schema(),
                 )?;
+                let groups_a_scalar_agg =
+                    aggregate.group_expr.is_empty() && !missing_exprs.is_empty();
 
                 // if the original group expressions are empty, need to handle the Count bug
                 let mut expr_result_map_for_count_bug = HashMap::new();
@@ -396,6 +402,9 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                 let new_plan = LogicalPlanBuilder::from((*aggregate.input).clone())
                     .aggregate(missing_exprs, aggregate.aggr_expr.to_vec())?
                     .build()?;
+                if groups_a_scalar_agg {
+                    self.grouped_scalar_aggs.push(new_plan.clone());
+                }
                 if !expr_result_map_for_count_bug.is_empty() {
                     self.collected_count_expr_map
                         .insert(new_plan.clone(), expr_result_map_for_count_bug);
