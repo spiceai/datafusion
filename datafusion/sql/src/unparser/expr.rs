@@ -736,8 +736,11 @@ impl Unparser<'_> {
             Expr::Wildcard { qualifier, .. } => {
                 let attached_token = AttachedToken::empty();
                 if let Some(qualifier) = qualifier {
-                    let idents: Vec<Ident> =
-                        qualifier.to_vec().into_iter().map(Ident::new).collect();
+                    let idents: Vec<Ident> = qualifier
+                        .to_vec()
+                        .into_iter()
+                        .map(|name| self.new_ident_quoted_if_needs(name))
+                        .collect();
                     Ok(ast::Expr::QualifiedWildcard(
                         ObjectName::from(idents),
                         attached_token,
@@ -3330,6 +3333,32 @@ mod tests {
         let expected = r#"(a > 4)"#;
         assert_eq!(actual, expected);
 
+        Ok(())
+    }
+
+    #[test]
+    fn qualified_wildcard_quotes_its_qualifier() -> Result<()> {
+        #[expect(deprecated)]
+        let wildcard = |qualifier: TableReference| Expr::Wildcard {
+            qualifier: Some(qualifier),
+            options: Box::new(WildcardOptions::default()),
+        };
+        let unparser = Unparser::default();
+        for (expr, expected) in [
+            (wildcard(TableReference::bare("a b")), r#""a b".*"#),
+            (wildcard(TableReference::bare("a\"b")), r#""a""b".*"#),
+            (wildcard(TableReference::bare("q")), "q.*"),
+            (
+                sum(wildcard(TableReference::bare("a b"))),
+                r#"sum("a b".*)"#,
+            ),
+            (
+                wildcard(TableReference::partial("s t", "a b")),
+                r#""s t"."a b".*"#,
+            ),
+        ] {
+            assert_eq!(unparser.expr_to_sql(&expr)?.to_string(), expected);
+        }
         Ok(())
     }
 
