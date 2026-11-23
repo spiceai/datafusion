@@ -25,8 +25,8 @@ use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, plan_err};
 use datafusion_expr::expr::{self, Exists, SetComparison, SetQuantifier};
-use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
+use datafusion_expr::logical_plan::{Filter, Projection, Subquery, SubqueryAlias};
 use datafusion_expr::{DmlStatement, Expr, LogicalPlan, WriteOp, lit};
 use std::sync::Arc;
 
@@ -175,6 +175,50 @@ fn build_set_comparison_subquery(
         )));
     }
 
+    // A HAVING over that aggregate leaves zero rows or one, so ANY and ALL are
+    // the comparison with the subquery's value when the HAVING holds, and false
+    // (ANY) or true (ALL) when it does not. The HAVING is read as a scalar
+    // subquery over the one-row aggregate. Decorrelation gives an outer row with
+    // no inner row the aggregate's values over no input, which a constant does
+    // not get and a subquery inside the HAVING cannot be evaluated for, so those
+    // keep the EXISTS form.
+    if scalar_allowed
+        && let Some((having, one_row)) = split_having_over_one_row(&subquery.subquery)
+        && !having.contains_outer()
+        && !having.column_refs().is_empty()
+        && !having.exists(|e| Ok(is_subquery(e)))?
+        && reads_input(&subquery.subquery, 0)
+    {
+        let value = scalar_subquery(
+            LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
+                .project(vec![Expr::Column(first_column)])?
+                .build()?,
+            &subquery,
+        );
+        let having = scalar_subquery(
+            LogicalPlanBuilder::from(one_row)
+                .project(vec![having])?
+                .build()?,
+            &subquery,
+        );
+        let otherwise = match quantifier {
+            SetQuantifier::Any => lit(false),
+            SetQuantifier::All => lit(true),
+        };
+        return Ok(Expr::Case(expr::Case {
+            expr: None,
+            when_then_expr: vec![(
+                Box::new(having),
+                Box::new(Expr::BinaryExpr(expr::BinaryExpr::new(
+                    expr,
+                    op,
+                    Box::new(value),
+                ))),
+            )],
+            else_expr: Some(Box::new(otherwise)),
+        }));
+    }
+
     let left_expr = to_outer_reference(*expr, outer_schema)?;
     // The subquery can read a relation with the outer query's name, as in
     // `x = ANY (SELECT x FROM t)` over `t`. Decorrelation drops the outer
@@ -244,6 +288,64 @@ fn returns_exactly_one_row(plan: &LogicalPlan) -> bool {
         LogicalPlan::Aggregate(aggregate) => aggregate.group_expr.is_empty(),
         _ => false,
     }
+}
+
+/// The HAVING of a subquery whose root is a filter over a plan that returns
+/// exactly one row, under projections and aliases, and the plan under it.
+fn split_having_over_one_row(plan: &LogicalPlan) -> Option<(Expr, LogicalPlan)> {
+    match plan {
+        LogicalPlan::Projection(Projection { input, .. })
+        | LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
+            split_having_over_one_row(input)
+        }
+        LogicalPlan::Filter(filter) if returns_exactly_one_row(&filter.input) => {
+            Some((filter.predicate.clone(), filter.input.as_ref().clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether output column `index` of `plan` is computed from an aggregate or a
+/// column, rather than being a constant.
+fn reads_input(plan: &LogicalPlan, index: usize) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            let Some(expr) = projection.expr.get(index) else {
+                return false;
+            };
+            match expr.clone().unalias_nested().data {
+                Expr::Column(column) => projection
+                    .input
+                    .schema()
+                    .maybe_index_of_column(&column)
+                    .is_some_and(|i| reads_input(&projection.input, i)),
+                expr => !expr.column_refs().is_empty(),
+            }
+        }
+        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
+        | LogicalPlan::Filter(Filter { input, .. }) => reads_input(input, index),
+        LogicalPlan::Aggregate(_) => true,
+        _ => false,
+    }
+}
+
+fn is_subquery(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Exists(_)
+            | Expr::InSubquery(_)
+            | Expr::ScalarSubquery(_)
+            | Expr::SetComparison(_)
+    )
+}
+
+fn scalar_subquery(plan: LogicalPlan, subquery: &Subquery) -> Expr {
+    let outer_ref_columns = plan.all_out_ref_exprs();
+    Expr::ScalarSubquery(Subquery {
+        subquery: Arc::new(plan),
+        outer_ref_columns,
+        spans: subquery.spans.clone(),
+    })
 }
 
 fn exists_subquery(subquery: &Subquery, filter: Expr) -> Result<Expr> {
