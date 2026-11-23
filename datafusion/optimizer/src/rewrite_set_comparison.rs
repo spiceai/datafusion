@@ -27,7 +27,7 @@ use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, plan_
 use datafusion_expr::expr::{self, Exists, SetComparison, SetQuantifier};
 use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
 use datafusion_expr::logical_plan::{Filter, Projection, Subquery, SubqueryAlias};
-use datafusion_expr::{DmlStatement, Expr, LogicalPlan, WriteOp, lit};
+use datafusion_expr::{DmlStatement, Expr, LogicalPlan, Operator, WriteOp, lit};
 use std::sync::Arc;
 
 use datafusion_expr::utils::merge_schema;
@@ -181,13 +181,15 @@ fn build_set_comparison_subquery(
     // subquery over the one-row aggregate. Decorrelation gives an outer row with
     // no inner row the aggregate's values over no input, which a constant does
     // not get and a subquery inside the HAVING cannot be evaluated for, so those
-    // keep the EXISTS form.
+    // keep the EXISTS form. So do expressions that can fail above the aggregate,
+    // which this form evaluates over no input and for groups the HAVING drops.
     if scalar_allowed
         && let Some((having, one_row)) = split_having_over_one_row(&subquery.subquery)
         && !having.contains_outer()
         && !having.column_refs().is_empty()
         && !having.exists(|e| Ok(is_subquery(e)))?
         && reads_input(&subquery.subquery, 0)
+        && !may_fail_above_aggregate(&subquery.subquery)
     {
         let value = scalar_subquery(
             LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
@@ -325,6 +327,36 @@ fn reads_input(plan: &LogicalPlan, index: usize) -> bool {
         LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
         | LogicalPlan::Filter(Filter { input, .. }) => reads_input(input, index),
         LogicalPlan::Aggregate(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether the SELECT list or the HAVING above the aggregate holds an
+/// expression that can fail: a division, a modulo, a cast or a function call.
+fn may_fail_above_aggregate(plan: &LogicalPlan) -> bool {
+    let may_fail = |expr: &Expr| {
+        expr.exists(|e| {
+            Ok(match e {
+                Expr::Cast(_) | Expr::ScalarFunction(_) => true,
+                Expr::BinaryExpr(binary) => {
+                    matches!(binary.op, Operator::Divide | Operator::Modulo)
+                }
+                _ => false,
+            })
+        })
+        .unwrap_or(true)
+    };
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            projection.expr.iter().any(may_fail)
+                || may_fail_above_aggregate(&projection.input)
+        }
+        LogicalPlan::Filter(filter) => {
+            may_fail(&filter.predicate) || may_fail_above_aggregate(&filter.input)
+        }
+        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
+            may_fail_above_aggregate(input)
+        }
         _ => false,
     }
 }

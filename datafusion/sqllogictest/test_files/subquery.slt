@@ -3228,6 +3228,20 @@ select o.k from set_cmp_agg_outer o where o.k < 3 and o.v >= all (select max(i.v
 ----
 1
 
+# A HAVING or a SELECT list that can fail, here by dividing, is evaluated only
+# where the HAVING keeps the row.
+query I
+select o.k from set_cmp_agg_outer o where o.k < 3 and o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having 100 * count(i.v) / count(*) >= 50) order by o.k;
+----
+1
+
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select 100 / (count(*) - 2) from set_cmp_agg_inner i where i.k = o.k having count(*) <> 2) order by o.k;
+----
+1
+2
+3
+
 query IB
 select o.k, 1 > all (select count(*) from set_cmp_agg_inner i where i.k = o.k) from set_cmp_agg_outer o order by o.k;
 ----
