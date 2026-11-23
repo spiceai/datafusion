@@ -42,9 +42,9 @@ use arrow::array::{
 };
 use arrow::array::{
     ArrayRef, BinaryArray, BinaryViewArray, BooleanArray, Date32Array, Date64Array,
-    Decimal128Array, FixedSizeBinaryArray, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-    StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+    Decimal128Array, Decimal256Array, FixedSizeBinaryArray, Float32Array, Float64Array,
+    Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+    StringArray, StringViewArray, TimestampMicrosecondArray, TimestampMillisecondArray,
     TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array,
 };
 use arrow::buffer::{BooleanBuffer, NullBuffer};
@@ -2746,6 +2746,7 @@ fn equal_rows_single_col(
         DataType::UInt32 => eq_loop!(UInt32Array),
         DataType::UInt64 => eq_loop!(UInt64Array),
         DataType::Decimal128(..) => eq_loop!(Decimal128Array),
+        DataType::Decimal256(..) => eq_loop!(Decimal256Array),
         DataType::Binary => eq_loop!(BinaryArray),
         DataType::LargeBinary => eq_loop!(LargeBinaryArray),
         DataType::BinaryView => eq_loop!(BinaryViewArray),

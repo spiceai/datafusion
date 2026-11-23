@@ -7,13 +7,13 @@ use crate::parquet::utils::MetricsFinder;
 use arrow::{
     array::{
         Array, ArrayRef, BinaryArray, Date32Array, Date64Array, Decimal128Array,
-        DictionaryArray, FixedSizeBinaryArray, Float64Array, Int8Array, Int16Array,
-        Int32Array, Int64Array, LargeBinaryArray, LargeStringArray, StringArray,
-        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
-        TimestampSecondArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
-        make_array,
+        Decimal256Array, DictionaryArray, FixedSizeBinaryArray, Float64Array, Int8Array,
+        Int16Array, Int32Array, Int64Array, LargeBinaryArray, LargeStringArray,
+        StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
+        TimestampNanosecondArray, TimestampSecondArray, UInt8Array, UInt16Array,
+        UInt32Array, UInt64Array, make_array,
     },
-    datatypes::{DataType, Field, Schema},
+    datatypes::{DataType, Field, Schema, i256},
     record_batch::RecordBatch,
     util::pretty::pretty_format_batches,
 };
@@ -75,6 +75,13 @@ enum Scenario {
     DecimalBloomFilterInt64,
     DecimalLargePrecision,
     DecimalLargePrecisionBloomFilter,
+    /// `Decimal256` stored as INT32
+    Decimal256BloomFilterInt32,
+    /// `Decimal256` stored as INT64
+    Decimal256BloomFilterInt64,
+    /// `Decimal256` at max precision, stored as a 32-byte FIXED_LEN_BYTE_ARRAY,
+    /// with values beyond the `i128` range
+    Decimal256BloomFilter,
     /// StringArray, BinaryArray, FixedSizeBinaryArray
     ByteArray,
     PeriodsInColumnNames,
@@ -640,6 +647,21 @@ fn make_f64_batch(v: Vec<f64>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![array.clone()]).unwrap()
 }
 
+/// Return record batch with a `Decimal256` column named "decimal_col"
+fn make_decimal256_batch(v: Vec<i256>, precision: u8, scale: i8) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "decimal_col",
+        DataType::Decimal256(precision, scale),
+        true,
+    )]));
+    let array = Arc::new(
+        Decimal256Array::from(v)
+            .with_precision_and_scale(precision, scale)
+            .unwrap(),
+    ) as ArrayRef;
+    RecordBatch::try_new(schema, vec![array]).unwrap()
+}
+
 /// Return record batch with decimal vector
 ///
 /// Columns are named
@@ -1018,6 +1040,34 @@ fn create_data_batch(scenario: Scenario) -> Vec<RecordBatch> {
                 make_decimal_batch(vec![100000, 200000, 300000, 400000, 500000], 38, 5),
                 make_decimal_batch(vec![-100000, 200000, 300000, 400000, 600000], 38, 5),
                 make_decimal_batch(vec![100000, 200000, 300000, 400000, 600000], 38, 5),
+            ]
+        }
+        Scenario::Decimal256BloomFilterInt32 | Scenario::Decimal256BloomFilterInt64 => {
+            let precision = if matches!(scenario, Scenario::Decimal256BloomFilterInt32) {
+                6
+            } else {
+                18
+            };
+            let batch = |v: [i128; 5]| {
+                make_decimal256_batch(v.map(i256::from_i128).to_vec(), precision, 2)
+            };
+            vec![
+                batch([100, 200, 300, 400, 500]),
+                batch([-100, 200, 300, 400, 600]),
+                batch([100, 200, 300, 400, 600]),
+            ]
+        }
+        Scenario::Decimal256BloomFilter => {
+            // 10^65 + v at scale 5
+            let base = i256::from_i128(10).wrapping_pow(70);
+            let batch = |v: [i128; 5]| {
+                let v = v.map(|v| base.wrapping_add(i256::from_i128(v * 100_000)));
+                make_decimal256_batch(v.to_vec(), 76, 5)
+            };
+            vec![
+                batch([1, 2, 3, 4, 5]),
+                batch([-1, 2, 3, 4, 6]),
+                batch([1, 2, 3, 4, 6]),
             ]
         }
         Scenario::ByteArray => {

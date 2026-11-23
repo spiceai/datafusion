@@ -58,19 +58,6 @@ where
     }
 }
 
-/// Adds a distinct input value to AVG's widened intermediate sum.
-/// Wrapping is intentional because the caller selects `S` with the same
-/// `avg_sum_data_type` headroom contract as the non-distinct AVG path.
-#[inline]
-fn add_avg_distinct_sum<I, S>(sum: S::Native, value: I::Native) -> S::Native
-where
-    I: ArrowNumericType,
-    S: ArrowNumericType,
-    I::Native: Into<S::Native>,
-{
-    sum.add_wrapping(value.into())
-}
-
 impl<I, S, O> Accumulator for DecimalDistinctAvgAccumulator<I, S, O>
 where
     I: DecimalType + ArrowNumericType + Debug,
@@ -101,9 +88,17 @@ where
 
         // Sum the distinct input values in the wider `S` so the total cannot
         // overflow the input's native width (mirrors the non-distinct path).
+        // Checked because `S` has no headroom left for `Decimal256` input near
+        // max precision.
         let mut sum = S::Native::usize_as(0);
         for value in self.sum_accumulator.distinct_values() {
-            sum = add_avg_distinct_sum::<I, S>(sum, value);
+            sum = sum.add_checked(value.into()).map_err(|_| {
+                exec_datafusion_err!(
+                    "Arithmetic overflow in avg: the sum of the distinct input \
+                     values does not fit {}",
+                    S::TYPE_CONSTRUCTOR(S::MAX_PRECISION, self.sum_scale)
+                )
+            })?;
         }
 
         let Some(count) = S::Native::from_usize(count) else {

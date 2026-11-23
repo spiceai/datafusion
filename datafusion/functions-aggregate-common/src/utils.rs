@@ -142,23 +142,34 @@ impl<T: DecimalType> DecimalAverager<T> {
     /// * count: total count, stored as a i128/i256 (*NOT* a Decimal128/Decimal256 value)
     #[inline(always)]
     pub fn avg(&self, sum: T::Native, count: T::Native) -> Result<T::Native> {
-        if let Ok(value) = sum.mul_checked(self.target_mul.div_wrapping(self.sum_mul)) {
-            let new_value = value.div_wrapping(count);
-
-            let validate = T::validate_decimal_precision(
-                new_value,
-                self.target_precision,
-                self.target_scale,
-            );
-
-            if validate.is_ok() {
-                Ok(new_value)
-            } else {
-                exec_err!("Arithmetic Overflow in AvgAccumulator")
+        let scale_up = self.target_mul.div_wrapping(self.sum_mul);
+        let new_value = match sum.mul_checked(scale_up) {
+            Ok(scaled_sum) => Ok(scaled_sum.div_wrapping(count)),
+            // The scaled-up sum can overflow even when the average fits, so
+            // divide first. The quotient and remainder share the sign of `sum`,
+            // so this truncates exactly like the scaled-up division.
+            Err(_) => {
+                let quotient = sum.div_wrapping(count);
+                let remainder = sum.mod_wrapping(count);
+                quotient.mul_checked(scale_up).and_then(|quotient| {
+                    let fraction = remainder.mul_checked(scale_up)?.div_wrapping(count);
+                    quotient.add_checked(fraction)
+                })
             }
-        } else {
-            // can't convert the lit decimal to the returned data type
-            exec_err!("Arithmetic Overflow in AvgAccumulator")
+        };
+
+        match new_value {
+            Ok(new_value)
+                if T::validate_decimal_precision(
+                    new_value,
+                    self.target_precision,
+                    self.target_scale,
+                )
+                .is_ok() =>
+            {
+                Ok(new_value)
+            }
+            _ => exec_err!("Arithmetic Overflow in AvgAccumulator"),
         }
     }
 }

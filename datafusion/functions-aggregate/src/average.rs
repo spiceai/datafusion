@@ -10,7 +10,7 @@ use arrow::array::{
 };
 
 use arrow::buffer::NullBuffer;
-use arrow::compute::{DecimalCast, sum};
+use arrow::compute::{DecimalCast, sum, sum_checked};
 use arrow::datatypes::{
     ArrowNativeType, DECIMAL32_MAX_PRECISION, DECIMAL64_MAX_PRECISION,
     DECIMAL128_MAX_PRECISION, DECIMAL256_MAX_PRECISION, DECIMAL256_MAX_SCALE, DataType,
@@ -18,9 +18,11 @@ use arrow::datatypes::{
     DurationMicrosecondType, DurationMillisecondType, DurationNanosecondType,
     DurationSecondType, Field, FieldRef, Float64Type, TimeUnit, UInt64Type,
 };
+use arrow::error::ArrowError;
 use datafusion_common::types::{NativeType, logical_float64};
 use datafusion_common::{
-    Result, ScalarValue, exec_datafusion_err, exec_err, internal_err, not_impl_err,
+    DataFusionError, Result, ScalarValue, exec_datafusion_err, exec_err, internal_err,
+    not_impl_err,
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::{AggregateOrderSensitivity, format_state_name};
@@ -115,17 +117,26 @@ impl Default for Avg {
     }
 }
 
-/// Digits reserved above the input precision for `avg`'s intermediate sum: 4 for
-/// the scale-up [`DecimalAverager`] applies before dividing (`Avg::return_type`
-/// adds 4 to the scale), 9 for the row count.
+/// Digits reserved above the input precision for `avg`'s intermediate sum.
 ///
-/// The 9 is a row budget. A sum of `n` rows of `Decimal(p, _)` is bounded by
-/// `n * 10^p`, so a sum type with `p + 4 + 9` digits holds `10^9` rows. The sum
+/// This is a row budget. A sum of `n` rows of `Decimal(p, _)` is bounded by
+/// `n * 10^p`, so a sum type with `p + 13` digits holds `10^13` rows. The sum
 /// wraps on overflow, like the `sum` aggregate; the budget is what puts that out
 /// of reach. `Decimal256` input near max precision is the exception: no wider
-/// type exists, so its sum keeps only whatever headroom `Decimal256(76, _)` has
-/// left, as before this budget was introduced.
+/// type exists, so its sum checks for overflow instead, see
+/// [`avg_sum_checks_overflow`].
 const AVG_SUM_HEADROOM_DIGITS: u8 = 13;
+
+/// Whether [`avg_sum_data_type`] cannot reserve [`AVG_SUM_HEADROOM_DIGITS`] for
+/// `data_type`, so a few rows can overflow the sum and every addition to it must
+/// be checked rather than wrapped.
+fn avg_sum_checks_overflow(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Decimal256(precision, _)
+            if precision.saturating_add(AVG_SUM_HEADROOM_DIGITS) > DECIMAL256_MAX_PRECISION
+    )
+}
 
 /// The narrowest decimal that can accumulate `avg`'s sum over `data_type`, never
 /// narrower than `data_type` itself. Other types accumulate as themselves.
@@ -164,7 +175,7 @@ fn avg_sum_data_type(data_type: &DataType) -> DataType {
 /// Instantiates `$builder::<Input, Sum, Output>` for every combination
 /// [`avg_sum_data_type`] and [`avg_decimal_return_type`] can produce.
 macro_rules! decimal_avg_dispatch {
-    ($input:expr, $sum:expr, $output:expr, $builder:ident) => {{
+    ($input:expr, $sum:expr, $output:expr, $builder:ident $(, $arg:expr)*) => {{
         let input = $input;
         let sum = $sum;
         let output = $output;
@@ -173,47 +184,47 @@ macro_rules! decimal_avg_dispatch {
                 DataType::Decimal32(..),
                 DataType::Decimal64(..),
                 DataType::Decimal32(..),
-            ) => $builder::<Decimal32Type, Decimal64Type, Decimal32Type>(sum, output),
+            ) => $builder::<Decimal32Type, Decimal64Type, Decimal32Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal32(..),
                 DataType::Decimal128(..),
                 DataType::Decimal64(..),
-            ) => $builder::<Decimal32Type, Decimal128Type, Decimal64Type>(sum, output),
+            ) => $builder::<Decimal32Type, Decimal128Type, Decimal64Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal64(..),
                 DataType::Decimal64(..),
                 DataType::Decimal64(..),
-            ) => $builder::<Decimal64Type, Decimal64Type, Decimal64Type>(sum, output),
+            ) => $builder::<Decimal64Type, Decimal64Type, Decimal64Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal64(..),
                 DataType::Decimal128(..),
                 DataType::Decimal64(..),
-            ) => $builder::<Decimal64Type, Decimal128Type, Decimal64Type>(sum, output),
+            ) => $builder::<Decimal64Type, Decimal128Type, Decimal64Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal64(..),
                 DataType::Decimal128(..),
                 DataType::Decimal128(..),
-            ) => $builder::<Decimal64Type, Decimal128Type, Decimal128Type>(sum, output),
+            ) => $builder::<Decimal64Type, Decimal128Type, Decimal128Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal128(..),
                 DataType::Decimal128(..),
                 DataType::Decimal128(..),
-            ) => $builder::<Decimal128Type, Decimal128Type, Decimal128Type>(sum, output),
+            ) => $builder::<Decimal128Type, Decimal128Type, Decimal128Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal128(..),
                 DataType::Decimal256(..),
                 DataType::Decimal128(..),
-            ) => $builder::<Decimal128Type, Decimal256Type, Decimal128Type>(sum, output),
+            ) => $builder::<Decimal128Type, Decimal256Type, Decimal128Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal128(..),
                 DataType::Decimal256(..),
                 DataType::Decimal256(..),
-            ) => $builder::<Decimal128Type, Decimal256Type, Decimal256Type>(sum, output),
+            ) => $builder::<Decimal128Type, Decimal256Type, Decimal256Type>(sum, output $(, $arg)*),
             (
                 DataType::Decimal256(..),
                 DataType::Decimal256(..),
                 DataType::Decimal256(..),
-            ) => $builder::<Decimal256Type, Decimal256Type, Decimal256Type>(sum, output),
+            ) => $builder::<Decimal256Type, Decimal256Type, Decimal256Type>(sum, output $(, $arg)*),
             (input, sum, output) => {
                 internal_err!(
                     "avg cannot accumulate {input} as {sum} and return {output}"
@@ -224,15 +235,19 @@ macro_rules! decimal_avg_dispatch {
 }
 
 /// Returns `Decimal(precision + 4, scale + 4)`, widening the Arrow decimal type
-/// when necessary and never narrowing it. Precision and scale are capped at the
-/// `Decimal256` limits. This follows [Spark's average type derivation] while
-/// accounting for Arrow's physical decimal types.
+/// when necessary and never narrowing it. This follows [Spark's average type
+/// derivation] while accounting for Arrow's physical decimal types.
+///
+/// Precision is capped at the `Decimal256` limit, and the scale grows only by
+/// the digits the precision gained, so the result keeps the input's integer
+/// digits: no average is larger in magnitude than the largest input.
 ///
 /// [Spark's average type derivation]: https://github.com/apache/spark/blob/fcf636d9eb8d645c24be3db2d599aba2d7e2955a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/Average.scala#L66
 fn avg_decimal_return_type(data_type: &DataType) -> Result<DataType> {
-    let (precision, scale) = decimal_parts(data_type)?;
-    let precision = DECIMAL256_MAX_PRECISION.min(precision.saturating_add(4));
-    let scale = DECIMAL256_MAX_SCALE.min(scale.saturating_add(4));
+    let (input_precision, input_scale) = decimal_parts(data_type)?;
+    let precision = DECIMAL256_MAX_PRECISION.min(input_precision.saturating_add(4));
+    let added_digits = precision.saturating_sub(input_precision) as i8;
+    let scale = DECIMAL256_MAX_SCALE.min(input_scale.saturating_add(added_digits));
 
     Ok(match data_type {
         DataType::Decimal32(..) if precision <= DECIMAL32_MAX_PRECISION => {
@@ -317,7 +332,8 @@ impl AggregateUDFImpl for Avg {
                         data_type,
                         &sum_data_type,
                         acc_args.return_type(),
-                        decimal_avg_accumulator
+                        decimal_avg_accumulator,
+                        avg_sum_checks_overflow(data_type)
                     )
                 }
 
@@ -420,7 +436,8 @@ impl AggregateUDFImpl for Avg {
                     data_type,
                     &sum_data_type,
                     args.return_field.data_type(),
-                    decimal_avg_groups_accumulator
+                    decimal_avg_groups_accumulator,
+                    avg_sum_checks_overflow(data_type)
                 )
             }
 
@@ -537,6 +554,7 @@ where
 fn decimal_avg_accumulator<I, S, O>(
     sum_data_type: &DataType,
     return_data_type: &DataType,
+    checked_sum: bool,
 ) -> Result<Box<dyn Accumulator>>
 where
     I: DecimalType + ArrowNumericType + Debug + Send + Sync,
@@ -554,6 +572,7 @@ where
         sum_data_type.clone(),
         return_data_type.clone(),
         avg_fn,
+        checked_sum,
     )))
 }
 
@@ -584,6 +603,7 @@ where
 fn decimal_avg_groups_accumulator<I, S, O>(
     sum_data_type: &DataType,
     return_data_type: &DataType,
+    checked_sum: bool,
 ) -> Result<Box<dyn GroupsAccumulator>>
 where
     I: DecimalType + ArrowNumericType + Debug + Send + Sync,
@@ -597,11 +617,10 @@ where
     let (target_precision, target_scale) = decimal_parts(return_data_type)?;
     let avg_fn = decimal_avg_fn::<O, S>(sum_scale, target_precision, target_scale)?;
 
-    Ok(Box::new(AvgGroupsAccumulator::<I, _, S, O>::new(
-        sum_data_type,
-        return_data_type,
-        avg_fn,
-    )))
+    Ok(Box::new(
+        AvgGroupsAccumulator::<I, _, S, O>::new(sum_data_type, return_data_type, avg_fn)
+            .with_checked_sum(checked_sum),
+    ))
 }
 
 /// An accumulator to compute the average
@@ -693,6 +712,8 @@ where
     sum_data_type: DataType,
     return_data_type: DataType,
     avg_fn: F,
+    /// See [`avg_sum_checks_overflow`]
+    checked_sum: bool,
     _phantom: PhantomData<(I, O)>,
 }
 
@@ -722,23 +743,73 @@ where
     I::Native: Into<S::Native>,
     F: Fn(S::Native, u64) -> Result<O::Native>,
 {
-    fn new(sum_data_type: DataType, return_data_type: DataType, avg_fn: F) -> Self {
+    fn new(
+        sum_data_type: DataType,
+        return_data_type: DataType,
+        avg_fn: F,
+        checked_sum: bool,
+    ) -> Self {
         Self {
             sum: None,
             count: 0,
             sum_data_type,
             return_data_type,
             avg_fn,
+            checked_sum,
             _phantom: PhantomData,
         }
     }
+
+    /// Sums `values` into `S`
+    fn sum_of(&self, values: &PrimitiveArray<I>) -> Result<Option<S::Native>> {
+        if self.checked_sum {
+            decimal_checked_sum_as::<I, S>(values)
+                .map_err(|_| avg_sum_overflow(&self.sum_data_type))
+        } else {
+            Ok(decimal_sum_as::<I, S>(values))
+        }
+    }
+
+    /// Adds `value` to the running sum
+    fn add(&mut self, value: S::Native) -> Result<()> {
+        let sum = self.sum.unwrap_or_default();
+        let sum = if self.checked_sum {
+            sum.add_checked(value)
+                .map_err(|_| avg_sum_overflow(&self.sum_data_type))?
+        } else {
+            add_avg_sum::<S, S>(sum, value)
+        };
+        self.sum = Some(sum);
+        Ok(())
+    }
+
+    /// Subtracts `value` from the running sum
+    fn sub(&mut self, value: S::Native) -> Result<()> {
+        let sum = self.sum.unwrap_or_default();
+        let sum = if self.checked_sum {
+            sum.sub_checked(value)
+                .map_err(|_| avg_sum_overflow(&self.sum_data_type))?
+        } else {
+            sub_avg_sum::<S, S>(sum, value)
+        };
+        self.sum = Some(sum);
+        Ok(())
+    }
+}
+
+fn avg_sum_overflow(sum_data_type: &DataType) -> DataFusionError {
+    exec_datafusion_err!(
+        "Arithmetic overflow in avg: the sum of the input values does not fit \
+         {sum_data_type}"
+    )
 }
 
 /// Sums `values` into the wider `S`.
 ///
 /// Wraps on overflow, matching the `sum` aggregate and [`arrow::compute::sum`].
 /// [`avg_sum_data_type`] gives `S` enough headroom that this is unreachable for
-/// any realistic row count.
+/// any realistic row count, except for the input types
+/// [`avg_sum_checks_overflow`] selects, which are summed with checked addition.
 #[inline]
 fn add_avg_sum<I, S>(sum: S::Native, value: I::Native) -> S::Native
 where
@@ -787,6 +858,35 @@ where
     Some(sum)
 }
 
+/// Like [`decimal_sum_as`], but errors on overflow rather than wrapping
+fn decimal_checked_sum_as<I, S>(
+    values: &PrimitiveArray<I>,
+) -> Result<Option<S::Native>, ArrowError>
+where
+    I: DecimalType + ArrowNumericType,
+    S: DecimalType + ArrowNumericType,
+    I::Native: Into<S::Native>,
+{
+    if values.null_count() == values.len() {
+        return Ok(None);
+    }
+
+    let add = |sum: S::Native, value: I::Native| sum.add_checked(value.into());
+    if values.null_count() == 0 {
+        values
+            .values()
+            .iter()
+            .try_fold(S::Native::default(), |sum, value| add(sum, *value))
+            .map(Some)
+    } else {
+        values
+            .iter()
+            .flatten()
+            .try_fold(S::Native::default(), add)
+            .map(Some)
+    }
+}
+
 impl<I, S, F, O> Accumulator for DecimalAvgAccumulator<I, S, F, O>
 where
     I: DecimalType + ArrowNumericType + Debug,
@@ -799,9 +899,8 @@ where
         let values = values[0].as_primitive::<I>();
         self.count += (values.len() - values.null_count()) as u64;
 
-        if let Some(x) = decimal_sum_as::<I, S>(values) {
-            let v = self.sum.unwrap_or_default();
-            self.sum = Some(add_avg_sum::<S, S>(v, x));
+        if let Some(x) = self.sum_of(values)? {
+            self.add(x)?;
         }
         Ok(())
     }
@@ -842,18 +941,23 @@ where
         self.count += sum(states[0].as_primitive::<UInt64Type>()).unwrap_or_default();
 
         // sums are summed
-        if let Some(x) = sum(states[1].as_primitive::<S>()) {
-            let v = self.sum.unwrap_or_default();
-            self.sum = Some(add_avg_sum::<S, S>(v, x));
+        let partial_sums = states[1].as_primitive::<S>();
+        let partial_sum = if self.checked_sum {
+            sum_checked(partial_sums)
+                .map_err(|_| avg_sum_overflow(&self.sum_data_type))?
+        } else {
+            sum(partial_sums)
+        };
+        if let Some(x) = partial_sum {
+            self.add(x)?;
         }
         Ok(())
     }
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let values = values[0].as_primitive::<I>();
         self.count -= (values.len() - values.null_count()) as u64;
-        if let Some(x) = decimal_sum_as::<I, S>(values) {
-            let v = self.sum.unwrap_or_default();
-            self.sum = Some(sub_avg_sum::<S, S>(v, x));
+        if let Some(x) = self.sum_of(values)? {
+            self.sub(x)?;
         }
         Ok(())
     }
@@ -1011,6 +1115,9 @@ where
     /// Function that computes the final average (value / count)
     avg_fn: F,
 
+    /// See [`avg_sum_checks_overflow`]
+    checked_sum: bool,
+
     _phantom: PhantomData<(I, O)>,
 }
 
@@ -1035,8 +1142,14 @@ where
             sums: vec![],
             null_state: NullState::new(),
             avg_fn,
+            checked_sum: false,
             _phantom: PhantomData,
         }
+    }
+
+    fn with_checked_sum(mut self, checked_sum: bool) -> Self {
+        self.checked_sum = checked_sum;
+        self
     }
 
     fn evaluate_values(
@@ -1113,6 +1226,28 @@ where
         // increment counts, update sums
         self.counts.resize(total_num_groups, 0);
         self.sums.resize(total_num_groups, S::default_value());
+
+        if self.checked_sum {
+            let mut overflowed = false;
+            self.null_state.accumulate(
+                group_indices,
+                values,
+                opt_filter,
+                total_num_groups,
+                |group_index, new_value| {
+                    let sum = &mut self.sums[group_index];
+                    match sum.add_checked(new_value.into()) {
+                        Ok(new_sum) => *sum = new_sum,
+                        Err(_) => overflowed = true,
+                    }
+                    self.counts[group_index] += 1;
+                },
+            );
+            if overflowed {
+                return Err(avg_sum_overflow(&self.sum_data_type));
+            }
+            return Ok(());
+        }
 
         self.null_state.accumulate(
             group_indices,
@@ -1201,6 +1336,8 @@ where
 
         // update sums
         self.sums.resize(total_num_groups, S::default_value());
+        let checked_sum = self.checked_sum;
+        let mut overflowed = false;
         self.null_state.accumulate(
             group_indices,
             partial_sums,
@@ -1209,9 +1346,18 @@ where
             |group_index, new_value: <S as ArrowPrimitiveType>::Native| {
                 // SAFETY: group_index is guaranteed to be in bounds
                 let sum = unsafe { self.sums.get_unchecked_mut(group_index) };
-                *sum = add_avg_sum::<S, S>(*sum, new_value);
+                if !checked_sum {
+                    *sum = add_avg_sum::<S, S>(*sum, new_value);
+                } else if let Ok(new_sum) = sum.add_checked(new_value) {
+                    *sum = new_sum;
+                } else {
+                    overflowed = true;
+                }
             },
         );
+        if overflowed {
+            return Err(avg_sum_overflow(&self.sum_data_type));
+        }
 
         Ok(())
     }
@@ -1499,8 +1645,10 @@ mod tests {
             (DataType::Decimal128(26, 2), DataType::Decimal128(30, 6)),
             (DataType::Decimal128(35, 2), DataType::Decimal256(39, 6)),
             (DataType::Decimal256(5, 2), DataType::Decimal256(9, 6)),
-            // Precision and scale remain capped at the Decimal256 limits.
-            (DataType::Decimal256(76, 72), DataType::Decimal256(76, 76)),
+            // Past the Decimal256 precision limit the scale grows only by the
+            // digits the precision still gains, keeping the integer digits.
+            (DataType::Decimal256(74, 10), DataType::Decimal256(76, 12)),
+            (DataType::Decimal256(76, 72), DataType::Decimal256(76, 72)),
         ];
         let avg = Avg::new();
 

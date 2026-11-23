@@ -1233,6 +1233,45 @@ async fn prune_decimal_in_list() {
 }
 
 #[tokio::test]
+async fn prune_decimal256_by_bloom_filter() {
+    // Each scenario's statistics keep all three row groups, and only the first
+    // contains 5: r1: {1,2,3,4,5}, r2: {-1,2,3,4,6}, r3: {1,2,3,4,6}
+    let cases = [
+        (
+            Scenario::Decimal256BloomFilterInt32,
+            "arrow_cast(5, 'Decimal256(6, 2)')",
+        ),
+        (
+            Scenario::Decimal256BloomFilterInt64,
+            "arrow_cast(5, 'Decimal256(18, 2)')",
+        ),
+        (
+            Scenario::Decimal256BloomFilter,
+            "CAST('100000000000000000000000000000000000000000000000000000000000000005' AS DECIMAL(76, 5))",
+        ),
+    ];
+    for (scenario, value) in cases {
+        for query in [
+            format!("SELECT * FROM t WHERE decimal_col = {value}"),
+            format!("SELECT * FROM t WHERE decimal_col IN ({value}, {value})"),
+        ] {
+            RowGroupPruningTest::new()
+                .with_scenario(scenario.clone())
+                .with_query(&query)
+                .with_expected_errors(Some(0))
+                .with_matched_by_stats(Some(3))
+                .with_pruned_by_stats(Some(0))
+                .with_pruned_files(Some(0))
+                .with_matched_by_bloom_filter(Some(1))
+                .with_pruned_by_bloom_filter(Some(2))
+                .with_expected_rows(1)
+                .test_row_group_prune()
+                .await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn prune_string_eq_match() {
     RowGroupPruningTest::new()
         .with_scenario(Scenario::ByteArray)
