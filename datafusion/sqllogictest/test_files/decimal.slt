@@ -1340,3 +1340,182 @@ from (
 ) t;
 ----
 32768.5 Decimal32(9, 4) 32768.5
+
+# `avg` of `Decimal256` near max precision. The output precision cannot grow
+# past 76, so its scale gives up the digits it cannot gain instead of the
+# integer digits, and the average of any input still fits.
+query RT
+select avg(d), arrow_typeof(avg(d))
+from (
+    values
+        (cast('1234567890123456789012345678901234567890123456789012345678901234.5678901234' as decimal(76, 10))),
+        (cast('2.25' as decimal(76, 10)))
+) t(d);
+----
+617283945061728394506172839450617283945061728394506172839450618.4089450617 Decimal256(76, 10)
+
+query IRT
+select g, avg(d), arrow_typeof(avg(d))
+from (
+    values
+        (1, cast('1234567890123456789012345678901234567890123456789012345678901234.5678901234' as decimal(76, 10))),
+        (1, cast('2.25' as decimal(76, 10)))
+) t(g, d)
+group by g;
+----
+1 617283945061728394506172839450617283945061728394506172839450618.4089450617 Decimal256(76, 10)
+
+# Two digits short of max precision, the scale grows by two
+query T
+select arrow_typeof(avg(cast(1 as decimal(74, 10))));
+----
+Decimal256(76, 12)
+
+# The sum of six `Decimal(72, 0)` maximums fits `i256`, but scaling it up by
+# 10^4 before dividing by the row count would not
+query RT
+select avg(d), arrow_typeof(avg(d))
+from (
+    select cast('999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(72, 0)) as d
+    from generate_series(1, 6)
+) t;
+----
+999999999999999999999999999999999999999999999999999999999999999999999999 Decimal256(76, 4)
+
+query R
+select avg(d)
+from (
+    select 1 as g, cast('999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(72, 0)) as d
+    from generate_series(1, 6)
+) t
+group by g;
+----
+999999999999999999999999999999999999999999999999999999999999999999999999
+
+# A sliding window adds and retracts values near the `i256` limit
+query R
+select avg(d) over (order by v rows between 1 preceding and current row)
+from (
+    select v, cast('9999999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(76, 0)) as d
+    from generate_series(1, 3) t(v)
+) t;
+----
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+
+# Each frame of five maximums fits `i256`, but the window adds the entering row
+# before it retracts the leaving one, so the running sum passes six of them
+query R
+select avg(d) over (order by v rows between 4 preceding and current row)
+from (
+    select v, cast('9999999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(76, 0)) as d
+    from generate_series(1, 6) t(v)
+) t;
+----
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+9999999999999999999999999999999999999999999999999999999999999999999999999999
+
+# Six maximums carry the running sum past `i256`, then five negative ones bring
+# the total back into range
+query IR
+select g, avg(d)
+from (
+    select 1 as g, case when v <= 6 then d else -d end as d
+    from (select v, cast('9999999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(76, 0)) as d from generate_series(1, 11) t(v)) s
+) t
+group by g;
+----
+1 909090909090909090909090909090909090909090909090909090909090909090909090909
+
+query R
+select avg(case when v <= 6 then d else -d end)
+from (select v, cast('9999999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(76, 0)) as d from generate_series(1, 11) t(v)) t;
+----
+909090909090909090909090909090909090909090909090909090909090909090909090909
+
+query RT
+select avg(distinct d), arrow_typeof(avg(distinct d))
+from (
+    values
+        (cast('9999999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(76, 0))),
+        (cast('9999999999999999999999999999999999999999999999999999999999999999999999999997' as decimal(76, 0))),
+        (cast('9999999999999999999999999999999999999999999999999999999999999999999999999999' as decimal(76, 0)))
+) t(d);
+----
+9999999999999999999999999999999999999999999999999999999999999999999999999998 Decimal256(76, 0)
+
+# `Decimal256` near max precision leaves the sum no headroom, so it errors
+# rather than wrapping. 12 * d is 2^256 + 8, which wrapped to 8 before and
+# returned an average of 0.6666.
+
+statement ok
+CREATE TABLE avg_decimal256_overflow AS
+SELECT v, v % 4 AS p, cast('9649340769776349618630915417390658987772498722136713669954798667326094136662' as decimal(76, 0)) AS d
+FROM generate_series(1, 12) t(v);
+
+query error Arithmetic overflow in avg: the sum of the input values does not fit Decimal256
+select avg(d) from avg_decimal256_overflow;
+
+query error Arithmetic overflow in avg: the sum of the input values does not fit Decimal256
+select avg(d) from avg_decimal256_overflow group by d;
+
+query error Arithmetic overflow in avg: the sum of the input values does not fit Decimal256
+select avg(d) over (order by v rows between unbounded preceding and current row) from avg_decimal256_overflow;
+
+query error Arithmetic overflow in avg: the sum of the distinct input values does not fit Decimal256
+select avg(distinct d - v), count(distinct p) from avg_decimal256_overflow;
+
+# Each union branch is its own partition whose partial sum of three rows fits,
+# so the overflow surfaces when the partial sums merge
+query error Arithmetic overflow in avg: the sum of the input values does not fit Decimal256
+select avg(d) from (
+    select d from avg_decimal256_overflow where p = 0
+    union all select d from avg_decimal256_overflow where p = 1
+    union all select d from avg_decimal256_overflow where p = 2
+    union all select d from avg_decimal256_overflow where p = 3
+) t;
+
+query error Arithmetic overflow in avg: the sum of the input values does not fit Decimal256
+select avg(d) from (
+    select d from avg_decimal256_overflow where p = 0
+    union all select d from avg_decimal256_overflow where p = 1
+    union all select d from avg_decimal256_overflow where p = 2
+    union all select d from avg_decimal256_overflow where p = 3
+) t
+group by d;
+
+statement ok
+DROP TABLE avg_decimal256_overflow;
+
+# Single-column hash join keys of `Decimal256`, with values beyond the `i128`
+# range and NULLs on both sides
+
+statement ok
+CREATE TABLE decimal256_keys(k DECIMAL(60, 2), v INT) AS VALUES
+    (CAST('100000000000000000000000000000000000000000000000001.25' AS DECIMAL(60, 2)), 1),
+    (CAST('-100000000000000000000000000000000000000000000000001.25' AS DECIMAL(60, 2)), 2),
+    (CAST('3.50' AS DECIMAL(60, 2)), 3),
+    (NULL, 4);
+
+query II rowsort
+SELECT a.v, b.v FROM decimal256_keys a JOIN decimal256_keys b ON a.k = b.k;
+----
+1 1
+2 2
+3 3
+
+query II rowsort
+SELECT a.v, b.v FROM decimal256_keys a JOIN decimal256_keys b ON a.k IS NOT DISTINCT FROM b.k;
+----
+1 1
+2 2
+3 3
+4 4
+
+statement ok
+DROP TABLE decimal256_keys;

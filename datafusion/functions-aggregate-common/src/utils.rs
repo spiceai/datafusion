@@ -155,23 +155,84 @@ impl<T: DecimalType> DecimalAverager<T> {
     /// * count: total count, stored as a i128/i256 (*NOT* a Decimal128/Decimal256 value)
     #[inline(always)]
     pub fn avg(&self, sum: T::Native, count: T::Native) -> Result<T::Native> {
-        if let Ok(value) = sum.mul_checked(self.target_mul.div_wrapping(self.sum_mul)) {
-            let new_value = value.div_wrapping(count);
-
-            let validate = T::validate_decimal_precision(
-                new_value,
-                self.target_precision,
-                self.target_scale,
-            );
-
-            if validate.is_ok() {
-                Ok(new_value)
-            } else {
-                exec_err!("Arithmetic Overflow in AvgAccumulator")
+        let scale_up = self.target_mul.div_wrapping(self.sum_mul);
+        let new_value = match sum.mul_checked(scale_up) {
+            Ok(scaled_sum) => Ok(scaled_sum.div_wrapping(count)),
+            // The scaled-up sum can overflow even when the average fits, so
+            // divide first. The quotient and remainder share the sign of `sum`,
+            // so this truncates exactly like the scaled-up division.
+            Err(_) => {
+                let quotient = sum.div_wrapping(count);
+                let remainder = sum.mod_wrapping(count);
+                quotient.mul_checked(scale_up).and_then(|quotient| {
+                    let fraction = remainder.mul_checked(scale_up)?.div_wrapping(count);
+                    quotient.add_checked(fraction)
+                })
             }
-        } else {
-            // can't convert the lit decimal to the returned data type
-            exec_err!("Arithmetic Overflow in AvgAccumulator")
+        };
+
+        match new_value {
+            Ok(new_value)
+                if T::validate_decimal_precision(
+                    new_value,
+                    self.target_precision,
+                    self.target_scale,
+                )
+                .is_ok() =>
+            {
+                Ok(new_value)
+            }
+            _ => exec_err!("Arithmetic Overflow in AvgAccumulator"),
+        }
+    }
+}
+
+/// Adds `value` to `sum`, wrapping on overflow like
+/// [`ArrowNativeTypeOp::add_wrapping`], and returns the wrap: `1` when the true
+/// total passed the type's maximum, `-1` when it passed its minimum, else `0`.
+///
+/// Wrapping arithmetic is exact modulo the type's range, so a running sum whose
+/// wraps add up to zero holds its true total, whatever the order of the
+/// additions and subtractions that produced it.
+///
+/// ```
+/// use datafusion_functions_aggregate_common::utils::{
+///     add_counting_wraps, sub_counting_wraps,
+/// };
+///
+/// let mut sum = i8::MAX;
+/// let mut wraps = add_counting_wraps(&mut sum, 1);
+/// assert_eq!((sum, wraps), (i8::MIN, 1));
+///
+/// wraps += sub_counting_wraps(&mut sum, 1);
+/// assert_eq!((sum, wraps), (i8::MAX, 0));
+/// ```
+#[inline]
+pub fn add_counting_wraps<T: ArrowNativeTypeOp>(sum: &mut T, value: T) -> i64 {
+    match sum.add_checked(value) {
+        Ok(new_sum) => {
+            *sum = new_sum;
+            0
+        }
+        Err(_) => {
+            *sum = sum.add_wrapping(value);
+            if value.is_lt(T::ZERO) { -1 } else { 1 }
+        }
+    }
+}
+
+/// Subtracts `value` from `sum`, wrapping on overflow, and returns the wrap as
+/// [`add_counting_wraps`] does.
+#[inline]
+pub fn sub_counting_wraps<T: ArrowNativeTypeOp>(sum: &mut T, value: T) -> i64 {
+    match sum.sub_checked(value) {
+        Ok(new_sum) => {
+            *sum = new_sum;
+            0
+        }
+        Err(_) => {
+            *sum = sum.sub_wrapping(value);
+            if value.is_lt(T::ZERO) { 1 } else { -1 }
         }
     }
 }

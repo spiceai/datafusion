@@ -16,7 +16,7 @@
 // under the License.
 
 use arrow::{
-    array::{ArrayRef, ArrowNativeTypeOp, ArrowNumericType},
+    array::{ArrayRef, ArrowNumericType},
     compute::DecimalCast,
     datatypes::{ArrowNativeType, DecimalType},
 };
@@ -27,7 +27,7 @@ use std::marker::PhantomData;
 use std::mem::size_of_val;
 
 use crate::aggregate::sum_distinct::DistinctSumAccumulator;
-use crate::utils::DecimalAverager;
+use crate::utils::{DecimalAverager, add_counting_wraps};
 
 /// Generic implementation of `AVG DISTINCT` for Decimal types.
 /// Handles both all Arrow decimal types (32, 64, 128 and 256 bits).
@@ -93,9 +93,19 @@ where
 
         // Sum the distinct input values in the wider `S` so the total cannot
         // overflow the input's native width (mirrors the non-distinct path).
+        // `S` has no headroom left for `Decimal256` input near max precision,
+        // so the wraps are counted: the sum is exact only when they cancel.
         let mut sum = S::Native::usize_as(0);
+        let mut wraps = 0;
         for value in self.sum_accumulator.distinct_values() {
-            sum = sum.add_wrapping(value.into());
+            wraps += add_counting_wraps(&mut sum, value.into());
+        }
+        if wraps != 0 {
+            return exec_err!(
+                "Arithmetic overflow in avg: the sum of the distinct input values \
+                 does not fit {}",
+                S::TYPE_CONSTRUCTOR(S::MAX_PRECISION, self.sum_scale)
+            );
         }
 
         let Some(count) = S::Native::from_usize(count) else {
