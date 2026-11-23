@@ -72,10 +72,16 @@ impl RewriteSetComparison {
         // doing it here also stops this rule leaving mismatched names in `Aggregate`
         // and `Window` nodes, which a projection-only fix could not reach.
         let name_preserver = NamePreserver::new(&plan);
+        let correlated_scalar = match &plan {
+            LogicalPlan::Projection(_) | LogicalPlan::Filter(_) => {
+                CorrelatedScalarSubquery::Allowed
+            }
+            _ => CorrelatedScalarSubquery::NotAllowed,
+        };
         plan.map_expressions(|expr| {
             let original_name = name_preserver.save(&expr);
             expr.transform_up(|expr| {
-                rewrite_set_comparison(expr, &schema, alias_generator)
+                rewrite_set_comparison(expr, &schema, alias_generator, correlated_scalar)
             })
             .map(|t| t.update_data(|expr| original_name.restore(expr)))
         })
@@ -97,10 +103,21 @@ impl OptimizerRule for RewriteSetComparison {
     }
 }
 
+/// Whether the plan node that holds a set comparison may hold a correlated
+/// scalar subquery. Only projections and filters may: `ScalarSubqueryToJoin`
+/// decorrelates only those, and the plan's subquery checks reject a correlated
+/// scalar subquery in most other nodes.
+#[derive(Clone, Copy)]
+enum CorrelatedScalarSubquery {
+    Allowed,
+    NotAllowed,
+}
+
 fn rewrite_set_comparison(
     expr: Expr,
     outer_schema: &DFSchema,
     alias_generator: &Arc<AliasGenerator>,
+    correlated_scalar: CorrelatedScalarSubquery,
 ) -> Result<Transformed<Expr>> {
     match expr {
         Expr::SetComparison(set_comparison) => {
@@ -108,6 +125,7 @@ fn rewrite_set_comparison(
                 set_comparison,
                 outer_schema,
                 alias_generator,
+                correlated_scalar,
             )?;
             Ok(Transformed::yes(rewritten))
         }
@@ -119,6 +137,7 @@ fn build_set_comparison_subquery(
     set_comparison: SetComparison,
     outer_schema: &DFSchema,
     alias_generator: &Arc<AliasGenerator>,
+    correlated_scalar: CorrelatedScalarSubquery,
 ) -> Result<Expr> {
     let SetComparison {
         expr,
@@ -127,13 +146,36 @@ fn build_set_comparison_subquery(
         quantifier,
     } = set_comparison;
 
-    let left_expr = to_outer_reference(*expr, outer_schema)?;
     let subquery_schema = subquery.subquery.schema();
     if subquery_schema.fields().is_empty() {
         return plan_err!("single expression required.");
     }
     // avoid `head_output_expr` for aggr/window plan, it will gives group-by expr if exists
     let first_column = Column::from(subquery_schema.qualified_field(0));
+
+    // ANY and ALL over exactly one value are the comparison with that value.
+    // The scalar form keeps the aggregate's row for an outer row that matches
+    // no subquery row (`max` NULL, `count` 0), which the EXISTS form below
+    // loses once decorrelation turns the subquery into a join.
+    let scalar_allowed = subquery.outer_ref_columns.is_empty()
+        || matches!(correlated_scalar, CorrelatedScalarSubquery::Allowed);
+    if scalar_allowed && returns_exactly_one_row(&subquery.subquery) {
+        let scalar = Subquery {
+            subquery: Arc::new(
+                LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
+                    .project(vec![Expr::Column(first_column)])?
+                    .build()?,
+            ),
+            ..subquery
+        };
+        return Ok(Expr::BinaryExpr(expr::BinaryExpr::new(
+            expr,
+            op,
+            Box::new(Expr::ScalarSubquery(scalar)),
+        )));
+    }
+
+    let left_expr = to_outer_reference(*expr, outer_schema)?;
     // The subquery can read a relation with the outer query's name, as in
     // `x = ANY (SELECT x FROM t)` over `t`. Decorrelation drops the outer
     // reference from `outer.x = inner.x`, so the subquery column gets a name
@@ -190,6 +232,18 @@ fn build_set_comparison_subquery(
     };
 
     Ok(result_expr)
+}
+
+/// An aggregate without `GROUP BY` returns one row, also over no input.
+/// Projections and aliases above it keep that row; a filter (`HAVING`) or a
+/// limit can drop it.
+fn returns_exactly_one_row(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => returns_exactly_one_row(&projection.input),
+        LogicalPlan::SubqueryAlias(alias) => returns_exactly_one_row(&alias.input),
+        LogicalPlan::Aggregate(aggregate) => aggregate.group_expr.is_empty(),
+        _ => false,
+    }
 }
 
 fn exists_subquery(subquery: &Subquery, filter: Expr) -> Result<Expr> {

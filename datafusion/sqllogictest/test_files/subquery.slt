@@ -3123,6 +3123,66 @@ select o.k from set_cmp_agg_outer o where o.v < any (select max(i.v) from set_cm
 ----
 2
 
+# Row 3 has no inner row: its max is NULL, so the comparison is NULL, not true
+# for ALL or false for ANY.
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
+----
+
+query I
+select o.k from set_cmp_agg_outer o where not (o.v < any (select max(i.v) from set_cmp_agg_inner i where i.k = o.k)) order by o.k;
+----
+1
+
+query IB
+select o.k, o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k) from set_cmp_agg_outer o order by o.k;
+----
+1 true
+2 false
+3 NULL
+
+# Row 3's count is 0, compared with an expression over the outer row.
+query I
+select o.k from set_cmp_agg_outer o where o.v - 40 = any (select count(*) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
+----
+3
+
+# A HAVING can drop the aggregate's row: ALL over no rows is true.
+query I
+select o.k from set_cmp_agg_outer o where o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) > 0) order by o.k;
+----
+1
+3
+
+query IB
+select o.k, 1 > all (select count(*) from set_cmp_agg_inner i where i.k = o.k) from set_cmp_agg_outer o order by o.k;
+----
+1 false
+2 false
+3 true
+
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select max(i.v) from set_cmp_agg_inner i) order by o.k;
+----
+3
+
+# Uncorrelated, over no rows: max is NULL.
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select max(i.v) from set_cmp_agg_inner i where i.k > 5) order by o.k;
+----
+
+# A join condition may not hold a correlated scalar subquery, so a correlated
+# comparison there keeps the EXISTS form, which spiceai-55 cannot plan in a
+# join condition. Expected `(1, 5) (1, 10)`.
+query error No field named a\.v
+select a.k, b.v from set_cmp_agg_outer a join set_cmp_agg_inner b on a.k = b.k and a.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = a.k) order by a.k, b.v;
+
+# An uncorrelated comparison takes the scalar form in a join condition too.
+query II
+select a.k, b.v from set_cmp_agg_outer a join set_cmp_agg_inner b on a.k = b.k and a.v > all (select max(i.v) from set_cmp_agg_inner i where i.k = 1) order by a.k, b.v;
+----
+2 30
+
 query error Physical plan does not support logical expression InSubquery
 select o.k from set_cmp_agg_outer o where 0 in (select count(*) from set_cmp_agg_inner i where i.k = o.k) order by o.k;
 
