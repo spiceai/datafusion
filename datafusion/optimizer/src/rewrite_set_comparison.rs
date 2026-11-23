@@ -19,6 +19,7 @@
 //! `> ALL`) into boolean expressions built from `EXISTS` subqueries
 //! that capture SQL three-valued logic.
 
+use crate::utils::NamePreserver;
 use crate::{OptimizerConfig, OptimizerRule};
 use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode};
@@ -62,10 +63,21 @@ impl RewriteSetComparison {
                 &target.schema(),
             )?);
         }
+        // This rule replaces `x > ALL (…)` with a `CASE WHEN EXISTS …`, whose display
+        // name is not the name of the field it produces. Rewriting an expression
+        // without preserving its name therefore changes the output schema, and the
+        // optimizer's "the schema is invariant under optimization" check fails with an
+        // internal error rather than returning the answer. `simplify_exprs` and
+        // `type_coercion` preserve names around `map_expressions` for the same reason;
+        // doing it here also stops this rule leaving mismatched names in `Aggregate`
+        // and `Window` nodes, which a projection-only fix could not reach.
+        let name_preserver = NamePreserver::new(&plan);
         plan.map_expressions(|expr| {
+            let original_name = name_preserver.save(&expr);
             expr.transform_up(|expr| {
                 rewrite_set_comparison(expr, &schema, alias_generator)
             })
+            .map(|t| t.update_data(|expr| original_name.restore(expr)))
         })
     }
 }
