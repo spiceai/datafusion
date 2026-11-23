@@ -25,9 +25,9 @@ use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, plan_err};
 use datafusion_expr::expr::{self, Exists, SetComparison, SetQuantifier};
-use datafusion_expr::logical_plan::Subquery;
 use datafusion_expr::logical_plan::builder::LogicalPlanBuilder;
-use datafusion_expr::{DmlStatement, Expr, LogicalPlan, WriteOp, lit};
+use datafusion_expr::logical_plan::{Filter, Projection, Subquery, SubqueryAlias};
+use datafusion_expr::{DmlStatement, Expr, LogicalPlan, Operator, WriteOp, lit};
 use std::sync::Arc;
 
 use datafusion_expr::utils::merge_schema;
@@ -175,6 +175,52 @@ fn build_set_comparison_subquery(
         )));
     }
 
+    // A HAVING over that aggregate leaves zero rows or one, so ANY and ALL are
+    // the comparison with the subquery's value when the HAVING holds, and false
+    // (ANY) or true (ALL) when it does not. The HAVING is read as a scalar
+    // subquery over the one-row aggregate. Decorrelation gives an outer row with
+    // no inner row the aggregate's values over no input, which a constant does
+    // not get and a subquery inside the HAVING cannot be evaluated for, so those
+    // keep the EXISTS form. So do expressions that can fail above the aggregate,
+    // which this form evaluates over no input and for groups the HAVING drops.
+    if scalar_allowed
+        && let Some((having, one_row)) = split_having_over_one_row(&subquery.subquery)
+        && !having.contains_outer()
+        && expr_reads_input(&having, &one_row)
+        && !having.exists(|e| Ok(is_subquery(e)))?
+        && reads_input(&subquery.subquery, 0)
+        && !may_fail_above_aggregate(&subquery.subquery)
+    {
+        let value = scalar_subquery(
+            LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
+                .project(vec![Expr::Column(first_column)])?
+                .build()?,
+            &subquery,
+        );
+        let having = scalar_subquery(
+            LogicalPlanBuilder::from(one_row)
+                .project(vec![having])?
+                .build()?,
+            &subquery,
+        );
+        let otherwise = match quantifier {
+            SetQuantifier::Any => lit(false),
+            SetQuantifier::All => lit(true),
+        };
+        return Ok(Expr::Case(expr::Case {
+            expr: None,
+            when_then_expr: vec![(
+                Box::new(having),
+                Box::new(Expr::BinaryExpr(expr::BinaryExpr::new(
+                    expr,
+                    op,
+                    Box::new(value),
+                ))),
+            )],
+            else_expr: Some(Box::new(otherwise)),
+        }));
+    }
+
     let left_expr = to_outer_reference(*expr, outer_schema)?;
     // The subquery can read a relation with the outer query's name, as in
     // `x = ANY (SELECT x FROM t)` over `t`. Decorrelation drops the outer
@@ -246,6 +292,98 @@ fn returns_exactly_one_row(plan: &LogicalPlan) -> bool {
     }
 }
 
+/// The HAVING of a subquery whose root is a filter over a plan that returns
+/// exactly one row, under projections and aliases, and the plan under it.
+fn split_having_over_one_row(plan: &LogicalPlan) -> Option<(Expr, LogicalPlan)> {
+    match plan {
+        LogicalPlan::Projection(Projection { input, .. })
+        | LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
+            split_having_over_one_row(input)
+        }
+        LogicalPlan::Filter(filter) if returns_exactly_one_row(&filter.input) => {
+            Some((filter.predicate.clone(), filter.input.as_ref().clone()))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `expr`, over `plan`'s output, is computed from the aggregate below
+/// it: it references a column, and every column it references resolves to the
+/// aggregate's output rather than to a constant.
+fn expr_reads_input(expr: &Expr, plan: &LogicalPlan) -> bool {
+    let columns = expr.column_refs();
+    !columns.is_empty()
+        && columns.iter().all(|column| {
+            plan.schema()
+                .maybe_index_of_column(column)
+                .is_some_and(|index| reads_input(plan, index))
+        })
+}
+
+/// Whether output column `index` of `plan` is computed from the aggregate
+/// below it, through projections, aliases and filters.
+fn reads_input(plan: &LogicalPlan, index: usize) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => projection
+            .expr
+            .get(index)
+            .is_some_and(|expr| expr_reads_input(expr, &projection.input)),
+        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. })
+        | LogicalPlan::Filter(Filter { input, .. }) => reads_input(input, index),
+        LogicalPlan::Aggregate(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether the SELECT list or the HAVING above the aggregate holds an
+/// expression that can fail: a division, a modulo, a cast or a function call.
+fn may_fail_above_aggregate(plan: &LogicalPlan) -> bool {
+    let may_fail = |expr: &Expr| {
+        expr.exists(|e| {
+            Ok(match e {
+                Expr::Cast(_) | Expr::ScalarFunction(_) => true,
+                Expr::BinaryExpr(binary) => {
+                    matches!(binary.op, Operator::Divide | Operator::Modulo)
+                }
+                _ => false,
+            })
+        })
+        .unwrap_or(true)
+    };
+    match plan {
+        LogicalPlan::Projection(projection) => {
+            projection.expr.iter().any(may_fail)
+                || may_fail_above_aggregate(&projection.input)
+        }
+        LogicalPlan::Filter(filter) => {
+            may_fail(&filter.predicate) || may_fail_above_aggregate(&filter.input)
+        }
+        LogicalPlan::SubqueryAlias(SubqueryAlias { input, .. }) => {
+            may_fail_above_aggregate(input)
+        }
+        _ => false,
+    }
+}
+
+fn is_subquery(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Exists(_)
+            | Expr::InSubquery(_)
+            | Expr::ScalarSubquery(_)
+            | Expr::SetComparison(_)
+    )
+}
+
+fn scalar_subquery(plan: LogicalPlan, subquery: &Subquery) -> Expr {
+    let outer_ref_columns = plan.all_out_ref_exprs();
+    Expr::ScalarSubquery(Subquery {
+        subquery: Arc::new(plan),
+        outer_ref_columns,
+        spans: subquery.spans.clone(),
+    })
+}
+
 fn exists_subquery(subquery: &Subquery, filter: Expr) -> Result<Expr> {
     let plan = LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
         .filter(filter)?
@@ -274,4 +412,30 @@ fn to_outer_reference(expr: Expr, outer_schema: &DFSchema) -> Result<Expr> {
         _ => Ok(Transformed::no(expr)),
     })
     .map(|t| t.data)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test::test_table_scan;
+    use datafusion_expr::col;
+    use datafusion_functions_aggregate::expr_fn::max;
+
+    /// A constant projected above the aggregate stays a constant when a later
+    /// projection reads it through an expression, alone or next to an
+    /// aggregate output.
+    #[test]
+    fn a_constant_read_through_an_expression_does_not_read_input() -> Result<()> {
+        let over_constant = |output: Expr| -> Result<LogicalPlan> {
+            LogicalPlanBuilder::from(test_table_scan()?)
+                .aggregate(Vec::<Expr>::new(), vec![max(col("a")).alias("m")])?
+                .project(vec![lit(40).alias("c"), col("m")])?
+                .project(vec![output.alias("v")])?
+                .build()
+        };
+        assert!(!reads_input(&over_constant(col("c") + lit(0))?, 0));
+        assert!(!reads_input(&over_constant(col("c") + col("m"))?, 0));
+        assert!(reads_input(&over_constant(col("m") + lit(0))?, 0));
+        Ok(())
+    }
 }

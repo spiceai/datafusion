@@ -3154,6 +3154,94 @@ select o.k from set_cmp_agg_outer o where o.v >= all (select max(i.v) from set_c
 1
 3
 
+# A HAVING over the aggregate leaves zero rows or one. For row 3, with no inner
+# row, it sees count 0 and max NULL, so it can keep the aggregate's row there:
+# row 3 then compares with NULL, or with count 0.
+query I
+select o.k from set_cmp_agg_outer o where o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) = 0) order by o.k;
+----
+1
+2
+
+query IB
+select o.k, o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) = 0) from set_cmp_agg_outer o order by o.k;
+----
+1 true
+2 true
+3 NULL
+
+query I
+select o.k from set_cmp_agg_outer o where not (o.v < any (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) < 2)) order by o.k;
+----
+1
+
+query IB
+select o.k, o.v > any (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) <= 1) from set_cmp_agg_outer o order by o.k;
+----
+1 false
+2 false
+3 NULL
+
+query I
+select o.k from set_cmp_agg_outer o where o.v - 40 = any (select count(*) from set_cmp_agg_inner i where i.k = o.k having max(i.v) is null) order by o.k;
+----
+3
+
+# A NULL HAVING drops the row: row 2's comparison is false, and row 3 has none.
+query I
+select o.k from set_cmp_agg_outer o where o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having max(i.v) > 0) order by o.k;
+----
+1
+3
+
+# The HAVING guards the SELECT list: count(*) is never 0 where it is divided by.
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select 100 / count(*) from set_cmp_agg_inner i where i.k = o.k having count(*) > 0) order by o.k;
+----
+3
+
+# Uncorrelated: the HAVING drops the only row, and ALL over no rows is true.
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select max(i.v) from set_cmp_agg_inner i having count(*) > 100) order by o.k;
+----
+1
+2
+3
+
+# A constant compared value, and a HAVING that holds a subquery.
+query I
+select o.k from set_cmp_agg_outer o where o.v >= all (select 40 from set_cmp_agg_inner i where i.k = o.k having count(*) = 0) order by o.k;
+----
+1
+2
+3
+
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select max(i.v) from set_cmp_agg_inner i having max(i.v) in (select v from set_cmp_agg_inner)) order by o.k;
+----
+3
+
+# A HAVING that reads an outer column. This form is still wrong for row 3, so the
+# case leaves row 3 out.
+query I
+select o.k from set_cmp_agg_outer o where o.k < 3 and o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) < o.k) order by o.k;
+----
+1
+
+# A HAVING or a SELECT list that can fail, here by dividing, is evaluated only
+# where the HAVING keeps the row.
+query I
+select o.k from set_cmp_agg_outer o where o.k < 3 and o.v >= all (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having 100 * count(i.v) / count(*) >= 50) order by o.k;
+----
+1
+
+query I
+select o.k from set_cmp_agg_outer o where o.v > all (select 100 / (count(*) - 2) from set_cmp_agg_inner i where i.k = o.k having count(*) <> 2) order by o.k;
+----
+1
+2
+3
+
 query IB
 select o.k, 1 > all (select count(*) from set_cmp_agg_inner i where i.k = o.k) from set_cmp_agg_outer o order by o.k;
 ----
