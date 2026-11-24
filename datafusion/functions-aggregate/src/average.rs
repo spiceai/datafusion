@@ -33,7 +33,8 @@ use arrow::datatypes::{
 };
 use datafusion_common::types::{NativeType, logical_float64};
 use datafusion_common::{
-    Result, ScalarValue, exec_datafusion_err, exec_err, internal_err, not_impl_err,
+    DataFusionError, Result, ScalarValue, exec_datafusion_err, exec_err, internal_err,
+    not_impl_err,
 };
 use datafusion_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion_expr::utils::format_state_name;
@@ -49,7 +50,9 @@ use datafusion_functions_aggregate_common::aggregate::groups_accumulator::accumu
 use datafusion_functions_aggregate_common::aggregate::groups_accumulator::nulls::{
     filtered_null_mask, set_nulls,
 };
-use datafusion_functions_aggregate_common::utils::DecimalAverager;
+use datafusion_functions_aggregate_common::utils::{
+    DecimalAverager, add_counting_wraps, sub_counting_wraps,
+};
 use datafusion_macros::user_doc;
 use log::debug;
 use std::fmt::Debug;
@@ -136,9 +139,28 @@ impl Default for Avg {
 /// `n * 10^p`, so a sum type with `p + 4 + 9` digits holds `10^9` rows. The sum
 /// wraps on overflow, like the `sum` aggregate; the budget is what puts that out
 /// of reach. `Decimal256` input near max precision is the exception: no wider
-/// type exists, so its sum keeps only whatever headroom `Decimal256(76, _)` has
-/// left, as before this budget was introduced.
+/// type exists, so its sum counts its wraps instead, see [`avg_sum_counts_wraps`].
 const AVG_SUM_HEADROOM_DIGITS: u8 = 13;
+
+/// Whether [`avg_sum_data_type`] cannot reserve [`AVG_SUM_HEADROOM_DIGITS`] for
+/// `data_type`, so a few rows can carry the sum past the range of its native
+/// type. Such a sum counts its wraps ([`add_counting_wraps`]) and errors only
+/// when the total itself does not fit, which a sliding window or values of
+/// mixed sign can pass through on the way to a total that does.
+fn avg_sum_counts_wraps(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Decimal256(precision, _)
+            if precision.saturating_add(AVG_SUM_HEADROOM_DIGITS) > DECIMAL256_MAX_PRECISION
+    )
+}
+
+fn avg_sum_overflow(sum_data_type: &DataType) -> DataFusionError {
+    exec_datafusion_err!(
+        "Arithmetic overflow in avg: the sum of the input values does not fit \
+         {sum_data_type}"
+    )
+}
 
 /// The narrowest decimal that can accumulate `avg`'s sum over `data_type`, never
 /// narrower than `data_type` itself. Other types accumulate as themselves.
@@ -242,8 +264,13 @@ impl AggregateUDFImpl for Avg {
             DataType::Decimal256(precision, scale) => {
                 // In the spark, the result type is DECIMAL(min(38,precision+4), min(38,scale+4)).
                 // Ref: https://github.com/apache/spark/blob/fcf636d9eb8d645c24be3db2d599aba2d7e2955a/sql/catalyst/src/main/scala/org/apache/spark/sql/catalyst/expressions/aggregate/Average.scala#L66
+                // No wider type exists, so past the precision limit the scale
+                // grows only by the digits the precision gained: the result
+                // keeps the input's integer digits, and every average fits.
                 let new_precision = DECIMAL256_MAX_PRECISION.min(*precision + 4);
-                let new_scale = DECIMAL256_MAX_SCALE.min(*scale + 4);
+                let added_digits = new_precision.saturating_sub(*precision) as i8;
+                let new_scale =
+                    DECIMAL256_MAX_SCALE.min(scale.saturating_add(added_digits));
                 Ok(DataType::Decimal256(new_precision, new_scale))
             }
             DataType::Duration(time_unit) => Ok(DataType::Duration(*time_unit)),
@@ -294,7 +321,8 @@ impl AggregateUDFImpl for Avg {
                         &sum_data_type,
                         decimal_avg_accumulator,
                         sum_data_type.clone(),
-                        acc_args.return_type().clone()
+                        acc_args.return_type().clone(),
+                        avg_sum_counts_wraps(data_type)
                     )
                 }
 
@@ -398,7 +426,8 @@ impl AggregateUDFImpl for Avg {
                     &sum_data_type,
                     decimal_avg_groups_accumulator,
                     &sum_data_type,
-                    args.return_field.data_type()
+                    args.return_field.data_type(),
+                    avg_sum_counts_wraps(data_type)
                 )
             }
 
@@ -512,6 +541,7 @@ where
 fn decimal_avg_accumulator<I, S>(
     sum_data_type: DataType,
     return_data_type: DataType,
+    count_wraps: bool,
 ) -> Result<Box<dyn Accumulator>>
 where
     I: DecimalType + ArrowNumericType + Debug + Send + Sync,
@@ -527,6 +557,7 @@ where
         sum_data_type,
         return_data_type,
         avg_fn,
+        count_wraps,
     )))
 }
 
@@ -555,6 +586,7 @@ where
 fn decimal_avg_groups_accumulator<I, S>(
     sum_data_type: &DataType,
     return_data_type: &DataType,
+    count_wraps: bool,
 ) -> Result<Box<dyn GroupsAccumulator>>
 where
     I: DecimalType + ArrowNumericType + Debug + Send + Sync,
@@ -566,11 +598,10 @@ where
     let (target_precision, target_scale) = decimal_parts(return_data_type)?;
     let avg_fn = decimal_avg_fn::<I, S>(sum_scale, target_precision, target_scale)?;
 
-    Ok(Box::new(AvgGroupsAccumulator::<I, _, S>::new(
-        sum_data_type,
-        return_data_type,
-        avg_fn,
-    )))
+    Ok(Box::new(
+        AvgGroupsAccumulator::<I, _, S>::new(sum_data_type, return_data_type, avg_fn)
+            .with_counted_wraps(count_wraps),
+    ))
 }
 
 /// An accumulator to compute the average
@@ -652,10 +683,14 @@ where
     F: Fn(S::Native, u64) -> Result<I::Native>,
 {
     sum: Option<S::Native>,
+    /// Net count of the times `sum` wrapped, kept when `count_wraps` is set
+    sum_wraps: i64,
     count: u64,
     sum_data_type: DataType,
     return_data_type: DataType,
     avg_fn: F,
+    /// See [`avg_sum_counts_wraps`]
+    count_wraps: bool,
     _phantom: PhantomData<I>,
 }
 
@@ -669,6 +704,7 @@ where
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DecimalAvgAccumulator")
             .field("sum", &self.sum)
+            .field("sum_wraps", &self.sum_wraps)
             .field("count", &self.count)
             .field("sum_data_type", &self.sum_data_type)
             .field("return_data_type", &self.return_data_type)
@@ -683,14 +719,50 @@ where
     I::Native: Into<S::Native>,
     F: Fn(S::Native, u64) -> Result<I::Native>,
 {
-    fn new(sum_data_type: DataType, return_data_type: DataType, avg_fn: F) -> Self {
+    fn new(
+        sum_data_type: DataType,
+        return_data_type: DataType,
+        avg_fn: F,
+        count_wraps: bool,
+    ) -> Self {
         Self {
             sum: None,
+            sum_wraps: 0,
             count: 0,
             sum_data_type,
             return_data_type,
             avg_fn,
+            count_wraps,
             _phantom: PhantomData,
+        }
+    }
+
+    /// Adds the sum of `values` to the running sum
+    fn add_values(&mut self, values: &PrimitiveArray<I>) {
+        if self.count_wraps {
+            if let Some((batch_sum, batch_wraps)) =
+                decimal_sum_counting_wraps::<I, S>(values)
+            {
+                self.add_counted(batch_sum, batch_wraps);
+            }
+        } else if let Some(batch_sum) = decimal_sum_as::<I, S>(values) {
+            let sum = self.sum.unwrap_or_default();
+            self.sum = Some(sum.add_wrapping(batch_sum));
+        }
+    }
+
+    /// Adds a sum that wrapped `wraps` times to the running sum
+    fn add_counted(&mut self, value: S::Native, wraps: i64) {
+        let sum = self.sum.get_or_insert_with(S::Native::default);
+        self.sum_wraps += wraps + add_counting_wraps(sum, value);
+    }
+
+    /// The running sum, or an error when the total does not fit `S`
+    fn exact_sum(&self) -> Result<Option<S::Native>> {
+        if self.sum_wraps == 0 {
+            Ok(self.sum)
+        } else {
+            Err(avg_sum_overflow(&self.sum_data_type))
         }
     }
 }
@@ -699,7 +771,8 @@ where
 ///
 /// Wraps on overflow, matching the `sum` aggregate and [`arrow::compute::sum`].
 /// [`avg_sum_data_type`] gives `S` enough headroom that this is unreachable for
-/// any realistic row count.
+/// any realistic row count, except for the input types [`avg_sum_counts_wraps`]
+/// selects, which use [`decimal_sum_counting_wraps`].
 fn decimal_sum_as<I, S>(values: &PrimitiveArray<I>) -> Option<S::Native>
 where
     I: DecimalType + ArrowNumericType,
@@ -725,6 +798,35 @@ where
     Some(sum)
 }
 
+/// Like [`decimal_sum_as`], but also returns the net count of the times the sum
+/// wrapped, see [`add_counting_wraps`]
+fn decimal_sum_counting_wraps<I, S>(
+    values: &PrimitiveArray<I>,
+) -> Option<(S::Native, i64)>
+where
+    I: DecimalType + ArrowNumericType,
+    S: DecimalType + ArrowNumericType,
+    I::Native: Into<S::Native>,
+{
+    if values.null_count() == values.len() {
+        return None;
+    }
+
+    let mut sum = S::Native::default();
+    let mut wraps = 0;
+    if values.null_count() == 0 {
+        for value in values.values() {
+            wraps += add_counting_wraps(&mut sum, (*value).into());
+        }
+    } else {
+        for value in values.iter().flatten() {
+            wraps += add_counting_wraps(&mut sum, value.into());
+        }
+    }
+
+    Some((sum, wraps))
+}
+
 impl<I, S, F> Accumulator for DecimalAvgAccumulator<I, S, F>
 where
     I: DecimalType + ArrowNumericType + Debug,
@@ -735,11 +837,7 @@ where
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let values = values[0].as_primitive::<I>();
         self.count += (values.len() - values.null_count()) as u64;
-
-        if let Some(x) = decimal_sum_as::<I, S>(values) {
-            let v = self.sum.unwrap_or_default();
-            self.sum = Some(v.add_wrapping(x));
-        }
+        self.add_values(values);
         Ok(())
     }
 
@@ -750,7 +848,9 @@ where
         let v = if self.count == 0 {
             None
         } else {
-            self.sum.map(|v| (self.avg_fn)(v, self.count)).transpose()?
+            self.exact_sum()?
+                .map(|v| (self.avg_fn)(v, self.count))
+                .transpose()?
         };
 
         ScalarValue::new_primitive::<I>(v, &self.return_data_type)
@@ -763,7 +863,7 @@ where
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
         Ok(vec![
             ScalarValue::from(self.count),
-            ScalarValue::new_primitive::<S>(self.sum, &self.sum_data_type)?,
+            ScalarValue::new_primitive::<S>(self.exact_sum()?, &self.sum_data_type)?,
         ])
     }
 
@@ -772,7 +872,14 @@ where
         self.count += sum(states[0].as_primitive::<UInt64Type>()).unwrap_or_default();
 
         // sums are summed
-        if let Some(x) = sum(states[1].as_primitive::<S>()) {
+        let partial_sums = states[1].as_primitive::<S>();
+        if self.count_wraps {
+            if let Some((partial_sum, wraps)) =
+                decimal_sum_counting_wraps::<S, S>(partial_sums)
+            {
+                self.add_counted(partial_sum, wraps);
+            }
+        } else if let Some(x) = sum(partial_sums) {
             let v = self.sum.unwrap_or_default();
             self.sum = Some(v.add_wrapping(x));
         }
@@ -781,7 +888,15 @@ where
     fn retract_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let values = values[0].as_primitive::<I>();
         self.count -= (values.len() - values.null_count()) as u64;
-        if let Some(x) = decimal_sum_as::<I, S>(values) {
+        if self.count_wraps {
+            if let Some((batch_sum, batch_wraps)) =
+                decimal_sum_counting_wraps::<I, S>(values)
+            {
+                let sum = self.sum.get_or_insert_with(S::Native::default);
+                self.sum_wraps -= batch_wraps;
+                self.sum_wraps += sub_counting_wraps(sum, batch_sum);
+            }
+        } else if let Some(x) = decimal_sum_as::<I, S>(values) {
             let v = self.sum.unwrap_or_default();
             self.sum = Some(v.sub_wrapping(x));
         }
@@ -933,6 +1048,13 @@ where
     /// Function that computes the final average (value / count)
     avg_fn: F,
 
+    /// See [`avg_sum_counts_wraps`]
+    count_wraps: bool,
+
+    /// Net count of the times each group's sum wrapped, kept when `count_wraps`
+    /// is set and empty otherwise
+    sum_wraps: Vec<i64>,
+
     _phantom: PhantomData<I>,
 }
 
@@ -956,8 +1078,29 @@ where
             sums: vec![],
             null_state: NullState::new(),
             avg_fn,
+            count_wraps: false,
+            sum_wraps: vec![],
             _phantom: PhantomData,
         }
+    }
+
+    fn with_counted_wraps(mut self, count_wraps: bool) -> Self {
+        self.count_wraps = count_wraps;
+        self
+    }
+
+    /// Takes the wrap counts of the emitted groups, erroring when any of their
+    /// totals does not fit `S`
+    fn take_exact_sums(&mut self, emit_to: EmitTo) -> Result<()> {
+        if self.count_wraps
+            && emit_to
+                .take_needed(&mut self.sum_wraps)
+                .iter()
+                .any(|w| *w != 0)
+        {
+            return Err(avg_sum_overflow(&self.sum_data_type));
+        }
+        Ok(())
     }
 }
 
@@ -982,6 +1125,22 @@ where
         self.counts.resize(total_num_groups, 0);
         self.sums.resize(total_num_groups, S::default_value());
 
+        if self.count_wraps {
+            self.sum_wraps.resize(total_num_groups, 0);
+            self.null_state.accumulate(
+                group_indices,
+                values,
+                opt_filter,
+                total_num_groups,
+                |group_index, new_value| {
+                    self.sum_wraps[group_index] +=
+                        add_counting_wraps(&mut self.sums[group_index], new_value.into());
+                    self.counts[group_index] += 1;
+                },
+            );
+            return Ok(());
+        }
+
         self.null_state.accumulate(
             group_indices,
             values,
@@ -1000,6 +1159,7 @@ where
     }
 
     fn evaluate(&mut self, emit_to: EmitTo) -> Result<ArrayRef> {
+        self.take_exact_sums(emit_to)?;
         let counts = emit_to.take_needed(&mut self.counts);
         let sums = emit_to.take_needed(&mut self.sums);
         let nulls = self.null_state.build(emit_to);
@@ -1041,6 +1201,7 @@ where
 
     // return arrays for sums and counts
     fn state(&mut self, emit_to: EmitTo) -> Result<Vec<ArrayRef>> {
+        self.take_exact_sums(emit_to)?;
         let nulls = self.null_state.build(emit_to);
 
         let counts = emit_to.take_needed(&mut self.counts);
@@ -1082,6 +1243,10 @@ where
 
         // update sums
         self.sums.resize(total_num_groups, S::default_value());
+        if self.count_wraps {
+            self.sum_wraps.resize(total_num_groups, 0);
+        }
+        let count_wraps = self.count_wraps;
         self.null_state.accumulate(
             group_indices,
             partial_sums,
@@ -1090,7 +1255,11 @@ where
             |group_index, new_value: <S as ArrowPrimitiveType>::Native| {
                 // SAFETY: group_index is guaranteed to be in bounds
                 let sum = unsafe { self.sums.get_unchecked_mut(group_index) };
-                *sum = sum.add_wrapping(new_value);
+                if count_wraps {
+                    self.sum_wraps[group_index] += add_counting_wraps(sum, new_value);
+                } else {
+                    *sum = sum.add_wrapping(new_value);
+                }
             },
         );
 
@@ -1137,9 +1306,11 @@ where
         // Heap buffers
         self.counts.capacity() * size_of::<u64>()
         + self.sums.capacity() * size_of::<S::Native>()
+        + self.sum_wraps.capacity() * size_of::<i64>()
         // Vec struct overhead (ptr, len, cap) for each field
         + size_of::<Vec<u64>>()
         + size_of::<Vec<S::Native>>()
+        + size_of::<Vec<i64>>()
         // Null tracking buffers
         + self.null_state.size()
     }

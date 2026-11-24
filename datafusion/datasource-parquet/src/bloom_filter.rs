@@ -105,57 +105,12 @@ impl BloomFilterStatistics {
             ScalarValue::Int32(Some(v)) => sbbf.check(v),
             ScalarValue::UInt64(Some(v)) => sbbf.check(v),
             ScalarValue::UInt32(Some(v)) => sbbf.check(v),
-            ScalarValue::Decimal128(Some(v), p, s) => match parquet_type {
-                Type::INT32 => {
-                    //https://github.com/apache/parquet-format/blob/eb4b31c1d64a01088d02a2f9aefc6c17c54cc6fc/Encodings.md?plain=1#L35-L42
-                    // All physical type  are little-endian
-                    if *p > 9 {
-                        //DECIMAL can be used to annotate the following types:
-                        //
-                        // int32: for 1 <= precision <= 9
-                        // int64: for 1 <= precision <= 18
-                        return true;
-                    }
-                    let b = (*v as i32).to_le_bytes();
-                    // Use Decimal constructor after https://github.com/apache/arrow-rs/issues/5325
-                    let decimal = Decimal::Int32 {
-                        value: b,
-                        precision: *p as i32,
-                        scale: *s as i32,
-                    };
-                    sbbf.check(&decimal)
-                }
-                Type::INT64 => {
-                    if *p > 18 {
-                        return true;
-                    }
-                    let b = (*v as i64).to_le_bytes();
-                    let decimal = Decimal::Int64 {
-                        value: b,
-                        precision: *p as i32,
-                        scale: *s as i32,
-                    };
-                    sbbf.check(&decimal)
-                }
-                Type::FIXED_LEN_BYTE_ARRAY => {
-                    let Ok(type_length) = usize::try_from(type_length) else {
-                        return true;
-                    };
-                    if type_length == 0 || type_length > 16 {
-                        return true;
-                    }
-                    let b = v.to_be_bytes();
-                    let b = b[(b.len() - type_length)..].to_vec();
-                    // Use Decimal constructor after https://github.com/apache/arrow-rs/issues/5325
-                    let decimal = Decimal::Bytes {
-                        value: b.into(),
-                        precision: *p as i32,
-                        scale: *s as i32,
-                    };
-                    sbbf.check(&decimal)
-                }
-                _ => true,
-            },
+            ScalarValue::Decimal128(Some(v), p, s) => {
+                check_decimal(sbbf, &v.to_be_bytes(), *p, *s, parquet_type, type_length)
+            }
+            ScalarValue::Decimal256(Some(v), p, s) => {
+                check_decimal(sbbf, &v.to_be_bytes(), *p, *s, parquet_type, type_length)
+            }
             ScalarValue::Dictionary(_, inner) => BloomFilterStatistics::check_scalar(
                 sbbf,
                 inner,
@@ -164,6 +119,77 @@ impl BloomFilterStatistics {
             ),
             _ => true,
         }
+    }
+}
+
+/// Checks a decimal, given as its big-endian two's complement bytes, against
+/// `sbbf` in the encoding of its Parquet physical type. Like
+/// [`BloomFilterStatistics::check_scalar`], returns `true` when it cannot tell.
+fn check_decimal(
+    sbbf: &Sbbf,
+    be_bytes: &[u8],
+    precision: u8,
+    scale: i8,
+    parquet_type: &Type,
+    type_length: i32,
+) -> bool {
+    let (precision, scale) = (i32::from(precision), i32::from(scale));
+    // Parquet stores the low bytes of the value, as wide as its physical type
+    let low_bytes = |len: usize| {
+        be_bytes
+            .len()
+            .checked_sub(len)
+            .map(|start| &be_bytes[start..])
+    };
+
+    // Use the Decimal constructors after https://github.com/apache/arrow-rs/issues/5325
+    match parquet_type {
+        // https://github.com/apache/parquet-format/blob/eb4b31c1d64a01088d02a2f9aefc6c17c54cc6fc/Encodings.md?plain=1#L35-L42
+        // All physical types are little-endian. DECIMAL can annotate int32 for
+        // 1 <= precision <= 9 and int64 for 1 <= precision <= 18.
+        Type::INT32 => {
+            if precision > 9 {
+                return true;
+            }
+            let Some(Ok(value)) = low_bytes(4).map(<[u8; 4]>::try_from) else {
+                return true;
+            };
+            let decimal = Decimal::Int32 {
+                value: i32::from_be_bytes(value).to_le_bytes(),
+                precision,
+                scale,
+            };
+            sbbf.check(&decimal)
+        }
+        Type::INT64 => {
+            if precision > 18 {
+                return true;
+            }
+            let Some(Ok(value)) = low_bytes(8).map(<[u8; 8]>::try_from) else {
+                return true;
+            };
+            let decimal = Decimal::Int64 {
+                value: i64::from_be_bytes(value).to_le_bytes(),
+                precision,
+                scale,
+            };
+            sbbf.check(&decimal)
+        }
+        Type::FIXED_LEN_BYTE_ARRAY => {
+            let Ok(type_length) = usize::try_from(type_length) else {
+                return true;
+            };
+            let Some(value) = low_bytes(type_length).filter(|_| type_length > 0) else {
+                return true;
+            };
+            let decimal = Decimal::Bytes {
+                value: value.to_vec().into(),
+                precision,
+                scale,
+            };
+            sbbf.check(&decimal)
+        }
+        _ => true,
     }
 }
 
