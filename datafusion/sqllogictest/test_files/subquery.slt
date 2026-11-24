@@ -1043,7 +1043,7 @@ query TT
 explain SELECT t1_id, (SELECT count(*) + 2 as cnt_plus_2 FROM t2 WHERE t2.t2_int = t1.t1_int having count(*) = 0) from t1
 ----
 logical_plan
-01)Projection: t1.t1_id, CASE WHEN __scalar_sq_1.__always_true IS NULL THEN Int64(2) WHEN __scalar_sq_1.count(Int64(1)) != Int64(0) THEN Int64(NULL) ELSE __scalar_sq_1.cnt_plus_2 END AS cnt_plus_2
+01)Projection: t1.t1_id, CASE WHEN __scalar_sq_1.__always_true IS NULL THEN Int64(2) WHEN __scalar_sq_1.count(Int64(1)) = Int64(0) IS NOT TRUE THEN Int64(NULL) ELSE __scalar_sq_1.cnt_plus_2 END AS cnt_plus_2
 02)--Left Join: t1.t1_int = __scalar_sq_1.t2_int
 03)----TableScan: t1 projection=[t1_id, t1_int]
 04)----SubqueryAlias: __scalar_sq_1
@@ -1117,7 +1117,7 @@ select t1.t1_int from t1 where (
 ----
 logical_plan
 01)Projection: t1.t1_int
-02)--Filter: CASE WHEN __scalar_sq_1.__always_true IS NULL THEN Int64(2) WHEN __scalar_sq_1.count(Int64(1)) != Int64(0) THEN Int64(NULL) ELSE __scalar_sq_1.cnt_plus_two END = Int64(2)
+02)--Filter: CASE WHEN __scalar_sq_1.__always_true IS NULL THEN Int64(2) WHEN __scalar_sq_1.count(Int64(1)) = Int64(0) IS NOT TRUE THEN Int64(NULL) ELSE __scalar_sq_1.cnt_plus_two END = Int64(2)
 03)----Projection: t1.t1_int, __scalar_sq_1.cnt_plus_two, __scalar_sq_1.count(Int64(1)), __scalar_sq_1.__always_true
 04)------Left Join: t1.t1_int = __scalar_sq_1.t2_int
 05)--------TableScan: t1 projection=[t1_int]
@@ -3352,6 +3352,79 @@ select o.k from set_cmp_agg_outer o where 3 in (select count(*) from set_cmp_agg
 1
 2
 3
+
+# A correlated scalar subquery over a groupless aggregate whose HAVING holds on
+# no rows: the HAVING decides each group, also for a constant and for a value
+# that is NULL on no rows, and a NULL HAVING drops the group.
+query IB
+select o.k, (select true from set_cmp_agg_inner i where i.k = o.k having count(*) = 0) from set_cmp_agg_outer o order by o.k;
+----
+1 NULL
+2 NULL
+3 true
+
+query I
+select o.k from set_cmp_agg_outer o where (select true from set_cmp_agg_inner i where i.k = o.k having count(*) = 0) is null order by o.k;
+----
+1
+2
+
+query II
+select o.k, (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) < 2) from set_cmp_agg_outer o order by o.k;
+----
+1 NULL
+2 30
+3 NULL
+
+query II
+select o.k, (select count(*) + max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) < 2) from set_cmp_agg_outer o order by o.k;
+----
+1 NULL
+2 31
+3 NULL
+
+statement ok
+create table set_cmp_agg_inner_nulls(k int, v int) as values (1, null), (2, 10);
+
+query II
+select o.k, (select count(*) from set_cmp_agg_inner_nulls i where i.k = o.k having count(*) = 0 or max(i.v) > 5) from set_cmp_agg_outer o order by o.k;
+----
+1 NULL
+2 1
+3 0
+
+statement ok
+drop table set_cmp_agg_inner_nulls;
+
+query III
+select o.k, (select count(*) from set_cmp_agg_inner i where i.k = o.k having count(*) < 2) as a, (select count(*) from set_cmp_agg_inner i where i.k = o.k having count(*) < 3) as b from set_cmp_agg_outer o order by o.k;
+----
+1 NULL 2
+2 1 1
+3 0 0
+
+# A HAVING that reads an outer column stays in the join condition, so a group
+# it rejects looks like no group and gets the empty-input value. A value that
+# is not NULL on no rows is refused; a value that is NULL on no rows is
+# answered.
+statement error Unsupported correlated scalar subquery: a HAVING or filter above a count-like aggregate reads outer columns
+select o.k, (select count(*) from set_cmp_agg_inner i where i.k = o.k having count(*) < o.k) from set_cmp_agg_outer o order by o.k;
+
+query II
+select o.k, (select max(i.v) from set_cmp_agg_inner i where i.k = o.k having count(*) < 2 and count(*) < o.v) from set_cmp_agg_outer o order by o.k;
+----
+1 NULL
+2 30
+3 NULL
+
+# A subquery in a value that reads no column is planned, here where every
+# outer row has a group.
+query III
+select o.k, s.x, s.c from set_cmp_agg_inner o cross join lateral (select (select 7) as x, count(*) as c from set_cmp_agg_inner i where i.k = o.k) s order by o.k, o.v;
+----
+1 7 2
+1 7 2
+2 7 1
 
 # A correlated scalar subquery over a groupless aggregate with a HAVING, through
 # a derived table: spiceai-55 fails it at planning (stale SubqueryAlias schema),
