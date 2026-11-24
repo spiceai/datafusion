@@ -17,7 +17,7 @@
 
 //! SQL planning extensions like [`WindowFunctionPlanner`]
 
-use datafusion_common::Result;
+use datafusion_common::{Result, plan_err};
 use datafusion_expr::{
     Expr,
     expr::{WindowFunction, WindowFunctionParams},
@@ -86,6 +86,19 @@ impl ExprPlanner for WindowFunctionPlanner {
             null_treatment,
             distinct,
         };
+
+        // count(1) counts rows, not distinct rows, so a DISTINCT wildcard
+        // cannot take the count(*) rewrite below.
+        // TODO: remove the next line after `Expr::Wildcard` is removed
+        #[expect(deprecated)]
+        if raw_expr.func_def.name() == "count"
+            && raw_expr.distinct
+            && let [wildcard @ Expr::Wildcard { .. }] = raw_expr.args.as_slice()
+        {
+            return plan_err!(
+                "count(DISTINCT {wildcard}) is not supported. List the columns, for example count(DISTINCT (a, b)). It counts each distinct (a, b) value, including (NULL, NULL). For one column, use count(DISTINCT struct(a))"
+            );
+        }
 
         // TODO: remove the next line after `Expr::Wildcard` is removed
         #[expect(deprecated)]
