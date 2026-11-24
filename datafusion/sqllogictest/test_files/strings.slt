@@ -71,25 +71,375 @@ p2
 p2e1
 p2m1e1
 
-# SIMILAR TO
+# SIMILAR TO with `%` wildcard (zero or more characters)
 query T rowsort
-SELECT s FROM test WHERE s SIMILAR TO 'p[12].*';
+SELECT s FROM test WHERE s SIMILAR TO 'p1%';
 ----
 p1
 p1e1
 p1m1e1
-p2
-p2e1
-p2m1e1
 
-# NOT SIMILAR TO
+# SIMILAR TO with `_` wildcard (exactly one character)
 query T rowsort
-SELECT s FROM test WHERE s NOT SIMILAR TO 'p[12].*';
+SELECT s FROM test WHERE s SIMILAR TO 'p_';
+----
+p1
+p2
+
+# SIMILAR TO requires full-string match (no implicit substring)
+query T rowsort
+SELECT s FROM test WHERE s SIMILAR TO 'p1';
+----
+p1
+
+# SIMILAR TO treats `. ^ $` as SQL literals (not as regex metachars).
+query B
+SELECT 'a.' SIMILAR TO 'a.';
+----
+true
+
+query B
+SELECT 'ab' SIMILAR TO 'a.';
+----
+false
+
+query B
+SELECT '^x$' SIMILAR TO '^x$';
+----
+true
+
+query B
+SELECT 'x' SIMILAR TO '^x$';
+----
+false
+
+# SIMILAR TO supports the POSIX metacharacters `| * + ? ( ) { } [ ]`.
+query B
+SELECT 'a' SIMILAR TO 'a|b';
+----
+true
+
+query B
+SELECT 'c' SIMILAR TO 'a|b';
+----
+false
+
+query B
+SELECT '' SIMILAR TO 'a*';
+----
+true
+
+query B
+SELECT 'aa' SIMILAR TO 'a*';
+----
+true
+
+query B
+SELECT 'ab' SIMILAR TO 'a*';
+----
+false
+
+query B
+SELECT 'a' SIMILAR TO 'a+';
+----
+true
+
+query B
+SELECT '' SIMILAR TO 'a+';
+----
+false
+
+query B
+SELECT '' SIMILAR TO 'a?';
+----
+true
+
+query B
+SELECT 'a' SIMILAR TO 'a?';
+----
+true
+
+query B
+SELECT 'aa' SIMILAR TO 'a?';
+----
+false
+
+query B
+SELECT 'ab' SIMILAR TO '(ab)';
+----
+true
+
+query B
+SELECT 'a' SIMILAR TO 'a{2}';
+----
+false
+
+query B
+SELECT 'aa' SIMILAR TO 'a{2}';
+----
+true
+
+query B
+SELECT 'a' SIMILAR TO '[ab]';
+----
+true
+
+query B
+SELECT 'c' SIMILAR TO '[ab]';
+----
+false
+
+query B
+SELECT 'c' SIMILAR TO '[^ab]';
+----
+true
+
+query B
+SELECT 'a' SIMILAR TO '[^ab]';
+----
+false
+
+# SIMILAR TO wildcards match newlines.
+query B
+SELECT 'a' || chr(10) || 'b' SIMILAR TO 'a%b';
+----
+true
+
+query B
+SELECT 'a' || chr(10) || 'b' SIMILAR TO 'a_b';
+----
+true
+
+query B
+SELECT 'ab' SIMILAR TO 'a_b';
+----
+false
+
+# SIMILAR TO with a dynamic (column) pattern: wildcards and regex-only
+# metacharacters are translated the same way as for literal patterns.
+statement ok
+CREATE TABLE dynamic_patterns(text TEXT, pattern TEXT) AS VALUES
+  ('abc', 'a%'),
+  ('ab', 'a.'),
+  ('x', '_'),
+  ('hello world', 'hello%');
+
+query T rowsort
+SELECT text FROM dynamic_patterns WHERE text SIMILAR TO pattern;
+----
+abc
+hello world
+x
+
+query T rowsort
+SELECT text FROM dynamic_patterns WHERE text NOT SIMILAR TO pattern;
+----
+ab
+
+statement ok
+DROP TABLE dynamic_patterns;
+
+# SIMILAR TO with a dynamic pattern produced by a function.
+query B
+SELECT 'abc' SIMILAR TO concat('a', '%');
+----
+true
+
+query B
+SELECT 'ab' SIMILAR TO concat('a', '.');
+----
+false
+
+query B
+SELECT 'x' SIMILAR TO lower('X');
+----
+true
+
+query B
+SELECT 'X' SIMILAR TO lower('X');
+----
+false
+
+# NOT SIMILAR TO with a literal pattern.
+query T rowsort
+SELECT s FROM test WHERE s NOT SIMILAR TO 'p1%';
 ----
 P1
 P1e1
 P1m1e1
 e1
+p2
+p2e1
+p2m1e1
+
+# SIMILAR TO NULL pattern returns NULL.
+query B
+SELECT 'a' SIMILAR TO NULL;
+----
+NULL
+
+# SIMILAR TO with a non-string pattern is rejected by the analyzer.
+statement error There isn't a common type to coerce Utf8 and Int64 in SIMILAR TO expression
+SELECT 'a' SIMILAR TO 1;
+
+# The value and the pattern are coerced to a common string type, so mixing
+# `Utf8`, `LargeUtf8` and `Utf8View` works instead of failing in the regex
+# kernel.
+query B
+SELECT 'abc' SIMILAR TO arrow_cast('a%', 'LargeUtf8');
+----
+true
+
+query B
+SELECT arrow_cast('ab', 'Utf8View') SIMILAR TO arrow_cast('a.', 'LargeUtf8');
+----
+false
+
+query B
+SELECT arrow_cast('a', 'Utf8View') SIMILAR TO NULL;
+----
+NULL
+
+query B
+SELECT arrow_cast('a', 'LargeUtf8') SIMILAR TO arrow_cast(NULL, 'Utf8View');
+----
+NULL
+
+statement ok
+CREATE TABLE mixed_patterns(text TEXT, pattern TEXT) AS VALUES ('abc', 'a%');
+
+query B
+SELECT text SIMILAR TO arrow_cast(pattern, 'LargeUtf8') FROM mixed_patterns;
+----
+true
+
+query B
+SELECT arrow_cast(text, 'Utf8View') SIMILAR TO arrow_cast(pattern, 'LargeUtf8')
+FROM mixed_patterns;
+----
+true
+
+# Dictionary-encoded values are coerced to their value type.
+query B
+SELECT arrow_cast(text, 'Dictionary(Int32, Utf8)') SIMILAR TO 'a%'
+FROM mixed_patterns;
+----
+true
+
+query B
+SELECT arrow_cast(text, 'Dictionary(Int32, Utf8)') SIMILAR TO pattern
+FROM mixed_patterns;
+----
+true
+
+statement ok
+DROP TABLE mixed_patterns;
+
+# SIMILAR TO: `\` is the default escape character, so an escaped wildcard,
+# metacharacter or backslash matches only itself.
+query BBBBBB
+SELECT 'a%' SIMILAR TO 'a\%', 'ab' SIMILAR TO 'a\%', 'a_' SIMILAR TO 'a\_',
+  'ab' SIMILAR TO 'a\_', 'a\b' SIMILAR TO 'a\\b', 'a|b' SIMILAR TO 'a\|b';
+----
+true false true false true true
+
+# SIMILAR TO: the `]` that closes a named class such as `[:digit:]` does not
+# close the bracket expression around it, and characters that are set
+# operators in the regex engine (`&&`, `~~`) are literal.
+query BBBBBB
+SELECT '_' SIMILAR TO '[[:digit:]_]', '5' SIMILAR TO '[[:digit:]_]',
+  's' SIMILAR TO '[[:digit:]_]', '&' SIMILAR TO '[a&&b]',
+  '~' SIMILAR TO '[a~~b]', 'c' SIMILAR TO '[a&&b]';
+----
+true true false true true false
+
+# The same patterns from a column.
+statement ok
+CREATE TABLE similar_to_cases(value TEXT, pattern TEXT) AS VALUES
+  ('a%', 'a\%'),
+  ('ab', 'a\%'),
+  ('a_', 'a\_'),
+  ('a\b', 'a\\b'),
+  ('_', '[[:digit:]_]'),
+  ('s', '[[:digit:]_]'),
+  ('&', '[a&&b]'),
+  ('c', '[a&&b]');
+
+query TTB rowsort
+SELECT value, pattern, value SIMILAR TO pattern FROM similar_to_cases;
+----
+& [a&&b] true
+_ [[:digit:]_] true
+a% a\% true
+a\b a\\b true
+a_ a\_ true
+ab a\% false
+c [a&&b] false
+s [[:digit:]_] false
+
+statement ok
+DROP TABLE similar_to_cases;
+
+# SIMILAR TO rejects a pattern with unbalanced parentheses, which would
+# otherwise let `|` take apart the anchors around the pattern.
+statement ok
+CREATE TABLE similar_to_invalid(value TEXT, pattern TEXT) AS VALUES ('ax', 'a)|b(');
+
+query error Invalid SIMILAR TO pattern 'a\)\|b\(': parentheses \(\) not balanced
+SELECT value SIMILAR TO 'a)|b(' FROM similar_to_invalid;
+
+query error Invalid SIMILAR TO pattern 'a\)\|b\(': parentheses \(\) not balanced
+SELECT value SIMILAR TO pattern FROM similar_to_invalid;
+
+statement ok
+DROP TABLE similar_to_invalid;
+
+# A pattern that is not valid fails only where it is matched against a value,
+# as in PostgreSQL: not in a CASE branch no row takes, and not in a row whose
+# value is NULL.
+query B
+SELECT CASE WHEN v = 'zzz' THEN v SIMILAR TO '[' END FROM (VALUES ('a'), ('b')) t(v);
+----
+NULL
+NULL
+
+query error Invalid SIMILAR TO pattern '\[': brackets \[\] not balanced
+SELECT CASE WHEN v = 'a' THEN v SIMILAR TO '[' END FROM (VALUES ('a'), ('b')) t(v);
+
+query B rowsort
+SELECT v SIMILAR TO p FROM (VALUES (CAST(NULL AS VARCHAR), '['), ('a', 'a')) t(v, p);
+----
+NULL
+true
+
+# A SIMILAR TO with column patterns is not a constant inside an IN list, so
+# the plan has no constant `(SET)`. The list has four items so it stays an IN
+# list instead of becoming ORs.
+statement ok
+CREATE TABLE similar_to_in_list(x BOOLEAN, a TEXT, p TEXT, q TEXT) AS VALUES
+  (true, 'abc', 'a%', 'b%'),
+  (false, 'abc', 'b%', 'c%');
+
+query TT
+EXPLAIN SELECT x IN (a SIMILAR TO p, a SIMILAR TO q, a SIMILAR TO p || 'x',
+  a SIMILAR TO q || 'x') FROM similar_to_in_list;
+----
+logical_plan
+01)Projection: similar_to_in_list.x IN ([similar_to_in_list.a SIMILAR TO similar_to_in_list.p, similar_to_in_list.a SIMILAR TO similar_to_in_list.q, similar_to_in_list.a SIMILAR TO similar_to_in_list.p || Utf8View("x"), similar_to_in_list.a SIMILAR TO similar_to_in_list.q || Utf8View("x")]) AS similar_to_in_list.x IN similar_to_in_list.a SIMILAR TO similar_to_in_list.p, similar_to_in_list.a SIMILAR TO similar_to_in_list.q, similar_to_in_list.a SIMILAR TO similar_to_in_list.p || Utf8("x"), similar_to_in_list.a SIMILAR TO similar_to_in_list.q || Utf8("x")
+02)--TableScan: similar_to_in_list projection=[x, a, p, q]
+physical_plan
+01)ProjectionExec: expr=[x@0 IN ([a@1 ~ sql_similar_to_regex(p@2), a@1 ~ sql_similar_to_regex(q@3), a@1 ~ sql_similar_to_regex(p@2 || x), a@1 ~ sql_similar_to_regex(q@3 || x)]) as similar_to_in_list.x IN similar_to_in_list.a SIMILAR TO similar_to_in_list.p, similar_to_in_list.a SIMILAR TO similar_to_in_list.q, similar_to_in_list.a SIMILAR TO similar_to_in_list.p || Utf8("x"), similar_to_in_list.a SIMILAR TO similar_to_in_list.q || Utf8("x")]
+02)--DataSourceExec: partitions=1, partition_sizes=[1]
+
+query B
+SELECT x IN (a SIMILAR TO p, a SIMILAR TO q, a SIMILAR TO p || 'x',
+  a SIMILAR TO q || 'x') FROM similar_to_in_list;
+----
+true
+true
+
+statement ok
+DROP TABLE similar_to_in_list;
 
 # NOT LIKE
 query T rowsort
