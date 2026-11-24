@@ -1114,25 +1114,27 @@ async fn prune_decimal_in_list() {
 #[tokio::test]
 async fn prune_decimal256_by_bloom_filter() {
     // Each scenario's statistics keep all three row groups, and only the first
-    // contains 5: r1: {1,2,3,4,5}, r2: {-1,2,3,4,6}, r3: {1,2,3,4,6}
+    // contains 5, while none contains 7:
+    // r1: {1,2,3,4,5}, r2: {-1,2,3,4,6}, r3: {1,2,3,4,6}
+    // 10^65 + v, the large base of the fixed-length scenario
+    let fixed = |v: u8| format!("CAST('1{v:0>65}' AS DECIMAL(76, 5))");
     let cases = [
         (
             Scenario::Decimal256BloomFilterInt32,
-            "arrow_cast(5, 'Decimal256(6, 2)')",
+            "arrow_cast(5, 'Decimal256(6, 2)')".to_string(),
+            "arrow_cast(7, 'Decimal256(6, 2)')".to_string(),
         ),
         (
             Scenario::Decimal256BloomFilterInt64,
-            "arrow_cast(5, 'Decimal256(18, 2)')",
+            "arrow_cast(5, 'Decimal256(18, 2)')".to_string(),
+            "arrow_cast(7, 'Decimal256(18, 2)')".to_string(),
         ),
-        (
-            Scenario::Decimal256BloomFilter,
-            "CAST('100000000000000000000000000000000000000000000000000000000000000005' AS DECIMAL(76, 5))",
-        ),
+        (Scenario::Decimal256BloomFilter, fixed(5), fixed(7)),
     ];
-    for (scenario, value) in cases {
+    for (scenario, present, absent) in cases {
         for query in [
-            format!("SELECT * FROM t WHERE decimal_col = {value}"),
-            format!("SELECT * FROM t WHERE decimal_col IN ({value}, {value})"),
+            format!("SELECT * FROM t WHERE decimal_col = {present}"),
+            format!("SELECT * FROM t WHERE decimal_col IN ({present}, {absent})"),
         ] {
             RowGroupPruningTest::new()
                 .with_scenario(scenario.clone())
