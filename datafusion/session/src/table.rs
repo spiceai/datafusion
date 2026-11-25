@@ -599,6 +599,18 @@ impl<'e, 's> TableFunctionArgs<'e, 's> {
 
 /// A trait for table function implementations
 pub trait TableFunctionImpl: Debug + Sync + Send + Any {
+    /// Bind a function with a relational input. The returned expressions are evaluated
+    /// against the input at execution time. Return `None` to use the provider path for
+    /// ordinary calls. A correlated call requires an input-aware implementation.
+    fn bind_with_input(
+        &self,
+        _args: TableFunctionArgs,
+        _input: &datafusion_common::DFSchema,
+    ) -> Result<Option<datafusion_physical_plan::table_function::TableFunctionBinding>>
+    {
+        Ok(None)
+    }
+
     /// Create a table provider
     #[deprecated(
         since = "53.0.0",

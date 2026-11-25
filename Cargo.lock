@@ -1975,17 +1975,17 @@ dependencies = [
  "datafusion-datasource-csv",
  "datafusion-datasource-json",
  "datafusion-datasource-parquet",
- "datafusion-doc 55.3.0",
+ "datafusion-doc",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
- "datafusion-functions-nested 55.3.0",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-nested",
  "datafusion-functions-table",
  "datafusion-functions-window",
  "datafusion-functions-window-common",
- "datafusion-macros 55.3.0",
+ "datafusion-macros",
  "datafusion-optimizer",
  "datafusion-physical-expr",
  "datafusion-physical-expr-adapter",
@@ -2320,8 +2320,8 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-functions-aggregate-common 55.3.0",
- "datafusion-functions-nested 55.3.0",
+ "datafusion-functions-aggregate-common",
+ "datafusion-functions-nested",
  "datafusion-physical-expr",
  "datafusion-physical-expr-adapter",
  "datafusion-physical-expr-common",
@@ -2338,12 +2338,6 @@ dependencies = [
  "tempfile",
  "tokio",
 ]
-
-[[package]]
-name = "datafusion-doc"
-version = "55.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d44c5919b560862dd1cb20a5c75b3e48c3d9e49719c91d78da5c38eaad5495c4"
 
 [[package]]
 name = "datafusion-doc"
@@ -2427,9 +2421,9 @@ dependencies = [
  "chrono",
  "ctor",
  "datafusion-common",
- "datafusion-doc 55.3.0",
+ "datafusion-doc",
  "datafusion-expr-common",
- "datafusion-functions-aggregate-common 55.3.0",
+ "datafusion-functions-aggregate-common",
  "datafusion-functions-window-common",
  "datafusion-physical-expr-common",
  "datafusion-proto-common",
@@ -2471,8 +2465,8 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
- "datafusion-functions-aggregate-common 55.3.0",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
  "datafusion-functions-table",
  "datafusion-functions-window",
  "datafusion-physical-expr",
@@ -2506,11 +2500,11 @@ dependencies = [
  "criterion",
  "ctor",
  "datafusion-common",
- "datafusion-doc 55.3.0",
+ "datafusion-doc",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
- "datafusion-macros 55.3.0",
+ "datafusion-macros",
  "datafusion-physical-expr-common",
  "env_logger",
  "hex",
@@ -2528,37 +2522,16 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-aggregate"
-version = "55.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "46c0c2b2e856883ecf6a4fa8b23e7c6041183af8a68d0583dc95d1d21e4eaee0"
-dependencies = [
- "arrow",
- "datafusion-common",
- "datafusion-doc 55.1.0",
- "datafusion-execution",
- "datafusion-expr",
- "datafusion-functions-aggregate-common 55.1.0",
- "datafusion-macros 55.1.0",
- "datafusion-physical-expr",
- "datafusion-physical-expr-common",
- "half",
- "hashbrown 0.17.1",
- "log",
- "num-traits",
-]
-
-[[package]]
-name = "datafusion-functions-aggregate"
 version = "55.3.0"
 dependencies = [
  "arrow",
  "criterion",
  "datafusion-common",
- "datafusion-doc 55.3.0",
+ "datafusion-doc",
  "datafusion-execution",
  "datafusion-expr",
- "datafusion-functions-aggregate-common 55.3.0",
- "datafusion-macros 55.3.0",
+ "datafusion-functions-aggregate-common",
+ "datafusion-macros",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "half",
@@ -2566,18 +2539,6 @@ dependencies = [
  "log",
  "num-traits",
  "rand 0.9.4",
-]
-
-[[package]]
-name = "datafusion-functions-aggregate-common"
-version = "55.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e35e42c87dfbff06934ea0e99cfed3440ac614c3f3bfb8c33be35ca0587d4140"
-dependencies = [
- "arrow",
- "datafusion-common",
- "datafusion-expr-common",
- "datafusion-physical-expr-common",
 ]
 
 [[package]]
@@ -2594,45 +2555,20 @@ dependencies = [
 
 [[package]]
 name = "datafusion-functions-nested"
-version = "55.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "08079b0604cdcc43c7d6cf006cfd5d3ed9c235ade0c1ebe91085a62f875603df"
-dependencies = [
- "arrow",
- "arrow-ord",
- "datafusion-common",
- "datafusion-doc 55.1.0",
- "datafusion-execution",
- "datafusion-expr",
- "datafusion-expr-common",
- "datafusion-functions",
- "datafusion-functions-aggregate 55.1.0",
- "datafusion-functions-aggregate-common 55.1.0",
- "datafusion-macros 55.1.0",
- "datafusion-physical-expr-common",
- "hashbrown 0.17.1",
- "itertools 0.15.0",
- "itoa",
- "log",
- "memchr",
-]
-
-[[package]]
-name = "datafusion-functions-nested"
 version = "55.3.0"
 dependencies = [
  "arrow",
  "arrow-ord",
  "criterion",
  "datafusion-common",
- "datafusion-doc 55.3.0",
+ "datafusion-doc",
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
- "datafusion-functions-aggregate-common 55.3.0",
- "datafusion-macros 55.3.0",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
+ "datafusion-macros",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "hashbrown 0.17.1",
@@ -2651,9 +2587,11 @@ dependencies = [
  "async-trait",
  "datafusion-catalog",
  "datafusion-common",
+ "datafusion-execution",
  "datafusion-expr",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
+ "futures",
  "parking_lot",
 ]
 
@@ -2664,10 +2602,10 @@ dependencies = [
  "arrow",
  "criterion",
  "datafusion-common",
- "datafusion-doc 55.3.0",
+ "datafusion-doc",
  "datafusion-expr",
  "datafusion-functions-window-common",
- "datafusion-macros 55.3.0",
+ "datafusion-macros",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "log",
@@ -2683,20 +2621,9 @@ dependencies = [
 
 [[package]]
 name = "datafusion-macros"
-version = "55.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3a711bd5a06ec85d9683e142d28a98ad0679a7220669f5c1b8589e57e9b29e46"
-dependencies = [
- "datafusion-doc 55.1.0",
- "quote",
- "syn 3.0.3",
-]
-
-[[package]]
-name = "datafusion-macros"
 version = "55.3.0"
 dependencies = [
- "datafusion-doc 55.3.0",
+ "datafusion-doc",
  "quote",
  "syn 3.0.3",
 ]
@@ -2713,7 +2640,7 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-expr-common",
- "datafusion-functions-aggregate 55.3.0",
+ "datafusion-functions-aggregate",
  "datafusion-functions-window",
  "datafusion-functions-window-common",
  "datafusion-physical-expr",
@@ -2739,7 +2666,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-expr-common",
  "datafusion-functions",
- "datafusion-functions-aggregate-common 55.3.0",
+ "datafusion-functions-aggregate-common",
  "datafusion-physical-expr-common",
  "datafusion-proto-models",
  "half",
@@ -2796,7 +2723,7 @@ dependencies = [
  "datafusion-expr",
  "datafusion-expr-common",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
+ "datafusion-functions-aggregate",
  "datafusion-functions-window",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
@@ -2827,8 +2754,8 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
- "datafusion-functions-aggregate-common 55.3.0",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
  "datafusion-functions-window",
  "datafusion-functions-window-common",
  "datafusion-physical-expr",
@@ -2872,7 +2799,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
+ "datafusion-functions-aggregate",
  "datafusion-functions-table",
  "datafusion-functions-window-common",
  "datafusion-physical-expr",
@@ -2922,7 +2849,7 @@ dependencies = [
  "datafusion-datasource",
  "datafusion-expr",
  "datafusion-expr-common",
- "datafusion-functions-nested 55.3.0",
+ "datafusion-functions-nested",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "datafusion-physical-plan",
@@ -2957,9 +2884,9 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
- "datafusion-functions-aggregate-common 55.3.0",
- "datafusion-functions-nested 55.3.0",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-aggregate-common",
+ "datafusion-functions-nested",
  "datafusion-session",
  "log",
  "num-traits",
@@ -2984,8 +2911,8 @@ dependencies = [
  "datafusion-common",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-functions-aggregate 55.3.0",
- "datafusion-functions-nested 55.3.0",
+ "datafusion-functions-aggregate",
+ "datafusion-functions-nested",
  "datafusion-functions-window",
  "env_logger",
  "indexmap 2.14.0",
@@ -3039,7 +2966,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "datafusion",
- "datafusion-functions-aggregate 55.3.0",
+ "datafusion-functions-aggregate",
  "half",
  "insta",
  "itertools 0.15.0",
@@ -7938,7 +7865,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-functions-nested 55.1.0",
+ "datafusion-functions-nested",
  "datafusion-physical-expr",
  "datafusion-physical-expr-adapter",
  "datafusion-physical-expr-common",

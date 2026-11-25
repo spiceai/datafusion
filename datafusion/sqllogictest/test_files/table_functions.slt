@@ -108,8 +108,8 @@ EXPLAIN FORMAT INDENT SELECT * FROM generate_series(100000) AS t1(v1) ORDER BY v
 logical_plan
 01)Sort: t1.v1 ASC NULLS LAST
 02)--SubqueryAlias: t1
-03)----Projection: generate_series().value AS v1
-04)------TableScan: generate_series() projection=[value]
+03)----Projection: generate_series(Int64(100000)).value AS v1
+04)------TableScan: generate_series(Int64(100000)) projection=[value]
 physical_plan
 01)ProjectionExec: expr=[value@0 as v1]
 02)--LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=0, end=100000, batch_size=8192]
@@ -167,7 +167,7 @@ SELECT * FROM generate_series(1, 5, NULL)
 query TT
 EXPLAIN SELECT * FROM generate_series(1, 5)
 ----
-logical_plan TableScan: generate_series() projection=[value]
+logical_plan TableScan: generate_series(Int64(1), Int64(5)) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=1, end=5, batch_size=8192]
 
 #
@@ -370,7 +370,7 @@ SELECT * FROM range(1, 5, NULL)
 query TT
 EXPLAIN SELECT * FROM range(1, 5)
 ----
-logical_plan TableScan: range() projection=[value]
+logical_plan TableScan: range(Int64(1), Int64(5)) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[range: start=1, end=5, batch_size=8192]
 
 #
@@ -542,7 +542,7 @@ SELECT * FROM generate_series(DATE '1992-09-01', DATE '1992-09-03', INTERVAL '1'
 query TT
 EXPLAIN SELECT * FROM generate_series(DATE '1992-09-01', DATE '1992-09-03', INTERVAL '1' DAY);
 ----
-logical_plan TableScan: generate_series() projection=[value]
+logical_plan TableScan: generate_series(CAST(Utf8("1992-09-01") AS Date32), CAST(Utf8("1992-09-03") AS Date32), IntervalMonthDayNano("IntervalMonthDayNano { months: 0, days: 1, nanoseconds: 0 }")) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[generate_series: start=715305600000000000, end=715478400000000000, batch_size=8192]
 
 # Backwards date range
@@ -562,7 +562,7 @@ SELECT * FROM range(DATE '1992-09-01', NULL::DATE, INTERVAL '1' MONTH)
 query TT
 EXPLAIN SELECT * FROM range(DATE '1992-09-01', NULL::DATE, INTERVAL '1' MONTH)
 ----
-logical_plan TableScan: range() projection=[value]
+logical_plan TableScan: range(CAST(Utf8("1992-09-01") AS Date32), CAST(NULL AS Date32), IntervalMonthDayNano("IntervalMonthDayNano { months: 1, days: 0, nanoseconds: 0 }")) projection=[value]
 physical_plan LazyMemoryExec: partitions=1, batch_generators=[range: empty]
 
 query P
@@ -632,3 +632,36 @@ SELECT * FROM generate_series(*)
 
 statement error DataFusion error: Error during planning: Unsupported function argument type: t\.\*
 SELECT * FROM generate_series(t.*)
+
+# A row-correlated table function keeps the identity of equal-valued input rows.
+query II rowsort
+SELECT q.id, s.n FROM (VALUES (1, 2), (2, 2), (3, 0)) AS q(id, stop)
+CROSS JOIN LATERAL generate_series(1, q.stop) AS s(n);
+----
+1 1
+1 2
+2 1
+2 2
+
+# Null extension happens after ON, including for an empty or NULL series.
+query II rowsort
+SELECT q.id, s.value FROM (VALUES (1, 2), (2, 1), (3, 0), (4, NULL)) AS q(id, stop)
+LEFT JOIN LATERAL generate_series(1, q.stop) s ON s.value > 1;
+----
+1 2
+2 NULL
+3 NULL
+4 NULL
+
+# The output projection can be empty even when the function produces many rows.
+query I
+SELECT count(*) FROM (VALUES (2), (3)) AS q(n), LATERAL range(q.n);
+----
+5
+
+# A consumer can stop before the function finishes a single invocation.
+query I
+SELECT s.value FROM (VALUES (9223372036854775807)) AS q(n)
+CROSS JOIN LATERAL generate_series(1, q.n) s LIMIT 1;
+----
+1

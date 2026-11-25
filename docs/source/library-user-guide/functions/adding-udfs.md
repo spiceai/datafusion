@@ -1406,8 +1406,8 @@ in the CLI to read the metadata from a Parquet file.
 ### Writing the UDTF
 
 The simple UDTF used here takes a single `Int64` argument and returns a table with a single column with the value of the
-argument. To create a function in DataFusion, you need to implement the `TableFunctionImpl` trait. This trait has a
-single method, `call_with_args`, that takes a `TableFunctionArgs` struct and returns a `Result<Arc<dyn TableProvider>>`.
+argument. To create a function in DataFusion, you need to implement the `TableFunctionImpl` trait. Its
+`call_with_args` method takes a `TableFunctionArgs` struct and returns a `Result<Arc<dyn TableProvider>>`.
 Passed struct includes function arguments as a slice of `Expr`s.
 
 In the `call_with_args` method, you parse the input `Expr`s and return a `TableProvider`. You might also want to do some
@@ -1601,3 +1601,32 @@ async fn main() -> Result<()> {
     Ok(())
 }
 ```
+
+### Table functions with row-dependent arguments
+
+A table function can use columns from an earlier relation in the same `FROM` clause.
+For example, this query returns two rows for `a` and one null-extended row for `b`.
+
+```sql
+SELECT q.id, s.value
+FROM (VALUES ('a', 2), ('b', 0)) AS q(id, stop)
+LEFT JOIN LATERAL generate_series(1, q.stop) AS s ON true
+ORDER BY q.id, s.value;
+```
+
+To implement this behavior, register a `TableFunctionImpl` and implement
+`bind_with_input`. During planning, inspect the argument expressions and input
+schema, resolve any constant options, and return a `TableFunctionBinding`.
+The binding declares a stable output schema through its evaluator and includes
+the expressions that DataFusion should evaluate for each input batch.
+
+The evaluator receives argument arrays, the input row count, the required
+output column indices, and the executing task context. It returns a stream
+of `TableFunctionRows`. Each chunk contains the projected output batch and
+one input row index per result. Row indices start at zero for each input batch.
+For example, indices `[1, 0, 1]` attach the first and third results to the
+second input row. Each input row can produce any number of chunks or no rows.
+DataFusion evaluates the join predicate and handles unmatched rows in a left join.
+
+A standalone call can use the same binding with a single zero-column input row.
+Returning `None` from `bind_with_input` selects the provider path for a standalone call.

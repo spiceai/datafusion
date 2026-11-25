@@ -1794,6 +1794,43 @@ impl DefaultPhysicalPlanner {
 
             // N Children
             LogicalPlan::Union(_) => UnionExec::try_new(children.vec())?,
+            plan if let Some(call) =
+                datafusion_expr::table_function::TableFunctionApply::from_plan(plan) =>
+            {
+                let arguments = call
+                    .function
+                    .arguments
+                    .iter()
+                    .map(|expr| {
+                        create_physical_expr(
+                            expr,
+                            call.input.schema(),
+                            execution_props,
+                            planning_ctx,
+                        )
+                    })
+                    .collect::<Result<_>>()?;
+                let predicate = call
+                    .predicate
+                    .as_ref()
+                    .map(|expr| {
+                        create_physical_expr(
+                            expr,
+                            &call.schema,
+                            execution_props,
+                            planning_ctx,
+                        )
+                    })
+                    .transpose()?;
+                Arc::new(
+                    datafusion_physical_plan::table_function::TableFunctionExec::try_new(
+                        children.one()?,
+                        call,
+                        arguments,
+                        predicate,
+                    )?,
+                )
+            }
             LogicalPlan::Extension(Extension { node }) => {
                 let mut maybe_plan = None;
                 let children = children.vec();

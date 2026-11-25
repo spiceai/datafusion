@@ -938,24 +938,23 @@ impl<S: ContextProvider> SqlToRel<'_, S> {
             _ => {
                 let mut from = from.into_iter();
 
-                let mut left = LogicalPlanBuilder::from({
+                let mut left = {
                     let input = from.next().unwrap();
                     self.plan_table_with_joins(input, planner_context)?
-                });
+                };
                 let old_outer_from_schema = {
                     let left_schema = Some(Arc::clone(left.schema()));
                     planner_context.set_outer_from_schema(left_schema)
                 };
                 for input in from {
                     // Join `input` with the current result (`left`).
-                    let right = self.plan_table_with_joins(input, planner_context)?;
-                    left = left.cross_join(right)?;
+                    left = self.plan_comma_join(left, input, planner_context)?;
                     // Update the outer FROM schema.
                     let left_schema = Some(Arc::clone(left.schema()));
                     planner_context.set_outer_from_schema(left_schema);
                 }
                 planner_context.set_outer_from_schema(old_outer_from_schema);
-                left.build()
+                Ok(left)
             }
         }
     }
