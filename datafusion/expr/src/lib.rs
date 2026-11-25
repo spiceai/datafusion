@@ -41,6 +41,7 @@ mod higher_order_function;
 mod literal;
 mod operation;
 mod partition_evaluator;
+pub mod table_function;
 mod table_source;
 mod udaf;
 mod udf;

@@ -260,3 +260,113 @@ fn read_csv_batches(csv_path: impl AsRef<Path>) -> Result<(SchemaRef, Vec<Record
     let schema = Arc::new(schema);
     Ok((schema, batches))
 }
+
+/// A two-column table function with a static source argument and one dynamic
+/// argument. The evaluator intentionally emits each batch in reverse order.
+#[derive(Debug)]
+struct Lookup;
+
+impl TableFunctionImpl for Lookup {
+    fn bind_with_input(
+        &self,
+        args: TableFunctionArgs,
+        _: &DFSchema,
+    ) -> Result<Option<datafusion_physical_plan::table_function::TableFunctionBinding>>
+    {
+        let [
+            Expr::Column(source),
+            key,
+            Expr::Literal(ScalarValue::Int64(Some(1)), Some(metadata)),
+        ] = args.exprs()
+        else {
+            return datafusion_common::plan_err!(
+                "lookup expects source, key, and named limit"
+            );
+        };
+        assert_eq!(source.name, "corpus");
+        assert_eq!(
+            metadata
+                .inner()
+                .get("spice.parameter_name")
+                .map(String::as_str),
+            Some("limit")
+        );
+        Ok(Some(
+            datafusion_physical_plan::table_function::TableFunctionBinding {
+                arguments: vec![key.clone()],
+                evaluator: Arc::new(Lookup),
+            },
+        ))
+    }
+}
+
+impl datafusion_physical_plan::table_function::TableFunctionEvaluator for Lookup {
+    fn schema(&self) -> SchemaRef {
+        use arrow::datatypes::{DataType, Field, Schema};
+        Arc::new(Schema::new(vec![
+            Field::new("body", DataType::Utf8, false),
+            Field::new("hit", DataType::Int64, false),
+        ]))
+    }
+    fn evaluate(
+        &self,
+        arguments: Vec<arrow::array::ArrayRef>,
+        num_rows: usize,
+        projection: &[usize],
+        _: Arc<TaskContext>,
+    ) -> Result<
+        futures::stream::BoxStream<
+            'static,
+            Result<datafusion_physical_plan::table_function::TableFunctionRows>,
+        >,
+    > {
+        use arrow::array::UInt32Array;
+        use datafusion_physical_plan::table_function::TableFunctionRows;
+        assert_eq!(
+            projection,
+            &[1],
+            "the unused payload must never be requested"
+        );
+        let input_rows = UInt32Array::from_iter_values((0..num_rows as u32).rev());
+        let batch = RecordBatch::try_new(
+            Arc::new(self.schema().project(projection)?),
+            vec![arrow::compute::take(
+                arguments[0].as_ref(),
+                &input_rows,
+                None,
+            )?],
+        )?;
+        Ok(Box::pin(futures::stream::iter([Ok(TableFunctionRows {
+            batch,
+            input_rows,
+        })])))
+    }
+}
+
+#[tokio::test]
+async fn input_table_function_resolves_static_arguments_and_projects_output() -> Result<()>
+{
+    let ctx = SessionContext::new();
+    ctx.register_udtf("lookup", Arc::new(Lookup));
+    let rows = ctx
+        .sql(
+            "SELECT q.id, r.hit FROM (VALUES (1, 7), (2, 8), (3, 7)) q(id, key)
+        CROSS JOIN LATERAL lookup(corpus, q.key + 1, limit => 1) r ORDER BY q.id",
+        )
+        .await?
+        .collect()
+        .await?;
+    datafusion_common::assert_batches_eq!(
+        [
+            "+----+-----+",
+            "| id | hit |",
+            "+----+-----+",
+            "| 1  | 8   |",
+            "| 2  | 9   |",
+            "| 3  | 8   |",
+            "+----+-----+"
+        ],
+        &rows
+    );
+    Ok(())
+}

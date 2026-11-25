@@ -17,7 +17,7 @@
 
 use arrow::array::timezone::Tz;
 use arrow::array::types::TimestampNanosecondType;
-use arrow::array::{ArrayRef, Int64Array, TimestampNanosecondArray};
+use arrow::array::{Array, ArrayRef, Int64Array, TimestampNanosecondArray, UInt32Array};
 use arrow::compute::SortOptions;
 use arrow::datatypes::{
     DataType, Field, IntervalMonthDayNano, Schema, SchemaRef, TimeUnit,
@@ -28,11 +28,16 @@ use datafusion_catalog::TableFunctionImpl;
 use datafusion_catalog::TableProvider;
 use datafusion_catalog::{Session, TableFunctionArgs};
 use datafusion_common::{Result, ScalarValue, plan_datafusion_err, plan_err};
-use datafusion_expr::{Expr, TableType};
+use datafusion_execution::{TaskContext, async_try_stream};
+use datafusion_expr::{Expr, ExprSchemable, TableType};
 use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_plan::ExecutionPlan;
 use datafusion_physical_plan::memory::{LazyBatchGenerator, LazyMemoryExec};
+use datafusion_physical_plan::table_function::{
+    TableFunctionBinding, TableFunctionEvaluator, TableFunctionRows,
+};
+use futures::stream::BoxStream;
 use parking_lot::RwLock;
 use std::any::Any;
 use std::fmt;
@@ -521,6 +526,16 @@ impl<T: SeriesValue> fmt::Display for GenericSeriesState<T> {
     }
 }
 
+fn integer_bounds(values: &[i64], name: &str) -> Result<(i64, i64, i64)> {
+    match values {
+        [end] => Ok((0, *end, 1)),
+        [start, end] => Ok((*start, *end, 1)),
+        [_, _, 0] => plan_err!("Step cannot be zero"),
+        [start, end, step] => Ok((*start, *end, *step)),
+        _ => plan_err!("{name} function requires 1 to 3 arguments"),
+    }
+}
+
 fn reach_end_int64(val: i64, end: i64, step: i64, include_end: bool) -> bool {
     if step > 0 {
         if include_end { val > end } else { val >= end }
@@ -569,15 +584,14 @@ impl TableProvider for GenerateSeriesTable {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GenerateSeriesFuncImpl {
     name: &'static str,
     include_end: bool,
 }
 
-impl TableFunctionImpl for GenerateSeriesFuncImpl {
-    fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
-        let exprs = args.exprs();
+impl GenerateSeriesFuncImpl {
+    fn series(&self, exprs: &[Expr]) -> Result<GenerateSeriesTable> {
         if exprs.is_empty() || exprs.len() > 3 {
             return plan_err!("{} function requires 1 to 3 arguments", self.name);
         }
@@ -607,7 +621,7 @@ impl TableFunctionImpl for GenerateSeriesFuncImpl {
 }
 
 impl GenerateSeriesFuncImpl {
-    fn call_int64(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_int64(&self, exprs: &[Expr]) -> Result<GenerateSeriesTable> {
         let mut normalize_args = Vec::new();
         for (expr_index, expr) in exprs.iter().enumerate() {
             match expr {
@@ -631,26 +645,14 @@ impl GenerateSeriesFuncImpl {
 
         if normalize_args.len() != exprs.len() {
             // contain null
-            return Ok(Arc::new(GenerateSeriesTable {
+            return Ok(GenerateSeriesTable {
                 schema,
                 args: GenSeriesArgs::ContainsNull { name: self.name },
-            }));
+            });
         }
 
-        let (start, end, step) = match &normalize_args[..] {
-            [end] => (0, *end, 1),
-            [start, end] => (*start, *end, 1),
-            [start, end, step] => (*start, *end, *step),
-            _ => {
-                return plan_err!("{} function requires 1 to 3 arguments", self.name);
-            }
-        };
-
-        if step == 0 {
-            return plan_err!("Step cannot be zero");
-        }
-
-        Ok(Arc::new(GenerateSeriesTable {
+        let (start, end, step) = integer_bounds(&normalize_args, self.name)?;
+        Ok(GenerateSeriesTable {
             schema,
             args: GenSeriesArgs::Int64Args {
                 start,
@@ -659,10 +661,10 @@ impl GenerateSeriesFuncImpl {
                 include_end: self.include_end,
                 name: self.name,
             },
-        }))
+        })
     }
 
-    fn call_timestamp(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_timestamp(&self, exprs: &[Expr]) -> Result<GenerateSeriesTable> {
         if exprs.len() != 3 {
             return plan_err!(
                 "{} function with timestamps requires exactly 3 arguments",
@@ -716,16 +718,16 @@ impl GenerateSeriesFuncImpl {
         // Check if any argument is null
         let (Some(start), Some(end), Some(step)) = (start_ts, end_ts, step_interval)
         else {
-            return Ok(Arc::new(GenerateSeriesTable {
+            return Ok(GenerateSeriesTable {
                 schema,
                 args: GenSeriesArgs::ContainsNull { name: self.name },
-            }));
+            });
         };
 
         // Validate step interval
         validate_interval_step(step)?;
 
-        Ok(Arc::new(GenerateSeriesTable {
+        Ok(GenerateSeriesTable {
             schema,
             args: GenSeriesArgs::TimestampArgs {
                 start,
@@ -735,10 +737,10 @@ impl GenerateSeriesFuncImpl {
                 include_end: self.include_end,
                 name: self.name,
             },
-        }))
+        })
     }
 
-    fn call_date(&self, exprs: &[Expr]) -> Result<Arc<dyn TableProvider>> {
+    fn call_date(&self, exprs: &[Expr]) -> Result<GenerateSeriesTable> {
         if exprs.len() != 3 {
             return plan_err!(
                 "{} function with dates requires exactly 3 arguments",
@@ -757,10 +759,10 @@ impl GenerateSeriesFuncImpl {
             Expr::Literal(ScalarValue::Date32(Some(date)), _) => *date,
             Expr::Literal(ScalarValue::Date32(None), _)
             | Expr::Literal(ScalarValue::Null, _) => {
-                return Ok(Arc::new(GenerateSeriesTable {
+                return Ok(GenerateSeriesTable {
                     schema,
                     args: GenSeriesArgs::ContainsNull { name: self.name },
-                }));
+                });
             }
             other => {
                 return plan_err!(
@@ -775,10 +777,10 @@ impl GenerateSeriesFuncImpl {
             Expr::Literal(ScalarValue::Date32(Some(date)), _) => *date,
             Expr::Literal(ScalarValue::Date32(None), _)
             | Expr::Literal(ScalarValue::Null, _) => {
-                return Ok(Arc::new(GenerateSeriesTable {
+                return Ok(GenerateSeriesTable {
                     schema,
                     args: GenSeriesArgs::ContainsNull { name: self.name },
-                }));
+                });
             }
             other => {
                 return plan_err!(
@@ -795,10 +797,10 @@ impl GenerateSeriesFuncImpl {
             }
             Expr::Literal(ScalarValue::IntervalMonthDayNano(None), _)
             | Expr::Literal(ScalarValue::Null, _) => {
-                return Ok(Arc::new(GenerateSeriesTable {
+                return Ok(GenerateSeriesTable {
                     schema,
                     args: GenSeriesArgs::ContainsNull { name: self.name },
-                }));
+                });
             }
             other => {
                 return plan_err!(
@@ -830,7 +832,7 @@ impl GenerateSeriesFuncImpl {
         // Validate step interval
         validate_interval_step(step_interval)?;
 
-        Ok(Arc::new(GenerateSeriesTable {
+        Ok(GenerateSeriesTable {
             schema,
             args: GenSeriesArgs::DateArgs {
                 start: start_ts,
@@ -839,7 +841,177 @@ impl GenerateSeriesFuncImpl {
                 include_end: self.include_end,
                 name: self.name,
             },
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BoundSeries {
+    schema: SchemaRef,
+    function: GenerateSeriesFuncImpl,
+}
+impl GenerateSeriesFuncImpl {
+    fn bind(
+        self,
+        exprs: &[Expr],
+        input: &datafusion_common::DFSchema,
+    ) -> Result<Option<TableFunctionBinding>> {
+        if input.fields().is_empty() {
+            return Ok(None);
+        }
+        let types = exprs
+            .iter()
+            .map(|expr| expr.get_type(input))
+            .collect::<Result<Vec<_>>>()?;
+        let result_type = match types.as_slice() {
+            [_, ..]
+                if types.len() <= 3
+                    && types
+                        .iter()
+                        .all(|t| matches!(t, DataType::Int64 | DataType::Null)) =>
+            {
+                DataType::Int64
+            }
+            [
+                DataType::Date32,
+                DataType::Date32 | DataType::Null,
+                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+                | DataType::Null,
+            ] => DataType::Timestamp(TimeUnit::Nanosecond, None),
+            [
+                DataType::Timestamp(TimeUnit::Nanosecond, tz),
+                DataType::Timestamp(TimeUnit::Nanosecond, _) | DataType::Null,
+                DataType::Interval(arrow::datatypes::IntervalUnit::MonthDayNano)
+                | DataType::Null,
+            ] => DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
+            _ => return plan_err!("Unsupported {} argument types: {types:?}", self.name),
+        };
+        Ok(Some(TableFunctionBinding {
+            arguments: exprs.to_vec(),
+            evaluator: Arc::new(BoundSeries {
+                schema: Arc::new(Schema::new(vec![Field::new(
+                    "value",
+                    result_type,
+                    false,
+                )])),
+                function: self,
+            }),
         }))
+    }
+}
+impl BoundSeries {
+    /// Pack short integer series from many input rows into a single Arrow batch.
+    fn evaluate_integers(
+        &self,
+        arguments: Vec<ArrayRef>,
+        num_rows: usize,
+        projection: &[usize],
+        batch_size: usize,
+    ) -> Result<BoxStream<'static, Result<TableFunctionRows>>> {
+        use arrow::array::{AsArray, Int64Builder, RecordBatchOptions, UInt32Builder};
+        use arrow::datatypes::Int64Type;
+        let schema = Arc::new(self.schema.project(projection)?);
+        let function = self.function.clone();
+        Ok(Box::pin(async_try_stream(move |mut out| async move {
+            let mut values = Int64Builder::with_capacity(if schema.fields().is_empty() {
+                0
+            } else {
+                batch_size
+            });
+            let mut indices = UInt32Builder::with_capacity(batch_size);
+            let finish =
+                |values: &mut Int64Builder, indices: &mut UInt32Builder| -> Result<_> {
+                    let input_rows = indices.finish();
+                    let columns = if schema.fields().is_empty() {
+                        vec![]
+                    } else {
+                        vec![Arc::new(values.finish()) as ArrayRef]
+                    };
+                    let batch = RecordBatch::try_new_with_options(
+                        Arc::clone(&schema),
+                        columns,
+                        &RecordBatchOptions::new().with_row_count(Some(input_rows.len())),
+                    )?;
+                    Ok(TableFunctionRows { batch, input_rows })
+                };
+            for row in 0..num_rows {
+                if arguments.iter().any(|arg| arg.is_null(row)) {
+                    continue;
+                }
+                let mut bounds = [0; 3];
+                for (slot, arg) in bounds.iter_mut().zip(&arguments) {
+                    *slot = arg.as_primitive::<Int64Type>().value(row);
+                }
+                let (mut value, end, step) =
+                    integer_bounds(&bounds[..arguments.len()], function.name)?;
+                while !reach_end_int64(value, end, step, function.include_end) {
+                    if !schema.fields().is_empty() {
+                        values.append_value(value);
+                    }
+                    indices.append_value(row as u32);
+                    if indices.values_slice().len() == batch_size {
+                        out.emit(finish(&mut values, &mut indices)?).await;
+                    }
+                    let Some(next) = value.checked_add(step) else {
+                        break;
+                    };
+                    value = next;
+                }
+            }
+            if !indices.values_slice().is_empty() {
+                out.emit(finish(&mut values, &mut indices)?).await;
+            }
+            Ok(())
+        })))
+    }
+}
+
+impl TableFunctionEvaluator for BoundSeries {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+    fn evaluate(
+        &self,
+        arguments: Vec<ArrayRef>,
+        num_rows: usize,
+        projection: &[usize],
+        context: Arc<TaskContext>,
+    ) -> Result<BoxStream<'static, Result<TableFunctionRows>>> {
+        let batch_size = context.session_config().batch_size();
+        if self.schema.field(0).data_type() == &DataType::Int64 {
+            return self.evaluate_integers(arguments, num_rows, projection, batch_size);
+        }
+        let function = self.function.clone();
+        let projection = projection.to_vec();
+        Ok(Box::pin(async_try_stream(move |mut out| async move {
+            for row in 0..num_rows {
+                if arguments.iter().any(|arg| arg.is_null(row)) {
+                    continue;
+                }
+                let args = arguments
+                    .iter()
+                    .map(|arg| {
+                        ScalarValue::try_from_array(arg, row)
+                            .map(|v| Expr::Literal(v, None))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let generator = function.series(&args)?.as_generator(batch_size)?;
+                loop {
+                    let batch = generator.write().generate_next_batch()?;
+                    let Some(batch) = batch else {
+                        break;
+                    };
+                    let input_rows =
+                        UInt32Array::from_value(row as u32, batch.num_rows());
+                    out.emit(TableFunctionRows {
+                        batch: batch.project(&projection)?,
+                        input_rows,
+                    })
+                    .await;
+                }
+            }
+            Ok(())
+        })))
     }
 }
 
@@ -847,12 +1019,24 @@ impl GenerateSeriesFuncImpl {
 pub struct GenerateSeriesFunc {}
 
 impl TableFunctionImpl for GenerateSeriesFunc {
+    fn bind_with_input(
+        &self,
+        args: TableFunctionArgs,
+        input: &datafusion_common::DFSchema,
+    ) -> Result<Option<TableFunctionBinding>> {
+        GenerateSeriesFuncImpl {
+            name: "generate_series",
+            include_end: true,
+        }
+        .bind(args.exprs(), input)
+    }
+
     fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
         let impl_func = GenerateSeriesFuncImpl {
             name: "generate_series",
             include_end: true,
         };
-        impl_func.call_with_args(args)
+        Ok(Arc::new(impl_func.series(args.exprs())?))
     }
 }
 
@@ -860,12 +1044,24 @@ impl TableFunctionImpl for GenerateSeriesFunc {
 pub struct RangeFunc {}
 
 impl TableFunctionImpl for RangeFunc {
+    fn bind_with_input(
+        &self,
+        args: TableFunctionArgs,
+        input: &datafusion_common::DFSchema,
+    ) -> Result<Option<TableFunctionBinding>> {
+        GenerateSeriesFuncImpl {
+            name: "range",
+            include_end: false,
+        }
+        .bind(args.exprs(), input)
+    }
+
     fn call_with_args(&self, args: TableFunctionArgs) -> Result<Arc<dyn TableProvider>> {
         let impl_func = GenerateSeriesFuncImpl {
             name: "range",
             include_end: false,
         };
-        impl_func.call_with_args(args)
+        Ok(Arc::new(impl_func.series(args.exprs())?))
     }
 }
 

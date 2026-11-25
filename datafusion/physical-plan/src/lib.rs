@@ -102,6 +102,7 @@ pub mod spill;
 pub mod statistics;
 pub mod stream;
 pub mod streaming;
+pub mod table_function;
 pub mod tree_node;
 pub mod union;
 pub mod unnest;

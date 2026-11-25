@@ -1991,6 +1991,25 @@ impl ContextProvider for SessionContextProvider<'_> {
             .ok_or_else(|| plan_datafusion_err!("table '{name}' not found"))
     }
 
+    fn bind_table_function(
+        &self,
+        name: &str,
+        args: &[Expr],
+        input: &DFSchema,
+    ) -> datafusion_common::Result<
+        Option<datafusion_expr::table_function::BoundTableFunction>,
+    > {
+        let function =
+            self.state.table_functions.get(name).ok_or_else(|| {
+                plan_datafusion_err!("table function '{name}' not found")
+            })?;
+        let binding = function.function().bind_with_input(
+            datafusion_catalog::TableFunctionArgs::new(args, self.state),
+            input,
+        )?;
+        Ok(binding.map(|binding| binding.into_logical()))
+    }
+
     fn get_table_function_source(
         &self,
         name: &str,

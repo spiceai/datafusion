@@ -127,6 +127,12 @@ fn analyze_internal(
         schema.merge(&source_schema);
     }
 
+    if let Some(call) =
+        datafusion_expr::table_function::TableFunctionApply::from_plan(&plan)
+    {
+        schema.merge(&call.schema);
+    }
+
     // MERGE expressions (ON / WHEN clauses) reference the target table, which
     // is not one of `plan.inputs()`. Rebuild the target schema from the DML's
     // `table_name` and `target` so those columns resolve during coercion.
@@ -187,6 +193,18 @@ impl<'a> TypeCoercionRewriter<'a> {
     /// Refer to [`TypeCoercionRewriter::coerce_join`] and [`TypeCoercionRewriter::coerce_union`]
     /// for type-coercion approach.
     pub fn coerce_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        if let Some(call) =
+            datafusion_expr::table_function::TableFunctionApply::from_plan(&plan)
+            && let Some(predicate) = &call.predicate
+        {
+            let mut call = call.clone();
+            call.predicate =
+                Some(self.coerce_predicate(
+                    predicate.clone(),
+                    "Table function join condition",
+                )?);
+            return Ok(call.into_plan());
+        }
         match plan {
             LogicalPlan::Join(join) => self.coerce_join(join),
             LogicalPlan::Union(union) => Self::coerce_union(union),

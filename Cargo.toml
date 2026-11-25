@@ -330,6 +330,7 @@ datafusion-execution = { path = "datafusion/execution" }
 datafusion-expr = { path = "datafusion/expr" }
 datafusion-expr-common = { path = "datafusion/expr-common" }
 datafusion-functions = { path = "datafusion/functions" }
+datafusion-functions-nested = { path = "datafusion/functions-nested" }
 datafusion-physical-expr = { path = "datafusion/physical-expr" }
 datafusion-physical-expr-common = { path = "datafusion/physical-expr-common" }
 datafusion-physical-expr-adapter = { path = "datafusion/physical-expr-adapter" }

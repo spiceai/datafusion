@@ -52,6 +52,16 @@ pub trait ContextProvider {
         not_impl_err!("Registered file types are not supported")
     }
 
+    /// Bind static arguments and choose the expressions evaluated on the input relation.
+    fn bind_table_function(
+        &self,
+        _name: &str,
+        _args: &[Expr],
+        _input: &DFSchema,
+    ) -> Result<Option<crate::table_function::BoundTableFunction>> {
+        Ok(None)
+    }
+
     /// Getter for a table function
     fn get_table_function_source(
         &self,

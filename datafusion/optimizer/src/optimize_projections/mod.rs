@@ -131,6 +131,52 @@ fn optimize_projections(
 ) -> Result<Transformed<LogicalPlan>> {
     // Recursively rewrite any nodes that may be able to avoid computation given
     // their parents' required indices.
+    if let Some(call) =
+        datafusion_expr::table_function::TableFunctionApply::from_plan(&plan)
+    {
+        // ON sees both sides. Bind arguments only see the input. Preserve these
+        // fields even when the parent does not select them.
+        let input_len = call.input.schema().fields().len();
+        let (left, right) = indices
+            .with_exprs(&call.schema, &call.predicate)
+            .split_off(input_len);
+        let left = left.with_exprs(call.input.schema(), &call.function.arguments);
+        let left_exprs = left.get_required_exprs(call.input.schema());
+        let input = optimize_projections(
+            Arc::unwrap_or_clone(Arc::clone(&call.input)),
+            config,
+            left,
+        )?
+        .transform_data(|plan| add_projection_on_top_if_helpful(plan, left_exprs))?;
+        if !input.transformed && right.indices().len() == call.projection.len() {
+            return Ok(Transformed::no(plan));
+        }
+        let right_fields = right
+            .indices()
+            .iter()
+            .map(|i| {
+                let (qualifier, field) = call.schema.qualified_field(input_len + i);
+                (qualifier.cloned(), Arc::clone(field))
+            })
+            .collect();
+        let fields =
+            DFSchema::new_with_metadata(right_fields, call.schema.metadata().clone())?;
+        let schema = Arc::new(input.data.schema().join(&fields)?);
+        let projection = right
+            .indices()
+            .iter()
+            .map(|&i| call.projection[i])
+            .collect();
+        return Ok(Transformed::yes(
+            datafusion_expr::table_function::TableFunctionApply {
+                input: Arc::new(input.data),
+                projection,
+                schema,
+                ..call.clone()
+            }
+            .into_plan(),
+        ));
+    }
     match plan {
         LogicalPlan::Projection(proj) => {
             return merge_consecutive_projections(proj)?
