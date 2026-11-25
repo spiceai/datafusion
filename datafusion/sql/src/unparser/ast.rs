@@ -18,6 +18,8 @@
 use core::fmt;
 use std::ops::ControlFlow;
 
+use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_expr::Expr;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     self, LimitClause, OrderByKind, SelectFlavor, visit_expressions,
@@ -314,6 +316,19 @@ pub struct SelectBuilder {
     /// the predicate already there in place — taking it out would change
     /// what the walk sees.
     predicates_added: usize,
+    /// Outer references the clauses already on this SELECT read.
+    ///
+    /// Added to with `note_clause_outer_references()` and read with
+    /// `clause_outer_references()`.
+    clause_outer_references: Vec<Expr>,
+    /// The subqueries the clauses already on this SELECT hold. An outer
+    /// reference one of them reads, at any depth, resolves outward through this
+    /// SELECT's `FROM` too, so a derived table built later under those clauses
+    /// can capture it the same way.
+    ///
+    /// Added to with `note_clause_outer_references()` and read with
+    /// `clause_subqueries()`.
+    clause_subqueries: Vec<Expr>,
 }
 
 /// Prefix used for auto-generated LATERAL FLATTEN table aliases.
@@ -345,6 +360,7 @@ pub(crate) const DERIVED_PROJECTION_ALIAS: &str = "derived_projection";
 pub(crate) const DERIVED_SORT_ALIAS: &str = "derived_sort";
 pub(crate) const DERIVED_UNION_ALIAS: &str = "derived_union";
 pub(crate) const DERIVED_UNNEST_ALIAS: &str = "derived_unnest";
+pub(crate) const DERIVED_UNNEST_ROWS_ALIAS: &str = "__unnest_rows";
 pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 
 /// Every one of those aliases, enumerated for code that has to recognise a name
@@ -356,13 +372,14 @@ pub(crate) const DERIVED_WINDOW_INPUT_ALIAS: &str = "derived_window_input";
 /// out of this list still compiles and still emits, and the guard reading it
 /// simply stops recognising the alias, which is the wrong-rows direction. Adding
 /// one here is the other half of adding one above.
-pub(crate) const DERIVED_TABLE_ALIASES: [&str; 7] = [
+pub(crate) const DERIVED_TABLE_ALIASES: [&str; 8] = [
     DERIVED_DISTINCT_ALIAS,
     DERIVED_LIMIT_ALIAS,
     DERIVED_PROJECTION_ALIAS,
     DERIVED_SORT_ALIAS,
     DERIVED_UNION_ALIAS,
     DERIVED_UNNEST_ALIAS,
+    DERIVED_UNNEST_ROWS_ALIAS,
     DERIVED_WINDOW_INPUT_ALIAS,
 ];
 
@@ -558,6 +575,42 @@ impl SelectBuilder {
     pub fn already_projected(&self) -> bool {
         self.projection.is_some()
     }
+
+    /// Records the outer references `expr` reads, for a clause it is emitted into
+    /// on this SELECT, and the subqueries it holds. A subquery is not entered
+    /// here: it is kept whole in `clause_subqueries`, for a guard that has to
+    /// follow its outer references out through this SELECT.
+    pub fn note_clause_outer_references(&mut self, expr: &Expr) {
+        // The visitor never fails, so there is no error to keep.
+        let _ = expr.apply(|node| {
+            match node {
+                Expr::OuterReferenceColumn(..) => {
+                    self.clause_outer_references.push(node.clone());
+                }
+                Expr::Exists(_)
+                | Expr::InSubquery(_)
+                | Expr::ScalarSubquery(_)
+                | Expr::SetComparison(_) => {
+                    self.clause_subqueries.push(node.clone());
+                }
+                _ => {}
+            }
+            Ok(TreeNodeRecursion::Continue)
+        });
+    }
+
+    /// The outer references the clauses already on this SELECT read — see
+    /// [`Self::note_clause_outer_references`].
+    pub fn clause_outer_references(&self) -> &[Expr] {
+        &self.clause_outer_references
+    }
+
+    /// The subqueries the clauses already on this SELECT hold — see
+    /// [`Self::note_clause_outer_references`].
+    pub fn clause_subqueries(&self) -> &[Expr] {
+        &self.clause_subqueries
+    }
+
     pub fn into(&mut self, value: Option<ast::SelectInto>) -> &mut Self {
         self.into = value;
         self
@@ -843,6 +896,8 @@ impl SelectBuilder {
             null_extended_join_inputs: 0,
             input_predicates_stay_scoped: false,
             predicates_added: 0,
+            clause_outer_references: Vec::new(),
+            clause_subqueries: Vec::new(),
         }
     }
 }
@@ -1411,7 +1466,7 @@ mod tests {
     /// member so removing one fails here rather than silently un-guarding an alias
     /// the emitter still writes.
     ///
-    /// What it cannot catch is the other direction — an eighth `DERIVED_*_ALIAS`
+    /// What it cannot catch is the other direction — a ninth `DERIVED_*_ALIAS`
     /// added and left out of the list. Nothing short of the two being generated
     /// from one declaration can, which is why they sit in the same block.
     #[test]
@@ -1423,6 +1478,7 @@ mod tests {
             DERIVED_SORT_ALIAS,
             DERIVED_UNION_ALIAS,
             DERIVED_UNNEST_ALIAS,
+            DERIVED_UNNEST_ROWS_ALIAS,
             DERIVED_WINDOW_INPUT_ALIAS,
         ] {
             assert!(

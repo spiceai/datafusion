@@ -20,7 +20,8 @@ use super::{
     ast::{
         BuilderError, DERIVED_DISTINCT_ALIAS, DERIVED_LIMIT_ALIAS,
         DERIVED_PROJECTION_ALIAS, DERIVED_SORT_ALIAS, DERIVED_TABLE_ALIASES,
-        DERIVED_UNION_ALIAS, DERIVED_UNNEST_ALIAS, DERIVED_WINDOW_INPUT_ALIAS,
+        DERIVED_UNION_ALIAS, DERIVED_UNNEST_ALIAS, DERIVED_UNNEST_ROWS_ALIAS,
+        DERIVED_WINDOW_INPUT_ALIAS,
         DerivedRelationBuilder, QueryBuilder, RelationBuilder, SelectBuilder,
         TableRelationBuilder, TableWithJoinsBuilder, is_numbered_alias,
     },
@@ -1520,6 +1521,102 @@ impl Unparser<'_> {
         }
     }
 
+    /// Emits the empty projection `p` over an `Unnest` as the placeholder select
+    /// list over a derived table, [`DERIVED_UNNEST_ROWS_ALIAS`], that projects the
+    /// `Unnest`'s columns and so keeps its rows.
+    ///
+    /// Kept out of [`Self::select_to_sql_recursively`], whose stack frame every
+    /// level of a nested plan pays for.
+    fn derive_unnest_rows(
+        &self,
+        p: &Projection,
+        select: &mut SelectBuilder,
+        relation: &mut RelationBuilder,
+    ) -> Result<()> {
+        self.ensure_unnest_rows_captures_no_outer_reference(select)?;
+        let items = self
+            .empty_projection_fallback()
+            .iter()
+            .map(|e| self.select_item_to_sql(e))
+            .collect::<Result<Vec<_>>>()?;
+        select.projection(items);
+        let expr = p
+            .input
+            .schema()
+            .columns()
+            .into_iter()
+            .map(Expr::Column)
+            .collect();
+        let rows =
+            LogicalPlan::Projection(Projection::try_new(expr, Arc::clone(&p.input))?);
+        self.derive(
+            &rows,
+            relation,
+            Some(self.new_table_alias(DERIVED_UNNEST_ROWS_ALIAS.to_string(), vec![])),
+            false,
+        )
+    }
+
+    /// Refuses the derived table an empty projection over an `Unnest` is emitted as
+    /// when an outer reference the clauses of this `SELECT` already carry, such as
+    /// the `WHERE` of an `EXISTS` body, could bind to it instead of the enclosing
+    /// query.
+    ///
+    /// - One qualified as [`DERIVED_UNNEST_ROWS_ALIAS`] is refused: that is the
+    ///   only relation name this `FROM` answers to, and it is written on every
+    ///   dialect, not only one that names every derived table.
+    /// - One with no qualifier is refused whatever its name, because the columns
+    ///   the derived table exposes are the ones the dialect renders the `Unnest`
+    ///   as, not the plan's: Snowflake's `FLATTEN` exposes `VALUE`, which no field
+    ///   of the plan is called.
+    /// - A subquery a clause holds is followed to every depth, since SQL resolves
+    ///   its outer references from the inside out and one no body in between binds
+    ///   reaches this `FROM` too. One a body in between would bind is refused as
+    ///   well, which costs that plan its pushdown and never a row.
+    ///
+    /// Any other qualified reference names a relation this `FROM` does not have, so
+    /// it reaches the enclosing query as the plan intends.
+    fn ensure_unnest_rows_captures_no_outer_reference(
+        &self,
+        select: &SelectBuilder,
+    ) -> Result<()> {
+        let alias =
+            self.emitted_qualifier_key(&TableReference::bare(DERIVED_UNNEST_ROWS_ALIAS));
+        let mut references = select.clause_outer_references().to_vec();
+        for held in select.clause_subqueries() {
+            let Some(subquery) = Self::subquery_of(held) else {
+                continue;
+            };
+            subquery.subquery.apply_with_subqueries(|plan| {
+                plan.apply_expressions(|expr| {
+                    expr.apply(|node| {
+                        if matches!(node, Expr::OuterReferenceColumn(..)) {
+                            references.push(node.clone());
+                        }
+                        Ok(TreeNodeRecursion::Continue)
+                    })
+                })
+            })?;
+        }
+        for expr in &references {
+            let Expr::OuterReferenceColumn(_, column) = expr else {
+                continue;
+            };
+            let carries = match &column.relation {
+                None => "no qualifier, so a column the derived table exposes can take it",
+                Some(relation) if self.emitted_qualifier_key(relation) == alias => {
+                    "the name the unparser gives the derived table"
+                }
+                Some(_) => continue,
+            };
+            return not_impl_err!(
+                "Unparsing an empty projection over an UNNEST is not supported when the outer reference {} carries {carries}",
+                column.flat_name()
+            );
+        }
+        Ok(())
+    }
+
     /// Whether the subtree carrying a row limit needs a `SELECT` of its own.
     ///
     /// The walk is top-down, so any predicate already on `select` came from a
@@ -2243,6 +2340,28 @@ impl Unparser<'_> {
                         .select_to_sql_recursively(&new_plan, query, select, relation);
                 }
 
+                // Projection pushdown leaves an empty projection over an Unnest
+                // nothing reads a column of. Its rows still count: a join with it
+                // multiplies the other side by the number of elements. Without a
+                // placeholder column to find, the Unnest below would be dropped and
+                // the projection unparsed as `SELECT 1`, a single row. The Unnest's
+                // columns, with any Limit or Sort between, are projected in a
+                // derived table of their own, which keeps its rows and its scope
+                // (Snowflake's FLATTEN joins inside it, not into this SELECT). The
+                // empty projection's own select list is the same placeholder every
+                // other empty projection gets, so e.g. a UNION's operands match.
+                // A projection already started here derives this one below, and
+                // the guard fires there. An Unnest with no output columns (a
+                // zero-field struct) has nothing to project, and deriving it would
+                // rebuild this same empty projection, so it is left alone.
+                if p.expr.is_empty()
+                    && !select.already_projected()
+                    && !p.input.schema().fields().is_empty()
+                    && Self::reaches_unnest_through_modifiers(p.input.as_ref())
+                {
+                    return self.derive_unnest_rows(p, select, relation);
+                }
+
                 // Projection can be top-level plan for unnest relation.
                 // The projection generated by the `RecursiveUnnestRewriter`
                 // will have at least one expression referencing an unnest
@@ -2573,6 +2692,9 @@ impl Unparser<'_> {
                         sort.expr.clone()
                     };
                     query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                    for sort_expr in &sort_exprs {
+                        select.note_clause_outer_references(&sort_expr.expr);
+                    }
                 }
                 if let Some(limit) = direct_limit {
                     let Some(query_ref) = query.as_mut() else {
@@ -2831,6 +2953,7 @@ impl Unparser<'_> {
                         None => filter.predicate.clone(),
                     };
                     let filter_expr = self.expr_to_sql(&predicate)?;
+                    select.note_clause_outer_references(&predicate);
                     select.selection(Some(filter_expr));
                 }
 
@@ -2968,6 +3091,9 @@ impl Unparser<'_> {
                     .collect::<Result<Vec<_>>>()?;
 
                 query_ref.order_by(self.sorts_to_sql(&sort_exprs)?);
+                for sort_expr in &sort_exprs {
+                    select.note_clause_outer_references(&sort_expr.expr);
+                }
 
                 self.select_to_sql_recursively(
                     sort.input.as_ref(),
@@ -3116,6 +3242,9 @@ impl Unparser<'_> {
                         if let Some(sort_expr) = &on.sort_expr {
                             if let Some(query_ref) = query {
                                 query_ref.order_by(self.sorts_to_sql(sort_expr)?);
+                                for sort_expr in sort_expr {
+                                    select.note_clause_outer_references(&sort_expr.expr);
+                                }
                             } else {
                                 return internal_err!(
                                     "Sort operator only valid in a statement context."
@@ -4079,6 +4208,21 @@ impl Unparser<'_> {
     /// plan directly, we bypass the normal Limit/Sort handlers which would
     /// create unwanted derived subqueries (since `already_projected` is
     /// set at the point this is called).
+    /// Whether `plan` is an Unnest, or reaches one through the Limits and
+    /// Sorts [`Self::peel_to_unnest_with_modifiers`] looks through.
+    fn reaches_unnest_through_modifiers(plan: &LogicalPlan) -> bool {
+        match plan {
+            LogicalPlan::Unnest(_) => true,
+            LogicalPlan::Limit(limit) => {
+                Self::reaches_unnest_through_modifiers(limit.input.as_ref())
+            }
+            LogicalPlan::Sort(sort) => {
+                Self::reaches_unnest_through_modifiers(sort.input.as_ref())
+            }
+            _ => false,
+        }
+    }
+
     fn peel_to_unnest_with_modifiers<'a>(
         &self,
         plan: &'a LogicalPlan,
