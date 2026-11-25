@@ -109,6 +109,8 @@ async fn assert_join_yields(join: Arc<dyn ExecutionPlan>) {
     let produced = Arc::new(AtomicUsize::new(0));
     let mut stream = join.execute(0, task_ctx()).unwrap();
     let counter = Arc::clone(&produced);
+    // The test explicitly aborts the JoinHandle and checks its cancellation error.
+    #[expect(clippy::disallowed_methods)]
     let drain = tokio::spawn(async move {
         while let Some(batch) = stream.next().await {
             batch.unwrap();

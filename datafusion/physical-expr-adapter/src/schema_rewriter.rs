@@ -867,13 +867,13 @@ impl BatchAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::ArrayRef;
     use arrow::array::{
         Array, BooleanArray, GenericListArray, Int32Array, Int64Array, MapArray,
         RecordBatch, RecordBatchOptions, StringArray, StringViewArray, StructArray,
         record_batch,
     };
     use arrow::buffer::{NullBuffer, OffsetBuffer};
-    use arrow::array::ArrayRef;
     use arrow::datatypes as arrow_schema;
     use arrow::datatypes::{Field, Fields, Schema};
     use datafusion_common::assert_contains;
@@ -1526,8 +1526,7 @@ mod tests {
             DataType::Struct(physical_struct_fields.clone()),
             true,
         ));
-        let offsets =
-            OffsetBuffer::from_lengths(vec![1usize; struct_array.len()]);
+        let offsets = OffsetBuffer::from_lengths(vec![1usize; struct_array.len()]);
         let list_array = GenericListArray::<i32>::new(
             item_field,
             offsets,
@@ -2011,11 +2010,7 @@ mod tests {
             None,
         );
         let map_array = MapArray::new(
-            Arc::new(Field::new(
-                "entries",
-                entries.data_type().clone(),
-                false,
-            )),
+            Arc::new(Field::new("entries", entries.data_type().clone(), false)),
             OffsetBuffer::from_lengths([1]),
             entries,
             None,

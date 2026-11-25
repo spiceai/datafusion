@@ -783,13 +783,10 @@ fn max_over_amplifying_join(
         AggregateMode::Single,
         PhysicalGroupBy::new(vec![], vec![], vec![], false),
         vec![Arc::new(
-            AggregateExprBuilder::new(
-                min_max::max_udaf(),
-                vec![col("probe", &schema)?],
-            )
-            .schema(Arc::clone(&schema))
-            .alias("max")
-            .build()?,
+            AggregateExprBuilder::new(min_max::max_udaf(), vec![col("probe", &schema)?])
+                .schema(Arc::clone(&schema))
+                .alias("max")
+                .build()?,
         )],
         vec![None],
         join,

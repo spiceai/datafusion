@@ -20,8 +20,8 @@ use std::sync::{Arc, OnceLock};
 use arrow::array::types::{Int16Type, Int32Type, Int64Type, RunEndIndexType};
 use arrow::array::{
     Array, ArrayDataBuilder, ArrayRef, BooleanArray, Capacities, MutableArrayData,
-    PrimitiveArray, RunArray, Scalar, StructArray, UInt32Array, UnionArray, cast::AsArray,
-    make_array, make_comparator,
+    PrimitiveArray, RunArray, Scalar, StructArray, UInt32Array, UnionArray,
+    cast::AsArray, make_array, make_comparator,
 };
 use arrow::compute::{SortOptions, take};
 use arrow::datatypes::{DataType, Field, FieldRef, UnionMode};
@@ -360,8 +360,10 @@ fn mask_union_with_nulls(
             let mut per_child_indices: Vec<Vec<Option<u32>>> =
                 fields.iter().map(|_| Vec::new()).collect();
             // old_offset -> new offset within that child's rebuilt buffer
-            let mut per_child_remap: Vec<std::collections::HashMap<u32, i32>> =
-                fields.iter().map(|_| std::collections::HashMap::new()).collect();
+            let mut per_child_remap: Vec<std::collections::HashMap<u32, i32>> = fields
+                .iter()
+                .map(|_| std::collections::HashMap::new())
+                .collect();
             // shared null slot per child (created lazily)
             let mut per_child_null_slot: Vec<Option<i32>> =
                 fields.iter().map(|_| None).collect();
@@ -462,9 +464,8 @@ fn mask_ree_impl<R: RunEndIndexType>(
             } else {
                 Some(physical_idx as u32)
             });
-            new_run_end_values.push(
-                R::Native::from_usize(end).expect("run end fits in index type"),
-            );
+            new_run_end_values
+                .push(R::Native::from_usize(end).expect("run end fits in index type"));
             cursor = end;
         }
         logical_start = logical_end;
@@ -1212,10 +1213,8 @@ mod tests {
         // 32-bit offsets (e.g. 8,192 rows × 1 MiB).
         const N: usize = 8192;
         let big = "x".repeat(1024); // large enough that N copies would be multi-MiB
-        let union_fields = UnionFields::try_new(
-            vec![0],
-            vec![Field::new("s", DataType::Utf8, true)],
-        )?;
+        let union_fields =
+            UnionFields::try_new(vec![0], vec![Field::new("s", DataType::Utf8, true)])?;
         let type_ids = ScalarBuffer::from(vec![0_i8; N]);
         let offsets = ScalarBuffer::from(vec![0_i32; N]);
         let children: Vec<ArrayRef> =
@@ -1246,9 +1245,7 @@ mod tests {
             2,
             "dense shared-offset rebuild must not duplicate per row"
         );
-        let logical = result_array
-            .logical_nulls()
-            .expect("logical nulls");
+        let logical = result_array.logical_nulls().expect("logical nulls");
         assert!(logical.is_valid(0));
         assert!(logical.is_null(N / 2));
         assert!(logical.is_valid(N - 1));
@@ -1292,9 +1289,7 @@ mod tests {
             result_ree.run_ends().values(),
             &[(N / 2) as i32, (N / 2 + 1) as i32, N as i32]
         );
-        let logical = result_array
-            .logical_nulls()
-            .expect("logical nulls");
+        let logical = result_array.logical_nulls().expect("logical nulls");
         assert!(logical.is_valid(0));
         assert!(logical.is_null(N / 2));
         assert!(logical.is_valid(N - 1));
@@ -1309,7 +1304,8 @@ mod tests {
         let mut meta = HashMap::new();
         meta.insert("k".to_string(), "v".to_string());
         let run_ends_field = Arc::new(
-            Field::new("custom_run_ends", DataType::Int32, false).with_metadata(meta.clone()),
+            Field::new("custom_run_ends", DataType::Int32, false)
+                .with_metadata(meta.clone()),
         );
         let values_field = Arc::new(
             Field::new("custom_values", DataType::Int32, true).with_metadata(meta),
@@ -1345,10 +1341,8 @@ mod tests {
         );
 
         // Same REE nested as a sparse-union variant.
-        let union_fields = UnionFields::try_new(
-            vec![1],
-            vec![Field::new("r", ree_dt.clone(), true)],
-        )?;
+        let union_fields =
+            UnionFields::try_new(vec![1], vec![Field::new("r", ree_dt.clone(), true)])?;
         let union = UnionArray::try_new(
             union_fields,
             ScalarBuffer::from(vec![1_i8, 1, 1]),
