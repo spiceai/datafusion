@@ -15,7 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+};
 
 use super::{
     Unparser, utils::bigquery_array_element_to_sql, utils::bigquery_date_trunc_to_sql,
@@ -39,6 +42,13 @@ use sqlparser::{
     },
     keywords::ALL_KEYWORDS,
 };
+
+/// An identifier [`DefaultDialect`] can write unquoted. Compiled once:
+/// `identifier_quote_style` runs for every identifier the unparser writes, and
+/// compiling the pattern on each call was most of the time it took to unparse
+/// a short query.
+static UNQUOTED_IDENTIFIER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").unwrap());
 
 pub type ScalarFnToSqlHandler =
     Box<dyn Fn(&Unparser, &[Expr]) -> Result<Option<ast::Expr>> + Send + Sync>;
@@ -774,14 +784,13 @@ pub struct DefaultDialect {}
 
 impl Dialect for DefaultDialect {
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
-        let identifier_regex = Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").unwrap();
         let id_upper = identifier.to_uppercase();
         // Special case ignore "ID", see https://github.com/sqlparser-rs/sqlparser-rs/issues/1382
         // ID is a keyword in ClickHouse, but we don't want to quote it when unparsing SQL here
         // Also quote identifiers with uppercase letters since unquoted identifiers are
         // normalized to lowercase by the SQL parser, which would break case-sensitive schemas
         let needs_quote = (id_upper != "ID" && ALL_KEYWORDS.contains(&id_upper.as_str()))
-            || !identifier_regex.is_match(identifier)
+            || !UNQUOTED_IDENTIFIER.is_match(identifier)
             || identifier.chars().any(|c| c.is_ascii_uppercase());
         if needs_quote { Some('"') } else { None }
     }

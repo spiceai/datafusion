@@ -19,7 +19,9 @@
 //! `> ALL`) into boolean expressions built from `EXISTS` subqueries
 //! that capture SQL three-valued logic.
 
+use crate::utils::NamePreserver;
 use crate::{OptimizerConfig, OptimizerRule};
+use datafusion_common::alias::AliasGenerator;
 use datafusion_common::tree_node::{Transformed, TreeNode};
 use datafusion_common::{Column, DFSchema, ExprSchema, Result, ScalarValue, plan_err};
 use datafusion_expr::expr::{self, Exists, SetComparison, SetQuantifier};
@@ -43,7 +45,11 @@ impl RewriteSetComparison {
         Self
     }
 
-    fn rewrite_plan(&self, plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
+    fn rewrite_plan(
+        &self,
+        plan: LogicalPlan,
+        alias_generator: &Arc<AliasGenerator>,
+    ) -> Result<Transformed<LogicalPlan>> {
         let mut schema = merge_schema(&plan.inputs());
         if let LogicalPlan::Dml(DmlStatement {
             op: WriteOp::MergeInto(_),
@@ -57,8 +63,27 @@ impl RewriteSetComparison {
                 &target.schema(),
             )?);
         }
+        // This rule replaces `x > ALL (…)` with a `CASE WHEN EXISTS …`, whose display
+        // name is not the name of the field it produces. Rewriting an expression
+        // without preserving its name therefore changes the output schema, and the
+        // optimizer's "the schema is invariant under optimization" check fails with an
+        // internal error rather than returning the answer. `simplify_exprs` and
+        // `type_coercion` preserve names around `map_expressions` for the same reason;
+        // doing it here also stops this rule leaving mismatched names in `Aggregate`
+        // and `Window` nodes, which a projection-only fix could not reach.
+        let name_preserver = NamePreserver::new(&plan);
+        let correlated_scalar = match &plan {
+            LogicalPlan::Projection(_) | LogicalPlan::Filter(_) => {
+                CorrelatedScalarSubquery::Allowed
+            }
+            _ => CorrelatedScalarSubquery::NotAllowed,
+        };
         plan.map_expressions(|expr| {
-            expr.transform_up(|expr| rewrite_set_comparison(expr, &schema))
+            let original_name = name_preserver.save(&expr);
+            expr.transform_up(|expr| {
+                rewrite_set_comparison(expr, &schema, alias_generator, correlated_scalar)
+            })
+            .map(|t| t.update_data(|expr| original_name.restore(expr)))
         })
     }
 }
@@ -71,19 +96,37 @@ impl OptimizerRule for RewriteSetComparison {
     fn rewrite(
         &self,
         plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
+        config: &dyn OptimizerConfig,
     ) -> Result<Transformed<LogicalPlan>> {
-        plan.transform_up_with_subqueries(|plan| self.rewrite_plan(plan))
+        let alias_generator = config.alias_generator();
+        plan.transform_up_with_subqueries(|plan| self.rewrite_plan(plan, alias_generator))
     }
+}
+
+/// Whether the plan node that holds a set comparison may hold a correlated
+/// scalar subquery. Only projections and filters may: `ScalarSubqueryToJoin`
+/// decorrelates only those, and the plan's subquery checks reject a correlated
+/// scalar subquery in most other nodes.
+#[derive(Clone, Copy)]
+enum CorrelatedScalarSubquery {
+    Allowed,
+    NotAllowed,
 }
 
 fn rewrite_set_comparison(
     expr: Expr,
     outer_schema: &DFSchema,
+    alias_generator: &Arc<AliasGenerator>,
+    correlated_scalar: CorrelatedScalarSubquery,
 ) -> Result<Transformed<Expr>> {
     match expr {
         Expr::SetComparison(set_comparison) => {
-            let rewritten = build_set_comparison_subquery(set_comparison, outer_schema)?;
+            let rewritten = build_set_comparison_subquery(
+                set_comparison,
+                outer_schema,
+                alias_generator,
+                correlated_scalar,
+            )?;
             Ok(Transformed::yes(rewritten))
         }
         _ => Ok(Transformed::no(expr)),
@@ -93,6 +136,8 @@ fn rewrite_set_comparison(
 fn build_set_comparison_subquery(
     set_comparison: SetComparison,
     outer_schema: &DFSchema,
+    alias_generator: &Arc<AliasGenerator>,
+    correlated_scalar: CorrelatedScalarSubquery,
 ) -> Result<Expr> {
     let SetComparison {
         expr,
@@ -101,13 +146,50 @@ fn build_set_comparison_subquery(
         quantifier,
     } = set_comparison;
 
-    let left_expr = to_outer_reference(*expr, outer_schema)?;
     let subquery_schema = subquery.subquery.schema();
     if subquery_schema.fields().is_empty() {
         return plan_err!("single expression required.");
     }
     // avoid `head_output_expr` for aggr/window plan, it will gives group-by expr if exists
-    let right_expr = Expr::Column(Column::from(subquery_schema.qualified_field(0)));
+    let first_column = Column::from(subquery_schema.qualified_field(0));
+
+    // ANY and ALL over exactly one value are the comparison with that value.
+    // The scalar form keeps the aggregate's row for an outer row that matches
+    // no subquery row (`max` NULL, `count` 0), which the EXISTS form below
+    // loses once decorrelation turns the subquery into a join.
+    let scalar_allowed = subquery.outer_ref_columns.is_empty()
+        || matches!(correlated_scalar, CorrelatedScalarSubquery::Allowed);
+    if scalar_allowed && returns_exactly_one_row(&subquery.subquery) {
+        let scalar = Subquery {
+            subquery: Arc::new(
+                LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
+                    .project(vec![Expr::Column(first_column)])?
+                    .build()?,
+            ),
+            ..subquery
+        };
+        return Ok(Expr::BinaryExpr(expr::BinaryExpr::new(
+            expr,
+            op,
+            Box::new(Expr::ScalarSubquery(scalar)),
+        )));
+    }
+
+    let left_expr = to_outer_reference(*expr, outer_schema)?;
+    // The subquery can read a relation with the outer query's name, as in
+    // `x = ANY (SELECT x FROM t)` over `t`. Decorrelation drops the outer
+    // reference from `outer.x = inner.x`, so the subquery column gets a name
+    // of its own.
+    let value_name = alias_generator.next("__set_comparison_value");
+    let subquery = Subquery {
+        subquery: Arc::new(
+            LogicalPlanBuilder::from(subquery.subquery.as_ref().clone())
+                .project(vec![Expr::Column(first_column).alias(&value_name)])?
+                .build()?,
+        ),
+        ..subquery
+    };
+    let right_expr = Expr::Column(Column::new_unqualified(value_name));
 
     let comparison = Expr::BinaryExpr(expr::BinaryExpr::new(
         Box::new(left_expr),
@@ -150,6 +232,18 @@ fn build_set_comparison_subquery(
     };
 
     Ok(result_expr)
+}
+
+/// An aggregate without `GROUP BY` returns one row, also over no input.
+/// Projections and aliases above it keep that row; a filter (`HAVING`) or a
+/// limit can drop it.
+fn returns_exactly_one_row(plan: &LogicalPlan) -> bool {
+    match plan {
+        LogicalPlan::Projection(projection) => returns_exactly_one_row(&projection.input),
+        LogicalPlan::SubqueryAlias(alias) => returns_exactly_one_row(&alias.input),
+        LogicalPlan::Aggregate(aggregate) => aggregate.group_expr.is_empty(),
+        _ => false,
+    }
 }
 
 fn exists_subquery(subquery: &Subquery, filter: Expr) -> Result<Expr> {
