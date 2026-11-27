@@ -487,8 +487,7 @@ impl Unparser<'_> {
                 negated: *negated,
                 expr: Box::new(self.expr_to_sql_inner(expr)?),
                 pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                escape_char: escape_char
-                    .map(|c| self.escape_char_to_sql(c)),
+                escape_char: escape_char.map(|c| self.escape_char_to_sql(c)),
                 any: false,
             }),
             Expr::Like(Like {
@@ -503,8 +502,7 @@ impl Unparser<'_> {
                         negated: *negated,
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char
-                            .map(|c| self.escape_char_to_sql(c)),
+                        escape_char: escape_char.map(|c| self.escape_char_to_sql(c)),
                         any: false,
                     })
                 } else {
@@ -512,8 +510,7 @@ impl Unparser<'_> {
                         negated: *negated,
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char
-                            .map(|c| self.escape_char_to_sql(c)),
+                        escape_char: escape_char.map(|c| self.escape_char_to_sql(c)),
                         any: false,
                     })
                 }
@@ -1706,12 +1703,20 @@ impl Unparser<'_> {
         // Render it faithfully (e.g. `AT TIME ZONE` or `CONVERT_TIMEZONE`) so the zone
         // name survives, instead of a bare `CAST(... AS TIMESTAMP WITH TIME ZONE)` that
         // silently drops it and changes the meaning on the remote engine.
-        if let DataType::Timestamp(_, Some(tz)) = data_type
-            && let Some(at_tz) = self
+        if let DataType::Timestamp(_, Some(tz)) = data_type {
+            // Dialects write the zone as a plain string literal. No valid zone
+            // name or offset holds a quote or a backslash.
+            if tz.contains(['\'', '\\']) {
+                return not_impl_err!(
+                    "A time zone that holds a quote or a backslash cannot be written as SQL"
+                );
+            }
+            if let Some(at_tz) = self
                 .dialect
                 .timestamp_at_time_zone_to_sql(inner_expr.clone(), tz.as_ref())
-        {
-            return Ok(at_tz);
+            {
+                return Ok(at_tz);
+            }
         }
         // Casting text to a timestamp *parses* it, and engines disagree about what
         // text they accept, so the dialect gets to spell the parse. BigQuery is the
@@ -3273,6 +3278,30 @@ mod tests {
     }
 
     #[test]
+    fn cast_to_a_zone_with_a_quote_or_backslash_is_not_written() {
+        let convert_timezone = CustomDialectBuilder::new()
+            .with_timezone_cast_style(TimezoneCastStyle::ConvertTimezone)
+            .build();
+        let dialects: [&dyn Dialect; 2] = [&DefaultDialect {}, &convert_timezone];
+        for dialect in dialects {
+            for tz in [r"x\", "x'"] {
+                let expr = Expr::Cast(Cast::new(
+                    Box::new(col("a")),
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+                ));
+                let written = Unparser::new(dialect).expr_to_sql(&expr);
+                assert!(
+                    matches!(
+                        written,
+                        Err(datafusion_common::DataFusionError::NotImplemented(_))
+                    ),
+                    "{tz:?} written as {written:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn custom_dialect_convert_timezone_style_nested_chain() -> Result<()> {
         // The reported bug shape: `MQL_AT AT TIME ZONE 'UTC' AT TIME ZONE 'LA'`.
         // Composes to nested CONVERT_TIMEZONE calls; correct on Snowflake when the
@@ -4078,9 +4107,21 @@ mod tests {
         let escaping = Unparser::new(&BackslashEscapeDialect);
         let default = Unparser::new(&DefaultDialect {});
         for (expr, escaped, unescaped) in [
-            (like(false), r"a LIKE 'x' ESCAPE '\\'", r"a LIKE 'x' ESCAPE '\'"),
-            (like(true), r"a ILIKE 'x' ESCAPE '\\'", r"a ILIKE 'x' ESCAPE '\'"),
-            (similar_to, r"a LIKE 'x' ESCAPE '\\'", r"a LIKE 'x' ESCAPE '\'"),
+            (
+                like(false),
+                r"a LIKE 'x' ESCAPE '\\'",
+                r"a LIKE 'x' ESCAPE '\'",
+            ),
+            (
+                like(true),
+                r"a ILIKE 'x' ESCAPE '\\'",
+                r"a ILIKE 'x' ESCAPE '\'",
+            ),
+            (
+                similar_to,
+                r"a LIKE 'x' ESCAPE '\\'",
+                r"a LIKE 'x' ESCAPE '\'",
+            ),
         ] {
             assert_eq!(escaping.expr_to_sql(&expr)?.to_string(), escaped);
             assert_eq!(default.expr_to_sql(&expr)?.to_string(), unescaped);
