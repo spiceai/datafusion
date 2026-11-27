@@ -9464,3 +9464,26 @@ physical_plan
 
 statement ok
 DROP TABLE count_order_by_t;
+
+# count(DISTINCT <wildcard>) cannot be planned as count(DISTINCT 1), which
+# counts 1 for any non-empty input.
+statement error DataFusion error: Error during planning: count\(DISTINCT t\.\*\) is not supported\. List the columns, for example count\(DISTINCT \(a, b\)\)\. It counts each distinct \(a, b\) value, including \(NULL, NULL\)\. For one column, use count\(DISTINCT struct\(a\)\)
+SELECT count(DISTINCT t.*) FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b')) AS t(a, b)
+
+statement error DataFusion error: Error during planning: count\(DISTINCT \*\) is not supported
+SELECT count(DISTINCT *) FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b')) AS t(a, b)
+
+statement error DataFusion error: Error during planning: count\(DISTINCT t\.\*\) is not supported
+SELECT count(DISTINCT t.*) OVER () FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b')) AS t(a, b)
+
+# The suggested form counts distinct rows, a row of NULLs included.
+query I
+SELECT count(DISTINCT (t.a, t.b)) FROM (VALUES (1, 'a'), (1, 'a'), (2, 'b'), (2, NULL), (NULL, NULL)) AS t(a, b)
+----
+4
+
+# Without DISTINCT, a wildcard counts rows.
+query III
+SELECT count(*), count(t.*), count(DISTINCT t.a) FROM (VALUES (1, 'a'), (1, 'a'), (NULL, NULL)) AS t(a, b)
+----
+3 3 1
