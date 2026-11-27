@@ -100,6 +100,28 @@ physical_plan
 02)--AsyncFuncExec: async_expr=[async_expr(name=__async_fn_0, expr=async_abs(x@0))]
 03)----DataSourceExec: partitions=1, partition_sizes=[1]
 
+# An async call that reads no column, in a correlated subquery over an
+# aggregate with no GROUP BY, is planned; here every outer row has a group.
+statement ok
+create table async_inner(k int, v int) as values (1, 5), (1, 10), (2, 30);
+
+query III
+select o.k, s.x, s.c from async_inner o cross join lateral (select async_abs(-7) as x, count(*) as c from async_inner i where i.k = o.k) s order by o.k, o.v;
+----
+1 7 2
+1 7 2
+2 7 1
+
+query II
+select o.k, (select async_abs(-7) from async_inner i where i.k = o.k having count(*) < 5) from async_inner o order by o.k, o.v;
+----
+1 7
+1 7
+2 7
+
+statement ok
+drop table async_inner;
+
 statement ok
 set datafusion.sql_parser.dialect = databricks;
 

@@ -72,6 +72,14 @@ pub struct PullUpCorrelatedExpr {
     pub collected_count_expr_map: HashMap<LogicalPlan, ExprResultMap>,
     /// pull up having expr, which must be evaluated after the Join
     pub pull_up_having_expr: Option<Expr>,
+    /// Outer-reference conditions from a `Filter` that sits above a count-bug
+    /// `Aggregate`: a `HAVING` clause (or an outer-only filter)
+    /// that filters the aggregate *output*. Unlike `join_filters`, these do
+    /// not merely correlate the two sides: an unmatched LEFT JOIN row may
+    /// mean one of them rejected the group rather than that no group
+    /// matched, and a scalar subquery must yield NULL for a rejected group.
+    /// `build_join` uses them to reject such queries up front.
+    pub having_like_join_filters: Vec<Expr>,
     /// whether we have converted a scalar aggregation into a group aggregation. When unnesting
     /// lateral joins, we need to produce a left outer join in such cases.
     pub pulled_up_scalar_agg: bool,
@@ -102,6 +110,7 @@ impl PullUpCorrelatedExpr {
             need_handle_count_bug: false,
             collected_count_expr_map: HashMap::new(),
             pull_up_having_expr: None,
+            having_like_join_filters: Vec::new(),
             pulled_up_scalar_agg: false,
             grouped_scalar_aggs: vec![],
             removed_duplicated_in_predicate: false,
@@ -199,6 +208,22 @@ impl TreeNodeRewriter for PullUpCorrelatedExpr {
                     let before = join_filters.len();
                     join_filters = remove_duplicated_filter(join_filters, in_predicate)?;
                     self.removed_duplicated_in_predicate |= join_filters.len() < before;
+                }
+                // A `Filter` above a count-bug `Aggregate` is a
+                // HAVING clause (or an outer-only filter above the aggregate):
+                // its outer-reference conditions filter the aggregate *output*,
+                // so a LEFT JOIN row can be unmatched either because the
+                // correlation matched no group or because one of them rejected
+                // the group. Record them so the scalar rewrite can tell the
+                // two apart; where the output needs count-bug compensation it
+                // rejects the query instead of guessing. A `Filter` below the
+                // aggregate only prunes input rows and is left out.
+                if self
+                    .collected_count_expr_map
+                    .contains_key(&*plan_filter.input)
+                {
+                    self.having_like_join_filters
+                        .extend(join_filters.iter().cloned());
                 }
                 let correlated_subquery_cols =
                     collect_subquery_cols(&join_filters, subquery_schema)?;
@@ -661,7 +686,28 @@ fn proj_exprs_evaluation_result_on_empty_batch(
             })
             .data()?;
 
-        if result_expr.ne(expr) {
+        // An expression that reads no column, like `1 AS x`, keeps its value
+        // on an empty input, while the join that replaces the subquery gives
+        // it NULL for an outer row without a match. A subquery, placeholder,
+        // variable or async function call is left out: its value cannot be
+        // computed here.
+        let is_constant = !expr.any_column_refs()
+            && !expr.contains_outer()
+            && !expr
+                .exists(|e| {
+                    Ok(match e {
+                        Expr::ScalarSubquery(_)
+                        | Expr::Exists(_)
+                        | Expr::InSubquery(_)
+                        | Expr::SetComparison(_)
+                        | Expr::Placeholder(_)
+                        | Expr::ScalarVariable(..) => true,
+                        Expr::ScalarFunction(f) => f.func.as_async().is_some(),
+                        _ => false,
+                    })
+                })
+                .unwrap_or(true);
+        if result_expr.ne(expr) || is_constant {
             let info = SimplifyContext::builder()
                 .with_schema(Arc::clone(schema))
                 .build();

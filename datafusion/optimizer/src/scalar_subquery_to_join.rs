@@ -34,7 +34,7 @@ use datafusion_common::{Column, Result, ScalarValue, assert_or_internal_err, pla
 use datafusion_expr::expr_rewriter::create_col_from_scalar_expr;
 use datafusion_expr::logical_plan::{JoinType, Subquery};
 use datafusion_expr::utils::conjunction;
-use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, lit, not, when};
+use datafusion_expr::{Expr, LogicalPlan, LogicalPlanBuilder, lit, when};
 
 /// Optimizer rule that rewrites scalar subquery filters to joins and places an
 /// additional projection on top of the filter to preserve the original schema.
@@ -361,6 +361,35 @@ fn build_join(
         .collected_count_expr_map
         .get(&decorrelated_subquery)
         .cloned();
+
+    // A HAVING or outer-only filter recorded from above the aggregate cannot
+    // stay in the join condition when the output's empty-input value is not
+    // NULL. Kept in the ON, a row the condition rejects looks unmatched
+    // and falls back to the empty-input default, which is a wrong 0. Checked
+    // in the compensation CASE instead, the condition would have to be
+    // evaluated twice, against the defaults for an unmatched row and against
+    // the actual output for a matched one, and neither evaluation is right
+    // for the rows the other one covers. The gate looks at the output column
+    // alone because only the output is read from the join; an output whose
+    // own default is NULL (the subquery projects `max`, say) keeps filtering
+    // in the ON, which is correct there because an unmatched row is NULL
+    // either way. Rather than guess, reject the query.
+    let output_name = subquery_plan.schema().field(0).name();
+    let output_needs_compensation = !pull_up.having_like_join_filters.is_empty()
+        && match collected_count_expr_map
+            .as_ref()
+            .and_then(|expr_map| expr_map.get(output_name))
+        {
+            Some(default_expr) => {
+                !evaluates_to_null(default_expr.clone(), default_expr.column_refs())?
+            }
+            None => false,
+        };
+    if output_needs_compensation {
+        return plan_err!(
+            "Unsupported correlated scalar subquery: a HAVING or filter above a count-like aggregate reads outer columns, and this rewrite cannot evaluate it against both the group and the empty input without risking wrong results. Move the condition outside the subquery"
+        );
+    }
     let aliased_subquery = LogicalPlanBuilder::from(decorrelated_subquery)
         .alias(subquery_alias.to_string())?
         .build()?;
@@ -395,18 +424,34 @@ fn build_join(
     // such expression in a CASE that substitutes the empty-input value
     // when the LEFT JOIN produced synthetic right-side NULLs (no inner
     // row matched), and uses the actual right-side value (which may
-    // itself be NULL) otherwise.
+    // itself be NULL) otherwise. A pulled up HAVING is applied only
+    // through this CASE, so with one every expression gets it.
     let mut compensation_exprs = HashMap::new();
     if let Some(expr_map) = collected_count_expr_map {
         let mut expr_rewrite = TypeCoercionRewriter {
             schema: new_plan.schema(),
         };
+        // The HAVING reads the subquery's output columns, which the join
+        // places under the subquery alias.
         let having_arm = pull_up
             .pull_up_having_expr
             .as_ref()
-            .map(|f| (not(f.clone()), lit(ScalarValue::Null)));
+            .map(|f| {
+                f.clone()
+                    .transform_up(|e| match e {
+                        Expr::Column(c) => Ok(Transformed::yes(Expr::Column(
+                            Column::new(Some(subquery_alias), c.name),
+                        ))),
+                        _ => Ok(Transformed::no(e)),
+                    })
+                    .data()
+            })
+            .transpose()?
+            .map(|f| (f.is_not_true(), lit(ScalarValue::Null)));
         for (name, result) in expr_map {
-            if evaluates_to_null(result.clone(), result.column_refs())? {
+            if having_arm.is_none()
+                && evaluates_to_null(result.clone(), result.column_refs())?
+            {
                 // Aggregates whose empty-input value is NULL (max/min/sum/…)
                 // need no compensation: the LEFT JOIN already produces NULL
                 // for unmatched outer rows.
