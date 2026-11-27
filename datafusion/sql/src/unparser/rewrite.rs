@@ -694,11 +694,15 @@ impl TreeNodeRewriter for TableAliasRewriter<'_> {
 /// offer one, which is why [`SelectBuilder::visit_expressions_in_clauses_mut`] skips any
 /// expression holding a subquery.
 ///
+/// `ident_name` reads an emitted identifier back to the name it stands for, which is
+/// what `derived_relations` is keyed by.
+///
 /// [`SelectBuilder::visit_expressions_in_clauses_mut`]: super::ast::SelectBuilder::visit_expressions_in_clauses_mut
 pub fn requalify_column_onto_derived_table(
     idents: &mut Vec<Ident>,
     derived_relations: &HashMap<String, HashMap<String, DataType>>,
     alias: Option<&Ident>,
+    ident_name: &dyn Fn(&Ident) -> String,
 ) {
     let shortest = if alias.is_some() {
         idents.len().saturating_sub(1).max(1)
@@ -708,11 +712,11 @@ pub fn requalify_column_onto_derived_table(
     let qualifier_len = (shortest..idents.len()).rev().find(|&len| {
         let qualifier = idents[..len]
             .iter()
-            .map(|ident| ident.value.clone())
+            .map(ident_name)
             .collect::<Vec<String>>()
             .join(".");
         derived_relations.get(&qualifier).is_some_and(|columns| {
-            len + 1 == idents.len() || is_field_path(columns, &idents[len..])
+            len + 1 == idents.len() || is_field_path(columns, &idents[len..], ident_name)
         })
     });
     let Some(qualifier_len) = qualifier_len else {
@@ -727,18 +731,23 @@ pub fn requalify_column_onto_derived_table(
 
 /// Whether `path` — a column, then a field of each struct in turn — names a field
 /// path through `columns`.
-fn is_field_path(columns: &HashMap<String, DataType>, path: &[Ident]) -> bool {
+fn is_field_path(
+    columns: &HashMap<String, DataType>,
+    path: &[Ident],
+    ident_name: &dyn Fn(&Ident) -> String,
+) -> bool {
     let Some((column, fields)) = path.split_first() else {
         return false;
     };
-    let Some(mut data_type) = columns.get(&column.value) else {
+    let Some(mut data_type) = columns.get(&ident_name(column)) else {
         return false;
     };
     for field in fields {
         let DataType::Struct(struct_fields) = data_type else {
             return false;
         };
-        let Some(next) = struct_fields.iter().find(|f| *f.name() == field.value) else {
+        let field = ident_name(field);
+        let Some(next) = struct_fields.iter().find(|f| *f.name() == field) else {
             return false;
         };
         data_type = next.data_type();

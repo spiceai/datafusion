@@ -66,6 +66,18 @@ pub trait Dialect: Send + Sync {
     /// Return the character used to quote identifiers.
     fn identifier_quote_style(&self, _identifier: &str) -> Option<char>;
 
+    /// The text written for a character inside a quoted identifier, for an
+    /// engine that reads escape sequences there.
+    ///
+    /// Each listed character is written as its text and every other character
+    /// as itself. The unparser reads its own identifiers back through the same
+    /// list when it compares names, so every text has to start with a
+    /// character the list escapes, and no text may start another. The default
+    /// writes each character as itself.
+    fn quoted_identifier_escapes(&self) -> &'static [(char, &'static str)] {
+        &[]
+    }
+
     /// Whether array literals should be rendered with the `ARRAY[...]` keyword.
     fn use_array_keyword_for_array_literals(&self) -> bool {
         false
@@ -1366,6 +1378,18 @@ pub struct BigQueryDialect {}
 impl Dialect for BigQueryDialect {
     fn identifier_quote_style(&self, _: &str) -> Option<char> {
         Some('`')
+    }
+
+    fn quoted_identifier_escapes(&self) -> &'static [(char, &'static str)] {
+        // GoogleSQL reads a backslash in a backtick identifier as the start of
+        // an escape, reads no doubled backtick there, and refuses a raw line
+        // break.
+        &[
+            ('\\', "\\\\"),
+            ('`', "\\u0060"),
+            ('\r', "\\r"),
+            ('\n', "\\n"),
+        ]
     }
 
     fn group_by_matches_select_subexpressions(&self) -> bool {

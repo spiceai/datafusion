@@ -26,6 +26,7 @@ use sqlparser::ast::{
     Subscript, TimezoneInfo, UnaryOperator,
 };
 use sqlparser::ast::{CaseWhen, DuplicateTreatment, OrderByOptions, ValueWithSpan};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::vec;
 
@@ -487,8 +488,7 @@ impl Unparser<'_> {
                 negated: *negated,
                 expr: Box::new(self.expr_to_sql_inner(expr)?),
                 pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                escape_char: escape_char
-                    .map(|c| SingleQuotedString(c.to_string()).into()),
+                escape_char: escape_char.map(|c| self.escape_char_to_sql(c)),
                 any: false,
             }),
             Expr::Like(Like {
@@ -503,8 +503,7 @@ impl Unparser<'_> {
                         negated: *negated,
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                        escape_char: escape_char.map(|c| self.escape_char_to_sql(c)),
                         any: false,
                     })
                 } else {
@@ -512,8 +511,7 @@ impl Unparser<'_> {
                         negated: *negated,
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
-                        escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                        escape_char: escape_char.map(|c| self.escape_char_to_sql(c)),
                         any: false,
                     })
                 }
@@ -1291,13 +1289,60 @@ impl Unparser<'_> {
     }
 
     /// This function can create an identifier with or without quotes based on the dialect rules
+    ///
+    /// A quoted identifier holds `ident` written with the dialect's
+    /// [`super::dialect::Dialect::quoted_identifier_escapes`]; compare it by
+    /// [`Self::ident_name`], not by its value.
     pub(super) fn new_ident_quoted_if_needs(&self, ident: String) -> Ident {
         let quote_style = self.dialect.identifier_quote_style(&ident);
+        let escapes = self.dialect.quoted_identifier_escapes();
+        let escaped = |c: char| escapes.iter().find(|(from, _)| *from == c);
+        let value =
+            if quote_style.is_some() && ident.chars().any(|c| escaped(c).is_some()) {
+                let mut written = String::with_capacity(ident.len());
+                for c in ident.chars() {
+                    match escaped(c) {
+                        Some((_, text)) => written.push_str(text),
+                        None => written.push(c),
+                    }
+                }
+                written
+            } else {
+                ident
+            };
         Ident {
-            value: ident,
+            value,
             quote_style,
             span: Span::empty(),
         }
+    }
+
+    /// The name an identifier built by [`Self::new_ident_quoted_if_needs`]
+    /// stands for: its value with the dialect's quoted-identifier escapes read
+    /// back.
+    pub(crate) fn ident_name<'a>(&self, ident: &'a Ident) -> Cow<'a, str> {
+        let escapes = self.dialect.quoted_identifier_escapes();
+        if ident.quote_style.is_none() || escapes.is_empty() {
+            return Cow::Borrowed(&ident.value);
+        }
+        let mut name = String::with_capacity(ident.value.len());
+        let mut rest = ident.value.as_str();
+        while let Some(c) = rest.chars().next() {
+            match escapes
+                .iter()
+                .find_map(|(from, text)| Some((*from, rest.strip_prefix(text)?)))
+            {
+                Some((from, after)) => {
+                    name.push(from);
+                    rest = after;
+                }
+                None => {
+                    name.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+        }
+        Cow::Owned(name)
     }
 
     pub(super) fn new_ident_without_quote_style(&self, str: String) -> Ident {
@@ -1706,12 +1751,20 @@ impl Unparser<'_> {
         // Render it faithfully (e.g. `AT TIME ZONE` or `CONVERT_TIMEZONE`) so the zone
         // name survives, instead of a bare `CAST(... AS TIMESTAMP WITH TIME ZONE)` that
         // silently drops it and changes the meaning on the remote engine.
-        if let DataType::Timestamp(_, Some(tz)) = data_type
-            && let Some(at_tz) = self
+        if let DataType::Timestamp(_, Some(tz)) = data_type {
+            // Dialects write the zone as a plain string literal. No valid zone
+            // name or offset holds a quote or a backslash.
+            if tz.contains(['\'', '\\']) {
+                return not_impl_err!(
+                    "A time zone that holds a quote or a backslash cannot be written as SQL"
+                );
+            }
+            if let Some(at_tz) = self
                 .dialect
                 .timestamp_at_time_zone_to_sql(inner_expr.clone(), tz.as_ref())
-        {
-            return Ok(at_tz);
+            {
+                return Ok(at_tz);
+            }
         }
         // Casting text to a timestamp *parses* it, and engines disagree about what
         // text they accept, so the dialect gets to spell the parse. BigQuery is the
@@ -1793,6 +1846,17 @@ impl Unparser<'_> {
                 array: false,
                 format: None,
             }),
+        }
+    }
+
+    /// The `ESCAPE` character of a `LIKE`, written the way the dialect writes a
+    /// string literal, so that `ESCAPE '\'` stays one literal in an engine that
+    /// reads `\` as an escape.
+    fn escape_char_to_sql(&self, c: char) -> ValueWithSpan {
+        let c = c.to_string();
+        match self.dialect.string_literal_to_sql(&c) {
+            Some(ast::Expr::Value(value)) => value,
+            _ => SingleQuotedString(c).into(),
         }
     }
 
@@ -3262,6 +3326,30 @@ mod tests {
     }
 
     #[test]
+    fn cast_to_a_zone_with_a_quote_or_backslash_is_not_written() {
+        let convert_timezone = CustomDialectBuilder::new()
+            .with_timezone_cast_style(TimezoneCastStyle::ConvertTimezone)
+            .build();
+        let dialects: [&dyn Dialect; 2] = [&DefaultDialect {}, &convert_timezone];
+        for dialect in dialects {
+            for tz in [r"x\", "x'"] {
+                let expr = Expr::Cast(Cast::new(
+                    Box::new(col("a")),
+                    DataType::Timestamp(TimeUnit::Nanosecond, Some(tz.into())),
+                ));
+                let written = Unparser::new(dialect).expr_to_sql(&expr);
+                assert!(
+                    matches!(
+                        written,
+                        Err(datafusion_common::DataFusionError::NotImplemented(_))
+                    ),
+                    "{tz:?} written as {written:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn custom_dialect_convert_timezone_style_nested_chain() -> Result<()> {
         // The reported bug shape: `MQL_AT AT TIME ZONE 'UTC' AT TIME ZONE 'LA'`.
         // Composes to nested CONVERT_TIMEZONE calls; correct on Snowflake when the
@@ -4029,6 +4117,62 @@ mod tests {
             let expr = Expr::Literal(ScalarValue::LargeUtf8(Some(s.to_string())), None);
             let ast = unparser.expr_to_sql(&expr)?;
             assert_eq!(ast.to_string(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn like_escape_char_is_written_as_a_dialect_string_literal() -> Result<()> {
+        struct BackslashEscapeDialect;
+
+        impl Dialect for BackslashEscapeDialect {
+            fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
+                None
+            }
+
+            fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
+                Some(ast::Expr::value(SingleQuotedString(s.replace('\\', r"\\"))))
+            }
+        }
+
+        let like = |case_insensitive| {
+            Expr::Like(Like {
+                negated: false,
+                expr: Box::new(col("a")),
+                pattern: Box::new(lit("x")),
+                escape_char: Some('\\'),
+                case_insensitive,
+            })
+        };
+        let similar_to = Expr::SimilarTo(Like {
+            negated: false,
+            expr: Box::new(col("a")),
+            pattern: Box::new(lit("x")),
+            escape_char: Some('\\'),
+            case_insensitive: false,
+        });
+
+        let escaping = Unparser::new(&BackslashEscapeDialect);
+        let default = Unparser::new(&DefaultDialect {});
+        for (expr, escaped, unescaped) in [
+            (
+                like(false),
+                r"a LIKE 'x' ESCAPE '\\'",
+                r"a LIKE 'x' ESCAPE '\'",
+            ),
+            (
+                like(true),
+                r"a ILIKE 'x' ESCAPE '\\'",
+                r"a ILIKE 'x' ESCAPE '\'",
+            ),
+            (
+                similar_to,
+                r"a LIKE 'x' ESCAPE '\\'",
+                r"a LIKE 'x' ESCAPE '\'",
+            ),
+        ] {
+            assert_eq!(escaping.expr_to_sql(&expr)?.to_string(), escaped);
+            assert_eq!(default.expr_to_sql(&expr)?.to_string(), unescaped);
         }
         Ok(())
     }
