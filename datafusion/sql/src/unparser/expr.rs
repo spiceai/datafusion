@@ -488,7 +488,7 @@ impl Unparser<'_> {
                 expr: Box::new(self.expr_to_sql_inner(expr)?),
                 pattern: Box::new(self.expr_to_sql_inner(pattern)?),
                 escape_char: escape_char
-                    .map(|c| SingleQuotedString(c.to_string()).into()),
+                    .map(|c| self.escape_char_to_sql(c)),
                 any: false,
             }),
             Expr::Like(Like {
@@ -504,7 +504,7 @@ impl Unparser<'_> {
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
                         escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                            .map(|c| self.escape_char_to_sql(c)),
                         any: false,
                     })
                 } else {
@@ -513,7 +513,7 @@ impl Unparser<'_> {
                         expr: Box::new(self.expr_to_sql_inner(expr)?),
                         pattern: Box::new(self.expr_to_sql_inner(pattern)?),
                         escape_char: escape_char
-                            .map(|c| SingleQuotedString(c.to_string()).into()),
+                            .map(|c| self.escape_char_to_sql(c)),
                         any: false,
                     })
                 }
@@ -1793,6 +1793,17 @@ impl Unparser<'_> {
                 array: false,
                 format: None,
             }),
+        }
+    }
+
+    /// The `ESCAPE` character of a `LIKE`, written the way the dialect writes a
+    /// string literal, so that `ESCAPE '\'` stays one literal in an engine that
+    /// reads `\` as an escape.
+    fn escape_char_to_sql(&self, c: char) -> ValueWithSpan {
+        let c = c.to_string();
+        match self.dialect.string_literal_to_sql(&c) {
+            Some(ast::Expr::Value(value)) => value,
+            _ => SingleQuotedString(c).into(),
         }
     }
 
@@ -4029,6 +4040,50 @@ mod tests {
             let expr = Expr::Literal(ScalarValue::LargeUtf8(Some(s.to_string())), None);
             let ast = unparser.expr_to_sql(&expr)?;
             assert_eq!(ast.to_string(), expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn like_escape_char_is_written_as_a_dialect_string_literal() -> Result<()> {
+        struct BackslashEscapeDialect;
+
+        impl Dialect for BackslashEscapeDialect {
+            fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
+                None
+            }
+
+            fn string_literal_to_sql(&self, s: &str) -> Option<ast::Expr> {
+                Some(ast::Expr::value(SingleQuotedString(s.replace('\\', r"\\"))))
+            }
+        }
+
+        let like = |case_insensitive| {
+            Expr::Like(Like {
+                negated: false,
+                expr: Box::new(col("a")),
+                pattern: Box::new(lit("x")),
+                escape_char: Some('\\'),
+                case_insensitive,
+            })
+        };
+        let similar_to = Expr::SimilarTo(Like {
+            negated: false,
+            expr: Box::new(col("a")),
+            pattern: Box::new(lit("x")),
+            escape_char: Some('\\'),
+            case_insensitive: false,
+        });
+
+        let escaping = Unparser::new(&BackslashEscapeDialect);
+        let default = Unparser::new(&DefaultDialect {});
+        for (expr, escaped, unescaped) in [
+            (like(false), r"a LIKE 'x' ESCAPE '\\'", r"a LIKE 'x' ESCAPE '\'"),
+            (like(true), r"a ILIKE 'x' ESCAPE '\\'", r"a ILIKE 'x' ESCAPE '\'"),
+            (similar_to, r"a LIKE 'x' ESCAPE '\\'", r"a LIKE 'x' ESCAPE '\'"),
+        ] {
+            assert_eq!(escaping.expr_to_sql(&expr)?.to_string(), escaped);
+            assert_eq!(default.expr_to_sql(&expr)?.to_string(), unescaped);
         }
         Ok(())
     }
