@@ -13999,6 +13999,240 @@ fn test_bigquery_hoists_a_recursive_cte_behind_a_derived_table() -> Result<()> {
     Ok(())
 }
 
+/// Names holding a character BigQuery escapes in a backtick identifier, each with
+/// the text it is written as there.
+const BIGQUERY_ESCAPED_NAMES: [(&str, &str); 4] = [
+    ("a\\b", "a\\\\b"),
+    ("a`b", "a\\u0060b"),
+    ("a\rb", "a\\rb"),
+    ("a\nb", "a\\nb"),
+];
+
+fn plan_with_mock_context(query: &str) -> Result<LogicalPlan> {
+    let statement = Parser::new(&GenericDialect {})
+        .try_with_sql(query)?
+        .parse_statement()?;
+    let context = MockContextProvider {
+        state: MockSessionState::default(),
+    };
+    SqlToRel::new(&context).sql_statement_to_plan(statement)
+}
+
+fn bigquery_sql(plan: &LogicalPlan) -> Result<String> {
+    Ok(Unparser::new(&BigQueryDialect {})
+        .plan_to_sql(plan)?
+        .to_string())
+}
+
+/// GoogleSQL reads a backslash in a backtick identifier as the start of an escape,
+/// reads no doubled backtick there and refuses a raw line break, so BigQuery writes
+/// each of those characters as an escape that reads back as the character: in a
+/// table alias, a column qualifier and a CTE name.
+#[test]
+fn test_bigquery_escapes_relation_names() -> Result<()> {
+    for (name, written) in BIGQUERY_ESCAPED_NAMES {
+        let sql = bigquery_sql(&plan_with_mock_context(&format!(
+            "SELECT \"{name}\".id FROM person AS \"{name}\""
+        ))?)?;
+        assert!(
+            sql.contains(&format!("AS `{written}`")),
+            "the table alias: {sql}"
+        );
+        assert!(
+            sql.contains(&format!("`{written}`.`id`")),
+            "the column qualifier: {sql}"
+        );
+        assert!(!sql.contains(name), "the name as it is: {sql}");
+
+        let sql = bigquery_sql(&plan_with_mock_context(&format!(
+            "WITH RECURSIVE \"{name}\" AS (\
+               SELECT 1 AS n UNION ALL SELECT n + 1 FROM \"{name}\" WHERE n < 5\
+             ) SELECT n FROM \"{name}\""
+        ))?)?;
+        assert!(
+            sql.starts_with(&format!("WITH RECURSIVE `{written}` AS")),
+            "the CTE name: {sql}"
+        );
+        assert!(!sql.contains(name), "the name as it is: {sql}");
+    }
+    Ok(())
+}
+
+/// A line break in a column name is written as its escape. A backslash or a
+/// backtick in a column name is not escaped, because BigQuery's
+/// `col_alias_overrides` renames such a column first.
+#[test]
+fn test_bigquery_escapes_a_line_break_in_a_column_name() -> Result<()> {
+    for &(name, written) in &BIGQUERY_ESCAPED_NAMES[2..] {
+        let sql = bigquery_sql(&plan_with_mock_context(&format!(
+            "SELECT s.\"{name}\" FROM (SELECT id AS \"{name}\" FROM person) AS s"
+        ))?)?;
+        assert!(
+            sql.contains(&format!("`{written}`")),
+            "the column name: {sql}"
+        );
+        assert!(!sql.contains(name), "the name as it is: {sql}");
+    }
+    Ok(())
+}
+
+/// A dialect that lists no quoted-identifier escapes writes each name as it is.
+#[test]
+fn test_names_are_not_escaped_by_dialects_without_identifier_escapes() -> Result<()> {
+    let dialects: [&dyn UnparserDialect; 4] = [
+        &UnparserDefaultDialect {},
+        &UnparserPostgreSqlDialect {},
+        &UnparserMySqlDialect {},
+        &SqliteDialect {},
+    ];
+    for (name, _) in BIGQUERY_ESCAPED_NAMES {
+        let plan = plan_with_mock_context(&format!(
+            "SELECT \"{name}\".id FROM person AS \"{name}\""
+        ))?;
+        for dialect in dialects {
+            let quote = dialect
+                .identifier_quote_style(name)
+                .expect("a name holding this character is quoted");
+            let quoted = Ident::with_quote(quote, name).to_string();
+            let sql = Unparser::new(dialect).plan_to_sql(&plan)?.to_string();
+            assert!(sql.contains(&format!("AS {quoted}")), "{sql}");
+        }
+    }
+    Ok(())
+}
+
+/// The check that a hoisted recursive CTE does not rebind a relation of its name
+/// compares the name the CTE stands for, not the escaped text BigQuery writes.
+#[test]
+fn test_bigquery_refuses_to_hoist_a_recursive_cte_over_a_relation_of_its_name()
+-> Result<()> {
+    for name in ["g"]
+        .into_iter()
+        .chain(BIGQUERY_ESCAPED_NAMES.map(|(name, _)| name))
+    {
+        let plan = plan_with_mock_context(&format!(
+            "WITH RECURSIVE \"{name}\" AS (\
+               SELECT 1 AS n UNION ALL SELECT n + 1 FROM \"{name}\" WHERE n < 5\
+             ) SELECT \"{name}\".id FROM person AS \"{name}\" \
+             JOIN (SELECT n FROM \"{name}\") gg ON \"{name}\".id = gg.n"
+        ))?;
+        let err = bigquery_sql(&plan).expect_err("hoisting would rebind the alias");
+        assert_contains!(err.to_string(), "cannot be hoisted");
+    }
+    Ok(())
+}
+
+/// Requalifying a reference onto a new scope matches its qualifier by the name it
+/// stands for, so a relation whose name BigQuery writes with an escape is
+/// requalified as a plain one is.
+#[test]
+fn test_bigquery_requalifies_a_group_output_of_a_relation_with_an_escaped_name()
+-> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Utf8, true),
+        Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            true,
+        ),
+    ]);
+    for (name, written) in [("t", "t")].into_iter().chain(BIGQUERY_ESCAPED_NAMES) {
+        let relation = || Some(TableReference::bare(name));
+        let grouped = table_scan(relation(), &schema, None)?
+            .aggregate(
+                vec![
+                    Expr::Column(Column::new(relation(), "a")),
+                    datafusion_functions::expr_fn::date_trunc(
+                        lit("week"),
+                        Expr::Column(Column::new(relation(), "ts")),
+                    ),
+                ],
+                vec![count(lit(1i64))],
+            )?
+            .build()?;
+        let outputs = grouped.schema().columns();
+        let plan = LogicalPlanBuilder::from(grouped)
+            .project(vec![
+                Expr::Column(outputs[0].clone()).alias("a"),
+                cast(Expr::Column(outputs[1].clone()), DataType::Date32).alias("wk"),
+            ])?
+            .build()?;
+
+        let sql = bigquery_sql(&plan)?;
+        let outer_select = &sql[..sql.find("FROM").expect("a FROM in: {sql}")];
+        assert!(
+            !outer_select.contains(&format!("`{written}`.`a`")),
+            "the outer select still names the enclosed relation: {sql}"
+        );
+    }
+    Ok(())
+}
+
+/// A stacked aggregate becomes a derived table, and the SELECT above it reads the
+/// enclosed relation's columns through the derived table's alias, matched by the
+/// name the relation stands for.
+#[test]
+fn test_bigquery_stacked_aggregate_requalifies_a_relation_with_an_escaped_name()
+-> Result<()> {
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::UInt32, false),
+        Field::new("b", DataType::UInt32, false),
+    ]);
+    for (name, written) in [("test", "test")].into_iter().chain(BIGQUERY_ESCAPED_NAMES) {
+        let relation = || Some(TableReference::bare(name));
+        let column = |column: &str| Expr::Column(Column::new(relation(), column));
+        let plan = table_scan(relation(), &schema, None)?
+            .aggregate(
+                vec![column("a"), column("b").alias("alias1")],
+                Vec::<Expr>::new(),
+            )?
+            .aggregate(vec![column("a")], vec![count_col("alias1")])?
+            .build()?;
+
+        let sql = bigquery_sql(&plan)?;
+        assert!(
+            sql.ends_with(
+                ") AS `derived_aggregate_1` GROUP BY `derived_aggregate_1`.`a`"
+            ),
+            "the outer GROUP BY still names the enclosed relation {written}: {sql}"
+        );
+    }
+    Ok(())
+}
+
+/// A WHERE re-pointed onto the derived table a sort scope builds drops the
+/// relation the derived table hides, matched by the name the relation stands for.
+#[test]
+fn test_bigquery_clause_re_pointed_onto_a_scope_drops_a_relation_with_an_escaped_name()
+-> Result<()> {
+    use datafusion_functions::core::expr_ext::FieldAccessor;
+    let schema = Schema::new(vec![
+        Field::new("a", DataType::Int32, false),
+        Field::new(
+            "payload",
+            DataType::Struct(vec![Field::new("x", DataType::Int32, false)].into()),
+            false,
+        ),
+    ]);
+    for (name, written) in [("t", "t")].into_iter().chain(BIGQUERY_ESCAPED_NAMES) {
+        let relation = || Some(TableReference::bare(name));
+        let column = |column: &str| Expr::Column(Column::new(relation(), column));
+        let plan = table_scan(relation(), &schema, None)?
+            .project(vec![column("a"), column("payload"), random().alias("r")])?
+            .sort(vec![col("r").add(lit(1.0)).sort(true, true)])?
+            .filter(column("payload").field("x").gt(lit(1)))?
+            .build()?;
+
+        let sql = bigquery_sql(&plan)?;
+        let where_clause = &sql[sql.find("WHERE").expect("a WHERE in: {sql}")..];
+        assert!(
+            !where_clause.contains(&format!("`{written}`")),
+            "the WHERE still names the hidden relation: {sql}"
+        );
+    }
+    Ok(())
+}
+
 /// Only a `Date32` cast is parsed as a date; a `Date64` keeps its time of day.
 ///
 /// `Date64` is rendered `DATETIME` by `ast_type_for_date64_in_cast`, so routing

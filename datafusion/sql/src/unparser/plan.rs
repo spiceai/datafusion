@@ -737,8 +737,8 @@ impl Unparser<'_> {
                 .collect();
             if !pending.is_empty() {
                 for cte in &pending {
-                    let bound =
-                        relations_capturable_by(plan, cte.alias.name.value.as_str())?;
+                    let name = self.ident_name(&cte.alias.name);
+                    let bound = relations_capturable_by(plan, &name)?;
                     // A hoisted CTE keeps its own name, and here that name joins
                     // the statement's top-level namespace. If the statement
                     // already binds a relation of that name, hoisting rebinds it:
@@ -751,7 +751,7 @@ impl Unparser<'_> {
                     // CTE, and hoisting the CTE to the top makes both read the
                     // CTE. Refuse the statement rather than emit SQL that binds
                     // the wrong relation and returns wrong rows.
-                    if bound.contains(cte.alias.name.value.as_str()) {
+                    if bound.contains(name.as_ref()) {
                         return not_impl_err!(
                             "a recursive CTE named `{}` cannot be hoisted to the \
                              top of this statement: the name already binds a \
@@ -1478,13 +1478,14 @@ impl Unparser<'_> {
                 let qualifier = idents
                     .iter()
                     .take(idents.len().saturating_sub(1))
-                    .map(|ident| ident.value.clone())
+                    .map(|ident| self.ident_name(ident).into_owned())
                     .collect::<Vec<_>>();
                 if !outer_qualifiers.contains(&self.qualifier_key(&qualifier)) {
                     requalify_column_onto_derived_table(
                         idents,
                         &derived_qualifiers,
                         Some(&alias),
+                        &|ident| self.ident_name(ident).into_owned(),
                     );
                 }
             }
@@ -1953,7 +1954,12 @@ impl Unparser<'_> {
         let mut captured = None;
         let mut repoint = |expr: &mut ast::Expr| {
             if let ast::Expr::CompoundIdentifier(idents) = expr {
-                requalify_column_onto_derived_table(idents, hidden_qualifiers, None);
+                requalify_column_onto_derived_table(
+                    idents,
+                    hidden_qualifiers,
+                    None,
+                    &|ident| self.ident_name(ident).into_owned(),
+                );
                 if names_derived_table
                     && captured.is_none()
                     && let Some((_, qualifier)) = idents.split_last()
@@ -1961,7 +1967,7 @@ impl Unparser<'_> {
                         &self.qualifier_key(
                             &qualifier
                                 .iter()
-                                .map(|ident| ident.value.clone())
+                                .map(|ident| self.ident_name(ident).into_owned())
                                 .collect::<Vec<_>>(),
                         ),
                     )
@@ -2304,7 +2310,7 @@ impl Unparser<'_> {
         name.0
             .iter()
             .map(|part| match part.as_ident() {
-                Some(ident) => self.identifier_comparison_key(&ident.value),
+                Some(ident) => self.identifier_comparison_key(&self.ident_name(ident)),
                 None => part.to_string(),
             })
             .collect()
@@ -4265,6 +4271,7 @@ impl Unparser<'_> {
                                 idents,
                                 &derived_qualifiers,
                                 Some(&alias),
+                                &|ident| self.ident_name(ident).into_owned(),
                             );
                         }
                     });

@@ -26,6 +26,7 @@ use sqlparser::ast::{
     Subscript, TimezoneInfo, UnaryOperator,
 };
 use sqlparser::ast::{CaseWhen, DuplicateTreatment, OrderByOptions, ValueWithSpan};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::vec;
 
@@ -1288,13 +1289,60 @@ impl Unparser<'_> {
     }
 
     /// This function can create an identifier with or without quotes based on the dialect rules
+    ///
+    /// A quoted identifier holds `ident` written with the dialect's
+    /// [`super::dialect::Dialect::quoted_identifier_escapes`]; compare it by
+    /// [`Self::ident_name`], not by its value.
     pub(super) fn new_ident_quoted_if_needs(&self, ident: String) -> Ident {
         let quote_style = self.dialect.identifier_quote_style(&ident);
+        let escapes = self.dialect.quoted_identifier_escapes();
+        let escaped = |c: char| escapes.iter().find(|(from, _)| *from == c);
+        let value =
+            if quote_style.is_some() && ident.chars().any(|c| escaped(c).is_some()) {
+                let mut written = String::with_capacity(ident.len());
+                for c in ident.chars() {
+                    match escaped(c) {
+                        Some((_, text)) => written.push_str(text),
+                        None => written.push(c),
+                    }
+                }
+                written
+            } else {
+                ident
+            };
         Ident {
-            value: ident,
+            value,
             quote_style,
             span: Span::empty(),
         }
+    }
+
+    /// The name an identifier built by [`Self::new_ident_quoted_if_needs`]
+    /// stands for: its value with the dialect's quoted-identifier escapes read
+    /// back.
+    pub(crate) fn ident_name<'a>(&self, ident: &'a Ident) -> Cow<'a, str> {
+        let escapes = self.dialect.quoted_identifier_escapes();
+        if ident.quote_style.is_none() || escapes.is_empty() {
+            return Cow::Borrowed(&ident.value);
+        }
+        let mut name = String::with_capacity(ident.value.len());
+        let mut rest = ident.value.as_str();
+        while let Some(c) = rest.chars().next() {
+            match escapes
+                .iter()
+                .find_map(|(from, text)| Some((*from, rest.strip_prefix(text)?)))
+            {
+                Some((from, after)) => {
+                    name.push(from);
+                    rest = after;
+                }
+                None => {
+                    name.push(c);
+                    rest = &rest[c.len_utf8()..];
+                }
+            }
+        }
+        Cow::Owned(name)
     }
 
     pub(super) fn new_ident_without_quote_style(&self, str: String) -> Ident {
