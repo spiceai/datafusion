@@ -19,12 +19,25 @@ use core::fmt;
 use std::ops::ControlFlow;
 
 use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion_common::utils::combine_limit;
 use datafusion_expr::Expr;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
     self, LimitClause, OrderByKind, SelectFlavor, visit_expressions,
     visit_expressions_mut,
 };
+
+/// The number a `LIMIT` or `OFFSET` expression names, when it is a plain
+/// numeric literal; an expression such as `CAST(7 AS INTEGER)` is `None`.
+fn literal_usize(expr: &ast::Expr) -> Option<usize> {
+    match expr {
+        ast::Expr::Value(ast::ValueWithSpan {
+            value: ast::Value::Number(number, _),
+            ..
+        }) => number.parse().ok(),
+        _ => None,
+    }
+}
 
 #[derive(Clone)]
 pub struct QueryBuilder {
@@ -39,6 +52,9 @@ pub struct QueryBuilder {
     for_clause: Option<ast::ForClause>,
     // If true, we need to unparse LogicalPlan::Union as a SQL `UNION` rather than a `UNION ALL`.
     distinct_union: bool,
+    // The names of the outer references the `ORDER BY` reads, which render as
+    // bare names a derived table's output of the same name would capture.
+    order_by_outer_references: Vec<String>,
 }
 
 impl QueryBuilder {
@@ -81,6 +97,62 @@ impl QueryBuilder {
     }
     pub fn get_order_by(&self) -> Option<OrderByKind> {
         self.order_by_kind.clone()
+    }
+    /// Records the names of the outer references a sort's keys read, set
+    /// together with the `ORDER BY` those keys become: once rendered they are
+    /// bare names, no longer told apart from the columns beside them.
+    pub fn set_order_by_outer_references(&mut self, names: Vec<String>) -> &mut Self {
+        self.order_by_outer_references = names;
+        self
+    }
+    /// The names of the outer references this query's `ORDER BY` reads.
+    pub fn order_by_outer_references(&self) -> &[String] {
+        &self.order_by_outer_references
+    }
+    /// Whether this query already carries an `ORDER BY`. A query holds one, so a
+    /// sort unparsed into it after another has set it is reordered by that one
+    /// and cannot be emitted here as well.
+    pub fn has_order_by(&self) -> bool {
+        self.order_by_kind.is_some()
+    }
+    /// The row bound this query carries as `(skip, fetch)`: an absent `OFFSET` is a
+    /// skip of 0 and an absent `LIMIT` an unbounded fetch. `None` when either is an
+    /// expression rather than a number, which no other bound can be merged with.
+    pub fn literal_row_bound(&self) -> Option<(usize, Option<usize>)> {
+        if self.fetch.is_some() || !self.limit_by.is_empty() {
+            return None;
+        }
+        let fetch = match &self.limit {
+            None => None,
+            Some(limit) => Some(literal_usize(limit)?),
+        };
+        let skip = match &self.offset {
+            None => 0,
+            Some(offset) => literal_usize(&offset.value)?,
+        };
+        Some((skip, fetch))
+    }
+    /// Merges a literal bound applied below this query's bound into it, the way the
+    /// optimizer merges stacked limits: the bound here reads the rows the one below
+    /// leaves. Returns `false`, leaving the bound unchanged, when the bound here is
+    /// an expression and so cannot absorb another.
+    pub fn merge_inner_row_bound(&mut self, skip: usize, fetch: Option<usize>) -> bool {
+        let Some((outer_skip, outer_fetch)) = self.literal_row_bound() else {
+            return false;
+        };
+        let (skip, fetch) = combine_limit(outer_skip, outer_fetch, skip, fetch);
+        self.set_literal_row_bound(skip, fetch);
+        true
+    }
+    /// Replaces this query's row bound with the numbers given; a skip of 0 leaves
+    /// the `OFFSET` out, and no fetch leaves the `LIMIT` out.
+    fn set_literal_row_bound(&mut self, skip: usize, fetch: Option<usize>) {
+        self.limit = fetch
+            .map(|fetch| ast::Expr::value(ast::Value::Number(fetch.to_string(), false)));
+        self.offset = (skip > 0).then(|| ast::Offset {
+            rows: ast::OffsetRows::None,
+            value: ast::Expr::value(ast::Value::Number(skip.to_string(), false)),
+        });
     }
     /// Applies `f` to every expression in this query's `ORDER BY`, nested ones
     /// included, so a caller that replaces the relation the `SELECT` reads — unparsing
@@ -139,7 +211,9 @@ impl QueryBuilder {
     /// SQL evaluates all of these after the body's `WHERE`, so a predicate
     /// added to that `WHERE` decides which rows the bound then keeps. A caller
     /// that needs its predicate applied to the bounded result has to put the
-    /// bounded query in a scope of its own instead.
+    /// bounded query in a scope of its own instead. Likewise a row bound unparsed
+    /// into it after another has set one either merges with that one or needs a
+    /// scope of its own.
     pub fn bounds_rows(&self) -> bool {
         self.limit.is_some()
             || self.offset.is_some()
@@ -193,6 +267,7 @@ impl QueryBuilder {
             locks: Default::default(),
             for_clause: Default::default(),
             distinct_union: false,
+            order_by_outer_references: vec![],
         }
     }
 }
